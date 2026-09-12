@@ -334,6 +334,20 @@ pass=0; fail=0   # EGL-43: reset before ARC-18 (that block never resets)
 # file must never literally contain a fleet fact either — the grep
 # pattern and the decoy string are assembled from parts (same discipline
 # as fleet_grep in packaging/snapshot-public.sh).
+#
+# EGL-74: the publisher (packaging/snapshot-public.sh) and the
+# internal_docs/ fixture are private-tree material — the public snapshot
+# ships neither. Cases that invoke or grep the publisher, or that need
+# internal_docs/ as a fixture, are SKIPPED (not deleted) when absent —
+# EGL-74-D1/D2; guards that need neither keep running (D2).
+SNAP_PUBLIC="$TREE_ROOT/packaging/snapshot-public.sh"
+HAVE_SNAPSHOT=0; [[ -f "$SNAP_PUBLIC" ]] && HAVE_SNAPSHOT=1
+HAVE_INTERNAL_DOCS=0; [[ -d "$TREE_ROOT/internal_docs" ]] && HAVE_INTERNAL_DOCS=1
+
+if [[ "$HAVE_SNAPSHOT" == 0 ]]; then
+    echo "SKIP: EGL-12 public snapshot staging — packaging/snapshot-public.sh is not on the public tree (EGL-74-D1)"
+    egl12_pass=0; egl12_fail=0
+else
 pass=0; fail=0
 a12k() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
 p12="$STATE/egl12"; rm -rf "$p12"; mkdir -p "$p12/kit"
@@ -386,6 +400,7 @@ o="$(bash "$snap12" --dry-run "$p12/stage-d" 2>&1)"; rc=$?
     && a12k pass || a12k fail "non-empty stage refused (rc=$rc, out: $o)"
 
 egl12_pass=$pass; egl12_fail=$fail
+fi
 
 # --- EGL-47: internal_docs never reaches a distribution path (D1–D3) --------
 pass=0; fail=0
@@ -394,14 +409,22 @@ p47="$STATE/egl47"; rm -rf "$p47"; mkdir -p "$p47/kit" "$p47/bin" "$p47/sbin" "$
 # The live checkout carries internal_docs/ (maintainer material) — copy
 # the whole tree so every guard is exercised against the real hazard.
 (cd "$TREE_ROOT" && tar -cf - --exclude=./.git .) | tar -xf - -C "$p47/kit"
-[[ -e "$p47/kit/internal_docs" ]] \
-    && a47 pass || a47 fail "fixture sanity: kit copy contains internal_docs"
+if [[ "$HAVE_INTERNAL_DOCS" == 1 ]]; then
+    [[ -e "$p47/kit/internal_docs" ]] \
+        && a47 pass || a47 fail "fixture sanity: kit copy contains internal_docs"
+else
+    echo "SKIP: EGL-47 fixture sanity — internal_docs/ is not on the public tree (EGL-74-D1)"
+fi
 
 # 1. Snapshot --dry-run: internal_docs present at source, absent in stage.
+if [[ "$HAVE_SNAPSHOT" == 1 && "$HAVE_INTERNAL_DOCS" == 1 ]]; then
 printf '# security policy (staged fixture for the snapshot gate)\n' > "$p47/kit/SECURITY.md"
 o="$(bash "$p47/kit/packaging/snapshot-public.sh" --dry-run "$p47/stage" 2>&1)"; rc=$?
 [[ "$rc" == 0 && ! -e "$p47/stage/internal_docs" ]] \
     && a47 pass || a47 fail "snapshot stage has no internal_docs (rc=$rc, out: $o)"
+else
+    echo "SKIP: EGL-47 snapshot dry-run — publisher/internal_docs not on the public tree (EGL-74-D1)"
+fi
 
 # 2. Deb staging (KEEP_STAGE): no staged path contains internal_docs.
 s47="$p47/debstage"
@@ -424,8 +447,15 @@ env EGRESSLOCK_TARBALL_OUT="$p47/k.tgz" "$p47/kit/packaging/build-tarball.sh" >"
     && a47 pass || a47 fail "tarball listing has no internal_docs (rc=$t47rc, log: $(cat "$p47/tlog"))"
 
 # 5. The guards are explicit in the scripts (not layout accidents).
+#    build-tarball.sh / build-deb.sh / install-kit.sh ship on the public
+#    tree — those greps stay (EGL-74-D2); the publisher grep needs the
+#    private script (EGL-74-D1).
+if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
 grep -q 'internal_docs' "$TREE_ROOT/packaging/snapshot-public.sh" \
     && a47 pass || a47 fail "snapshot-public.sh names internal_docs (D1)"
+else
+    echo "SKIP: EGL-47 publisher grep — packaging/snapshot-public.sh not on the public tree (EGL-74-D1)"
+fi
 grep -q -- '--exclude=./internal_docs' "$TREE_ROOT/packaging/build-tarball.sh" \
     && a47 pass || a47 fail "build-tarball.sh excludes internal_docs (D2)"
 grep -q 'internal_docs' "$TREE_ROOT/packaging/build-deb.sh" \
@@ -436,11 +466,15 @@ grep -q 'internal_docs' "$TREE_ROOT/packaging/build-deb.sh" \
 #    simulate a widened copy rule by removing the exclude from the kit
 #    copy's own build-tarball.sh (it must stay in packaging/ so its
 #    src resolution is unchanged) and re-run: guard must fail closed.
+if [[ "$HAVE_INTERNAL_DOCS" == 1 ]]; then
 sed 's/--exclude=\.\/internal_docs//' "$p47/kit/packaging/build-tarball.sh" > "$p47/kit/packaging/build-tarball-widened.sh"
 mv "$p47/kit/packaging/build-tarball-widened.sh" "$p47/kit/packaging/build-tarball.sh"
 o="$(env EGRESSLOCK_TARBALL_OUT="$p47/k2.tgz" bash "$p47/kit/packaging/build-tarball.sh" 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$o" == *"internal_docs leaked"* ]] \
     && a47 pass || a47 fail "widened tarball copy trips the guard (rc=$rc, out: $o)"
+else
+    echo "SKIP: EGL-47 widened-tarball tripwire — internal_docs/ is not on the public tree (EGL-74-D1)"
+fi
 
 egl47_pass=$pass; egl47_fail=$fail
 pass=0; fail=0
@@ -2434,9 +2468,17 @@ egl55_pass=$pass; egl55_fail=$fail
 pass=0; fail=0
 e59() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
 k59_id_re='ARC-[0-9]|EGL-[0-9]|docs/tickets/[A-Za-z0-9]'
-for entry in "egresslock-setup:-h" "egresslock-verify:-h" \
-             "install-kit.sh:-h" "uninstall-kit.sh:-h" \
-             "packaging/snapshot-public.sh:-h" "build-gateway:-h"; do
+entries59=("egresslock-setup:-h" "egresslock-verify:-h" \
+           "install-kit.sh:-h" "uninstall-kit.sh:-h" \
+           "build-gateway:-h")
+# EGL-74-D1: the private publisher is not on the public tree — skip its
+# -h entry there.
+if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
+    entries59+=("packaging/snapshot-public.sh:-h")
+else
+    echo "SKIP: packaging/snapshot-public.sh -h — not on the public tree (EGL-74-D1)"
+fi
+for entry in "${entries59[@]}"; do
     f="${entry%%:*}"; flag="${entry##*:}"
     o="$(bash "$TREE_ROOT/$f" "$flag" 2>&1)"; rc=$?
     if [[ "$rc" == 0 ]] && ! grep -qE "$k59_id_re" <<<"$o"; then
@@ -2659,6 +2701,9 @@ tar -tzf "$p65/k.tgz" | grep -q 'docs/README.md' \
 # 2. (D2) the widened fleet grep fails closed on each widened name,
 #    naming the file and removing the stage. Decoys are assembled from
 #    parts — this file is itself in the staged set.
+#    EGL-74-D1: the dry-runs invoke the private publisher; skip on the
+#    public tree.
+if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
 printf 'note: confirmed on ni'"tro"' with the profile\n' > "$p65/kit/docs/leak-decoy-a.md"
 printf 'worked through on haz'"mat"' box\n' > "$p65/kit/docs/leak-decoy-b.md"
 o="$(bash "$p65/kit/packaging/snapshot-public.sh" --dry-run "$p65/stage-a" 2>&1)"; e65_rc=$?
@@ -2669,6 +2714,9 @@ o="$(bash "$p65/kit/packaging/snapshot-public.sh" --dry-run "$p65/stage-b" 2>&1)
 [[ "$e65_rc" == 1 && "$o" == *"fleet facts"* && "$o" == *"leak-decoy-b.md"* && ! -e "$p65/stage-b" ]] \
     && e65 pass || e65 fail "widened grep catches second nickname (rc=$e65_rc, out: $o)"
 rm -f "$p65/kit/docs/leak-decoy-b.md"
+else
+    echo "SKIP: EGL-65 widened-fleet-grep dry-runs — packaging/snapshot-public.sh not on the public tree (EGL-74-D1)"
+fi
 
 # 3. (D2) the scrubbed product tree carries no fleet nickname outside
 #    the repo-only paths (the publisher's own pattern literals, the
