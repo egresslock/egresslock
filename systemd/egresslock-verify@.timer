@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic network policy verification for %i (drift signal)
+
+[Timer]
+# Every 15 minutes; Persistent=true catches up once if the host was
+# down at a scheduled time. Signal only: verify never mutates policy.
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target

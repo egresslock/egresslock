@@ -1,0 +1,17 @@
+# ARC-27: allow podman to SIGTERM the shared-rootless-netns pasta holder.
+#
+# Podman reclaims the shared rootless netns by signaling its helper
+# (pasta) with SIGTERM. Ubuntu/Debian ship an AppArmor profile for
+# pasta in enforce mode whose signal rules predate that handoff, so
+# the profile denies "signal (receive) signal=term peer=podman" and
+# every shared-netns operation fails with podman's cryptic:
+#
+#   Error: rootless netns: kill network process: permission denied
+#
+# This one rule keeps the profile ENFORCED (the signal is the only
+# thing being widened) instead of falling back to `aa-complain`, which
+# logs every pasta denial and is the whole-profile answer.
+#
+# Apply: see README.md in this directory.
+
+signal (receive) set=(term) peer=podman,

@@ -1,0 +1,23 @@
+[Unit]
+Description=Verify network policy for %i (drift signal, not auto-fix)
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+# ARC-16-D9.1 (amended, on-host gate finding): do NOT set
+# XDG_RUNTIME_DIR here — %U/%h did not expand per-User= on the gate
+# host. The kit entry scripts (egresslock-verify, egresslock-start)
+# resolve it from the executing uid instead. (Rootless Podman needs
+# the account's runtime dir, kept alive by linger.)
+# Per-account unit.env (0600, account-owned) supplies
+# EGRESSLOCK_CONF (required) and optionally EGRESSLOCK_PROFILE
+# (named verify) — written by the site copy/deploy step.
+# NOTE: %h proved unreliable under this host's systemd (resolved to the
+# manager's home, not User='s — on-host finding, ARC-16 gate); the
+# instance name IS the account, and site accounts live under /home.
+# ExecStart placeholder is substituted by install-kit.sh with the
+# deployed prefix (R-017-1 F1: a non-default --prefix must not leave
+# the timer pointing at a binary that is not there).
+EnvironmentFile=-/home/%i/.config/egresslock/unit.env
+ExecStart=__EGRESSLOCK_PREFIX__/egresslock-verify

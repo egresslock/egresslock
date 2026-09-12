@@ -1,0 +1,3291 @@
+#!/usr/bin/env bash
+#
+# egresslock — restricted egress for agent accounts.
+#
+# Each restricted profile is a dedicated bridge network with a fixed subnet
+# plus a fail-closed nftables policy installed in the rootless Podman network
+# namespace. All rootless bridge networks of this
+# user share ONE rootless netns, so every policy rule is scoped with
+# `ip saddr <subnet>` to never affect other networks.
+#
+# The rootless netns (and all nftables state in it) is destroyed when the
+# last container stops, so policy is NEVER assumed to persist: `ensure`
+# creates the network, starts an anchor container that keeps the netns
+# alive, installs/refreshes the policy, and verifies it. `agent-run` calls
+# `ensure` before starting an agent and refuses to start the agent on any
+# failure.
+#
+# Usage:
+#   [--config <file>]                   # data-driven profile config (below)
+#   egresslock ensure <profile>     # network + anchor + policy + verify
+#   egresslock verify <profile>     # verify only (exit 1 = fail closed)
+#   egresslock network <profile>    # print the Podman network name
+#   egresslock proxy-env <profile> [token]  # proxy env assignments
+#                                        # (tokens: proxyip | proxyport | noproxy)
+#   egresslock allowlist <profile>  # print the allowlist file (raw)
+#   egresslock rules <profile>      # nftables policy
+#   egresslock denied <profile> [--all] [--days N]
+#                                        # hosts the gateway denied
+#                                        # (--all: raw, incl. allowlisted;
+#                                        #  --days N: window, 0 = full log,
+#                                        #  default 14 days)
+#   egresslock allow <profile> <h> [h...]  # append allowlist entries + re-ensure
+#   egresslock disallow <profile> <h> [h...] # remove allowlist entries + re-ensure
+#   egresslock allow-host <profile> <host:port>  # add direct allow rule
+#   egresslock disallow-host <profile> <host:port> # remove direct allow
+#   egresslock init <name> [--subnet <cidr>]  # write a starter conf pair
+#   egresslock list                 # list profiles
+#   egresslock doctor               # host environment probe: podman,
+#                                      # netavark, nft, unprivileged
+#                                      # userns (+ advisory backend/netns
+#                                      # lines). Kit/apparmor
+#                                      # checks live in egresslock-setup
+#                                      # (see `egresslock-setup --help`).
+#
+# Which check answers which question — four commands, four layers:
+#   checks:
+#     egresslock doctor                      host env (podman/nft/userns)
+#     egresslock-setup --doctor [--account]  kit/account wiring
+#     egresslock-setup --apparmor-check      pasta AppArmor patch
+#     egresslock verify <profile>            profile runtime (fail-closed)
+#
+#   egresslock teardown [profile|all]  # stop anchor, remove network(s)
+#   egresslock teardown --runtime  # no-conf sweep: kit containers and
+#                                      # networks of BOTH name generations
+#                                      # plus our nft tables
+#   egresslock --help               # this help
+#   egresslock --version            # kit stamp (or 'dev')
+#
+# Profile configuration: with `--config <file>` (or the
+# EGRESSLOCK_CONF environment variable) profiles, rules, and gateways
+# come from a strictly-validated declarative config file. A config is
+# REQUIRED: the engine has no compiled-in profiles — a profile subcommand
+# without one exits 2 with `no profile config: pass --config <file> or
+# set EGRESSLOCK_CONF`. When neither is given, the
+# engine probes the running user's default folder
+# (~/.config/egresslock): named commands use <profile>.conf if
+# present, else main.conf (the --init-conf destination); bare `list` and
+# bare `verify --ensured` aggregate every *.conf there; bare `teardown
+# all` stays main.conf-only. `teardown --runtime` is the
+# exception: it loads NO conf at all — explicit --config / EGRESSLOCK_CONF
+# are ignored — and sweeps kit containers/networks of BOTH name
+# generations by name scan (the recovery when the conf is already gone).
+# Prints `using config <path>` / `using
+# configs in <dir>` on stderr when found AND stdout is a terminal (the
+# hint is suppressed under pipes/substitution). Explicit beats
+# implicit. See examples/main.conf for a worked config grammar example.
+#
+# Environment overrides (for testing):
+#   EGRESSLOCK_CONF    same as --config (required for profile
+#                          subcommands; unset or empty = fail closed)
+#   NFT_BIN                absolute path to nft (default: /usr/sbin/nft,
+#                          then $PATH)
+#   EGRESSLOCK_ANCHOR_IMAGE     anchor image (default: base image or alpine)
+#   EGRESSLOCK_GW_IMAGE         gateway image (default:
+#                          localhost/egresslock-gateway:latest)
+#   EGRESSLOCK_ALLOW_ROOT=1
+#                          allow running as root (NOT recommended — root's
+#                          Podman store/netns is not an account)
+#   EGRESSLOCK_SKIP_NETNS_PROBE=1
+#                          skip the podman rootless-netns preflight probe
+#                          (test harness only)
+#
+# Subcommands: ensure, verify (also: verify --ensured),
+# network, proxy-env (tokens: proxyip|proxyport|noproxy), rules,
+# allowlist, denied (--all, --days),
+# allow, disallow, allow-host, disallow-host,
+# init, list, doctor (host environment probe; kit-state
+# checks are `egresslock-setup`'s job — see `egresslock-setup --help`),
+# teardown, --version (kit stamp or 'dev').
+
+set -euo pipefail
+
+# Usage text = the header block above, delimited by this line: print
+# everything between line 2 and the "set -euo pipefail" boundary so
+# header edits cannot truncate or extend the help text (R-014-1 F1).
+usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "$0" | head -1 | cut -d: -f1) - 1 ))p" "$0" | sed 's/^# \{0,1\}//'; }
+
+# Short usage: the command index only (no config/env/prose), for a bare
+# invocation or an argument-error. Lists the subcommands so a caller who
+# typed the wrong thing sees what is available.
+short_usage() {
+    echo "usage: egresslock [--config <file>] <command> [args...]"
+    echo "commands: ensure, verify, network, proxy-env, rules, allowlist, denied, allow, disallow, allow-host, disallow-host, init, list, doctor, teardown"
+    echo "run 'egresslock --help' for the full help"
+}
+
+# Profile state (ARC-8): loaded from the strictly-validated config file
+# by load_config. There are NO compiled-in profiles (ARC-20) — a profile
+# subcommand without a config fails closed in main. The `declare -A`
+# attributes matter: load_config's `=()` resets preserve them.
+PROFILES=()
+declare -A PROFILE_SUBNET=()
+declare -A GW_IP=()
+declare -A GW_PORT=()
+# Per-profile allowlist source, from the config's `gateway` directive.
+declare -A GW_ALLOWLIST=()
+# Hosts that a profile may reach DIRECTLY (bypassing the proxy) must be
+# excluded from proxy env vars, or proxy-honoring clients would send
+# allowed traffic into the denying Squid ACL (ARC-6 finding).
+declare -A PROFILE_NO_PROXY_EXTRA=()
+
+TABLE="egresslock"
+# ARC-14: site host defaults live in the CONF DATA, not the binary — the
+# engine never assigns the site host vars or any fleet default. A bare
+# ${VAR} with no fallback and no explicit override fails closed in
+# cfg_expand instead of leaking fleet names into a public conf; explicit
+# env overrides of conf data keep working (ARC-8 data semantics).
+
+# Config selection (ARC-8): --config <file> (parsed in main) or the
+# EGRESSLOCK_CONF environment variable. Empty is the same as unset:
+# profile subcommands then fail closed (ARC-20-D1).
+ENGINE_CONF="${EGRESSLOCK_CONF:-}"
+# ARC-37-D3: profile name -> conf file it was loaded from, so a
+# cross-file duplicate error can name the earlier file exactly.
+declare -A PROFILE_CONF=()
+
+gw_name() { echo "egresslock-gateway-$1"; }
+is_gateway_profile() { [[ -n "${GW_IP[$1]:-}" ]]; }
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+#
+# CIDR helpers (ARC-11-D3): unsigned-32 IPv4 math in pure bash, no
+# external dependencies. cidr_parse validates and decomposes a CIDR;
+# the result is stored in globals (CIDR_*) because bash cannot return
+# multiple values.
+#
+# cidr_parse return codes (designed for `if ! cidr_parse` + case $rc):
+#   0 ok | 1 syntax/not IPv4 | 2 prefixlen outside 8-29 | 3 host bits set
+#
+cidr_u32() { # "A.B.C.D" -> decimal u32 on stdout
+    local IFS=. o1 o2 o3 o4
+    read -r o1 o2 o3 o4 <<<"$1"
+    echo $(( (o1 << 24) | (o2 << 16) | (o3 << 8) | o4 ))
+}
+
+cidr_ip() { # decimal u32 -> "A.B.C.D"
+    echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"
+}
+
+cidr_parse() { # cidr_parse <A.B.C.D/P>  (prefixlen 8-29, canonical network)
+    local cidr="$1" addr plen u32 mask net
+    [[ "$cidr" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+    addr="${BASH_REMATCH[1]}"
+    plen="${BASH_REMATCH[2]}"
+    (( plen >= 8 && plen <= 29 )) || return 2
+    cfg_is_ipv4 "$addr" || return 1
+    u32="$(cidr_u32 "$addr")"
+    mask=$(( 0xFFFFFFFF << (32 - plen) & 0xFFFFFFFF ))
+    net=$(( u32 & mask ))
+    # Canonical network address required: host bits set is a config error,
+    # not a silent re-render (fail closed per ARC-11-D3).
+    (( u32 == net )) || return 3
+    CIDR_PLEN=$plen
+    CIDR_NETWORK=$net
+    CIDR_BCAST=$(( net | (0xFFFFFFFF >> plen & 0xFFFFFFFF) ))
+    CIDR_FIRST=$(( net + 1 ))   # bridge gateway (DNS allow target)
+    CIDR_LAST=$(( CIDR_BCAST - 1 ))  # anchor address
+    return 0
+}
+
+# True if two parsed CIDRs share any address space (operands: the two
+# FIRST/LAST usable ranges; callers keep the parsed values).
+cidr_overlaps() { # cidr_overlaps <first1> <last1> <first2> <last2>
+    (( $1 <= $4 && $3 <= $2 ))
+}
+
+#
+# Relaxed parse for FOREIGN networks in the overlap scan (R-011-1
+# finding 1): accepts any prefixlen 0-32, canonical or not, and yields
+# the occupied range as CIDR_FIRST..CIDR_LAST. Configured profiles
+# still go through the strict cidr_parse (8-29, canonical); the scan
+# must not silently skip foreign subnets merely because the profile
+# policy would reject them.
+#
+cidr_parse_any() { # cidr_parse_any <A.B.C.D/P>
+    local cidr="$1" addr plen u32 mask net
+    [[ "$cidr" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+    addr="${BASH_REMATCH[1]}"
+    plen="${BASH_REMATCH[2]}"
+    (( plen <= 32 )) || return 1
+    cfg_is_ipv4 "$addr" || return 1
+    u32="$(cidr_u32 "$addr")"
+    if (( plen == 0 )); then
+        mask=0
+    else
+        mask=$(( 0xFFFFFFFF << (32 - plen) & 0xFFFFFFFF ))
+    fi
+    net=$(( u32 & mask ))
+    CIDR_FIRST=$net
+    CIDR_LAST=$(( net | (0xFFFFFFFF >> plen & 0xFFFFFFFF) ))
+    return 0
+}
+
+is_profile() {
+    local p
+    for p in "${PROFILES[@]}"; do
+        [[ "$p" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+require_profile() {
+    # require_profile <profile> [<command-name>]
+    # The command name is used only to give a precise usage line when the
+    # profile argument is missing (a missing profile is an argument error,
+    # not an unknown-profile error).
+    local cmdname="${2:-}"
+    if [[ $# -lt 1 || -z "$1" ]]; then
+        if [[ -n "$cmdname" ]]; then
+            echo "Error: $cmdname requires a profile name." >&2
+            echo "usage: egresslock $cmdname <profile>" >&2
+        else
+            echo "Error: a profile name is required." >&2
+            echo "run 'egresslock --help' for the command list" >&2
+        fi
+        exit 2
+    fi
+    is_profile "$1" || {
+        echo "Error: unknown profile '$1' (known: ${PROFILES[*]})" >&2
+        exit 2
+    }
+}
+
+network_of() { echo "egresslock-$1"; }
+anchor_of() { echo "egresslock-anchor-$1"; }
+chain_of() { echo "p_${1//-/_}"; }
+
+nft_bin() {
+    if [[ -n "${NFT_BIN:-}" ]]; then
+        # ARC-59-D1: a value that starts with '-' would read as a flag
+        # in `podman unshare ... "$(nft_bin)"`. Empty stays the default.
+        [[ "$NFT_BIN" == -* ]] && die "NFT_BIN value must not start with '-' (got '$NFT_BIN')"
+        [[ -x "$NFT_BIN" ]] || die "NFT_BIN='$NFT_BIN' is not executable"
+        echo "$NFT_BIN"
+        return
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        command -v nft
+    elif [[ -x /usr/sbin/nft ]]; then
+        # /usr/sbin is often missing from a non-root PATH.
+        echo /usr/sbin/nft
+    else
+        die "nftables not found; install it: sudo apt install nftables"
+    fi
+}
+
+netns_nft() {
+    local bin
+    # Plain assignment so a die() inside nft_bin (ARC-59 env guard)
+    # propagates under set -e instead of being swallowed by the
+    # inline-command-substitution pattern (same footgun as the
+    # gw_generate_config note).
+    bin="$(nft_bin)"
+    podman unshare --rootless-netns "$bin" "$@"
+}
+
+# ARC-26-D3: netns preflight. `podman unshare --rootless-netns true` is
+# the exact repro of the shared-netns EPERM: podman reclaims the shared
+# rootless netns by SIGTERMing its pasta holder, and an enforce-mode
+# AppArmor pasta profile denies that signal (ARC-27). Run once per
+# invocation, before any network/policy work, in the commands that
+# actually touch the netns (ensure/verify/allow/teardown — ARC-26-D1).
+# Skippable for the mock harness (no real podman rootless netns) via
+# EGRESSLOCK_SKIP_NETNS_PROBE=1.
+netns_probe() {
+    [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" == "1" ]] && return 0
+    if ! podman unshare --rootless-netns true 2>/dev/null; then
+        # EGL-35 (EGL-33/D39-7 wording): the probe is ground truth; the
+        # cause names the LABEL (any profile mode), never "confined
+        # podman"; the shipped command leads. Deep diagnosis (aa-status,
+        # parser reload, session restarts) lives in
+        # docs/troubleshooting/pasta-apparmor.md, not here.
+        echo "Error: podman rootless-netns is broken for this user (probe: 'podman unshare --rootless-netns true' -> 'kill network process: permission denied'). Podman is running under an AppArmor label (any profile mode) and the enforce-mode pasta profile denies the SIGTERM handoff:" >&2
+        echo "  sudo egresslock-setup --apparmor-add      # apply the shipped rule (or --apparmor-check to inspect)" >&2
+        echo "Then re-run the probe. If it still fails, see docs/troubleshooting/pasta-apparmor" >&2
+        echo "(EGL-16 Debian report context). Do NOT reinstall the kit — nothing is installed wrong." >&2
+        return 1
+    fi
+}
+
+anchor_image() {
+    if [[ -n "${EGRESSLOCK_ANCHOR_IMAGE:-}" ]]; then
+        # ARC-59-D1: a non-empty value that starts with '-' is a
+        # flag-shaped token in the `podman run ... "$(anchor_image)"`.
+        [[ "$EGRESSLOCK_ANCHOR_IMAGE" == -* ]] \
+            && die "EGRESSLOCK_ANCHOR_IMAGE value must not start with '-' (got '$EGRESSLOCK_ANCHOR_IMAGE')"
+        echo "$EGRESSLOCK_ANCHOR_IMAGE"
+    elif podman image exists localhost/base:latest 2>/dev/null; then
+        echo "localhost/base:latest"
+    else
+        # EGL-66-D2: the fallback is digest-pinned, same discipline as
+        # gateway/Containerfile — never a floating third-party tag the
+        # engine would pull on demand. Refresh deliberately: pull the
+        # tag, confirm the new digest, update here, record it in the
+        # ticket. The digest is the multi-arch OCI index digest.
+        echo "docker.io/library/alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
+    fi
+}
+
+resolve_ip() {
+    # Capture first: getent may get SIGPIPE from awk's early exit, and
+    # pipefail would turn that into a spurious failure.
+    local out
+    out="$(getent ahostsv4 "$1" 2>/dev/null || true)"
+    awk '{print $1; exit}' <<<"$out"
+}
+
+resolved_dest() { # resolved_dest <host> -> IP for rule emission
+    # ARC-12-D1: in verify-pin mode (expected-ruleset build), a missing
+    # pin must NOT silently render an empty daddr; fail the verify.
+    # Install path (pin mode off): first-A resolve, die if unresolvable
+    # (fail-closed install unchanged).
+    if [[ "$VERIFY_PIN_MODE" == 1 ]]; then
+        local dip
+        dip="$(resolve_pin "$1")"
+        [[ -n "$dip" ]] || die "verify: no live pin for allow-host '$1' (chain/config mismatch)"
+        echo "$dip"
+    else
+        local dip
+        dip="$(resolve_ip "$1")"
+        [[ -n "$dip" ]] || die "cannot resolve $1"
+        echo "$dip"
+    fi
+}
+
+#
+# ARC-11-D1/D2 overlap pre-check: fail `ensure` closed when the profile's
+# subnet overlaps any OTHER Podman network this user can see. Scope is
+# Podman-visible networks only (this user's rootless store): other
+# accounts' netns and host/LAN routes are invisible by design (the
+# existing single-rootless-user threat-model item; see `doctor`/docs for
+# host-level checks). Runs on both the create path and the
+# exists-and-matches path — a colliding network created later is still a
+# fail-closed ensure.
+#
+ensure_no_overlap() {
+    local profile="$1" net want name info sub
+    net="$(network_of "$profile")"
+    want="${PROFILE_SUBNET[$profile]}"
+    cidr_parse "$want" || die "invalid subnet '$want' for profile '$profile'"
+    local wfirst=$CIDR_FIRST wlast=$CIDR_LAST
+    local names
+    # ARC-67-D3: a failed list must disable the overlap pre-check
+    # LOUDLY, never silently (the {{.Names}} template bug made this
+    # scan vacuous on real hosts for its whole life).
+    if ! names="$(podman_network_names 2>&1)"; then
+        die "cannot list Podman networks; the ARC-11 overlap pre-check cannot run (fail closed): $names"
+    fi
+    for name in $names; do
+        [[ "$name" == "$net" ]] && continue
+        info="$(podman network inspect "$name" 2>/dev/null || true)"
+        while IFS= read -r sub; do
+            [[ -n "$sub" ]] || continue
+            # Relaxed parse (any prefixlen): a foreign subnet the profile
+            # policy would reject (e.g. a /30 inside the profile's /24)
+            # is still a collision and must fail ensure, not be skipped.
+            if cidr_parse_any "$sub" \
+               && cidr_overlaps "$wfirst" "$wlast" "$CIDR_FIRST" "$CIDR_LAST"; then
+                die "profile subnet ${want} overlaps existing Podman network '$name' (subnet ${sub}); overlapping routes in one rootless netns are never benign. Pick a different subnet in the profile config, or remove the colliding network if it is a leftover:
+  podman network rm '$name'"
+            fi
+        done < <(grep -oE '"subnet": *"[^"]+"' <<<"$info" | sed -E 's/"subnet": *"([^"]+)"/\1/')
+    done
+}
+
+ensure_network() {
+    local profile="$1" net want info want_gw
+    net="$(network_of "$profile")"
+    want="${PROFILE_SUBNET[$profile]}"
+    ensure_no_overlap "$profile"
+    # Re-parse OUR subnet here: ensure_no_overlap parses foreign subnets
+    # too, and the CIDR_* result globals are single-assignment scratch.
+    cidr_parse "$want" || die "invalid subnet '$want' for profile '$profile'"
+    want_gw="$(cidr_ip "$CIDR_FIRST")"
+    if podman network inspect "$net" >/dev/null 2>&1; then
+        # Reviews R-003-3/R-003-4: an existing network is only acceptable
+        # when its configuration matches this profile's fixed IPv4-only
+        # definition EXACTLY — one subnet (the fixed one), nothing else.
+        # A second subnet would put part of the container traffic outside
+        # the scoped policy rules. Fail closed with a remediation hint.
+        local info
+        info="$(podman network inspect "$net" 2>/dev/null || true)"
+        # R-003-7 finding 4: the policy depends on the rootless BRIDGE
+        # forward path; a same-name macvlan/ipvlan/plugin network with
+        # the expected subnet would bypass it entirely.
+        if ! grep -qE '"driver": *"bridge"' <<<"$info"; then
+            die "network '$net' exists but is not a bridge network; restricted profiles require driver bridge. Remove and recreate it:
+  podman network rm '$net' && egresslock ensure '$profile'"
+        fi
+        local subnet_count
+        subnet_count="$(grep -cE '"subnet": *"' <<<"$info" || true)"
+        if [[ "$subnet_count" != 1 ]]; then
+            die "network '$net' exists with $subnet_count subnets; restricted
+profiles require exactly one (${want}). Remove and recreate it:
+  podman network rm '$net' && egresslock ensure '$profile'"
+        fi
+        if ! grep -qE "\"subnet\": *\"${want}\"" <<<"$info"; then
+            die "network '$net' exists with a different subnet than the fixed
+profile configuration (${want}). Remove and recreate it:
+  podman network rm '$net' && egresslock ensure '$profile'
+(or inspect it with: podman network inspect '$net')"
+        fi
+        # The policy rules assume the standard bridge gateway (the FIRST
+        # usable address of the subnet, ARC-11-D3); a different gateway
+        # would break the DNS allow.
+        if ! grep -qE "\"gateway\": *\"${want_gw}\"" <<<"$info"; then
+            die "network '$net' exists with an unexpected gateway (expected ${want_gw}); the policy rules assume it. Remove and recreate it:
+  podman network rm '$net' && egresslock ensure '$profile'"
+        fi
+        if grep -qE '"ipv6_enabled": *(true|True)' <<<"$info"; then
+            die "network '$net' exists with IPv6 enabled; restricted profiles
+are IPv4-only. Remove and recreate it:
+  podman network rm '$net' && egresslock ensure '$1'"
+        fi
+        return 0
+    fi
+    # Pass the gateway explicitly so Netavark cannot pick anything but
+    # the first usable address the policy rules assume (ARC-11-D3).
+    podman network create --subnet "$want" --gateway "$want_gw" "$net" >/dev/null
+    echo "created network $net ($want)"
+}
+
+anchor_running() {
+    # Capture ps output before grepping: 'grep -q' exits on the first
+    # match and SIGPIPEs the writer, which pipefail reports as failure.
+    local names
+    names="$(podman ps --format '{{.Names}}' 2>/dev/null || true)"
+    grep -qx "$1" <<<"$names"
+}
+
+# ARC-67-D1: real podman's `network ls` template field is {{.Name}}
+# (singular) — {{.Names}} is the podman ps CONTAINER field and errors
+# on network ls. One helper so the format string cannot drift; the
+# failure policy is the caller's (ARC-67-D3): ensure dies (the ARC-11
+# overlap check must not be silently disabled), init treats a broken
+# list as "taken", teardown --runtime notes and continues.
+podman_network_names() {
+    podman network ls --format '{{.Name}}'
+}
+
+ensure_anchor() {
+    local profile="$1" anchor
+    anchor="$(anchor_of "$profile")"
+    if anchor_running "$anchor"; then
+        return 0
+    fi
+    # Stale stopped anchor from an interrupted run.
+    podman rm -f "$anchor" >/dev/null 2>&1 || true
+    # The anchor holds the rootless netns (bridge + policy) open. It runs
+    # no services and only sleeps; --restart=always brings it back after
+    # a crash or image-level restart. It gets the LAST usable host
+    # address of the subnet (ARC-11-D3) so it can never collide with the
+    # bridge gateway (first usable) or the gateway's static IP (on-host
+    # finding, ARC-5: IPAM once handed the anchor the address the
+    # gateway needed).
+    local anchor_ip animg
+    cidr_parse "${PROFILE_SUBNET[$profile]}" \
+        || die "invalid subnet '${PROFILE_SUBNET[$profile]}'"
+    anchor_ip="$(cidr_ip "$CIDR_LAST")"
+    # EGL-66-D1: the anchor only sleeps, but it is kit-created and sits
+    # on the profile L2 — run it with the same hardening pair as the
+    # kit-built gateway (ARC-32-D5): no capabilities, no privilege gain.
+    animg="$(anchor_image)"
+    podman run -d --name "$anchor" \
+        --network "$(network_of "$profile")" \
+        --ip "$anchor_ip" \
+        --cap-drop=all \
+        --security-opt=no-new-privileges \
+        --restart=always \
+        "$animg" sleep 86400 >/dev/null
+    # ARC-69-D3: announce only the create — a silent ensure_anchor was
+    # indistinguishable from reuse; already-running return stays silent.
+    echo "started anchor $anchor"
+    # Give Podman a moment to report it as running before we rely on it.
+    local i
+    for i in $(seq 1 20); do
+        anchor_running "$anchor" && return 0
+        sleep 0.5
+    done
+    die "anchor container '$anchor' did not reach running state"
+}
+
+#
+# Emit the profile's canonical rule lines (no table/chain wrapper). Used
+# both to generate the install file and to build the expected rule set for
+# deep verification (review R-003-3).
+#
+#
+# Rule generation entry point: the generic rule compiler for the loaded
+# config (there is no legacy path — ARC-20).
+#
+policy_rules() {
+    compiled_rules "$1"
+}
+
+# ARC-12-D1: when set (verify path), the compilers take allow-host
+# daddrs from VERIFY_PINS (the live chain's pins) instead of
+# resolve_ip — DNS drift must not fail or die verify.
+VERIFY_PIN_MODE=0
+
+#
+# ARC-12-D4: the profile's allow-host destinations as ordered
+# "host:port" lines — the DNS-resolved (drift-checkable) destinations,
+# as configured. The gateway IP and the bridge-gateway DNS allow are
+# static/derived data, NOT drift candidates, and are excluded here.
+#
+profile_allow_hosts() {
+    local profile="$1"
+    local i kind pfx="${profile}|"
+    for i in "${!ENGINE_KINDS[@]}"; do
+        [[ "${ENGINE_KINDS[$i]}" == "$pfx"* ]] || continue
+        kind="${ENGINE_KINDS[$i]#"$pfx"}"
+        [[ "$kind" == "allow-host" ]] || continue
+        echo "${ENGINE_ARGS[$i]}"
+    done
+}
+
+#
+# ARC-12-D4: build the EXPECTED ruleset for verification with
+# allow-host daddrs taken from the LIVE chain's pins (not a fresh
+# resolve — a DNS change must not make verify fail or die). Re-runs
+# policy_rules with the pinned IPs injected: emits each rule through
+# the same compiler paths but with resolution replaced by the zipped
+# live pins. Returns rc=1 if the live chain has no zip-able allow-host
+# set (missing chain, count or port-order mismatch) — a structural
+# mismatch, fail closed.
+#
+# Implementation: rather than duplicating the compilers, pin the
+# resolution: PIN_<host>_<port> association array is consulted by a
+# resolver shim. resolve_pin() replaces resolve_ip in the expected-
+# ruleset build only.
+#
+declare -A VERIFY_PINS=()
+
+resolve_pin() { # resolve_pin <host> -> pinned IP; empty = no pin
+    local key host="$1" port="${2:-}" k
+    # First-A semantics: any port of a host was installed from ONE
+    # resolve_ip call (D5), so look up by host regardless of port.
+    for k in "${!VERIFY_PINS[@]}"; do
+        if [[ "${k%%|*}" == "$host" ]]; then
+            echo "${VERIFY_PINS[$k]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+verify_expected_rules() { # prints expected ruleset; rc 1 on zip mismatch
+    local profile="$1" chain subnet
+    chain="$(chain_of "$profile")"
+    subnet="${PROFILE_SUBNET[$profile]}"
+    # Live chain, canonicalized exactly as the deep compare does.
+    local raw actual
+    raw="$(netns_nft list chain inet "$TABLE" "$chain" 2>/dev/null || true)"
+    actual="$(canonicalize <<<"$raw")"
+
+    # Zip config allow-hosts to live `ip daddr <ip> tcp dport <port>`
+    # accepts (in order), excluding DNS (dport 53) and the gateway hop.
+    local gw_ip="${GW_IP[$profile]:-}"
+    local -a want_hosts=() want_ports=() got_ips=() got_ports=()
+    local h line hip hport ip port
+    while IFS= read -r hp; do
+        [[ -n "$hp" ]] || continue
+        want_hosts+=("${hp%:*}")
+        want_ports+=("${hp##*:}")
+    done < <(profile_allow_hosts "$profile")
+
+    while IFS= read -r r; do
+        [[ "$r" =~ ^ip\ saddr\ ${subnet}\ ip\ daddr\ ([0-9.]+)\ tcp\ dport\ ([0-9]+)\ counter\ accept$ ]] || continue
+        ip="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+        # Exclude the DNS-to-bridge rule and the static gateway hop.
+        [[ "$ip" == "$gw_ip" ]] && continue
+        got_ips+=("$ip")
+        got_ports+=("$port")
+    done <<<"$actual"
+
+    if (( ${#want_ports[@]} != ${#got_ports[@]} )); then
+        echo "verify: allow-host rule count mismatch for profile '$profile' (config: ${#want_ports[@]}, chain: ${#got_ports[@]})" >&2
+        return 1
+    fi
+    local i
+    for i in "${!want_ports[@]}"; do
+        if [[ "${want_ports[$i]}" != "${got_ports[$i]}" ]]; then
+            echo "verify: allow-host port order mismatch for profile '$profile' (config ${want_hosts[$i]}:${want_ports[$i]}, chain dport ${got_ports[$i]})" >&2
+            return 1
+        fi
+        # D5: one pin per host (first-A semantics); keyed host|firstport.
+        local key="${want_hosts[$i]}|${want_ports[$i]}"
+        [[ -n "${VERIFY_PINS[$key]:-}" ]] || VERIFY_PINS[$key]="${got_ips[$i]}"
+    done
+
+    # Emit the expected ruleset with pins. The zip above has filled
+    # VERIFY_PINS for every configured host; in VERIFY_PIN_MODE the
+    # compilers resolve via resolve_pin (no DNS). Fill VERIFY_PINS in
+    # the CALLER's scope: this function must NOT run inside $().
+    VERIFY_PIN_MODE=1
+    policy_rules "$profile"
+    local rc=$?
+    VERIFY_PIN_MODE=0
+    return $rc
+}
+
+#
+# ---------------------------------------------------------------------------
+# ARC-8: data-driven profile configuration engine
+# ---------------------------------------------------------------------------
+#
+# Config format (Decision ARC-8-D1): line-based, one directive per line,
+# '#' comments and blank lines ignored, every line matched against a strict
+# grammar. The config is DATA, never sourced or eval'd; every interpolated
+# value is regex-validated before it reaches nftables or Squid generation.
+# Any unparseable or contradictory content fails closed with exit 2,
+# reporting file, line number, and the offending line.
+#
+#   profile <name> <cidr>              # starts a profile block (IPv4 /8-29)
+#       rule allow-host <host>:<port>  # ordered, repeatable
+#       rule public-only
+#       rule gateway-only              # requires a `gateway` directive
+#       gateway <ip> <port> <file>     # static gateway IP inside the subnet
+#       no-proxy <host[,host...]>      # extra NO_PROXY entries
+#
+# ARC-11: the profile subnet is any IPv4 CIDR with prefixlen 8-29 (parsed
+# with integer CIDR math); bridge gateway = first usable, anchor = last
+# usable. The `creds` directive was REMOVED (ARC-11-D4): credential
+# injection is the consumer's decision, not engine grammar.
+#
+# Host fields may reference environment variables: ${VAR} or
+# ${VAR:-default} (parsed manually — never eval'd), so the shipped config
+# keeps FORGEJO_HOST/OLLAMA_HOST overridable while carrying the defaults.
+#
+
+# A profile's config rules are stored in two flat global arrays (kind and
+# argument per entry, profile-prefixed) — appended in config order and
+# filtered by the compiler. Plain arrays keep the config data: no eval,
+# no dynamic code, no dynamic variable names.
+ENGINE_KINDS=()
+ENGINE_ARGS=()
+
+engine_rule_push() { # engine_rule_push <profile> <kind> <args>
+    ENGINE_KINDS+=("$1|$2")
+    ENGINE_ARGS+=("$3")
+}
+
+# Fail-closed config error: file:line, reason, offending text. Exit 2
+# (usage-class error) so a broken config can never silently fall back.
+config_error() {
+    echo "Error: $ENGINE_CONF_NAME:$1: $2" >&2
+    [[ $# -ge 3 ]] && echo "  offending line: $3" >&2
+    exit 2
+}
+
+cfg_trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Expand a ${VAR} / ${VAR:-default} reference (or pass literals through).
+# Parsed with a regex, never eval'd. Unset without default is an error.
+cfg_expand() {
+    local v="$1"
+    if [[ "$v" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}$ ]]; then
+        local val="${BASH_REMATCH[1]}"
+        val="${!val-}"
+        if [[ -z "$val" ]]; then
+            [[ -n "${BASH_REMATCH[2]:-}" ]] || return 1
+            val="${BASH_REMATCH[3]}"
+        fi
+        printf '%s' "$val"
+        return 0
+    fi
+    printf '%s' "$v"
+}
+
+cfg_is_ipv4() {
+    local o
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1:4}"; do
+        # Reject leading zeros: bash arithmetic would read '010' as
+        # octal 8 (R-011-1 finding 3), silently re-aiming the config.
+        [[ "$o" =~ ^0[0-9]+$ ]] && return 1
+        (( o <= 255 )) || return 1
+    done
+    return 0
+}
+
+load_config() {
+    local conf="$1" append="${2:-}"
+    [[ -f "$conf" ]] || { echo "Error: config file not found: $conf" >&2; exit 2; }
+    ENGINE_CONF_NAME="$conf"
+    local dir
+    dir="$(cd "$(dirname "$conf")" && pwd)"
+
+    # ARC-37-D3: append mode (aggregation) keeps the arrays from earlier
+    # files; a fresh load resets them. R-038-1 finding 1: ENGINE_KINDS /
+    # ENGINE_ARGS (the config rules, appended by engine_rule_push) MUST
+    # also reset here — allow-host/disallow-host reload the mutated conf
+    # in-process, and a stale accumulation would register every rule
+    # twice, corrupting the enforced chain and silently passing verify.
+    if [[ "$append" != 1 ]]; then
+        PROFILES=()
+        PROFILE_SUBNET=()
+        GW_IP=()
+        GW_PORT=()
+        GW_ALLOWLIST=()
+        PROFILE_NO_PROXY_EXTRA=()
+        PROFILE_CONF=()
+        ENGINE_KINDS=()
+        ENGINE_ARGS=()
+    fi
+
+    local raw line n=0 cur="" name subnet rest host port ip path val
+    local has_gw has_gw_only canon rc
+    local has_public=0 n_allow=0
+    # In-file subnet overlap (ARC-11-D3): real CIDR overlap (identical OR
+    # nested, e.g. /16 vs /24), not an identical-string match.
+    local -a prev_first=() prev_last=() prev_subnets=()
+    local -A seen_names=()
+    # R-008-1 finding 2: block-closing errors are attributed to the
+    # profile line that opened the block, not the line where the close
+    # was detected.
+    local block_line=0 block_raw=""
+
+    # Close out the current profile block with the end-of-block checks.
+    block_end() {
+        [[ -n "$cur" ]] || return 0
+        if [[ "$has_gw_only" == yes && "$has_gw" == no ]]; then
+            config_error "$block_line" "profile '$cur' has 'rule gateway-only' but no 'gateway' directive" "$block_raw"
+        fi
+        cur=""
+    }
+
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        n=$((n+1))
+        line="$(cfg_trim "${raw%%#*}")"
+        [[ -z "$line" ]] && continue
+
+        case "$line" in
+            "profile "*)
+                block_end
+                read -r _ name subnet rest <<<"$line"
+                [[ -z "${rest:-}" ]] || config_error "$n" "unexpected trailing text after subnet" "$raw"
+                # ARC-59-D1: profile names start alnum — a leading '-'
+                # would read as a flag-like token in argv even where a
+                # fixed prefix (egresslock-*, p_*) saves the sink today.
+                [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+                    || config_error "$n" "invalid profile name '$name' (expected [a-z0-9][a-z0-9-]*, must not start with '-')" "$raw"
+                [[ -z "${seen_names[$name]:-}" ]] \
+                    || config_error "$n" "duplicate profile name '$name'" "$raw"
+                # ARC-37-D3: aggregation must not silently shadow a name
+                # already loaded from an earlier file. config_error names
+                # the CURRENT file (its prefix); PROFILE_CONF names the
+                # earlier one so both are identified.
+                is_profile "$name" \
+                    && config_error "$n" "duplicate profile name '$name' across configs (also in '${PROFILE_CONF[$name]:-<earlier file>}')" "$raw"
+                seen_names[$name]=1
+                # ARC-11-D3: any IPv4 prefixlen 8-29, canonical network
+                # address, integer CIDR math.
+                rc=0
+                cidr_parse "$subnet" || rc=$?
+                case $rc in
+                    0) ;;
+                    2) config_error "$n" "invalid subnet '$subnet' (prefix length must be between 8 and 29)" "$raw" ;;
+                    3) config_error "$n" "invalid subnet '$subnet' (not the canonical network address; host bits must be zero)" "$raw" ;;
+                    *) config_error "$n" "invalid subnet '$subnet' (expected IPv4 CIDR like 192.0.2.0/24)" "$raw" ;;
+                esac
+                local i
+                for i in "${!prev_first[@]}"; do
+                    if cidr_overlaps "$CIDR_FIRST" "$CIDR_LAST" "${prev_first[$i]}" "${prev_last[$i]}"; then
+                        config_error "$n" "subnet '$subnet' overlaps an earlier profile ('${PROFILES[$i]}' ${prev_subnets[$i]})" "$raw"
+                    fi
+                done
+                canon="$(cidr_ip "$CIDR_NETWORK")/$CIDR_PLEN"
+                prev_first+=("$CIDR_FIRST"); prev_last+=("$CIDR_LAST")
+                prev_subnets+=("$canon")
+                PROFILES+=("$name")
+                PROFILE_SUBNET[$name]="$canon"
+                PROFILE_CONF[$name]="$conf"
+                has_gw=no; has_gw_only=no; has_public=no; n_allow=0
+                block_line=$n; block_raw="$raw"
+                cur="$name"
+                ;;
+            "creds "*)
+                # ARC-11-D4: dedicated error, not a generic unknown
+                # directive — a config from a pre-ARC-11 engine must be
+                # told exactly what changed, never silently ignored. If
+                # the file is a deployed copy, hand-editing is the WRONG
+                # remedy; point at the deploy step (on-host finding:
+                # install_service.sh updates the engine kit but the
+                # account data needs copy_files.sh).
+                config_error "$n" "the 'creds' directive was removed (ARC-11); update this config — delete the line, credential injection is the consumer's decision. If this file is a deployed copy, re-run your deployment script (e.g. copy_files.sh) instead of editing" "$raw"
+                ;;
+            "rule "*)
+                [[ -n "$cur" ]] || config_error "$n" "'rule' outside a profile block" "$raw"
+                rest="${line#"rule "}"
+                if [[ "$rest" == "public-only" ]]; then
+                    # Contradiction guard: a terminal public accept cannot
+                    # coexist with scoped allows or a gateway.
+                    [[ "$has_gw" == no && "$n_allow" == 0 ]] \
+                        || config_error "$n" "public-only combined with allow-host/gateway (contradictory)" "$raw"
+                    has_public=yes
+                    engine_rule_push "$cur" public-only ""
+                elif [[ "$rest" == "gateway-only" ]]; then
+                    has_gw_only=yes
+                    engine_rule_push "$cur" gateway-only ""
+                elif [[ "$rest" == "allow-host "* ]]; then
+                    read -r _ _ host rest <<<"$line"
+                    [[ -z "${rest:-}" ]] || config_error "$n" "unexpected trailing text" "$raw"
+                    [[ "$host" == *:* ]] \
+                        || config_error "$n" "allow-host needs <host>:<port>" "$raw"
+                    # Split at the last colon: host part, port part.
+                    port="${host##*:}"
+                    host="${host%:*}"
+                    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+                        config_error "$n" "invalid port '$port' (expected 1-65535)" "$raw"
+                    fi
+                    val="$(cfg_expand "$host")" \
+                        || config_error "$n" "environment variable in '$host' is unset and has no default" "$raw"
+                    # ARC-59-D1: host fields start alnum or '.' (dstdomain suffix) —
+                    # never '-'. '--help' / '-x' are flag-shaped tokens.
+                    [[ "$val" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+                        || config_error "$n" "invalid host name '$val'" "$raw"
+                    # ARC-32-D2: same DNS length caps as the allowlist
+                    # predicate (host <= 253, labels 1..63) — the conf
+                    # must not carry a token the gateway can never use.
+                    arc32_dns_len_ok "${val#.}" \
+                        || config_error "$n" "host '$val' exceeds DNS length limits (host <= 253 bytes, labels <= 63)" "$raw"
+                    [[ "$has_public" == no ]] \
+                        || config_error "$n" "public-only combined with allow-host (contradictory)" "$raw"
+                    n_allow=$((n_allow+1))
+                    engine_rule_push "$cur" allow-host "$val:$port"
+                else
+                    config_error "$n" "unknown rule kind '$rest' (expected allow-host <host>:<port>, public-only, or gateway-only)" "$raw"
+                fi
+                ;;
+            "gateway "*)
+                [[ -n "$cur" ]] || config_error "$n" "'gateway' outside a profile block" "$raw"
+                [[ "$has_gw" == no ]] || config_error "$n" "duplicate 'gateway' directive in profile '$cur'" "$raw"
+                [[ "$has_public" == no ]] \
+                    || config_error "$n" "public-only combined with gateway (contradictory)" "$raw"
+                read -r _ ip port path rest <<<"$line"
+                [[ -z "${rest:-}" ]] || config_error "$n" "unexpected trailing text" "$raw"
+                cfg_is_ipv4 "$ip" || config_error "$n" "invalid gateway IP '$ip'" "$raw"
+                # Membership + reserved-address exclusion via CIDR math
+                # (ARC-11-D3): the static gateway IP must lie strictly
+                # between the bridge gateway (first usable) and the anchor
+                # (last usable) — never network, broadcast, or either
+                # derived address.
+                cidr_parse "${PROFILE_SUBNET[$cur]}" \
+                    || config_error "$n" "invalid profile subnet '${PROFILE_SUBNET[$cur]}'" "$raw"
+                local ipu32
+                ipu32="$(cidr_u32 "$ip")"
+                if (( ipu32 <= CIDR_FIRST || ipu32 >= CIDR_LAST )); then
+                    config_error "$n" "gateway IP '$ip' is outside the usable range of profile subnet '${PROFILE_SUBNET[$cur]}' (must not be the network address, the bridge gateway, or the anchor address)" "$raw"
+                fi
+                if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+                    config_error "$n" "invalid gateway port '$port' (expected 1-65535)" "$raw"
+                fi
+                [[ "$path" =~ [[:space:]] ]] \
+                    && config_error "$n" "allowlist path must not contain whitespace" "$raw"
+                # ARC-58-D1: relative paths are confdir basenames. A
+                # single component only — no '/', no '..' segment — so a
+                # pasted '../other/secret' cannot resolve outside the
+                # conf dir (confused deputy against sibling files).
+                # Absolute paths are an explicit operator choice.
+                if [[ "$path" == /* ]]; then
+                    GW_ALLOWLIST[$cur]="$path"
+                elif [[ "$path" =~ ^[A-Za-z0-9._-]+$ && "$path" != ".." ]]; then
+                    GW_ALLOWLIST[$cur]="$dir/$path"
+                else
+                    config_error "$n" "invalid allowlist path '$path' (relative paths must be a single basename like 'main-allowlist'; use an absolute path for elsewhere)" "$raw"
+                fi
+                GW_IP[$cur]="$ip"
+                GW_PORT[$cur]="$port"
+                has_gw=yes
+                ;;
+            "no-proxy "*)
+                [[ -n "$cur" ]] || config_error "$n" "'no-proxy' outside a profile block" "$raw"
+                [[ -z "${PROFILE_NO_PROXY_EXTRA[$cur]:-}" ]] \
+                    || config_error "$n" "duplicate 'no-proxy' directive in profile '$cur'" "$raw"
+                read -r _ val rest <<<"$line"
+                [[ -z "${rest:-}" ]] || config_error "$n" "unexpected trailing text" "$raw"
+                local entry out="" expanded
+                # Intentional comma-split of the no-proxy list; each
+                # entry is validated against the host grammar below.
+                local IFS=,
+                for entry in $val; do
+                    entry="$(cfg_trim "$entry")"
+                    expanded="$(cfg_expand "$entry")" \
+                        || config_error "$n" "environment variable in '$entry' is unset and has no default" "$raw"
+                    # ARC-59-D1: NO_PROXY entries are host fields — start
+                    # alnum or '.', never '-'.
+                    [[ "$expanded" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+                        || config_error "$n" "invalid NO_PROXY entry '$expanded'" "$raw"
+                    # ARC-32-D2: same DNS length caps as the allowlist
+                    # predicate (host <= 253, labels 1..63).
+                    arc32_dns_len_ok "${expanded#.}" \
+                        || config_error "$n" "NO_PROXY entry '$expanded' exceeds DNS length limits (host <= 253 bytes, labels <= 63)" "$raw"
+                    out="${out:+$out,}$expanded"
+                done
+                unset IFS
+                [[ -n "$out" ]] || config_error "$n" "empty no-proxy list" "$raw"
+                PROFILE_NO_PROXY_EXTRA[$cur]="$out"
+                ;;
+            *) config_error "$n" "unknown directive" "$raw" ;;
+        esac
+    done < "$conf"
+    n=$((n+1))
+    block_end
+
+    (( ${#PROFILES[@]} > 0 )) || config_error 0 "config defines no profiles"
+}
+
+#
+# Generic rule compiler (successor of the legacy hardcoded cases). Emits,
+# per profile, in order:
+#   1. implicit established/related + DNS-to-gateway allows;
+#   2. config rules in config order (allow-host resolved NOW, fail closed);
+#   3. the terminal rule, derived — never configured:
+#      public-only -> scoped accept; otherwise scoped drop, preceded by
+#      the gateway-source exemption when a gateway exists (ARC-2-D4).
+#
+compiled_rules() {
+    local profile="$1" subnet gateway
+    subnet="${PROFILE_SUBNET[$profile]}"
+    # The DNS allow targets the bridge gateway = first usable address
+    # (ARC-11-D3); integer CIDR math, any supported prefix.
+    cidr_parse "$subnet" || die "invalid subnet '$subnet'"
+    gateway="$(cidr_ip "$CIDR_FIRST")"
+
+    echo "ip saddr ${subnet} ct state established,related counter accept"
+    echo "ip saddr ${subnet} ip daddr ${gateway} meta l4proto { tcp, udp } th dport 53 counter accept"
+
+    local i kind arg pfx="${profile}|"
+    local hip hport dip is_public=no
+    for i in "${!ENGINE_KINDS[@]}"; do
+        [[ "${ENGINE_KINDS[$i]}" == "$pfx"* ]] || continue
+        kind="${ENGINE_KINDS[$i]#"$pfx"}"
+        arg="${ENGINE_ARGS[$i]}"
+        case "$kind" in
+            allow-host)
+                hip="${arg%:*}"; hport="${arg##*:}"
+                dip="$(resolved_dest "$hip")"
+                echo "ip saddr ${subnet} ip daddr ${dip} tcp dport ${hport} counter accept"
+                ;;
+            public-only)
+                is_public=yes
+                echo "ip saddr ${subnet} ip daddr 10.0.0.0/8 counter drop"
+                echo "ip saddr ${subnet} ip daddr 172.16.0.0/12 counter drop"
+                echo "ip saddr ${subnet} ip daddr 192.168.0.0/16 counter drop"
+                echo "ip saddr ${subnet} ip daddr 169.254.0.0/16 counter drop"
+                echo "ip saddr ${subnet} ip daddr 224.0.0.0/4 counter drop"
+                # Bare address, not /32: nft re-renders /32 as a bare
+                # address on list, breaking exact-match verification.
+                echo "ip saddr ${subnet} ip daddr 255.255.255.255 counter drop"
+                ;;
+            gateway-only)
+                echo "ip saddr ${subnet} ip daddr ${GW_IP[$profile]} tcp dport ${GW_PORT[$profile]} counter accept"
+                ;;
+        esac
+    done
+
+    if [[ "$is_public" == yes ]]; then
+        echo "ip saddr ${subnet} counter accept"
+    elif is_gateway_profile "$profile"; then
+        # ARC-2-D4: the gateway's own egress is exempted INSIDE this
+        # chain (a lower-priority accept chain never sees the packet),
+        # then the terminal scoped drop.
+        echo "ip saddr ${GW_IP[$profile]} counter accept"
+        echo "ip saddr ${subnet} counter drop"
+    else
+        echo "ip saddr ${subnet} counter drop"
+    fi
+}
+
+#
+# Resolve a profile's allowlist source file: per-profile from the config
+# (`gateway` directive), conf-relative unless absolute.
+#
+allowlist_src() {
+    echo "${GW_ALLOWLIST[$1]}"
+}
+
+#
+# Emit the nftables file for the profile's forward chain. Rules are scoped
+# by the profile subnet: other networks sharing the rootless netns are
+# untouched, and an unscoped drop is only present for IPv6 (all restricted
+# profiles are IPv4-only).
+#
+# The file is a SINGLE nftables transaction that adds the table (no-op if
+# it already exists), the shared v6-deny chain (only when missing — an
+# 'add chain' over an existing chain fails the whole transaction), and the
+# profile chain (the caller flush+deletes it first so this is a clean
+# create). See install_policy and review attempt R-003-2.
+#
+# Emit a transaction that creates the profile's base chain WITHOUT
+# rules. Used only when the chain does not exist yet (fresh network —
+# no agents can be running yet), so the empty interval is safe.
+policy_chain_base_file() {
+    local profile="$1" chain
+    chain="$(chain_of "$profile")"
+    local tmp
+    tmp="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
+    cat > "$tmp" <<EOF
+table inet ${TABLE} {
+    chain ${chain} {
+        type filter hook forward priority -150; policy accept;
+    }
+}
+EOF
+    echo "$tmp"
+}
+
+# Emit ONE nftables transaction that atomically replaces the profile
+# chain's rules: `flush chain` + the re-added rules in the same file.
+# R-003-7 finding 1: flushing and re-creating in separate invocations
+# left an empty-chain window during which running agents on the shared
+# class network passed unfiltered (Netavark accepts). nft -f files are
+# a single atomic netlink transaction, so observers see either the old
+# or the new ruleset, never an empty chain.
+policy_refresh_file() {
+    local profile="$1" chain
+    chain="$(chain_of "$profile")"
+    local tmp
+    tmp="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
+    {
+        echo "flush chain inet ${TABLE} ${chain}"
+        echo "table inet ${TABLE} {"
+        echo "    chain ${chain} {"
+        echo "        type filter hook forward priority -150; policy accept;"
+        policy_rules "$profile"
+        echo "    }"
+        echo "}"
+    } > "$tmp"
+    echo "$tmp"
+}
+
+install_policy() {
+    local profile="$1" chain f
+    chain="$(chain_of "$profile")"
+    # 1) Base chain, create-if-missing. On first install the network is
+    #    brand new (no agents yet), so the empty interval is safe; on
+    #    refresh the chain already exists and this is a no-op.
+    if ! netns_nft list chain inet "$TABLE" "$chain" >/dev/null 2>&1; then
+        f="$(policy_chain_base_file "$profile")"
+        if ! netns_nft -f "$f"; then
+            rm -f "$f"
+            die "nft policy base-chain install failed for profile '$profile' (fail closed)"
+        fi
+        rm -f "$f"
+    fi
+    # 1b) Shared unscoped IPv6 deny chain: create-if-missing, then an
+    #     ATOMIC refresh in the same transaction style as the profile
+    #     chain. Older versions re-emitted this chain on every install
+    #     and real additive semantics APPENDED a duplicate drop rule
+    #     each time (on-host finding: stacked 'meta nfproto ipv6 counter
+    #     drop' rules); the strict ordered verify fails closed on such
+    #     a chain, so install must self-heal it. flush+re-add in one
+    #     file means observers never see an empty chain.
+    f="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
+    if netns_nft list chain inet "$TABLE" p_v6deny >/dev/null 2>&1; then
+        echo "flush chain inet ${TABLE} p_v6deny" > "$f"
+    fi
+    cat >> "$f" <<EOF
+table inet ${TABLE} {
+    chain p_v6deny {
+        type filter hook forward priority -160; policy accept;
+        meta nfproto ipv6 counter drop
+    }
+}
+EOF
+    if ! netns_nft -f "$f"; then
+        rm -f "$f"
+        die "nft policy v6-deny install failed for profile '$profile' (fail closed)"
+    fi
+    rm -f "$f"
+    # 2) Atomic refresh (R-003-7 finding 1): flush + re-added rules in
+    #    ONE transaction — running agents never observe an empty chain.
+    #    The old separate flush/delete/recreate left a fail-open window
+    #    for concurrent agent-run on the shared class network.
+    f="$(policy_refresh_file "$profile")"
+    if ! netns_nft -f "$f"; then
+        rm -f "$f"
+        die "nft policy refresh failed for profile '$profile' (fail closed)"
+    fi
+    rm -f "$f"
+    # 3) Remove the deprecated separate exemption chain (pre-ARC-5-D4
+    #    layout) from hosts that installed it. Safe at any time: the
+    #    exemption now lives inside the class chain itself.
+    if is_gateway_profile "$profile"; then
+        netns_nft flush chain inet "$TABLE" p_gw_egress >/dev/null 2>&1 || true
+        netns_nft delete chain inet "$TABLE" p_gw_egress >/dev/null 2>&1 || true
+    fi
+}
+
+#
+# Canonicalize an nft chain listing to a sorted rule set: strip counter
+# packet/byte expansion (real nft prints 'counter packets N bytes N'),
+# drop indentation and keep only rule lines. Expected and actual listings
+# then compare equal iff the rule sets match (order-insensitive; the
+# order-sensitive DNS-before-drops requirement is checked separately).
+#
+verify_policy() {
+    local profile="$1" subnet chain anchor
+    subnet="${PROFILE_SUBNET[$profile]}"
+    chain="$(chain_of "$profile")"
+    anchor="$(anchor_of "$profile")"
+    podman network inspect "$(network_of "$profile")" >/dev/null 2>&1 \
+        || { echo "verify: network $(network_of "$profile") missing — run: egresslock ensure $profile" >&2; return 1; }
+    anchor_running "$anchor" \
+        || { echo "verify: anchor $anchor not running" >&2; return 1; }
+
+    # ARC-52-D3: verify saw only its own table, but nft accept is not
+    # terminal across base chains — a stale table's forward-hook drop at
+    # the same or earlier priority silently overrides this kit's accepts
+    # (observed on-host: pre-rename 'agent_policy' table killed all
+    # workload egress while verify was green). Fail closed on leftover
+    # legacy tables and foreign early hooks; never delete anything here
+    # (ensure owns the ARC-54 legacy delete).
+    verify_no_early_foreign_hooks || return 1
+
+    # Review R-003-3/R-003-7: verify the COMPLETE policy with semantic
+    # ORDER preserved: the shared v6-deny chain (type, priority, policy,
+    # exact rule order) and the profile chain (hook, priority, exact
+    # ordered ruleset). nft first-match semantics mean a reordered
+    # accept/drop is a different policy, so nothing is sorted.
+
+    # Shared unscoped IPv6 deny chain: exact ordered content.
+    local v6 v6actual v6expected
+    v6="$(netns_nft list chain inet "$TABLE" p_v6deny 2>/dev/null || true)"
+    v6actual="$(canonicalize <<<"$v6")"
+    v6expected="$(printf '%s\n' \
+        'type filter hook forward priority -160; policy accept;' \
+        'meta nfproto ipv6 counter drop')"
+    if [[ "$v6actual" != "$v6expected" ]]; then
+        echo "verify: shared v6-deny chain missing or does not match the expected policy" >&2
+        diff <(echo "$v6expected") <(echo "$v6actual") >&2 || true
+        return 1
+    fi
+
+    # Profile chain: hook, priority, and the exact ORDERED rule set.
+    # ARC-12-D1/D4: allow-host daddrs in the EXPECTED ruleset come from
+    # the live chain's own pins (verify_expected_rules), so DNS drift
+    # is not a verify failure; the zip's count/port checks still fail
+    # closed on structural mismatch. resolve_ip is NOT called here.
+    # NOTE: verify_expected_rules runs WITHOUT a command substitution
+    # (no $() ) because it fills VERIFY_PINS for check_dns_drift; a
+    # subshell would discard those assignments.
+    local raw actual
+    raw="$(netns_nft list chain inet "$TABLE" "$chain" 2>/dev/null || true)"
+    actual="$(canonicalize <<<"$raw")"
+    VERIFY_PINS=()
+    # verify_expected_rules FILLS VERIFY_PINS (consumed by
+    # check_dns_drift), so it must NOT run inside a $() subshell:
+    # capture its output via a temp file instead.
+    local pinfile
+    pinfile="$(mktemp /tmp/agent-verify.XXXXXX)"
+    local ok=1
+    verify_expected_rules "$profile" > "$pinfile" || ok=0
+    if (( ok == 0 )); then
+        rm -f "$pinfile"
+        echo "verify: policy chain $chain does not match the expected ruleset" >&2
+        return 1
+    fi
+    { echo "type filter hook forward priority -150; policy accept;"
+      cat "$pinfile"
+    } > "$pinfile.new"
+    mv "$pinfile.new" "$pinfile"
+    expected="$(cat "$pinfile")"
+    rm -f "$pinfile"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "verify: policy chain $chain does not match the expected ruleset" >&2
+        diff <(echo "$expected") <(echo "$actual") >&2 || true
+        return 1
+    fi
+}
+
+canonicalize() {
+    # Normalize an nft chain listing to its semantic content, PRESERVING
+    # rule order: real output indents rules (R-003-4: filter AFTER
+    # de-indenting), expands counters, and renders priorities as named
+    # aliases ('mangle' = -150; -160 renders as 'mangle - 10'). Order
+    # matters (R-003-7 finding 2): first-match semantics mean a
+    # reordered accept/drop changes the policy, so NO sorting here.
+    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//
+        s/counter packets [0-9]+ bytes [0-9]+/counter/
+        s/priority mangle - 10/priority -160/
+        s/priority mangle;/priority -150;/' \
+        | grep -E '^(type filter|ip saddr|meta nfproto)'
+}
+
+#
+# ARC-52-D3: numeric value of an nft `priority <spec>` rendering, as
+# `nft list ruleset` prints it — bare numbers ('-150'), named aliases
+# ('filter' = 0, 'mangle' = -150, 'mangle - 10' = -160, plus the other
+# standard names), or empty/unknown (return 1: the spec cannot be
+# judged, so callers skip it instead of guessing).
+#
+nft_priority_value() {
+    local spec="$1" base num=0
+    spec="${spec#"${spec%%[![:space:]]*}"}"
+    spec="${spec%"${spec##*[![:space:]]}"}"
+    if [[ "$spec" =~ ^-?[0-9]+$ ]]; then
+        echo "$spec"
+        return 0
+    fi
+    base="$spec"
+    if [[ "$spec" =~ ^([a-z]+)[[:space:]]+([+-])[[:space:]]*([0-9]+)$ ]]; then
+        base="${BASH_REMATCH[1]}"
+        if [[ "${BASH_REMATCH[2]}" == "-" ]]; then
+            num=$(( -BASH_REMATCH[3] ))
+        else
+            num=$(( BASH_REMATCH[3] ))
+        fi
+    fi
+    case "$base" in
+        raw)      echo $(( -300 + num )) ;;
+        mangle)   echo $(( -150 + num )) ;;
+        dstnat)   echo $(( -100 + num )) ;;
+        filter)   echo $(( num )) ;;
+        srcnat)   echo $(( 100 + num )) ;;
+        security) echo $(( 225 + num )) ;;
+        *) return 1 ;;
+    esac
+}
+
+#
+# ARC-52-D3: fail closed on early foreign FORWARD hooks. nft accept is
+# NOT terminal across base chains: a second forward-hook chain at the
+# same or earlier priority terminal-drops everything the profile chain
+# accepts. Observed on-host (ARC-52): the pre-rename 'agent_policy'
+# table outlived the ARC-47 rename, and its terminal drop silently
+# killed all workload egress while verify stayed green — verify
+# inspected only its own table. This check fails when:
+#   1. the leftover legacy table 'inet agent_policy' still exists in
+#      the netns (ensure removes it — ARC-54; verify never deletes);
+#   2. any OTHER table declares a `type filter hook forward` base
+#      chain at priority <= -150 (same or earlier than the profile
+#      chains); the message names table and chain.
+# Exempt (D3 check 3): later-priority hooks (Netavark's FORWARD at 0)
+# and this kit's own table. A ruleset listing that cannot be read or
+# parsed degrades to no-op — the per-chain checks below still verify
+# the kit's own policy.
+#
+verify_no_early_foreign_hooks() {
+    local ruleset hits rc=0
+    ruleset="$(netns_nft list ruleset 2>/dev/null || true)"
+    [[ -n "$ruleset" ]] || return 0
+    if grep -q "^table inet ${LEGACY_TABLE} " <<<"$ruleset"; then
+        echo "verify: leftover policy table 'inet ${LEGACY_TABLE}' still exists in the netns — a second policy table terminal-drops traffic this kit accepts. Run ensure to remove it (ARC-54)." >&2
+        rc=1
+    fi
+    # Emit one <family<TAB>table<TAB>chain<TAB>priority> per filter/forward
+    # base chain found in any table of the ruleset.
+    hits="$(awk '
+        /^[[:space:]]*table[[:space:]]/ {
+            fam=$2; tbl=$3; sub(/[[:space:]]*\{[[:space:]]*$/, "", tbl); next
+        }
+        /^[[:space:]]*chain[[:space:]]/ {
+            ch=$2; sub(/[[:space:]]*\{[[:space:]]*$/, "", ch)
+            inchain=1; infwd=0; prio=""; next
+        }
+        inchain && /type[[:space:]]+filter[[:space:]]+hook[[:space:]]+forward/ {
+            infwd=1
+            if (match($0, /priority[[:space:]]+[^;]+/)) {
+                prio=substr($0, RSTART+8, RLENGTH-8)
+                gsub(/[[:space:]]+/, " ", prio)
+                sub(/^[[:space:]]+/, "", prio)
+                sub(/[[:space:]]+$/, "", prio)
+            }
+            next
+        }
+        /^[[:space:]]*\}/ {
+            if (inchain && infwd) print fam "\t" tbl "\t" ch "\t" prio
+            inchain=0; next
+        }
+    ' <<<"$ruleset")"
+    while IFS=$'\t' read -r fam tbl ch prio; do
+        [[ -n "$fam" ]] || continue
+        [[ "$fam" == inet && "$tbl" == "$TABLE" ]] && continue
+        [[ -n "$prio" ]] || continue
+        local val
+        val="$(nft_priority_value "$prio")" || continue
+        (( val > -150 )) && continue
+        echo "verify: foreign forward-hook chain '${ch}' in table '${fam} ${tbl}' (priority ${prio}) runs at or before the profile chains (-150) — its drop would silently override this kit's accepts. Not managed by this kit: remove it or move it later in the hook." >&2
+        rc=1
+    done <<<"$hits"
+    return "$rc"
+}
+
+gw_image() {
+    if [[ -n "${EGRESSLOCK_GW_IMAGE:-}" ]]; then
+        # ARC-59-D1: a non-empty value that starts with '-' is a
+        # flag-shaped token in the `podman run ... "$(gw_image)"`.
+        [[ "$EGRESSLOCK_GW_IMAGE" == -* ]] \
+            && die "EGRESSLOCK_GW_IMAGE value must not start with '-' (got '$EGRESSLOCK_GW_IMAGE')"
+        echo "$EGRESSLOCK_GW_IMAGE"
+    else
+        echo "localhost/egresslock-gateway:latest"
+    fi
+}
+
+#
+# Squid dstdomain allowlist content generated from the repo source file.
+# Lines: comment (#) and blank lines stripped; entries are host[:port] or
+# leading-dot domain suffixes (passed through for Squid dstdomain).
+#
+#
+# Parse and validate the repo allowlist into entries: "host" or
+# "host:port" (ARC-2-D2 contract). Comments/blanks stripped, malformed
+# lines fail closed. Prints one entry per line.
+#
+gw_allowlist_entries() {
+    local profile="$1" src
+    src="$(allowlist_src "$profile")"
+    [[ -f "$src" ]] || die "allowlist file missing: $src"
+    local raw entry host port probe
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        entry="${raw%%#*}"
+        entry="$(tr -d '[:space:]' <<<"$entry")"
+        [[ -z "$entry" ]] && continue
+        # ARC-59-D1: host fields start alnum or '.' (dstdomain suffix) — a
+        # leading '-' would read as a flag-like token.
+        if [[ "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]+$ ]]; then
+            host="${entry%:*}"
+            port="${entry##*:}"
+            if (( port < 1 || port > 65535 )); then
+                die "invalid port in allowlist entry '$entry'"
+            fi
+            # ARC-51-D1: the allowlist is names only (squid dstdomain).
+            # A literal IPv4 in the file is a fail-closed error, not a
+            # skipped line — the operator must move it to allow-host.
+            probe="${host#.}"
+            if cfg_is_ipv4 "$probe"; then
+                die "allowlist entry '$entry' is an IPv4 literal; literals belong on 'allow-host' (host:port), not the gateway allowlist"
+            fi
+            # ARC-32-D2: the file path inherits the DNS length caps —
+            # fail closed here rather than persisting a line the
+            # gateway can never use (ARC-48 U9).
+            arc32_dns_len_ok "$probe" \
+                || die "allowlist entry '$entry' exceeds DNS length limits (host <= 253 bytes, labels <= 63)"
+            # 443 is the default HTTPS group; keep it there so an
+            # explicit :443 does not create a redundant second group.
+            if (( port == 443 )); then
+                echo "$host"
+            else
+                echo "$host:$port"
+            fi
+        elif [[ "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            probe="${entry#.}"
+            if cfg_is_ipv4 "$probe"; then
+                die "allowlist entry '$entry' is an IPv4 literal; literals belong on 'allow-host' (host:port), not the gateway allowlist"
+            fi
+            # ARC-32-D2: the file path inherits the DNS length caps
+            # (see the host:port branch above).
+            arc32_dns_len_ok "$probe" \
+                || die "allowlist entry '$entry' exceeds DNS length limits (host <= 253 bytes, labels <= 63)"
+            echo "$entry"
+        else
+            die "invalid allowlist entry '$entry' (expected host or host:port)"
+        fi
+    done < "$src"
+}
+
+#
+# Generate the complete Squid config for the gateway into $1, with the
+# hostname groups' dstdomain files written next to it (same staging dir).
+#
+# Layout: entries without an explicit port are restricted to 443 (TLS);
+# "host:port" entries get their own dstdomain group + port ACL. All
+# egress rules are followed by a terminal deny all (fail closed).
+#
+gw_generate_config() {
+    local profile="$1" out="$2" stage="$3"
+    local entries host port p
+    # NOTE: explicit rc check — inside an `if !` condition context the
+    # function body is exempt from set -e, so a die() in the command
+    # substitution would otherwise be silently swallowed.
+    entries="$(gw_allowlist_entries "$profile")" || {
+        die "allowlist generation failed (invalid entries; fail closed)"
+    }
+
+    # Squid resolves allowlisted destinations itself. Bypass Aardvark
+    # (its upstream forwarding fails on some CDN CNAME chains — on-host
+    # finding: api.openrouter.ai unresolvable while the apex name
+    # worked) and use the pasta DNS forwarder, which reaches the host
+    # resolver for any name. Squid's own queries are exempted in
+    # p_llm_cloud (saddr GW_IP) so they are not dropped.
+    # R-005-5 nit: validate the override — it is interpolated into the
+    # Squid config, so reject anything that could inject directives.
+    # ARC-56-D1: the sink consumes a LIST OF IPv4 ADDRESSES, so a charset
+    # allowlist is not enough. The grammar is single-space-separated
+    # non-whitespace tokens: tabs/newlines (any whitespace but a literal
+    # space) and leading/trailing/double spaces all fail closed, then each
+    # token must pass cfg_is_ipv4.
+    local gw_dns="${GW_DNS_NAMESERVERS:-169.254.1.1}"
+    if [[ ! "$gw_dns" =~ ^[^[:space:]]+( [^[:space:]]+)*$ ]]; then
+        die "GW_DNS_NAMESERVERS must be a single-space-separated list of IPv4 addresses"
+    fi
+    local -a gw_dns_tokens=() tok
+    read -r -a gw_dns_tokens <<< "$gw_dns"
+    for tok in "${gw_dns_tokens[@]}"; do
+        cfg_is_ipv4 "$tok" || die "GW_DNS_NAMESERVERS entry '$tok' is not a valid IPv4 address"
+    done
+    gw_dns="${gw_dns_tokens[*]}"
+    cat > "$out" <<EOF
+# Generated by egresslock from $(allowlist_src "$profile") — do not edit.
+http_port ${GW_PORT[$profile]}
+pid_filename /tmp/squid.pid
+dns_nameservers $gw_dns
+shutdown_lifetime 2 seconds
+coredump_dir /var/spool/squid
+access_log stdio:/var/log/squid/access.log
+cache_log /var/log/squid/cache.log
+cache deny all
+
+acl agent_class src ${PROFILE_SUBNET[$profile]}
+EOF
+
+    # Group 1: hosts without an explicit port -> default HTTPS port.
+    local noport=0
+    : > "$stage/allowlist.domains"
+    while IFS= read -r entry; do
+        # Empty entries (e.g. the heredoc newline from an EMPTY allowlist
+        # file) must not mint a phantom no-port ACL group — that would
+        # quietly turn a fail-closed empty allowlist into an allow rule.
+        [[ -z "$entry" ]] && continue
+        [[ "$entry" != *:* ]] || continue
+        echo "$entry" >> "$stage/allowlist.domains"
+        noport=1
+    done <<<"$entries"
+    if [[ "$noport" == 1 ]]; then
+        {
+            echo 'acl agent_allowlist dstdomain "/etc/squid/agent/allowlist.domains"'
+            echo 'acl agent_port_443 port 443'
+            echo 'http_access allow agent_class agent_allowlist agent_port_443'
+        } >> "$out"
+    fi
+
+    # Group 2+: hosts with an explicit destination port.
+    local seen=""
+    while IFS= read -r entry; do
+        [[ "$entry" == *:* ]] || continue
+        port="${entry##*:}"
+        [[ " $seen " == *" $port "* ]] && continue
+        seen="$seen $port"
+    done <<<"$entries"
+    # Intentional word-split of the port set (space-joined ports extracted
+    # from already-validated host:port entries — digits only).
+    for p in $seen; do
+        : > "$stage/allowlist.p$p"
+        while IFS= read -r entry; do
+            [[ "$entry" == *:* ]] || continue
+            [[ "${entry##*:}" == "$p" ]] || continue
+            echo "${entry%:*}" >> "$stage/allowlist.p$p"
+        done <<<"$entries"
+        {
+            echo "acl agent_allowlist_p$p dstdomain \"/etc/squid/agent/allowlist.p$p\""
+            echo "acl agent_port_p$p port $p"
+            echo "http_access allow agent_class agent_allowlist_p$p agent_port_p$p"
+        } >> "$out"
+    done
+
+    echo "http_access deny all" >> "$out"
+}
+
+#
+# Apply the generated allowlist config to the running gateway: stage
+# everything, validate the candidate with `squid -k check`, swap it in,
+# and restart the container (a reconfigure would re-read the config path
+# the process was started with, which may be the bootstrap config). Any
+# failure leaves the previous config active and fails closed.
+#
+gw_apply_allowlist() {
+    local profile="$1" gwname
+    gwname="$(gw_name "$profile")"
+    local stage
+    stage="$(mktemp -d /tmp/agent-allowlist.XXXXXX)"
+    local candidate="$stage/squid-gw.conf"
+    chmod 755 "$stage"
+    if ! gw_generate_config "$profile" "$candidate" "$stage"; then
+        rm -rf "$stage"
+        die "allowlist generation failed (fail closed)"
+    fi
+    chmod 644 "$candidate" "$stage"/allowlist.* 2>/dev/null || true
+
+    local f
+    for f in "$stage"/allowlist.*; do
+        [[ -f "$f" ]] || continue
+        if ! podman cp "$f" "${gwname}:/etc/squid/agent/$(basename "$f")"; then
+            rm -rf "$stage"
+            die "gateway allowlist staging failed (podman cp; fail closed)"
+        fi
+    done
+    if ! podman cp "$candidate" "${gwname}:/etc/squid/agent/check.conf"; then
+        rm -rf "$stage"
+        die "gateway config staging failed (podman cp; fail closed)"
+    fi
+    # -k parse validates the config WITHOUT a running instance or PID
+    # file; -k check demands the instance PID file, which `squid -N`
+    # does not reliably leave behind (on-host finding, ARC-5).
+    if ! check_out="$(podman exec "$gwname" squid -k parse -f /etc/squid/agent/check.conf 2>&1)"; then
+        podman exec "$gwname" rm -f /etc/squid/agent/check.conf >/dev/null 2>&1 || true
+        rm -rf "$stage"
+        die "gateway rejected the generated config (fail closed): $check_out"
+    fi
+    if ! podman exec "$gwname" mv /etc/squid/agent/check.conf /etc/squid/agent/squid.conf; then
+        podman exec "$gwname" rm -f /etc/squid/agent/check.conf >/dev/null 2>&1 || true
+        rm -rf "$stage"
+        die "gateway config swap failed (fail closed)"
+    fi
+    rm -rf "$stage"
+    # Activate: restart so the entrypoint picks the generated config via
+    # its -f path; a `squid -k reconfigure` would re-read whatever config
+    # the process was originally started with.
+    podman restart -t 5 "$gwname" >/dev/null
+    local i port="${GW_PORT[$profile]}"
+    for i in $(seq 1 120); do
+        gw_running "$gwname" && gw_probe "$gwname" "$port" && return 0
+        sleep 0.5
+    done
+    die "gateway did not come back healthy after config application (fail closed)"
+}
+
+gw_running() {
+    local names
+    names="$(podman ps --format '{{.Names}}' 2>/dev/null || true)"
+    grep -qx "$1" <<<"$names"
+}
+
+gw_probe() {
+    # Direct liveness probe: the proxy must answer a TCP connect on its
+    # port. Used instead of the image HEALTHCHECK state, which is
+    # absent when the image is built in OCI format (on-host finding,
+    # ARC-5) and is therefore unreliable.
+    local gwname="$1" port="$2"
+    podman exec "$gwname" bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" >/dev/null 2>&1
+}
+
+gw_healthy() {
+    gw_running "$1" && gw_probe "$1" "$2"
+}
+
+# ARC-32-D1: overlay log cap. The generated squid.conf logs to
+# `stdio:/var/log/squid/access.log` with no rotate, and a workload
+# CONNECT flood (plus cache.log) grows the gateway overlay without
+# bound until it fills and `denied` OOMs on the read (ARC-42 capped the
+# detect loop's *time* window and ARC-32-D1 caps its *transfer*; this
+# caps the *disk*). Called on `verify`, and on `ensure` once the
+# gateway is running: any access.log/cache.log over
+# EGRESSLOCK_GW_LOG_MAX_BYTES (default 32 MiB; 0 = no cap) is rotated —
+# mv aside, `squid -k rotate` (fixed argv; stdio logs reopen onto fresh
+# files), then drop the moved generation. One generation only; this is
+# NOT the ARC-31 reset, and `denied` itself still never deletes or
+# rotates the file.
+gw_log_cap() { # gw_log_cap <profile>
+    local profile="$1" gwname max log size
+    gwname="$(gw_name "$profile")"
+    max="${EGRESSLOCK_GW_LOG_MAX_BYTES:-33554432}"
+    [[ "$max" =~ ^(0|[1-9][0-9]*)$ ]] || {
+        echo "Error: EGRESSLOCK_GW_LOG_MAX_BYTES must be a non-negative integer (bytes; 0 = no cap)." >&2
+        return 1
+    }
+    (( max == 0 )) && return 0
+    gw_running "$gwname" || return 0
+    for log in /var/log/squid/access.log /var/log/squid/cache.log; do
+        size="$(podman exec "$gwname" stat -c %s "$log" 2>/dev/null || true)"
+        [[ "$size" =~ ^[0-9]+$ ]] || continue
+        (( size <= max )) && continue
+        echo "rotating: $log is $size bytes (over the ${max}-byte cap) on $gwname" >&2
+        if ! podman exec "$gwname" mv "$log" "$log.1"; then
+            echo "warn: could not move $log aside on $gwname; skipping rotation" >&2
+            continue
+        fi
+        if ! podman exec "$gwname" squid -k rotate; then
+            # Reopen failed: put the live file back so squid keeps
+            # logging to the path it holds open. The oversize log stays
+            # until the operator intervenes — this fails open for the
+            # LOG (never for policy), the same trade `denied`'s rc-0
+            # truncation makes.
+            echo "warn: squid -k rotate failed on $gwname; restoring $log" >&2
+            podman exec "$gwname" mv "$log.1" "$log" >/dev/null 2>&1 || true
+            continue
+        fi
+        podman exec "$gwname" rm -f "$log.1" >/dev/null 2>&1 || true
+    done
+}
+
+gw_start() {
+    # A failed start (e.g. an IPAM conflict) leaves container storage
+    # holding the name in real Podman (on-host finding, ARC-5): the name
+    # is registered before the IP allocation fails. Always clear it so a
+    # retry can reuse the name.
+    local profile="$1" gwname net ip img
+    gwname="$(gw_name "$profile")"
+    net="$(network_of "$profile")"
+    ip="${GW_IP[$profile]}"
+    # Plain assignment so a die() inside gw_image (ARC-59 env guard)
+    # propagates under set -e (command-substitution footgun).
+    img="$(gw_image)"
+    podman rm -f "$gwname" >/dev/null 2>&1 || true
+    podman run -d --name "$gwname" \
+        --network "$net" \
+        --ip "$ip" \
+        --restart=always \
+        --cap-drop=all \
+        --security-opt=no-new-privileges \
+        "$img" >/dev/null
+}
+
+ensure_gateway() {
+    local profile="$1" gwname port img
+    gwname="$(gw_name "$profile")"
+    port="${GW_PORT[$profile]}"
+    if gw_running "$gwname" && gw_probe "$gwname" "$port"; then
+        return 0
+    fi
+    # Plain assignment so a die() inside gw_image (ARC-59 env guard)
+    # propagates under set -e (command-substitution footgun).
+    img="$(gw_image)"
+    podman rm -f "$gwname" >/dev/null 2>&1 || true
+    podman image exists "$img" 2>/dev/null \
+        || die "gateway image $img not found; build it: build-gateway (kit tree / installed prefix copy)"
+    # The gateway joins the same class network with a FIXED ip so the
+    # nftables rule and the proxy env vars stay stable.
+    if ! gw_start "$profile"; then
+        # On-host finding (maintainer, ARC-5): a legacy anchor created
+        # before the gateway existed may hold the gateway's static IP.
+        # The anchor is our own disposable netns holder with no services;
+        # recycle it (it is recreated below with its own reserved IP)
+        # and retry once.
+        podman rm -f "$(anchor_of "$profile")" >/dev/null 2>&1 || true
+        gw_start "$profile" || die "gateway start failed (static IP ${GW_IP[$profile]} conflict?)"
+    fi
+    local i
+    # 60s budget: container start + squid -z + port bind.
+    for i in $(seq 1 120); do
+        gw_running "$gwname" && gw_probe "$gwname" "$port" && return 0
+        sleep 0.5
+    done
+    die "gateway container '$gwname' did not become healthy (proxy not answering on $port)"
+}
+
+verify_gateway() {
+    local profile="$1" gwname net ip
+    gwname="$(gw_name "$profile")"
+    net="$(network_of "$profile")"
+    ip="${GW_IP[$profile]}"
+    gw_running "$gwname" \
+        || { echo "verify: gateway $gwname not running" >&2; return 1; }
+    # Gateway must be attached to the class network with its static IP.
+    local nets
+    nets="$(podman inspect "$gwname" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null || true)"
+    grep -qw "$net" <<<"$nets" \
+        || { echo "verify: gateway not attached to $net" >&2; return 1; }
+    local cip
+    cip="$(podman inspect "$gwname" --format "{{(index .NetworkSettings.Networks \"$net\").IPAddress}}" 2>/dev/null || true)"
+    [[ "$cip" == "$ip" ]] \
+        || { echo "verify: gateway IP is '$cip', expected $ip" >&2; return 1; }
+    # Config sanity: parse the deployed config. `-k parse` needs no
+    # running-instance PID file (unlike `-k check`); on-host finding,
+    # ARC-5. Liveness itself is covered by gw_probe.
+    podman exec "$gwname" squid -k parse -f /etc/squid/agent/squid.conf >/dev/null 2>&1 \
+        || { echo "verify: gateway squid config invalid" >&2; return 1; }
+}
+
+# ARC-54-D1: the ARC-47 rename (agent_policy -> egresslock) left old
+# accounts with a stale `inet agent_policy` table in the shared rootless
+# netns (empty `policy accept` chains). It is residue, not a compat shim
+# (ARC-47-D3 forbids dual-run), and two policy tables confuse `nft list`.
+# If it exists, DELETE it — before any egresslock policy is installed or
+# verified — on `ensure` (any profile) and `teardown all`. Rules are NOT
+# copied out of it; profiles that were never ensured stay uninstalled
+# (that fail-closed behavior is unchanged). A failed delete fails closed.
+LEGACY_TABLE="agent_policy"
+drop_legacy_table() {
+    netns_nft list table inet "$LEGACY_TABLE" >/dev/null 2>&1 || return 0
+    if ! netns_nft delete table inet "$LEGACY_TABLE"; then
+        die "leftover nft table 'inet $LEGACY_TABLE' exists but could not be deleted (fail closed); remove it manually: podman unshare --rootless-netns nft delete table inet $LEGACY_TABLE"
+    fi
+    echo "removed leftover nft table 'inet $LEGACY_TABLE' (pre-ARC-47 rename residue)"
+}
+
+cmd_ensure() {
+     require_profile "${1:-}" ensure
+     netns_probe || exit 1
+     drop_legacy_table
+     ensure_network "$1"
+    # Gateway-first on gateway profiles: the static IP must be claimed
+    # before any dynamic allocation can take it (on-host IPAM finding,
+    # ARC-5).
+    if is_gateway_profile "$1"; then
+        ensure_gateway "$1"
+        gw_apply_allowlist "$1"
+        # ARC-32-D1: the gateway is confirmed healthy here — rotate any
+        # oversize overlay logs before the policy work continues.
+        gw_log_cap "$1"
+        ensure_anchor "$1"
+    else
+        ensure_anchor "$1"
+    fi
+    # ARC-12-D2: snapshot the pre-refresh allow-host pins so a DNS
+    # change the refresh just healed is announced (refreshed: lines).
+    # No chain yet (first ensure) = nothing to announce.
+    local -A before=()
+    if netns_nft list chain inet "$TABLE" "$(chain_of "$1")" >/dev/null 2>&1; then
+        VERIFY_PINS=()
+        verify_expected_rules "$1" >/dev/null 2>&1 || true
+        local k
+        for k in "${!VERIFY_PINS[@]}"; do
+            before[$k]="${VERIFY_PINS[$k]}"
+        done
+    fi
+    install_policy "$1"
+    verify_policy "$1" || die "policy verification failed for profile '$1' (fail closed)"
+    # D2: announce healed drift (exactly ONE line per HOST, first-A
+    # semantics — before is keyed host|port, so dedupe by host).
+    if (( ${#before[@]} > 0 )); then
+        local key host old
+        local -A announced=()
+        for key in "${!before[@]}"; do
+            host="${key%%|*}"
+            [[ -n "${announced[$host]:-}" ]] && continue
+            announced[$host]=1
+            old="${before[$key]}"
+            local now
+            now="$(resolve_ip "$host")"
+            if [[ -n "$now" && "$now" != "$old" ]]; then
+                echo "refreshed: host $host $old -> $now (policy re-installed with the new address)"
+            fi
+        done
+    fi
+    if is_gateway_profile "$1"; then
+        verify_gateway "$1" || die "gateway verification failed for profile '$1' (fail closed)"
+        echo "gateway '$(gw_name "$1")' ready (allowlist applied, health verified)"
+    fi
+    echo "profile '$1' ready (network $(network_of "$1"), policy verified)"
+}
+
+#
+# ARC-12: drift check. Called from cmd_verify ONLY, after policy (and
+# gateway) verification succeeded. Warn-only: DNS drift is an operator
+# signal, never an exit-code change (D1/D3). One line per drifted host
+# (D5 first-A semantics; two ports of one host share a single warn).
+#
+check_dns_drift() {
+    local profile="$1" hp host pinned fresh
+    local -A warned=()
+    while IFS= read -r hp; do
+        [[ -n "$hp" ]] || continue
+        host="${hp%:*}"
+        [[ -n "${warned[$host]:-}" ]] && continue
+        # VERIFY_PINS keys are host|port; bash assoc lookup has no glob,
+        # so scan (cheap: a handful of entries).
+        local k pinned=""
+        for k in "${!VERIFY_PINS[@]}"; do
+            if [[ "${k%%|*}" == "$host" ]]; then
+                pinned="${VERIFY_PINS[$k]}"
+                break
+            fi
+        done
+        [[ -n "$pinned" ]] || continue
+        warned[$host]=1
+        fresh="$(resolve_ip "$host")"
+        if [[ -z "$fresh" ]]; then
+            echo "drift: host $host no longer resolves; policy still pins $pinned — re-run ensure to update" >&2
+        elif [[ "$fresh" != "$pinned" ]]; then
+            echo "drift: host $host resolved to $fresh but the policy pins $pinned — re-run ensure to update" >&2
+        fi
+    done < <(profile_allow_hosts "$profile")
+}
+
+cmd_verify() {
+     require_profile "${1:-}" verify
+     netns_probe || exit 1
+     verify_policy "$1" || exit 1
+    if is_gateway_profile "$1"; then
+        verify_gateway "$1" || exit 1
+        # ARC-32-D1: gateway confirmed up — rotate oversize overlay logs.
+        gw_log_cap "$1"
+        echo "profile '$1' policy and gateway verified"
+    else
+        echo "profile '$1' policy verified"
+    fi
+    # ARC-12-D1/D3: warn-only, never changes the exit code.
+    check_dns_drift "$1"
+}
+
+# ARC-16-D3: verify every profile that is CURRENTLY ensured (its anchor
+# is running); profiles without a live anchor are skipped (they are not
+# installed, not broken). No ensured profiles at all: exit 0 silently —
+# the timer's job is a drift signal for installed policy, not a
+# complaint about profiles that were never used. Any verification
+# failure exits 1 (the oneshot unit fails -> journal signal).
+cmd_verify_ensured() {
+     netns_probe || exit 1
+     local p failed=0
+    for p in "${PROFILES[@]}"; do
+        anchor_running "$(anchor_of "$p")" || continue
+        if ! verify_policy "$p"; then
+            echo "verify: profile '$p' FAILED policy verification" >&2
+            failed=1
+            continue
+        fi
+        if is_gateway_profile "$p" && ! verify_gateway "$p"; then
+            echo "verify: profile '$p' FAILED gateway verification" >&2
+            failed=1
+            continue
+        fi
+        echo "profile '$p' verified (ensured)"
+        check_dns_drift "$p"
+    done
+    return "$failed"
+}
+
+# ARC-44-D2: emit exactly one validated token on stdout, fail closed.
+# $1 = value, $2 = kind (ipv4 | port | noproxy | netname). Conf
+# validation is the first gate; this emission re-check is the belt for
+# command-substitution consumers. Reject, never sanitize.
+emit_token() {
+    local v="$1" kind="$2"
+    case "$kind" in
+        ipv4)    cfg_is_ipv4 "$v" || die "internal: invalid gateway IP '$v'" ;;
+        port)    if [[ ! "$v" =~ ^[0-9]+$ ]] || (( v < 1 || v > 65535 )); then
+                     die "internal: invalid gateway port '$v'"
+                 fi ;;
+        noproxy) [[ "$v" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*(,\.?[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] \
+                     || die "internal: invalid NO_PROXY value '$v'" ;;
+        netname) [[ "$v" =~ ^egresslock-[a-z0-9-]+$ ]] \
+                     || die "internal: invalid network name '$v'" ;;
+        *) die "internal: unknown token kind '$kind'" ;;
+    esac
+    printf '%s\n' "$v"
+}
+
+no_proxy_value() {
+    local np="localhost,127.0.0.1"
+    [[ -n "${PROFILE_NO_PROXY_EXTRA[$1]:-}" ]] \
+        && np="${np},${PROFILE_NO_PROXY_EXTRA[$1]}"
+    # EGL-18-D3 (partial ARC-38-D4 overturn, IPv4 literals ONLY): a
+    # literal has no supported Squid path (ARC-51-D1), so the only way
+    # an HTTP client honors the nft pin is to bypass the proxy for it.
+    # Union at emission (never a conf rewrite): unique IPv4 hosts from
+    # the profile's allow-host pins in conf order. Hostname pins stay
+    # out — ARC-38-D4's rationale (HTTP to the same name as an SSH pin
+    # is a separate operator choice) still holds for names.
+    # `disallow-host` is automatically consistent because the union
+    # rebuilds on every call.
+    local e host
+    while IFS= read -r e; do
+        [[ -n "$e" ]] || continue
+        host="${e%:*}"
+        cfg_is_ipv4 "$host" || continue
+        [[ ",$np," == *",${host},"* ]] && continue
+        np="${np},${host}"
+    done < <(profile_allow_hosts "$1")
+    echo "$np"
+}
+
+cmd_proxy_env() {
+    # Print proxy env assignments for a profile's agents (consumed by
+    # agent-run; ARC-6-D3). Profiles without a gateway print nothing.
+    # ARC-44-D1: an optional machine token emits exactly one validated
+    # value for command substitution: proxyip | proxyport | noproxy.
+    # Unknown token / extra args exit 2 — never fall through to the
+    # assignment form (that would inject NAME=value into $(...)).
+    require_profile "${1:-}" proxy-env
+    local token="${2:-}"
+    if [[ -n "$token" ]]; then
+        [[ -z "${3:-}" ]] || {
+            echo "Error: proxy-env takes at most one token." >&2
+            echo "usage: egresslock proxy-env <profile> [proxyip|proxyport|noproxy]" >&2
+            exit 2
+        }
+        require_gateway_profile "$1" proxy-env
+        case "$token" in
+            proxyip)   emit_token "${GW_IP[$1]}" ipv4 ;;
+            proxyport) emit_token "${GW_PORT[$1]}" port ;;
+            noproxy)   emit_token "$(no_proxy_value "$1")" noproxy ;;
+            *)         echo "Error: unknown proxy-env token '$token' (expected: proxyip, proxyport, noproxy)." >&2; exit 2 ;;
+        esac
+        return 0
+    fi
+    is_gateway_profile "$1" || return 0
+    local ip="${GW_IP[$1]}" port="${GW_PORT[$1]}"
+    local proxy="http://${ip}:${port}"
+    local no_proxy
+    no_proxy="$(no_proxy_value "$1")"
+    echo "HTTP_PROXY=$proxy"
+    echo "HTTPS_PROXY=$proxy"
+    echo "http_proxy=$proxy"
+    echo "https_proxy=$proxy"
+    echo "NO_PROXY=$no_proxy"
+    echo "no_proxy=$no_proxy"
+}
+
+cmd_network() {
+    # ARC-44-D2: single-token output (network names are embedded in
+    # command substitutions); extra args exit 2.
+    require_profile "${1:-}" network
+    [[ -z "${2:-}" ]] || {
+        echo "Error: network takes no extra arguments." >&2
+        echo "usage: egresslock network <profile>" >&2
+        exit 2
+    }
+    emit_token "$(network_of "$1")" netname
+}
+
+cmd_rules() {
+    # Print the policy rules for a profile (the same code path install
+    # and verify use). Used by the golden equivalence tests (ARC-8) and
+    # for debugging.
+    require_profile "${1:-}" rules
+    policy_rules "$1"
+}
+
+#
+# ARC-7-D1 detect-and-allow workflow. Both commands operate on per-profile
+# config data and are gateway-only.
+#
+require_engine() {
+    [[ -n "$ENGINE_CONF" ]] || die "this command requires the config engine (pass --config <file> or set EGRESSLOCK_CONF)"
+}
+
+require_gateway_profile() {
+    is_gateway_profile "$1" || die "profile '$1' has no gateway; the '$2' command applies to gateway profiles"
+}
+
+cmd_denied() {
+    # Print de-duplicated entries the profile's gateway DENIED (Squid
+    # TCP_DENIED entries from the gateway access log), most recent last,
+    # to drive the detect-and-allow loop. ARC-41: CONNECT entries stay
+    # hostname-only ('host'; :443 is the no-port allowlist group);
+    # plain-HTTP entries (GET/HEAD/POST/... with an http(s):// URL) are
+    # emitted as allow-grammar host[:port] (http -> :80, explicit port
+    # preserved, :443 collapses to bare host) so `allow` consumes them
+    # verbatim (D1/D2). ARC-42: a time window (default 14 days, --days N,
+    # 0 = full log) is applied to BOTH views (D2) on the host after
+    # `cat` (D3); the log is never truncated. ARC-31: by default omit
+    # entries already covered by the profile's allowlist ON THE SAME
+    # PORT (D3) so the loop shows only still-blocked destinations; --all
+    # prints the raw de-duplicated union (pre-ARC-31 behavior).
+    # ARC-32-D1: the log is STREAMED into the parser, never slurped into
+    # a bash string, and the read is byte-capped at
+    # EGRESSLOCK_DENIED_MAX_BYTES (default 8 MiB; 0 = uncapped) so a
+    # workload CONNECT flood cannot OOM the account here. `denied` still
+    # never deletes or rotates the log file (ARC-31/ARC-42-D3).
+    require_profile "${1:-}" denied
+    require_engine
+    require_gateway_profile "$1" denied
+    local profile="$1"
+    shift
+    local all=0 days=14
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)  all=1; shift ;;
+            --days) [[ $# -ge 2 ]] || { echo "Error: --days requires a value." >&2; exit 2; }
+                    days="$2"; shift 2 ;;
+            *)      echo "Error: denied takes --all and/or --days N." >&2
+                    echo "usage: egresslock denied <profile> [--all] [--days N]" >&2
+                    exit 2 ;;
+        esac
+    done
+    [[ "$days" =~ ^(0|[1-9][0-9]*)$ ]] || {
+        echo "Error: --days must be a non-negative integer (0 = no time limit)." >&2
+        exit 2
+    }
+    # ARC-32-D1: byte cap for the streamed read. Validated like --days:
+    # non-negative integer; 0 disables the cap (operator's explicit
+    # choice, the default 8 MiB cap is what protects the naive path).
+    local max_bytes="${EGRESSLOCK_DENIED_MAX_BYTES:-8388608}"
+    [[ "$max_bytes" =~ ^(0|[1-9][0-9]*)$ ]] || {
+        echo "Error: EGRESSLOCK_DENIED_MAX_BYTES must be a non-negative integer (bytes; 0 = uncapped)." >&2
+        exit 2
+    }
+    # ARC-42-D1: window is epoch seconds; `now` from the host clock
+    # (rootless Podman shares it; do not exec date in the gateway).
+    local now cutoff
+    now="$(date +%s)"
+    cutoff=0
+    (( days > 0 )) && cutoff=$(( now - days * 86400 ))
+    # Squid native access.log fields: ts, elapsed, client,
+    # code/HTTP_status, bytes, method, url — so method=$6, url=$7.
+    # CONNECT url is "host:port"; other methods carry an absolute URL.
+    # De-duplicate by emitted string, first-seen order (ARC-41-D1/D2).
+    # Malformed URLs, userinfo, and IPv6 literals are skipped best-effort
+    # (the command must not fail on a line it cannot parse).
+    # ARC-32-D1: one streaming pass. LC_ALL=C makes length() count
+    # BYTES; once the read passes maxb the parser exits (the producer
+    # gets SIGPIPE — its status is invisible in the process
+    # substitution, which is exactly why the slurp + $() forms are
+    # gone). The window filter (--days) applies to whatever prefix was
+    # read. Candidates stream straight into the ARC-57 emit filter; the
+    # parser's trailing @ARC32META@ line carries had_denied (any
+    # TCP_DENIED line seen — the ARC-42-D3 empty-window note's input),
+    # truncated (cap hit), and bytes read (0 => container down or empty
+    # log). '@' is outside the allow grammar charset, so no candidate
+    # can collide with the meta line.
+    local -a ok_entries=()
+    local cand had_denied=0 truncated=0 read_bytes=0 ipv4_seen=0
+    while IFS= read -r cand; do
+        if [[ "$cand" == "@ARC32META@ "* ]]; then
+            read -r had_denied truncated read_bytes _ <<<"${cand#'@ARC32META@ '}"
+            continue
+        fi
+        [[ -n "$cand" ]] || continue
+        # ARC-57-D1: the emit side is the filter. `denied` is the documented
+        # feed for the next `allow`; a malicious or malformed log line must
+        # not print a string the allow grammar rejects (the operator paste
+        # loop would break with a confusing exit-2). Skip any candidate that
+        # is not a valid allowlist entry — silently: rc stays 0 and no
+        # "invalid allowlist entry" stderr (that would look like `denied`
+        # failed). Malformed lines stay best-effort skip (ARC-41 contract).
+        # EGL-18-D1: the one widening — a well-formed IPv4 host[:port] is
+        # ALSO emitted (it is not an allowlist entry, but it is a real
+        # destination; `allow` already points the operator at allow-host,
+        # and hiding the 403'd literal left the EGL-17 shape undiagnosable).
+        # The IPv4 branch flips `ipv4_seen`, which prints the one-time
+        # stderr note (denied_ipv4_note) after the list.
+        if allow_entry_ok "$cand"; then
+            ok_entries+=("$cand")
+        elif denied_entry_ok "$cand"; then
+            ok_entries+=("$cand")
+            ipv4_seen=1
+        fi
+    done < <(
+        podman exec "$(gw_name "$profile")" cat /var/log/squid/access.log 2>/dev/null |
+        LC_ALL=C awk -v cutoff="$cutoff" -v maxb="$max_bytes" '
+            function emit(s) { if (!seen[s]++) print s }
+
+            # ARC-32-D1: abort the read after maxb bytes (the +1 is the
+            # newline length() already stripped). Line-granular, which is
+            # fine for a DoS cap (8 MiB default, harness uses ~1 KiB).
+            {
+                read += length($0) + 1
+                if (maxb > 0 && read > maxb) { truncated = 1; exit }
+            }
+
+            $4 ~ /^TCP_DENIED\// {
+                had = 1
+                if (cutoff != 0 && $1+0 < cutoff) next
+                if ($6 == "CONNECT") {
+                    h = $7
+                    sub(/:[0-9]+$/, "", h)
+                    emit(h)
+                    next
+                }
+                u = tolower($7)
+                if (u !~ /^https?:\/\//) next
+                rest = $7
+                sub(/^https?:\/\//, "", rest)
+                if (match(rest, /[/?#]/)) rest = substr(rest, 1, RSTART - 1)
+                if (rest ~ /@/) next            # userinfo
+                if (rest ~ /^\[/) next          # IPv6 literal
+                host = rest
+                port = (u ~ /^http:\/\//) ? "80" : "443"
+                if (match(rest, /:[0-9]+$/)) {
+                    host = substr(rest, 1, RSTART - 1)
+                    port = substr(rest, RSTART + 1)
+                }
+                if (host == "") next
+                if (port == "443") emit(host); else emit(host ":" port)
+            }
+
+            END { printf "@ARC32META@ %d %d %d\n", (had ? 1 : 0), (truncated ? 1 : 0), read + 0 }
+        '
+    )
+    # ARC-32-D1: keep the ARC-42-era empty-log contract. bytes=0 means
+    # the container was down or the log is empty — same message as the
+    # old slurp produced for both cases.
+    (( read_bytes > 0 )) || { echo "no gateway log (container down or no denials yet)"; return 0; }
+    if (( truncated == 1 )); then
+        echo "note: log read stopped at ${max_bytes} bytes (EGRESSLOCK_DENIED_MAX_BYTES); entries beyond the cap were not read" >&2
+    fi
+    local denied_entries=""
+    if (( ${#ok_entries[@]} > 0 )); then
+        denied_entries="$(printf '%s\n' "${ok_entries[@]}")"
+    fi
+    if [[ -z "$denied_entries" ]]; then
+        # ARC-42-D3: windowed parse produced nothing but the log HAS
+        # denied lines — tell the operator the window is the reason
+        # (the silent-empty trap from ARC-41). stdout stays empty.
+        if [[ "$had_denied" == 1 && "$days" != 0 ]]; then
+            echo "note: no denials in the last $days days (older entries exist; denied <profile> --days 0)" >&2
+        fi
+        return 0
+    fi
+    if [[ "$all" == 1 ]]; then
+        echo "$denied_entries"
+        if (( ipv4_seen == 1 )); then denied_ipv4_note; fi
+        return 0
+    fi
+    # ARC-31 filter, port-aware (ARC-41-D3): an entry is omitted only
+    # when the allowlist covers that host on that port. Bare host means
+    # the 443 no-port group; host:80 needs an explicit :80 allowlist
+    # entry (or a leading-dot suffix on :80). A bare 'host' 443 entry
+    # must NOT hide a 'host:80' denial — that would recreate the silent
+    # non-fix. R-031-1 finding 1: leading-dot dstdomain suffixes
+    # ('.example.test') are valid allowlist entries and, per Squid
+    # dstdomain semantics, cover the bare host (example.test) AND every
+    # subdomain (*.example.test) — per port.
+    local -A exact=() suf=()
+    local e h port
+    while IFS= read -r e; do
+        [[ -n "$e" ]] || continue
+        if [[ "$e" == *:* ]]; then
+            h="${e%:*}"; port="${e##*:}"
+        else
+            h="$e"; port="443"
+        fi
+        if [[ "$h" == .* && "${#h}" -gt 1 ]]; then
+            suf[$port]+=" ${h#.}"
+        else
+            exact[$port]+=" $h"
+        fi
+    done < <(gw_allowlist_entries "$profile")
+    local d dhost dport hh ss covered
+    while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        if [[ "$d" == *:* ]]; then
+            dhost="${d%:*}"; dport="${d##*:}"
+        else
+            dhost="$d"; dport="443"
+        fi
+        covered=0
+        for hh in ${exact[$dport]:-}; do
+            [[ "$hh" == "$dhost" ]] && { covered=1; break; }
+        done
+        if [[ "$covered" != 1 ]]; then
+            for ss in ${suf[$dport]:-}; do
+                [[ "$dhost" == "$ss" || "$dhost" == *".$ss" ]] && { covered=1; break; }
+            done
+        fi
+        [[ "$covered" == 1 ]] && continue
+        echo "$d"
+    done <<<"$denied_entries"
+    # EGL-18-D1: the note fires when an IPv4 was EMITTED. An IPv4 can
+    # never be covered by the ARC-31 filter below (the allowlist cannot
+    # contain literals — ARC-51), so "in ok_entries" == "printed". An
+    # explicit if, not `&&`, so the command's rc stays 0 when no IPv4
+    # was seen (the function must not inherit a false arithmetic).
+    if (( ipv4_seen == 1 )); then denied_ipv4_note; fi
+}
+
+cmd_allowlist() {
+    # ARC-43/ARC-45: print the profile's gateway allowlist file raw
+    # (same bytes as `cat -- "$src"`) so operators do not type the path.
+    # Comments, blank lines, explicit :443, and a missing trailing
+    # newline are preserved (D2) — this is the file view, `denied` is
+    # the normalized/loop view. Gateway-only; missing file fails closed
+    # (D3).
+    require_profile "${1:-}" allowlist
+    require_engine
+    require_gateway_profile "$1" allowlist
+    [[ -z "${2:-}" ]] || {
+        echo "Error: allowlist takes no extra arguments." >&2
+        echo "usage: egresslock allowlist <profile>" >&2
+        exit 2
+    }
+    local src
+    src="$(allowlist_src "$1")"
+    [[ -f "$src" ]] || die "allowlist file missing: $src (check the profile's 'gateway' directive)"
+    cat -- "$src"
+}
+
+# ARC-32-D2: DNS length bounds for a host token (the port is split off
+# by the callers, and a leading-dot dstdomain suffix is stripped too):
+# full host <= 253 bytes, each dot-separated label 1..63 bytes (RFC
+# 1035). Charset is enforced by the callers' grammars (ARC-50-D6) —
+# this is the size gate, so an oversize "hostname" is rejected at the
+# predicate instead of persisting in the allowlist until `squid -k
+# parse` fails closed at the next ensure (ARC-48 U9). Empty labels
+# ('a..b', a trailing dot) fail the 1..63 label rule as well.
+arc32_dns_len_ok() { # arc32_dns_len_ok <host>
+    local host="$1" label
+    (( ${#host} <= 253 )) || return 1
+    local IFS=.
+    for label in $host; do
+        (( ${#label} >= 1 && ${#label} <= 63 )) || return 1
+    done
+    return 0
+}
+
+# ARC-57-D1: silent shared predicate — the ONE grammar the allow path
+# enforces (host/host:port, first char alnum or '.', port 1-65535, and
+# ARC-51's IPv4-literal rejection). No stderr. Returns 0 valid, 1
+# invalid. `validate_allow_entry` wraps it with the user-facing error
+# for argv; `denied` calls it silently to skip emit (rc stays 0).
+# ARC-32-D2: the DNS length caps live here too, so `allow`,
+# `gw_allowlist_entries`, and the `denied` emit filter all inherit the
+# one predicate.
+allow_entry_ok() { # allow_entry_ok <entry>
+    local entry="$1"
+    if [[ "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]+$ ]]; then
+        local port="${entry##*:}"
+        (( port >= 1 && port <= 65535 )) || return 1
+    elif [[ ! "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        return 1
+    fi
+    local probe="${entry%:*}"
+    probe="${probe#.}"
+    cfg_is_ipv4 "$probe" && return 1
+    arc32_dns_len_ok "$probe" || return 1
+    return 0
+}
+
+# EGL-18-D1: the deny-log twin of allow_entry_ok — the `denied` emit
+# filter keeps a candidate if it is a valid allowlist entry (ARC-57-D1)
+# OR a well-formed IPv4 literal host[:port]. IPv4 stays OUT of the
+# allow grammar (ARC-51-D1: `allow` still rejects it with the
+# allow-host pointer); hiding IPv4 403s from this feed made the
+# EGL-17 incident undiagnosable (rules showed the accept, Squid showed
+# the 403, `denied` showed nothing). Injection payloads (`foo;rm`,
+# backticks, leading-dash hosts) fail BOTH branches and stay skipped:
+# the port check is numeric 1-65535 and the host check is `cfg_is_ipv4`
+# (4 dotted numeric octets, <= 255, no leading zeros), so nothing
+# that the allow grammar rejects with a confusing error can slip in.
+# Silent — rc 0 emit, 1 skip.
+denied_entry_ok() { # denied_entry_ok <candidate>
+    allow_entry_ok "$1" && return 0
+    local host="$1" port
+    if [[ "$host" == *:* ]]; then
+        port="${host##*:}"
+        host="${host%:*}"
+        [[ "$port" =~ ^[0-9]+$ ]] || return 1
+        (( port >= 1 && port <= 65535 )) || return 1
+    fi
+    cfg_is_ipv4 "$host"
+}
+
+# EGL-18-D1: the ONE-TIME stderr note for a `denied` invocation that
+# emitted at least one IPv4 (verbatim per the approved design; never
+# on stdout — the destination list stays a paste-safe feed).
+denied_ipv4_note() {
+    echo "note: IPv4 destinations are not allowlist hostnames — use allow-host, not allow. Proxied clients 403 unless the IP is in NO_PROXY (proxy-env includes allow-host IPv4 pins; recreate the workload)." >&2
+}
+
+# ARC-46-D2: validate an allowlist entry's grammar; argument errors are
+# usage-class (exit 2 via caller). Returns 0 valid, 1 invalid (message
+# already printed). Grammar lives in allow_entry_ok (ARC-57-D1); this
+# wrapper only turns the silent result into the specific argv error.
+validate_allow_entry() { # validate_allow_entry <entry>
+    local entry="$1"
+    allow_entry_ok "$entry" && return 0
+    if [[ "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]+$ ]]; then
+        local port="${entry##*:}"
+        if (( port < 1 || port > 65535 )); then
+            echo "Error: invalid port in entry '$entry'" >&2
+        elif ! arc32_dns_len_ok "${entry%:*}"; then
+            echo "Error: allowlist entry '$entry' exceeds DNS length limits (host <= 253 bytes, labels <= 63)" >&2
+        else
+            echo "Error: allowlist entry '$entry' is an IPv4 literal; literals belong on 'allow-host' (host:port), not the gateway allowlist" >&2
+        fi
+    elif [[ "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        local probe="${entry%:*}"
+        probe="${probe#.}"
+        if ! arc32_dns_len_ok "$probe"; then
+            echo "Error: allowlist entry '$entry' exceeds DNS length limits (host <= 253 bytes, labels <= 63)" >&2
+        else
+            echo "Error: allowlist entry '$entry' is an IPv4 literal; literals belong on 'allow-host' (host:port), not the gateway allowlist" >&2
+        fi
+    else
+        echo "Error: invalid allowlist entry '$entry' (expected host or host:port)" >&2
+    fi
+    return 1
+}
+
+# ARC-46-D1: one stderr line before a mutator's re-ensure so the ~3s
+# gateway restart is not a silent gap. Stdout stays the data channel.
+re_ensuring() { echo "re-ensuring profile '$1' ..." >&2; }
+
+cmd_allow() {
+    # Validate and append one or more host[:port] entries to the profile's
+    # allowlist file, then ONE re-ensure (ARC-46-D2).
+    require_profile "${1:-}" allow
+    require_engine
+    require_gateway_profile "$1" allow
+    local profile="$1"
+    shift
+    [[ $# -ge 1 ]] || {
+        echo "Error: allow requires a destination." >&2
+        echo "usage: egresslock allow <profile> <host[:port]> [host[:port] ...]" >&2
+        exit 2
+    }
+    local e
+    for e in "$@"; do
+        validate_allow_entry "$e" || exit 2
+    done
+    local src
+    src="$(allowlist_src "$profile")"
+    # R-007-1 finding 5: never silently create the allowlist file. A
+    # typo'd gateway path in the config would fail ensure closed; `allow`
+    # must not heal that by inventing the file.
+    [[ -f "$src" ]] || die "allowlist file missing: $src (check the profile's 'gateway' directive)"
+    # BUG-002: if the file does not end in a newline (a starter shipped
+    # without one, or an operator-truncated file), a plain append would
+    # glue the first entry onto the last line, silently dropping it
+    # (gw_allowlist_entries strips everything from the first '#');
+    # `allow` would report added but the entry would never take effect.
+    # Write ONE leading newline so the entry lands on its own line. This
+    # heals truncation but intentionally does NOT un-glue an entry already
+    # fused to a comment line — that line stays a comment (BUG-002-D1).
+    if [[ -s "$src" && -n "$(tail -c 1 "$src")" ]]; then
+        printf '\n' >> "$src" || die "cannot write $src"
+    fi
+    for e in "$@"; do
+        if grep -qxF "$e" "$src" 2>/dev/null; then
+            echo "entry already present: $e"
+        else
+            printf '%s\n' "$e" >> "$src" || die "cannot write $src"
+            echo "added: $e -> $src"
+        fi
+    done
+    re_ensuring "$profile"
+    cmd_ensure "$profile"
+}
+
+cmd_disallow() {
+    # ARC-30/ARC-46-D2: remove one or more exact allowlist entries, then
+    # ONE re-ensure. Exact `grep -xF` line match only. If ANY entry is
+    # absent -> exit 1, allowlist unchanged, no ensure. Never creates the
+    # allowlist file.
+    require_profile "${1:-}" disallow
+    require_engine
+    require_gateway_profile "$1" disallow
+    local profile="$1"
+    shift
+    [[ $# -ge 1 ]] || {
+        echo "Error: disallow requires a destination." >&2
+        echo "usage: egresslock disallow <profile> <host[:port]> [host[:port] ...]" >&2
+        exit 2
+    }
+    local e
+    for e in "$@"; do
+        validate_allow_entry "$e" || exit 2
+    done
+    local src
+    src="$(allowlist_src "$profile")"
+    [[ -f "$src" ]] || die "allowlist file missing: $src (check the profile's 'gateway' directive)"
+    for e in "$@"; do
+        if ! grep -qxF "$e" "$src"; then
+            echo "Error: entry not present: $e" >&2
+            exit 1
+        fi
+    done
+    # ARC-30-D2: atomic rewrite — same-dir temp + mv (no in-place sed -i).
+    # R-030-1 finding 1: preserve the source's mode instead of forcing 600.
+    local tmp keep=() line a skip
+    tmp="$(mktemp "$src.XXXXXX")" || die "cannot create temp next to $src"
+    chmod "$(stat -c %a "$src" 2>/dev/null || echo 600)" "$tmp" 2>/dev/null || true
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        skip=0
+        for a in "$@"; do
+            [[ "$line" == "$a" ]] && { skip=1; break; }
+        done
+        [[ "$skip" == 0 ]] && keep+=("$line")
+    done < "$src"
+    if (( ${#keep[@]} > 0 )); then
+        printf '%s\n' "${keep[@]}" > "$tmp"
+    else
+        : > "$tmp"
+    fi
+    mv "$tmp" "$src" || { rm -f "$tmp"; die "cannot rewrite $src"; }
+    for e in "$@"; do echo "removed: $e -> $src"; done
+    re_ensuring "$profile"
+    cmd_ensure "$profile"
+}
+
+#
+# ARC-38: allow-host / disallow-host — mutate the CONF (the direct
+# `rule allow-host` line), the gateway allowlist commands' sibling for
+# non-HTTP egress (git-over-SSH etc). Works on any profile that can take
+# allow-host (gateway or not; ARC-38-D2). A `public-only` profile is
+# contradictory and fails closed, nothing written.
+#
+is_public_profile() {
+    local i pfx="${1}|"
+    for i in "${!ENGINE_KINDS[@]}"; do
+        [[ "${ENGINE_KINDS[$i]}" == "$pfx"* ]] || continue
+        [[ "${ENGINE_KINDS[$i]#"$pfx"}" == "public-only" ]] && return 0
+    done
+    return 1
+}
+
+# Same grammar the conf parser enforces for `rule allow-host`: host
+# [A-Za-z0-9._-]*, port 1-65535, colon-required, first char alnum or '.'
+# (ARC-59-D1). Sets HOST_ARG/PORT_ARG;
+# argument errors are usage-class (exit 2).
+validate_host_port() { # validate_host_port <host:port>
+    local entry="$1"
+    # ARC-59-D1: host part starts alnum or '.' — never '-'.
+    if [[ ! "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]+$ ]]; then
+        echo "Error: invalid allow-host entry '$entry' (expected host:port)" >&2
+        exit 2
+    fi
+    HOST_ARG="${entry%:*}"
+    PORT_ARG="${entry##*:}"
+    if (( PORT_ARG < 1 || PORT_ARG > 65535 )); then
+        echo "Error: invalid port in entry '$entry' (expected 1-65535)" >&2
+        exit 2
+    fi
+    # ARC-32-D2: same DNS length caps as the conf parser — a CLI
+    # allow-host/disallow-host must not mint a conf the parser then
+    # rejects (that would fail closed at the next load).
+    if ! arc32_dns_len_ok "${HOST_ARG#.}"; then
+        echo "Error: host '$HOST_ARG' exceeds DNS length limits (host <= 253 bytes, labels <= 63)" >&2
+        exit 2
+    fi
+}
+
+# Escape regex metacharacters for a literal match inside [[ =~ ]].
+# R-038-1 finding 2: $host is interpolated into a block-match pattern;
+# without escaping, each '.' matches any char, so a near-collision
+# host (gitXexample.test vs git.example.test) could falsely match —
+# making allow-host a silent no-op or disallow-host delete the wrong
+# line. Hosts are [A-Za-z0-9._-]* (start alnum or '.'), so only '.'
+# and '-' need escaping.
+host_re() { printf '%s' "${1//./\\.}"; }
+
+# ARC-38-D3: write a same-dir temp, insert the rule as the LAST line of
+# the NAMED profile's block (not EOF — a multi-block conf must not get
+# the rule attached to the last block), validate the temp with
+# load_config (fail closed -> delete temp, original untouched), then mv
+# over the original and reload. Return 0 ok (rule written); 1 already
+# present (nothing written).
+conf_insert_allow_host() { # conf_insert_allow_host <conf> <profile> <host> <port>
+    local conf="$1" profile="$2" host="$3" port="$4"
+    local host_r host_port_r
+    host_r="$(host_re "$host")"
+    host_port_r="${host_r//-/\\-}:$port"
+    local rule="    rule allow-host $host:$port"
+    local line in_block=0 found_block=0 present=0
+    local -a out=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*profile[[:space:]]+([a-z0-9][a-z0-9-]*)[[:space:]]+ ]]; then
+            if [[ "$in_block" == 1 && "$found_block" == 1 && "$present" == 0 ]]; then
+                out+=("$rule")
+            fi
+            in_block=0
+            if [[ "${BASH_REMATCH[1]}" == "$profile" ]]; then
+                in_block=1
+                found_block=1
+            fi
+        elif [[ "$in_block" == 1 && "$line" =~ ^[[:space:]]*rule[[:space:]]+allow-host[[:space:]]+${host_port_r}[[:space:]]*$ ]]; then
+            present=1
+        fi
+        out+=("$line")
+    done < "$conf"
+    if [[ "$in_block" == 1 && "$found_block" == 1 && "$present" == 0 ]]; then
+        out+=("$rule")
+    fi
+    if [[ "$present" == 1 ]]; then
+        return 1
+    fi
+    [[ "$found_block" == 1 ]] || die "internal: profile block '$profile' not found in $conf"
+    local tmp
+    tmp="$(mktemp "$conf.XXXXXX")" || die "cannot create temp next to $conf"
+    chmod "$(stat -c %a "$conf" 2>/dev/null || echo 600)" "$tmp" 2>/dev/null || true
+    printf '%s\n' "${out[@]}" > "$tmp"
+    if ! ( load_config "$tmp" ) 2>/dev/null; then
+        rm -f "$tmp"
+        die "allow-host would produce an invalid config; nothing written"
+    fi
+    mv "$tmp" "$conf" || { rm -f "$tmp"; die "cannot rewrite $conf"; }
+    load_config "$conf"
+    return 0
+}
+
+# ARC-38-D2/D3: delete the exact `rule allow-host <host>:<port>` line
+# (optional leading whitespace) inside the named block only. Same
+# temp+validate+mv. Return 0 deleted; 1 not present (conf unchanged).
+conf_delete_allow_host() { # conf_delete_allow_host <conf> <profile> <host> <port>
+    local conf="$1" profile="$2" host="$3" port="$4"
+    local host_r host_port_r
+    host_r="$(host_re "$host")"
+    host_port_r="${host_r//-/\\-}:$port"
+    local line in_block=0 found=0
+    local -a out=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*profile[[:space:]]+([a-z0-9][a-z0-9-]*)[[:space:]]+ ]]; then
+            in_block=0
+            [[ "${BASH_REMATCH[1]}" == "$profile" ]] && in_block=1
+        elif [[ "$in_block" == 1 && "$line" =~ ^[[:space:]]*rule[[:space:]]+allow-host[[:space:]]+${host_port_r}[[:space:]]*$ ]]; then
+            found=1
+            continue
+        fi
+        out+=("$line")
+    done < "$conf"
+    [[ "$found" == 1 ]] || return 1
+    local tmp
+    tmp="$(mktemp "$conf.XXXXXX")" || die "cannot create temp next to $conf"
+    chmod "$(stat -c %a "$conf" 2>/dev/null || echo 600)" "$tmp" 2>/dev/null || true
+    printf '%s\n' "${out[@]}" > "$tmp"
+    if ! ( load_config "$tmp" ) 2>/dev/null; then
+        rm -f "$tmp"
+        die "disallow-host would produce an invalid config; nothing written"
+    fi
+    mv "$tmp" "$conf" || { rm -f "$tmp"; die "cannot rewrite $conf"; }
+    load_config "$conf"
+    return 0
+}
+
+cmd_allow_host() {
+    require_profile "${1:-}" allow-host
+    require_engine
+    local profile="$1" entry="${2:-}"
+    [[ -n "$entry" ]] || {
+        echo "Error: allow-host requires a destination." >&2
+        echo "usage: egresslock allow-host <profile> <host:port>" >&2
+        exit 2
+    }
+    if [[ $# -gt 2 ]]; then
+        echo "Error: allow-host takes exactly one host:port." >&2
+        echo "usage: egresslock allow-host <profile> <host:port>" >&2
+        exit 2
+    fi
+    validate_host_port "$entry"
+    is_public_profile "$profile" && {
+        echo "Error: profile '$profile' is public-only; allow-host is contradictory." >&2
+        exit 2
+    }
+    local conf="$ENGINE_CONF"
+    [[ -f "$conf" ]] || die "config file missing: $conf"
+    if ! conf_insert_allow_host "$conf" "$profile" "$HOST_ARG" "$PORT_ARG"; then
+        echo "entry already present: $HOST_ARG:$PORT_ARG"
+    else
+        echo "added: rule allow-host $HOST_ARG:$PORT_ARG -> $conf"
+    fi
+    # EGL-18-D2: mutation-time hint, IPv4 + gateway profile only. The
+    # remaining footgun after the D3 NO_PROXY union is BAKED env: the
+    # pin is in the conf and already in proxy-env output, but a running
+    # workload started before the pin does not have it and will still
+    # 403 through the proxy path. Hostname pins get no hint (ssh
+    # ignores HTTP(S)_PROXY — the ARC-38 case); non-gateway profiles
+    # have no proxy path at all. A duplicate (already present) still
+    # hints: the operator may have missed the recreate.
+    if is_gateway_profile "$profile" && cfg_is_ipv4 "$HOST_ARG"; then
+        echo "note: IPv4 allow-host pins are included in proxy-env NO_PROXY; recreate running workloads to pick up the new env." >&2
+    fi
+    re_ensuring "$profile"
+    cmd_ensure "$profile"
+}
+
+cmd_disallow_host() {
+    require_profile "${1:-}" disallow-host
+    require_engine
+    local profile="$1" entry="${2:-}"
+    [[ -n "$entry" ]] || {
+        echo "Error: disallow-host requires a destination." >&2
+        echo "usage: egresslock disallow-host <profile> <host:port>" >&2
+        exit 2
+    }
+    if [[ $# -gt 2 ]]; then
+        echo "Error: disallow-host takes exactly one host:port." >&2
+        echo "usage: egresslock disallow-host <profile> <host:port>" >&2
+        exit 2
+    fi
+    validate_host_port "$entry"
+    local conf="$ENGINE_CONF"
+    [[ -f "$conf" ]] || die "config file missing: $conf"
+    if ! conf_delete_allow_host "$conf" "$profile" "$HOST_ARG" "$PORT_ARG"; then
+        echo "Error: rule not present: allow-host $HOST_ARG:$PORT_ARG in profile '$profile'" >&2
+        exit 1
+    fi
+    echo "removed: rule allow-host $HOST_ARG:$PORT_ARG -> $conf"
+    re_ensuring "$profile"
+    cmd_ensure "$profile"
+}
+
+# ARC-35-D3: is a CIDR taken by (a) a `profile <name> <cidr>` line in a
+# sibling *.conf in $dest or (b) a Podman network this user can see?
+# Scans are tolerant (cidr_parse_any) so a foreign subnet that the
+# profile policy would reject is still treated as a collision.
+init_cidr_taken() { # init_cidr_taken <cidr> <dest>
+    local cidr="$1" dest="$2" f line scidr name info sub
+    cidr_parse "$cidr" || return 1
+    local wfirst=$CIDR_FIRST wlast=$CIDR_LAST
+    for f in "$dest"/*.conf; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*profile[[:space:]]+([a-z0-9][a-z0-9-]*)[[:space:]]+([0-9.]+/[0-9]+) ]]; then
+                scidr="${BASH_REMATCH[2]}"
+                if cidr_parse_any "$scidr" \
+                   && cidr_overlaps "$wfirst" "$wlast" "$CIDR_FIRST" "$CIDR_LAST"; then
+                    return 0
+                fi
+            fi
+        done < "$f"
+    done
+    local names
+    # ARC-67-D3: a list we cannot run is treated as TAKEN — never
+    # "free" — so auto-pick / --subnet cannot claim an unchecked CIDR.
+    if ! names="$(podman_network_names 2>/dev/null)"; then
+        return 0
+    fi
+    for name in $names; do
+        info="$(podman network inspect "$name" 2>/dev/null || true)"
+        while IFS= read -r sub; do
+            [[ -n "$sub" ]] || continue
+            if cidr_parse_any "$sub" \
+               && cidr_overlaps "$wfirst" "$wlast" "$CIDR_FIRST" "$CIDR_LAST"; then
+                return 0
+            fi
+        done < <(grep -oE '"subnet": *"[^"]+"' <<<"$info" | sed -E 's/"subnet": *"([^"]+)"/\1/')
+    done
+    return 1
+}
+
+# ARC-35-D3: next free /24 in 10.199.0.0/16 (the example range), starting
+# at 10.199.0.0/24, skipping any CIDR init_cidr_taken reports.
+init_pick_subnet() { # init_pick_subnet <dest> -> cidr or non-zero
+    local dest="$1" i cidr
+    for (( i=0; i<=255; i++ )); do
+        cidr="10.199.$i.0/24"
+        if ! init_cidr_taken "$cidr" "$dest"; then
+            echo "$cidr"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ARC-35: `init <name> [--subnet <cidr>]` — write a starter conf+allowlist
+# pair for a NEW profile, as the account. NOT a load_config subcommand
+# (it is a file-writer, not a profile operation). Subject to the ARC-25
+# root guard (enforced in main). Never overwrites; never ensures.
+cmd_init() {
+    local name="" subnet="" arg
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --subnet) [[ $# -ge 2 ]] || { echo "Error: --subnet requires a CIDR." >&2; exit 2; }
+                       subnet="$2"; shift 2 ;;
+            --subnet=*) subnet="${1#--subnet=}"; shift ;;
+            --*)       echo "Error: unknown init option '$1'." >&2; exit 2 ;;
+            *)         if [[ -z "$name" ]]; then name="$1"; else
+                           echo "Error: init takes one profile name." >&2; exit 2
+                       fi
+                       shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || {
+        echo "Error: init requires a profile name." >&2
+        echo "usage: egresslock init <name> [--subnet <cidr>]" >&2
+        exit 2
+    }
+    [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
+        echo "Error: invalid profile name '$name' (expected [a-z0-9][a-z0-9-]*, must not start with '-')." >&2
+        exit 2
+    }
+
+    # Dest dir: dirname of the resolved config (--config / EGRESSLOCK_CONF /
+    # ARC-24 default), else $HOME/.config/egresslock. init is a writer and
+    # works even when no config exists yet.
+    local dest
+    if [[ -n "$ENGINE_CONF" ]]; then
+        dest="$(dirname "$ENGINE_CONF")"
+    else
+        dest="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.config/egresslock"
+    fi
+    mkdir -p "$dest" || die "cannot create $dest"
+    local conf_path="$dest/$name.conf" al_path="$dest/$name-allowlist"
+    if [[ -e "$conf_path" || -e "$al_path" ]]; then
+        echo "Error: '$name' already exists ($conf_path or $al_path); init never overwrites." >&2
+        echo "  to replace it, teardown + archive the pair first (see docs/quickstart/create-a-profile.md and the policy reference's profile lifecycle)." >&2
+        exit 1
+    fi
+
+    # Subnet: explicit --subnet (validated strict + overlap) or auto-pick.
+    local cidr=""
+    if [[ -n "$subnet" ]]; then
+        cidr_parse "$subnet" || {
+            echo "Error: invalid --subnet '$subnet' (expected IPv4 CIDR, prefixlen 8-29, canonical network address)." >&2
+            exit 2
+        }
+        cidr="$subnet"
+        if init_cidr_taken "$cidr" "$dest"; then
+            echo "Error: --subnet $subnet overlaps an existing profile/network." >&2
+            exit 1
+        fi
+    else
+        cidr="$(init_pick_subnet "$dest")" || {
+            echo "Error: no free /24 in 10.199.0.0/16; pass --subnet explicitly." >&2
+            exit 1
+        }
+    fi
+
+    cidr_parse "$cidr" || die "internal: picked subnet invalid"
+    local gw
+    gw="$(cidr_ip "$(( CIDR_FIRST + 1 ))")"   # .2 on a /24
+
+    # Write under a restrictive umask so the pair is never observable as
+    # 0644 before the chmod lands (R-035-1 note 3 follow-up); chmod 600
+    # remains the authoritative mode.
+    ( umask 077
+      {
+        echo "# $name.conf — starter for profile '$name' (egresslock init, ARC-35)."
+        echo "# Fail-closed: empty allowlist, gateway-only."
+        echo "# Grow with: egresslock allow $name <host[:port]>"
+        echo "profile $name $cidr"
+        echo "    rule gateway-only"
+        echo "    gateway $gw 3128 $name-allowlist"
+      } > "$conf_path"
+      : > "$al_path" )
+    chmod 600 "$conf_path" "$al_path" 2>/dev/null || true
+    echo "init: wrote $conf_path"
+    echo "init: wrote $al_path (empty allowlist — deny all)"
+    echo "init: next: egresslock ensure $name"
+    echo "init:       (or explicitly: egresslock --config $conf_path ensure $name)"
+}
+
+cmd_list() {
+    # ARC-11-D5: name, network, subnet. The old creds= column was site
+    # credential policy, not engine network state (removed ARC-11).
+    # Column headers so bare `list` output is self-describing.
+    printf '%-14s %-22s %-16s\n' "NAME" "NETWORK" "SUBNET"
+    local p
+    for p in "${PROFILES[@]}"; do
+        printf '%-14s %-22s %-16s\n' \
+            "$p" "$(network_of "$p")" "${PROFILE_SUBNET[$p]}"
+    done
+}
+
+# ARC-60-D1: `teardown --runtime` — the no-conf runtime sweep.
+# Loads NO conf (the dispatcher ignores explicit --config / EGRESSLOCK_CONF
+# for this form). As the account, name-scan THIS store and remove
+# kit-owned objects of the CURRENT naming generation only (ARC-68-D1:
+# the regexes are egresslock-only; the pre-rename agent-* family was
+# cleaned up manually on one host — ARC-73 — and this sweep leaves it
+# alone):
+#   container: ^egresslock-(gateway|anchor)-[a-z0-9-]+$
+#   network:   ^egresslock-[a-z0-9-]+$
+# never shackle-*, never non-kit names
+# (the opencode recipe's `--name agent-opencode` container stays), never
+# images. Containers first (so the networks can actually go), then
+# networks best-effort with the same keep+note as teardown. Idempotent:
+# nothing matching -> rc 0 and one `no kit runtime` line. Our nft tables
+# (`inet egresslock`, leftover `inet agent_policy`) are deleted too,
+# best-effort (ARC-66-D4; `ensure`/`teardown all` keep the ARC-54
+# fail-closed delete-on-encounter behavior).
+cmd_teardown_runtime() {
+    if [[ $# -gt 1 ]]; then
+        echo "Error: teardown --runtime takes no other arguments." >&2
+        echo "usage: egresslock teardown --runtime" >&2
+        exit 2
+    fi
+    local names name found=0 nets_ok=1
+    names="$(podman ps -a --format '{{.Names}}' 2>/dev/null || true)"
+    for name in $names; do
+        [[ "$name" =~ ^egresslock-(gateway|anchor)-[a-z0-9-]+$ ]] || continue
+        # ARC-69-D1: `removed` only after a successful rm (closes the
+        # R-060-1 O2 blind echo); a failed rm is one honest note.
+        if podman rm -f "$name" >/dev/null 2>&1; then
+            echo "removed container $name"
+            found=1
+        else
+            echo "note: could not remove container $name"
+        fi
+    done
+    # ARC-67-D3: best-effort here — a failed list is one note and the
+    # sweep continues (nft tables still go); `no kit runtime` is NOT
+    # printed for a run that could not see the networks.
+    if ! names="$(podman_network_names 2>/dev/null)"; then
+        echo "note: could not list Podman networks; kit-named networks were NOT swept (remove them manually: podman network rm <name>)"
+        nets_ok=0
+    else
+        for name in $names; do
+            [[ "$name" =~ ^egresslock-[a-z0-9-]+$ ]] || continue
+            # ARC-69-D1: same vocabulary as conf-scoped teardown — a
+            # network that exists but won't rm is `kept (in use)`; the
+            # count includes only real removals, never failed rms.
+            if podman network rm "$name" >/dev/null 2>&1; then
+                echo "removed network $name"
+                found=1
+            else
+                echo "kept network $name (in use)"
+            fi
+        done
+    fi
+    # ARC-66-D4: our nft tables are kit POLICY in the shared rootless
+    # netns (filter hooks apply netns-wide, not just to kit bridges), so
+    # the sweep deletes them too — amends ARC-60-D1's hands-off rule.
+    # `inet egresslock` is the live policy table; `inet agent_policy` is
+    # the pre-rename leftover (ARC-54). Best effort: a missing table or
+    # netns is a skip; a failing delete is one note and rc 0 — this is
+    # the recovery command (unlike `ensure`, which still fails closed on
+    # a leftover agent_policy it cannot delete). Never run from
+    # uninstall/postrm (ARC-7-D5).
+    local tbl
+    for tbl in "$TABLE" "$LEGACY_TABLE"; do
+        if netns_nft list table inet "$tbl" >/dev/null 2>&1; then
+            if netns_nft delete table inet "$tbl" >/dev/null 2>&1; then
+                echo "removed nft table inet $tbl"
+                found=1
+            else
+                echo "note: could not delete nft table inet $tbl; remove it manually: podman unshare --rootless-netns nft delete table inet $tbl"
+            fi
+        fi
+    done
+    if [[ "$found" == 0 ]]; then
+        # ARC-67-D3: not printed when the network list failed — that run
+        # saw an unknown state, "no kit runtime" would be a false claim.
+        if [[ "$nets_ok" == 1 ]]; then
+            echo "no kit runtime"
+        fi
+        return
+    fi
+}
+
+cmd_teardown() {
+    local target="${1:-}" p
+    if [[ -z "$target" ]]; then
+        # ARC-69-D4: bare teardown is a usage error naming every form,
+        # not a require_profile "" misfire.
+        echo "Error: teardown requires an argument." >&2
+        echo "usage: egresslock teardown <profile> | egresslock teardown all | egresslock teardown --runtime" >&2
+        exit 2
+    fi
+    # ARC-71-D1: `--runtime` dispatches BEFORE the netns probe. The
+    # recovery sweep installs no policy; blocking it on a pasta EPERM
+    # made it unusable exactly when uninstall needed it (dogfood host,
+    # 2026-09-07). Amends ARC-26-D1: --runtime is not in the probe set.
+    if [[ "$target" == "--runtime" ]]; then
+        cmd_teardown_runtime "$@"
+        return
+    fi
+    # ARC-71-D2: conf-scoped teardown keeps the probe — day-to-day
+    # commands fail loud on a wedged netns with the ARC-26 guidance.
+    netns_probe || exit 1
+    local listed nets removed_total=0 nothing_total=1
+    # ARC-69-D1: existence is checked BEFORE rm (membership in the
+    # current listings), so repeat teardown reports the three real
+    # states instead of guessing from rm's rc.
+    listed="$(podman ps -a --format '{{.Names}}' 2>/dev/null || true)"
+    nets="$(podman_network_names 2>/dev/null || true)"
+    case "$target" in
+        all) set -- "${PROFILES[@]}"; drop_legacy_table ;;
+        *)   require_profile "$target" teardown; set -- "$target" ;;
+    esac
+    for p in "$@"; do
+        teardown_profile_objects "$p" "$listed" "$nets"
+        if (( TD_REMOVED )); then
+            removed_total=1
+        fi
+        (( TD_NOTPRESENT )) || nothing_total=0
+    done
+    if (( nothing_total == 1 && removed_total == 0 )); then
+        # ARC-69-D2: every object was already gone — no nft note (it
+        # would be a lie: a no-op run proves nothing about the table).
+        if [[ "$target" == "all" ]]; then
+            echo "nothing left for any profile"
+        else
+            echo "nothing left for profile '$target'"
+        fi
+    else
+        # ARC-69-D2: something was removed (or something is stuck, so
+        # the table genuinely persists) — point at --runtime, which
+        # deletes the table; pasta may keep it alive past this run.
+        echo "note: nft table inet $TABLE is unchanged; 'egresslock teardown --runtime' deletes it"
+    fi
+}
+
+# ARC-69-D1: the per-profile object teardown with honest vocabulary.
+# Existence first (membership in the listings captured by the caller),
+# then rm; the rm's rc decides removed vs note/kept. Sets TD_REMOVED (1
+# when something was actually removed) and TD_NOTPRESENT (1 when every
+# object was already gone).
+teardown_profile_objects() { # <profile> <container-list> <network-list>
+    local p="$1" listed="$2" nets="$3"
+    local gwname aname netname
+    TD_REMOVED=0
+    TD_NOTPRESENT=1
+    gwname="$(gw_name "$p")"
+    aname="$(anchor_of "$p")"
+    netname="$(network_of "$p")"
+    if is_gateway_profile "$p"; then
+        if has_podman_name "$gwname" "$listed"; then
+            if podman rm -f "$gwname" >/dev/null 2>&1; then
+                echo "removed gateway $gwname"
+                TD_REMOVED=1
+                TD_NOTPRESENT=0
+            else
+                echo "note: could not remove gateway $gwname"
+                TD_NOTPRESENT=0
+            fi
+        else
+            echo "not present gateway $gwname"
+        fi
+    fi
+    if has_podman_name "$aname" "$listed"; then
+        if podman rm -f "$aname" >/dev/null 2>&1; then
+            echo "removed anchor $aname"
+            TD_REMOVED=1
+            TD_NOTPRESENT=0
+        else
+            echo "note: could not remove anchor $aname"
+            TD_NOTPRESENT=0
+        fi
+    else
+        echo "not present anchor $aname"
+    fi
+    if has_podman_name "$netname" "$nets"; then
+        if podman network rm "$netname" >/dev/null 2>&1; then
+            echo "removed $netname"
+            TD_REMOVED=1
+            TD_NOTPRESENT=0
+        else
+            echo "kept $netname (in use)"
+            TD_NOTPRESENT=0
+        fi
+    else
+        echo "not present $netname"
+    fi
+}
+
+# ARC-69-D1 helper: membership of $1 in the whitespace-separated list $2.
+has_podman_name() {
+    local n
+    for n in $2; do
+        [[ "$n" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+#
+# ARC-37-D2/D3/D4: config resolution when neither --config nor
+# EGRESSLOCK_CONF is given. Peek the profile argument before
+# load_config ($1 = command, $2 = first arg after the command).
+#
+#   named commands (ensure, verify <name>, network, proxy-env, rules,
+#   denied, allow, disallow, allow-host, disallow-host, teardown <name>):
+#       $CONFDIR/<profile>.conf wins, then $CONFDIR/main.conf (ARC-24).
+#   bare list: aggregate every $CONFDIR/*.conf (ARC-37-D3).
+#   bare verify --ensured: same aggregate glob (a check, not a delete).
+#   bare teardown all: main.conf only, never scans (ARC-37-D4).
+#
+confdir_default() {
+    echo "${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.config/egresslock"
+}
+
+# ARC-60-D2: the pre-rename confdir. The engine NEVER reads it as a
+# fallback (ARC-47-D3); it is consulted only to fail LOUDLY when a probe
+# against an empty new confdir finds the old one still in place — that is
+# a half-finished cutover, not a missing profile.
+legacy_confdir_default() {
+    echo "${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.config/agent-network"
+}
+
+confdir_has_conf() { # any *.conf in the dir?
+    local f
+    for f in "$1"/*.conf; do
+        [[ -f "$f" ]] && return 0
+    done
+    return 1
+}
+
+cutover_incomplete_msg() { # one-line hint before the generic probe error
+    local legacy newdir
+    legacy="$(legacy_confdir_default)"
+    newdir="$(confdir_default)"
+    [[ -d "$legacy" ]] || return 0
+    confdir_has_conf "$newdir" && return 0
+    echo "Error: cutover incomplete: found $legacy; mv it to $newdir or see docs/setup/upgrade.md" >&2
+}
+
+probe_named_conf() { # probe_named_conf <confdir> <profile>
+    local confdir="$1" profile="$2"
+    local candidate=""
+    if [[ -n "$profile" && -f "$confdir/$profile.conf" ]]; then
+        candidate="$confdir/$profile.conf"
+    elif [[ -f "$confdir/main.conf" ]]; then
+        candidate="$confdir/main.conf"
+    else
+        # ARC-60-D2: name a half-finished cutover before the generic line.
+        cutover_incomplete_msg
+        echo "Error: no profile config: pass --config <file> or set EGRESSLOCK_CONF" >&2
+        echo "Checked '$confdir/$profile.conf' and '$confdir/main.conf' (the default locations). If you expected a config to be found, make sure you are running as the dedicated account (not root) and that the profile file is in place — 'egresslock init <name>' or 'egresslock-setup --init-conf' creates them." >&2
+        exit 2
+    fi
+    # The probe hint is a HUMAN signal: emit it only when stdout is a
+    # terminal. Under command substitution / pipes (e.g. the README's
+    # `--env HTTP_PROXY="http://$(... proxyip):$(... proxyport)"` pattern)
+    # it would be pure noise on every captured call (ARC-45).
+    if [[ -t 1 ]]; then
+        echo "using config $candidate" >&2
+    fi
+    ENGINE_CONF="$candidate"
+    load_config "$ENGINE_CONF"
+}
+
+# ARC-37-D3/D4: load every CONFDIR/*.conf (non-recursive; not .bak/,
+# not allowlists). Fail closed on a file that fails load_config or a
+# profile name that appears in two files. No *.conf at all -> the same
+# ARC-20/24 exit 2 as a bare probe miss. stderr: one
+# 'using configs in <CONFDIR>' line.
+aggregate_configs() { # aggregate_configs <confdir>
+    local confdir="$1"
+    local -a confs=()
+    local f
+    for f in "$confdir"/*.conf; do
+        [[ -f "$f" ]] && confs+=("$f")
+    done
+    if (( ${#confs[@]} == 0 )); then
+        # ARC-60-D2: name a half-finished cutover before the generic line.
+        cutover_incomplete_msg
+        echo "Error: no profile config: pass --config <file> or set EGRESSLOCK_CONF" >&2
+        echo "Checked '$confdir' for *.conf (the default location). If you expected a config to be found, make sure you are running as the dedicated account (not root) and that the profile file is in place — 'egresslock init <name>' or 'egresslock-setup --init-conf' creates them." >&2
+        exit 2
+    fi
+    if [[ -t 1 ]]; then
+        echo "using configs in $confdir" >&2
+    fi
+    local first=1 c
+    for c in "${confs[@]}"; do
+        if [[ "$first" == 1 ]]; then
+            load_config "$c"
+            first=0
+        else
+            load_config "$c" 1
+        fi
+    done
+}
+
+resolve_conf_for() { # resolve_conf_for <command> <arg2>
+    local cmd="${1:-}" arg2="${2:-}"
+    local confdir
+    confdir="$(confdir_default)"
+    case "$cmd" in
+        list)
+            aggregate_configs "$confdir"
+            ;;
+        verify)
+            if [[ "$arg2" == "--ensured" ]]; then
+                aggregate_configs "$confdir"
+            else
+                probe_named_conf "$confdir" "$arg2"
+            fi
+            ;;
+        teardown)
+            if [[ "$arg2" == "all" ]]; then
+                probe_named_conf "$confdir" "main"
+            else
+                probe_named_conf "$confdir" "$arg2"
+            fi
+            ;;
+        *)
+            probe_named_conf "$confdir" "$arg2"
+            ;;
+    esac
+}
+
+# --- EGL-45: engine doctor — host environment probe --------------------------
+# ARC-4 piece 6 / EGL-10: runtime evidence for the version-compat question,
+# genericized from the old site experiment: docs claim support only for
+# what the host actually provides, never "any rootless Podman".
+#
+# NOT `egresslock-setup --apparmor-check` (the AppArmor pasta slice) and
+# NOT `egresslock-setup --doctor` (kit/account install state) — see each
+# binary's help. D45-3: no connectivity experiment — no policy install,
+# no networks, no gateway, no destination curls, and no supported/
+# unsupported verdict beyond the required-tools rc.
+#
+# Output (D45-2): one `key: value` line per check on stdout (stable keys,
+# greppable); errors/hints on stderr. A REQUIRED check missing → rc 1;
+# all required present → rc 0 even when advisory lines are unknown/fail.
+cmd_doctor() {
+    local rc=0
+    local podman_ok=1 backend=""
+
+    # Required: podman on PATH.
+    if command -v podman >/dev/null 2>&1; then
+        echo "podman: $(podman --version 2>/dev/null || echo 'present')"
+    else
+        echo "podman: MISSING"
+        podman_ok=0
+        rc=1
+    fi
+
+    # One podman info roundtrip feeds both the netavark fallback and the
+    # bridge_driver advisory. Missing/failed podman info -> empty.
+    if (( podman_ok )); then
+        backend="$(podman info --format '{{.Host.NetworkBackend}}' 2>/dev/null || true)"
+    fi
+
+    # Required: netavark — on PATH, or the backend podman reports.
+    if command -v netavark >/dev/null 2>&1; then
+        echo "netavark: $(command -v netavark)"
+    elif [[ -n "$backend" ]]; then
+        echo "netavark: present (podman NetworkBackend: $backend)"
+    else
+        echo "netavark: MISSING"
+        rc=1
+    fi
+
+    # Required: nft — NFT_BIN, then /usr/sbin/nft, then PATH (the engine's
+    # own resolution order; resolved WITHOUT dying — a miss is a MISSING
+    # line, not an abort).
+    local nft_resolved=""
+    if [[ -n "${NFT_BIN:-}" ]]; then
+        nft_resolved="$NFT_BIN"
+    elif command -v nft >/dev/null 2>&1; then
+        nft_resolved="$(command -v nft)"
+    elif [[ -x /usr/sbin/nft ]]; then
+        nft_resolved=/usr/sbin/nft
+    fi
+    if [[ -n "$nft_resolved" && -e "$nft_resolved" ]]; then
+        echo "nft: $("$nft_resolved" --version 2>/dev/null || echo "present ($nft_resolved)")"
+    else
+        echo "nft: MISSING"
+        rc=1
+    fi
+
+    # Required: unprivileged user namespaces (file is 1; kernels without
+    # the sysctl always allow).
+    if [[ -r /proc/sys/kernel/unprivileged_userns_clone ]]; then
+        if [[ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" == "1" ]]; then
+            echo "userns: enabled"
+        else
+            echo "userns: disabled"
+            rc=1
+        fi
+    else
+        echo "userns: enabled (kernel has no unprivileged_userns_clone gate)"
+    fi
+
+    # --- advisory lines: never affect the rc --------------------------------
+    if command -v pasta >/dev/null 2>&1; then
+        echo "network_backend: pasta"
+    elif command -v slirp4netns >/dev/null 2>&1; then
+        echo "network_backend: slirp"
+    else
+        echo "network_backend: unknown"
+    fi
+
+    if (( ! podman_ok )); then
+        echo "rootless_netns: skipped (podman MISSING)"
+    else
+        local nerr="" nrc=0
+        nerr="$(podman unshare --rootless-netns true 2>&1)" && nrc=0 || nrc=$?
+        if (( nrc == 0 )); then
+            echo "rootless_netns: ok"
+        else
+            # D2 scopes the AppArmor pointer to the AppArmor-shaped
+            # failure (rc 126 / permission denied); any other netns
+            # failure gets a generic pointer instead — do not misroute
+            # a non-AppArmor problem to --apparmor-check.
+            echo "rootless_netns: fail:$(printf '%s' "$nerr" | head -1)"
+            if (( nrc == 126 )) || grep -qi 'permission denied' <<<"$nerr"; then
+                echo "Hint: run 'egresslock-setup --apparmor-check' for the pasta AppArmor slice." >&2
+            else
+                echo "Hint: run as the dedicated account; see docs/troubleshooting/netns-inspection.md." >&2
+            fi
+        fi
+    fi
+
+    if [[ "$backend" == "netavark" ]]; then
+        echo "bridge_driver: bridge"
+    else
+        echo "bridge_driver: unknown"
+    fi
+
+    exit "$rc"
+}
+
+# ARC-8: --config <file> (or EGRESSLOCK_CONF) activates the
+# data-driven engine; it must precede the subcommand. Validation is
+# fail-closed and happens before ANY command runs.
+# ARC-16-D5: --version prints the kit VERSION stamp (or 'dev').
+# ARC-20-D1: profile subcommands REQUIRE a config — there are no
+# compiled-in profiles. --help/-h/no-args usage and --version never touch
+# profile state and do not require one.
+if [[ "${1:-}" == "--version" ]]; then
+    vfile="$(dirname "${BASH_SOURCE[0]}")/VERSION"
+    if [[ -f "$vfile" ]]; then cat "$vfile"; else echo "dev"; fi
+    exit 0
+fi
+if [[ "${1:-}" == --config=* ]]; then
+    ENGINE_CONF="${1#--config=}"
+    shift
+elif [[ "${1:-}" == --config ]]; then
+    [[ $# -ge 2 ]] || { echo "Error: --config requires a path argument." >&2; usage >&2; exit 2; }
+    ENGINE_CONF="$2"
+    shift 2
+fi
+case "${1:-}" in
+    ensure|verify|network|proxy-env|rules|allowlist|denied|allow|disallow|allow-host|disallow-host|list|teardown)
+        # ARC-25: fail closed when run as root — root's Podman store/
+        # netns is a separate world from every account's. Accounts
+        # execute the engine; root only distributes the kit (ARC-7-D5).
+        # Escape hatch for intentional root use (not recommended).
+        if [[ "${EGRESSLOCK_ALLOW_ROOT:-0}" != "1" && "$(id -u)" == "0" ]]; then
+            echo "Error: egresslock must run as the account, not root — root's Podman store/netns is separate from every account's. Use 'sudo -iu <account> -- egresslock ...'." >&2
+            exit 1
+        fi
+        if [[ "${1:-}" == "teardown" && "${2:-}" == "--runtime" ]]; then
+            # ARC-60-D1: --runtime loads NO conf — it sweeps by name so it
+            # works when the conf is already gone. An explicit --config /
+            # EGRESSLOCK_CONF is deliberately ignored (not even loaded).
+            :
+        elif [[ -n "$ENGINE_CONF" ]]; then
+            load_config "$ENGINE_CONF"
+        else
+            # ARC-24/ARC-37-D2/D3/D4: per-user default resolution. Named
+            # commands probe <profile>.conf then main.conf; bare list and
+            # bare verify --ensured aggregate CONFDIR/*.conf; bare teardown
+            # all stays main.conf-only. Explicit beats implicit (D1).
+            resolve_conf_for "${1:-}" "${2:-}"
+        fi
+        ;;
+    init)
+        # ARC-35: init writes account-owned profile files; root would
+        # write into root's home, so the ARC-25 root guard applies (but
+        # init does NOT require a loadable config — it is a writer).
+        if [[ "${EGRESSLOCK_ALLOW_ROOT:-0}" != "1" && "$(id -u)" == "0" ]]; then
+            echo "Error: egresslock must run as the account, not root — root's Podman store/netns is separate from every account's. Use 'sudo -iu <account> -- egresslock ...'." >&2
+            exit 1
+        fi
+        ;;
+    doctor)
+        # EGL-45-D1: the host environment probe loads NO conf (same
+        # class as --help/--version). ARC-25 root guard applies: probe
+        # the ACCOUNT's store/netns, never root's.
+        if [[ "${EGRESSLOCK_ALLOW_ROOT:-0}" != "1" && "$(id -u)" == "0" ]]; then
+            echo "Error: egresslock must run as the account, not root — root's Podman store/netns is separate from every account's. Use 'sudo -iu <account> -- egresslock ...'." >&2
+            exit 1
+        fi
+        ;;
+esac
+
+case "${1:-}" in
+    ensure)      shift; cmd_ensure "$@" ;;
+    verify)      shift
+                 if [[ "${1:-}" == "--ensured" ]]; then
+                     shift
+                     [[ $# -eq 0 ]] || { echo "Error: verify --ensured takes no profile argument." >&2; usage >&2; exit 2; }
+                     cmd_verify_ensured
+                 else
+                     cmd_verify "$@"
+                 fi ;;
+    network)     shift; cmd_network "$@" ;;
+    proxy-env)   shift; cmd_proxy_env "$@" ;;
+    rules)       shift; cmd_rules "$@" ;;
+    allowlist)   shift; cmd_allowlist "$@" ;;
+    denied)      shift; cmd_denied "$@" ;;
+    allow)       shift; cmd_allow "$@" ;;
+    disallow)    shift; cmd_disallow "$@" ;;
+    allow-host)  shift; cmd_allow_host "$@" ;;
+    disallow-host) shift; cmd_disallow_host "$@" ;;
+    init)        shift; cmd_init "$@" ;;
+    list)        cmd_list ;;
+    doctor)      shift
+                 # EGL-45-D1: no profile argument, no extra args.
+                 [[ $# -eq 0 ]] || { echo "Error: doctor takes no arguments." >&2; short_usage >&2; exit 2; }
+                 cmd_doctor ;;
+    teardown)    shift; cmd_teardown "$@" ;;
+    -h|--help) usage ;;
+    "")        short_usage ;;
+    *)         echo "Error: unknown command '$1'." >&2; short_usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,44 @@
+# Base pinned by digest (ARC-32-D3, 2026-09-07): the tag's OCI index
+# digest per the registry API — multi-arch correct, and every rebuild
+# verifies the same base content. Refresh deliberately: pull the tag,
+# confirm the new digest, update here, and record it in the ticket.
+# The squid apt package stays UNPINNED (distro security updates).
+FROM docker.io/library/debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+
+# Minimal allowlist gateway (ARC-5).
+# Runs Squid as an HTTP CONNECT forward proxy with a hostname allowlist.
+# No credentials, no other services: same-class agents can reach every
+# port this container exposes (ARC-1 L2 limitation), so the proxy must
+# be the only listener.
+
+# Prevent apt from attempting to start services (no init in a build
+# container; the invoke-rc.d/policy-rc.d messages are build noise).
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod +x /usr/sbin/policy-rc.d
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends squid \
+    && rm -rf /var/lib/apt/lists/*
+
+# Replace the shipped config: everything is generated/managed by
+# egresslock; the shipped default config is never used.
+RUN rm -f /etc/squid/squid.conf
+COPY squid.conf /etc/squid/squid.conf
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+# Runs as the proxy user: the container is started with --cap-drop=all
+# (on-host finding, ARC-5), so root has no CAP_CHOWN / CAP_DAC_OVERRIDE /
+# CAP_SETUID — it can neither write proxy-owned dirs nor setuid down to
+# the proxy user at runtime. Running the whole container as proxy avoids
+# all three.
+RUN chmod 755 /usr/local/bin/entrypoint.sh \
+    && mkdir -p /var/spool/squid /var/log/squid /etc/squid/agent \
+    && chown -R proxy:proxy /var/spool/squid /var/log/squid /etc/squid/agent
+
+# Health check: the proxy must accept a TCP connect on 3128 (bash
+# /dev/tcp avoids extra packages in the slim base).
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' || exit 1
+
+EXPOSE 3128
+USER proxy
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

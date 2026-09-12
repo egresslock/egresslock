@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# egresslock-verify — periodic policy verification for one account.
+# The instanced timer unit
+# `egresslock-verify@<account>.service` runs this as the account.
+#
+# Hybrid verify modes:
+#   - EGRESSLOCK_PROFILE set    -> verify exactly that profile (a missing
+#                             network FAILS: drift/teardown signal).
+#   - EGRESSLOCK_PROFILE unset  -> `egresslock verify --ensured`:
+#                             verify every profile whose anchor is
+#                             running; none running exits 0 silently.
+# EGRESSLOCK_CONF is always REQUIRED (fail closed).
+#
+# Environment:
+#   EGRESSLOCK_DIR     engine resolution: this var >
+#                         /opt/egresslock > this script's directory.
+#   EGRESSLOCK_CONF   profile config. REQUIRED.
+#   EGRESSLOCK_PROFILE         optional profile name (named-verify mode).
+#
+# Options:
+#   -h, --help            print this help
+#
+# Defaults that are not parameter-changeable:
+#   - XDG_RUNTIME_DIR is forced to /run/user/$(id -u) (systemd %U does
+#     not expand per-User=; rootless Podman needs the account's own
+#     runtime dir, kept alive by linger)
+#   - EGRESSLOCK_PROFILE unset -> verify --ensured, which exits 0 silently
+#     when no anchors are running (silence = nothing ensured)
+
+set -euo pipefail
+
+usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+# ARC-16-D9.1 (amended, on-host gate finding): systemd's %U specifier
+# did not expand per-User= on the gate host (same failure class as %h),
+# so the unit must NOT supply XDG_RUNTIME_DIR — resolve it here from
+# the executing uid. Rootless Podman requires it to point at the
+# account's own runtime dir (/run/user/<uid>, kept alive by linger).
+# (Assigned before export so an id -u failure cannot silently mask a void
+# XDG_RUNTIME_DIR under set -eou pipefail — SC2155.)
+_euid="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$_euid"
+
+if [[ -n "${EGRESSLOCK_DIR:-}" ]]; then
+    kit_dir="$EGRESSLOCK_DIR"
+elif [[ -x /opt/egresslock/egresslock ]]; then
+    kit_dir=/opt/egresslock
+else
+    kit_dir="$(cd "$(dirname "$0")" && pwd)"
+fi
+tool="$kit_dir/egresslock"
+
+[[ -n "${EGRESSLOCK_CONF:-}" ]] || {
+    echo "egresslock-verify: EGRESSLOCK_CONF is required" >&2
+    exit 1
+}
+[[ -f "$EGRESSLOCK_CONF" ]] || {
+    echo "egresslock-verify: profile config not found: $EGRESSLOCK_CONF" >&2
+    exit 1
+}
+[[ -x "$tool" ]] || {
+    echo "egresslock-verify: egresslock not found/executable: $tool" >&2
+    exit 1
+}
+
+# ARC-26: same netns preflight as the engine, so the timer's
+# drift-signal failure is not misread as policy drift when the real
+# cause is a broken shared netns (e.g. enforce-mode AppArmor pasta
+# profile). Skippable in the mock harness.
+if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
+    if ! podman unshare --rootless-netns true 2>/dev/null; then
+        echo "egresslock-verify: podman rootless-netns is broken for this user (probe: 'podman unshare --rootless-netns true'). Check whether AppArmor blocks pasta:" >&2
+        echo "  sudo aa-status | grep -i pasta        # enforced profile?" >&2
+        echo "  # primary fix (ARC-27-D2/EGL-15): add 'signal (receive) set=(term) peer=podman,' to the pasta profile, then" >&2
+        echo "  sudo apparmor_parser -r /etc/apparmor.d/usr.bin.pasta" >&2
+        echo "  # alternate but less secure workaround: sudo aa-complain /usr/bin/pasta" >&2
+        echo "Then re-run the probe. On some hosts this is instead a session problem:" >&2
+        echo "  sudo systemctl restart user@<uid>     # WARNING: stops user-unit children (containers); expect 'podman start <container>' / a reboot as follow-ups" >&2
+        echo "  systemctl --user is-system-running" >&2
+        echo "Do NOT reinstall the kit — nothing is installed wrong." >&2
+        exit 1
+    fi
+fi
+
+if [[ -n "${EGRESSLOCK_PROFILE:-}" ]]; then
+    exec "$tool" --config "$EGRESSLOCK_CONF" verify "$EGRESSLOCK_PROFILE"
+fi
+exec "$tool" --config "$EGRESSLOCK_CONF" verify --ensured

@@ -1,0 +1,1579 @@
+#!/usr/bin/env bash
+# egresslock-setup — one-command per-account setup.
+#
+# Run as ROOT. The deployed kit copy is the normal entry point:
+#   sudo /opt/egresslock/egresslock-setup --account <acct> \
+#        --conf /home/<acct>/.config/egresslock/<profile>.conf \
+#        --profile <profile> --enable
+#   sudo /opt/egresslock/egresslock-setup --account <acct> --init-conf --enable
+# (A checkout copy also works: ./egresslock/egresslock-setup ...)
+#
+# What it does (as the ACCOUNT, via runuser, always from the account's
+# own home — runuser inherits the caller's CWD and chdir-fails when the
+# account cannot traverse it, e.g. an operator checkout under a 0700
+# home):
+#   0. With --init-conf: ship the sshd-style starter conf pair
+#      (examples/main.conf + the empty main-allowlist) from the deployed
+#      prefix into the account — ONLY when the destination conf is
+#      missing. Never overwrites; never heals an existing conf's missing
+#      allowlist. Without --conf the starter lands at
+#      ~/.config/egresslock/main.conf (the README well-known path).
+#   0b. Confdir migration: if the pre-rename
+#       ~/.config/agent-network exists and ~/.config/egresslock does NOT,
+#       it is `mv`d to the new confdir as the account (printed as
+#       `migrated:` with the *.conf basenames). If BOTH exist: exit 1,
+#       naming both paths — never merged, never overwritten (the
+#       operator picks).
+#   1. Validates the conf: exists AND readable by the account, parses
+#      cleanly under the deployed engine, and (with --profile) that the
+#      named profile exists in it. A conf the account cannot read or
+#      that fails validation would otherwise surface later only as a
+#      failing or vacuous verify timer.
+#   2. Writes ~/.config/egresslock/unit.env (0600): exactly one
+#      EGRESSLOCK_CONF=<conf> line, plus EGRESSLOCK_PROFILE=<name> only
+#      when --profile is given (omit for --ensured verify mode).
+#      Re-runs overwrite the file wholesale (kit-generated state).
+#   3. With --enable: enables linger for the account (moved
+#      before the gateway build so the account-side build
+#      is never linger-less; fails closed if it does not stick).
+#   4. For gateway profiles (conf declares a `gateway` directive):
+#      starts the account's systemd user manager (user@<uid>.service)
+#      so a never-logged-in account can run the build, then
+#      builds the gateway image into the account's Podman store from
+#      the deployed --prefix if the image is missing.
+#   5. With --enable: enables+starts egresslock-verify@<account>.timer
+#      (linger above keeps /run/user/<uid> alive outside login
+#      sessions for the timer's egresslock-verify).
+#
+# The account bundle prints a numbered run map,
+# one line per step in execution order:
+#   1) validate conf   2) write unit.env   3) linger   4) user manager
+#   5) gateway image   6) timer
+# with … OK / … SKIP (step not requested) / … FAIL (fail-closed stop;
+# FAIL is the last printed step). --init-conf, confdir migration, and
+# AppArmor are not numbered.
+#
+# Host environment probe (podman/netavark/nft/unprivileged userns) is
+# the ENGINE's `egresslock doctor`; kit/account install state
+# is `--doctor` HERE. Two questions, two binaries.
+#
+# Modular sub-actions alongside the account bundle:
+#   egresslock-setup --doctor          # read-only kit/account state check
+#                                      # with fix commands (host slice
+#                                      # without --account)
+#   egresslock-setup --build-gateway   # account-shell gateway build from
+#                                      # the deployed/share prefix (needs
+#                                      # an active user manager; never
+#                                      # starts user@ or enables linger)
+#
+# Requires a deployed kit (install-kit.sh). With no --prefix, the
+# deployed prefix is derived from the installed verify unit template's
+# ExecStart (which install-kit rewrote with its prefix); if that is
+# missing, /opt/egresslock is assumed.
+#
+# Options:
+#   --account <name>  target account (required unless --apparmor-add,
+#                     --apparmor-remove, or --apparmor-check is used
+#                     alone)
+#   --conf <path>     profile conf to validate + wire into unit.env
+#                     (required unless --init-conf)
+#   --init-conf       ship the starter conf pair from the deployed
+#                     prefix when the dest conf is missing (never
+#                     overwrites); without --conf the dest is
+#                     ~/.config/egresslock/main.conf
+#   --profile <name>  write EGRESSLOCK_PROFILE=<name> (named verify mode);
+#                     omit for --ensured mode
+#   --prefix <path>   deployed kit prefix (default: derived from the
+#                     installed unit template, else /opt/egresslock)
+#   --enable          enable+start egresslock-verify@<account>.timer
+#                     AND enable linger for the account (fails
+#                     closed if linger does not stick)
+#   --apparmor-add    apply the shipped pasta SIGTERM rule (root; may be
+#                     combined with --account or used alone):
+#                     resolves the distro pasta profile
+#                     (/etc/apparmor.d/usr.bin.pasta or .../pasta — names
+#                     vary by packaging) and writes the rule into the
+#                     local include that profile names (idempotent),
+#                     then apparmor_parser -r's the RESOLVED profile.
+#                     If the distro profile has no local include,
+#                     a marked egresslock compatibility
+#                     include is added (backed up first) so the rule
+#                     actually loads; --apparmor-remove strips exactly
+#                     that. After reload the rule is verified present in
+#                     the loaded profile. Without the flag
+#                     AppArmor is never touched; if pasta is enforced,
+#                     one stderr hint points at --apparmor-add.
+#   --apparmor-remove unapply instead of apply — strip ONLY
+#                     the marker-scoped block this tool appended from the
+#                     resolved local include (and the legacy
+#                     local/usr.bin.pasta path; never rm the file,
+#                     operator lines stay), then apparmor_parser -r when
+#                     the profile is present. Idempotent (rc 0 when
+#                     already gone); an unmarked signal rule is never
+#                     guessed at (rc 1). (The old flag spellings
+#                     are dropped — no alias, no deprecation.)
+#   --apparmor-check  report AppArmor/pasta amendment health;
+#                     read-only, works without root:
+#                       AppArmor: enabled
+#                       pasta enforcement: enforced / NOT enforced /
+#                       unknown / n/a
+#                       podman label: labeled / unlabeled / unknown
+#                         (any mode counts as labeled —
+#                         the label, not the mode, is the
+#                         discriminator; kernel listing only, so
+#                         non-root on root-only kernels reports
+#                         unknown, never a guess)
+#                       pasta amendment: required on this host / not
+#                         required on this host (podman unlabeled |
+#                         pasta not enforced) / condition unknown
+#                         (verify: podman unshare --rootless-netns true
+#                         as the account)
+#                       pasta profile: found / missing file
+#                       pasta local extension: present (stock |
+#                         egresslock) / MISSING (the
+#                         separate compatibility-patch line is
+#                         dropped — patch state is the
+#                         `(egresslock)` ownership here)
+#                       egresslock rule in local file: absent /
+#                         present (stock | egresslock)
+#                       Summary: CHECK OK (AppArmor patch applied |
+#                         AppArmor patch not needed) / CHECK FAILED
+#                         (AppArmor patch incomplete | AppArmor patch
+#                         needed) / CHECK UNKNOWN (run as root if
+#                         apparmor policy not visible to current user)
+#                         (rc agrees with the summary —
+#                         OK 0, FAILED 1, UNKNOWN 1; unknown
+#                         components never print a green summary)
+#                     Exits nonzero when a required element is missing.
+#                     (The --doctor name is the kit/account state
+#                     check — see --doctor.)
+#   --doctor          report kit/account install state with the command
+#                     that fixes each missing item (read-only). Host
+#                     slice without --account: engine
+#                     present at the derived prefix, unit templates
+#                     installed. With --account it adds: conf parses,
+#                     unit.env matches, timer enabled, linger on, and
+#                     (gateway confs) user@<uid>.service active +
+#                     gateway image present. AppArmor is one pointer
+#                     line at --apparmor-check (its strings stay
+#                     there). rc nonzero when a required item is
+#                     missing. Distinct from the engine's `egresslock
+#                     doctor` (host environment probe).
+#   --build-gateway   account-shell gateway build: builds
+#                     the gateway image from the deployed/share prefix
+#                     into the invoking user's Podman store. Requires
+#                     an already-active user manager (session or
+#                     linger) and fails closed otherwise; never starts
+#                     user@, never enables linger. Cannot be combined
+#                     with --account (the bundle builds via runuser).
+#   -h, --help        print this help
+#
+# Which check answers which question — four commands, four layers:
+#   checks:
+#     egresslock doctor                      host env (podman/nft/userns)
+#     egresslock-setup --doctor [--account]  kit/account wiring
+#     egresslock-setup --apparmor-check      pasta AppArmor patch
+#     egresslock verify <profile>            profile runtime (fail-closed)
+#
+# Kit data locations: examples and the apparmor snippet are
+# resolved share-first — $EGRESSLOCK_SHARE when set, else
+# /usr/share/egresslock (the .deb layout), else the directory holding
+# this script (= the deployed prefix, or an egresslock/ checkout/tree).
+# The ENGINE always comes from the deployed prefix.
+#
+# Environment:
+#   EGRESSLOCK_GW_IMAGE            gateway image (default:
+#                             localhost/egresslock-gateway:latest)
+#   EGRESSLOCK_KIT_ALLOW_NON_ROOT=1   allow non-root runs (tests only)
+#   EGRESSLOCK_UNIT_DIR=<dir>      unit template dir for prefix derivation
+#                             (default: /etc/systemd/system; EXPLICIT
+#                             hook — suppresses the deb fallback and
+#                             the stale-prefix retry)
+#   EGRESSLOCK_DEFAULT_UNIT_DIR=<dir>  harness-only override of the
+#                             DEFAULT /etc probe path (heuristic-
+#                             preserving: deb fallback + stale-prefix
+#                             retry still run)
+#   EGRESSLOCK_ACCOUNT_HOME=<dir>  account home in non-root test mode
+#
+# Defaults that are not parameter-changeable:
+#   - unit.env path: ~/.config/egresslock/unit.env, mode 0600, with
+#     exactly EGRESSLOCK_CONF (+ EGRESSLOCK_PROFILE when --profile)
+#   - --init-conf dest: ~/.config/egresslock/main.conf with sibling
+#     main-allowlist (empty starter), both copied as the account
+#   - account-side steps run as the account from its own home
+#
+# Exit codes: 0 ok, 1 preflight/validation failure, 2 usage error.
+set -euo pipefail
+
+prefix=""
+account=""
+conf=""
+profile_name=""
+enable=0
+init_conf=0
+apparmor=0
+aa_add=0
+aa_remove=0
+aa_check=0
+doctor=0
+buildgw=0
+prefix_explicit=0
+gw_img="${EGRESSLOCK_GW_IMAGE:-localhost/egresslock-gateway:latest}"
+# ARC-59-D1: a non-empty override that starts with '-' is a flag-shaped
+# token in the `podman build -t` / `podman image exists` positional args
+# below. Empty stays the default; a value is never optional flags.
+[[ "$gw_img" == -* ]] && { echo "egresslock-setup: EGRESSLOCK_GW_IMAGE value must not start with '-' (got '$gw_img')" >&2; exit 2; }
+
+usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --account)  [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --account" >&2; exit 2; }
+                    account="$2"; shift 2 ;;
+        --conf)     [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --conf" >&2; exit 2; }
+                    conf="$2"; shift 2 ;;
+        --profile)  [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --profile" >&2; exit 2; }
+                    profile_name="$2"; shift 2 ;;
+        --prefix)   [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --prefix" >&2; exit 2; }
+                    prefix="$2"; prefix_explicit=1; shift 2 ;;
+        --enable)   enable=1; shift ;;
+        --init-conf) init_conf=1; shift ;;
+        --apparmor-add) apparmor=1; aa_add=1; shift ;;
+        --apparmor-check) aa_check=1; shift ;;
+        --doctor)   doctor=1; shift ;;
+        --build-gateway) buildgw=1; shift ;;
+        --apparmor-remove) apparmor=1; aa_remove=1; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          echo "egresslock-setup: unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+# Derive the deployed prefix when not given: the installed unit
+# template's ExecStart carries the prefix install-kit deployed to. Any
+# failure here (no template, unreadable) falls back to /opt below —
+# never fatal: the engine-presence check reports the real problem.
+if [[ -z "$prefix" ]]; then
+    # EGRESSLOCK_DEFAULT_UNIT_DIR overrides the DEFAULT /etc probe path
+    # without being an explicit user hook (harness only): the deb
+    # fallback and the D37-1 stale-/etc retry still run, unlike
+    # EGRESSLOCK_UNIT_DIR which suppresses both (documented "explicit
+    # hook beats heuristics" behavior).
+    unit_dir="${EGRESSLOCK_UNIT_DIR:-${EGRESSLOCK_DEFAULT_UNIT_DIR:-/etc/systemd/system}}"
+    prefix="$(sed -n "s|^ExecStart=\(.*\)/egresslock-verify$|\1|p" \
+        "$unit_dir/egresslock-verify@.service" 2>/dev/null | head -1 || true)"
+    if [[ -z "$prefix" && -z "${EGRESSLOCK_UNIT_DIR:-}" ]]; then
+        # ARC-22 R-022-1 F1: the .deb installs the unit templates under
+        # /usr/lib/systemd/system, so on a fresh .deb-only host the /etc
+        # probe misses and the derived prefix must come from the deb
+        # template — otherwise the postinst's own next step
+        # ('egresslock-setup --account …') fails with 'no engine at
+        # /opt/egresslock'. EGRESSLOCK_DEB_UNIT_DIR overrides for the
+        # mock harness; EGRESSLOCK_UNIT_DIR (explicit hook) suppresses
+        # this probe entirely.
+        deb_unit_dir="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}"
+        prefix="$(sed -n "s|^ExecStart=\(.*\)/egresslock-verify$|\1|p" \
+            "$deb_unit_dir/egresslock-verify@.service" 2>/dev/null | head -1 || true)"
+    fi
+fi
+# EGL-37 / D37-1: a derived prefix is only a LEAD — the engine must
+# exist. A stale /etc unit (leftover from a removed prefix install)
+# points at a dead path while the live kit is the .deb; an installed-deb
+# host hit exactly this ('no engine at /opt/egresslock' on an installed
+# deb).
+# Retry the deb unit dir when the derived engine is missing and the
+# deb probe has not run yet; only then fall back to /opt. A WORKING
+# /etc prefix always wins (prefix-install hosts).
+if (( prefix_explicit == 0 )) && [[ -n "$account" && -n "$prefix" && ! -f "$prefix/egresslock" && -z "${EGRESSLOCK_UNIT_DIR:-}" ]]; then
+    # D37-1 gate note: EGRESSLOCK_DEFAULT_UNIT_DIR (harness-only /etc
+    # override) does NOT suppress the retry — only the explicit
+    # EGRESSLOCK_UNIT_DIR hook does.
+    deb_unit_dir="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}"
+    deb_prefix="$(sed -n "s|^ExecStart=\(.*\)/egresslock-verify$|\1|p" \
+        "$deb_unit_dir/egresslock-verify@.service" 2>/dev/null | head -1 || true)"
+    if [[ -n "$deb_prefix" && -f "$deb_prefix/egresslock" && "$deb_prefix" != "$prefix" ]]; then
+        prefix="$deb_prefix"
+    fi
+fi
+[[ -n "$prefix" ]] || prefix="/opt/egresslock"
+
+if [[ "$aa_add" == 1 && "$aa_remove" == 1 ]]; then
+    echo "egresslock-setup: --apparmor-add and --apparmor-remove are mutually exclusive" >&2
+    usage >&2
+    exit 2
+fi
+if [[ "$doctor" == 1 && ( "$apparmor" == 1 || "$aa_check" == 1 ) ]]; then
+    echo "egresslock-setup: --doctor cannot be combined with the AppArmor actions (its AppArmor row points at --apparmor-check)" >&2
+    usage >&2
+    exit 2
+fi
+if [[ "$buildgw" == 1 ]]; then
+    # D38-3: the standalone build runs in the account's own shell; the
+    # bundle flags belong to the root --account run (which builds via
+    # runuser and owns the D1 user-manager start).
+    for bad in "account:$account" "enable:$enable" "init-conf:$init_conf" "conf:$conf" "profile:$profile_name" "apparmor:$apparmor" "apparmor-check:$aa_check" "doctor:$doctor"; do
+        if [[ "${bad#*:}" != "" && "${bad#*:}" != "0" ]]; then
+            echo "egresslock-setup: --build-gateway cannot be combined with --${bad%%:*} (the root --account bundle builds via runuser; --build-gateway is the account-shell form)" >&2
+            usage >&2
+            exit 2
+        fi
+    done
+fi
+if [[ -z "$account" && "$apparmor" == 0 && "$doctor" == 0 && "$aa_check" == 0 && "$buildgw" == 0 ]]; then
+    echo "egresslock-setup: --account is required (or --apparmor-add, --apparmor-remove, --apparmor-check, --doctor, or --build-gateway alone)" >&2
+    usage >&2
+    exit 2
+fi
+if [[ -n "$account" && -z "$conf" && "$init_conf" == 0 && "$doctor" == 0 ]]; then
+    echo "egresslock-setup: --conf is required (or --init-conf to ship the starter conf)" >&2
+    usage >&2
+    exit 2
+fi
+
+
+# Testability hook: the mock harness runs as non-root. Fail closed
+# outside tests. --apparmor-check is read-only (EGL-14-D3) and needs no
+# root; --build-gateway is the account-shell build (D38-3) and likewise
+# runs unprivileged; a read-only --doctor without --account is the
+# host slice only. Everything else (account slices, root actions) needs
+# root.
+[[ "$aa_check" == 1 || "$buildgw" == 1 || ( "$doctor" == 1 && -z "$account" ) \
+    || "$(id -u)" == 0 || "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]] || {
+    echo "egresslock-setup: must run as root (sudo)" >&2
+    exit 1
+}
+# EGL-38-D5: --doctor --account reads the account state via runuser
+# dispatch (conf parse, gateway image), so it needs root like the
+# bundle (the test hook excepted). Account-less --doctor stays
+# read-only and rootless.
+[[ "$doctor" == 0 || -z "$account" || "$(id -u)" == 0 || "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]] || {
+    echo "egresslock-setup: --doctor --account needs root (sudo) to read the account state" >&2
+    exit 1
+}
+# Home + account steps apply only when an account was named; --apparmor-add
+# alone is host-level and needs neither.
+home=""
+if [[ -n "$account" ]]; then
+    if [[ "$(id -u)" == 0 ]]; then
+        id "$account" >/dev/null 2>&1 || { echo "egresslock-setup: no such account: $account" >&2; exit 1; }
+        home="$(getent passwd "$account" | cut -d: -f6)"
+    else
+        # Hook mode (non-root tests): the account is virtual; the test
+        # supplies its home.
+        home="${EGRESSLOCK_ACCOUNT_HOME:?egresslock-setup: non-root test mode requires EGRESSLOCK_ACCOUNT_HOME}"
+    fi
+    # EGL-38: --doctor reports a missing engine as a doctor row with the
+    # fix line instead of hard-exiting (read-only check, D38-2).
+    if [[ "$doctor" == 0 ]]; then
+        [[ -f "$prefix/egresslock" ]] || {
+            # EGL-37 / D37-1: name both install shapes — a .deb host that
+            # reaches here needs the package (or an explicit --prefix), not
+            # install-kit.
+            echo "egresslock-setup: no engine at $prefix/egresslock" >&2
+            echo "  .deb hosts: reinstall the current package, or pass --prefix /usr/lib/egresslock" >&2
+            echo "  prefix installs: run install-kit.sh first (or pass --prefix)" >&2
+            exit 1
+        }
+    fi
+fi
+
+# ARC-22-D1: share resolution — examples and the apparmor snippet live in
+# the share tree for the .deb (/usr/share/egresslock), in the deployed
+# prefix for install-kit.sh deploys, and next to this script in a
+# checkout/kit tree. EGRESSLOCK_SHARE overrides (tests; explicit beats
+# implicit). The ENGINE still always comes from the deployed prefix.
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+if [[ -n "${EGRESSLOCK_SHARE:-}" ]]; then
+    share_dir="$EGRESSLOCK_SHARE"
+elif [[ -d "/usr/share/egresslock/examples" ]]; then
+    share_dir="/usr/share/egresslock"
+elif [[ -d "$prefix/examples" ]]; then
+    share_dir="$prefix"
+elif [[ "$prefix_explicit" == 0 && -d "$script_dir/examples" ]]; then
+    # A kit-tree run (checkout / tarball extraction) with no explicit
+    # --prefix. An EXPLICIT prefix deploy must provide its own examples:
+    # no checkout fallback for a broken deploy (ARC-19-D3 fail closed).
+    share_dir="$script_dir"
+else
+    share_dir="$prefix"
+fi
+examples_dir="$share_dir/examples"
+apparmor_dir="$share_dir/apparmor"
+
+# ARC-22-D3: AppArmor activation — explicit --apparmor-add only, never
+# automatic (ARC-27-D3 holds for install/postinst: the package ships the
+# snippet, applying it is host MAC policy).
+# EGL-22-D1: pasta enforce-mode is read from the KERNEL listing
+# /sys/kernel/security/apparmor/profiles (world-readable on Debian,
+# identical for root and non-root) — never from aa-status prose, which
+# renders differently unprivileged and made non-root --doctor claim
+# "NOT enforced" for an enforced profile. EGL-22-D2: the predicate is
+# tri-state so "unknown" is never treated as "not enforced".
+#
+# Returns / sets pasta_enforce_state:
+#   0 = pasta is enforced (whole-line `pasta (enforce)` or
+#       `/usr/bin/pasta (enforce)` in the profiles file)
+#   1 = AppArmor enabled, profiles listing readable, pasta NOT in
+#       enforce (known not-enforced — the only state apply may skip on)
+#   2 = AppArmor enabled but enforcement is UNKNOWN (profiles file
+#       missing/unreadable) — never claim enforced, never skip
+#   3 = AppArmor not enabled (no profiles file AND aa-status --enabled
+#       fails or aa-status missing)
+podman_label_state=2
+podman_labeled() {
+    # EGL-39 / D39-3: podman LABEL tri-state from the same kernel
+    # listing as pasta_enforced(). Any mode counts as labeled —
+    # including `(unconfined)` (EGL-33: the label, not the mode, is
+    # the discriminator). ERE is anchored so hat lines (`podman//…`)
+    # cannot match. rc: 0 for labeled/unlabeled (see
+    # podman_label_state: 0 = labeled, 1 = unlabeled), 1 for unknown
+    # (podman_label_state=2; grep rc 2 is EACCES — UNKNOWN, never
+    # "no").
+    local profiles grc
+    profiles="${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles}"
+    podman_label_state=2
+    if [[ ! -r "$profiles" ]]; then
+        return 1
+    fi
+    if grep -qE '^(podman|/usr/bin/podman) \([^)]*\)$' "$profiles" 2>/dev/null; then
+        podman_label_state=0
+    else
+        grc=$?
+        if (( grc == 2 )); then
+            podman_label_state=2
+            return 1
+        fi
+        # rc 1: readable listing, no podman profile line -> unlabeled.
+        podman_label_state=1
+    fi
+    return 0
+}
+
+podman_noop_note() {
+    # EGL-39 / D39-1: print the future-proofing note ONLY when the
+    # label state is KNOWN-unlabeled (D39-2: silence on UNKNOWN).
+    if (( podman_label_state == 1 )); then
+        echo "AppArmor: podman unlabeled; amendment is a no-op for this host (applied anyway — future-proofing)"
+    fi
+}
+
+pasta_enforce_state=3
+pasta_enforced() {
+    local profiles grc
+    profiles="${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles}"
+    pasta_enforce_state=3
+    if [[ -r "$profiles" ]]; then
+        # The mode bits on /sys/kernel/security/apparmor/profiles are 0444
+        # but modern kernels still deny non-root open() (EACCES) — and
+        # unprivileged `aa-status` refuses the same read. So a grep
+        # rc of 2 (read error) is NOT "no match": it is UNKNOWN.
+        if grep -qE '^(pasta|/usr/bin/pasta) \(enforce\)$' "$profiles" 2>/dev/null; then
+            pasta_enforce_state=0
+        else
+            grc=$?
+            if (( grc == 2 )); then
+                # Read error despite -r: unknown, not "not enforced".
+                pasta_enforce_state=2
+            else
+                # rc 1: readable listing, no enforce match -> known-not.
+                pasta_enforce_state=1
+            fi
+        fi
+        return 0
+    fi
+    if command -v aa-status >/dev/null 2>&1 && aa-status --enabled >/dev/null 2>&1; then
+        # AppArmor is on but we cannot read the kernel listing.
+        pasta_enforce_state=2
+        return 1
+    fi
+    pasta_enforce_state=3
+    return 1
+}
+
+apparmor_block_begin='# begin egresslock-setup --apparmor'
+apparmor_block_end='# end egresslock-setup --apparmor'
+apparmor_legacy_start='# added by egresslock-setup --apparmor'
+# EGL-15: the shipped rule is narrow (set=(term)); accept the legacy
+# broad form as "already applied" / "present" so re-apply and unapply
+# stay correct on hosts that got the pre-EGL-15 rule. ERE.
+# EGL-30-D1: also accept the parser-CANONICAL form (real
+# apparmor_parser --preprocess output drops the parens:
+# `signal receive set=term peer=podman,`) — the literal-source grep
+# false-negotatived a successful apply on a labeled-podman host. One
+# ERE, reused
+# everywhere (apply idempotence, unapply unmarked refusal, awk legacy
+# strip, pasta_rule_loaded, doctor rule line); do not fork a second
+# pattern.
+apparmor_signal_re='signal[[:space:]]+\(?receive\)?([[:space:]]+set=\(?term\)?)?[[:space:]]+peer=podman'
+# EGL-14-D1: a marked block we insert into the DISTRO profile file (not
+# the local fragment) when it lacks a local include, so the local rule
+# we write actually loads. `--remove` strips exactly this block.
+apparmor_patch_begin='# begin egresslock-setup --apparmor compatibility patch'
+apparmor_patch_end='# end egresslock-setup --apparmor compatibility patch'
+pasta_profile_changed=0
+
+# ARC-72-D1: resolve the pasta PROFILE file and the local include the
+# profile itself names. Candidates cover the two common packaging names
+# (usr.bin.pasta, pasta); a file named "pasta" that is not the pasta
+# profile (does not mention /usr/bin/pasta) is skipped, not edited.
+# Sets pasta_profile_file / pasta_local_file / pasta_had_include on
+# success; rc 1 when no candidate profile exists (apply must refuse —
+# recovery message names the force-confmiss reinstall). When the profile
+# exists but names no local include, EGL-14-D1 defaults to the canonical
+# usr.bin.pasta fragment and flags pasta_had_include=0 so the apply path
+# installs a marked compatibility include (never append to the distro
+# profile body directly).
+pasta_profile_file=""
+pasta_local_file=""
+pasta_had_include=0
+resolve_pasta_profile() {
+    local aa_d cand inc
+    aa_d="$1"
+    pasta_profile_file=""
+    pasta_local_file=""
+    pasta_had_include=0
+    for cand in "$aa_d/usr.bin.pasta" "$aa_d/pasta"; do
+        if [[ -f "$cand" ]] && grep -q '/usr/bin/pasta' "$cand"; then
+            pasta_profile_file="$cand"
+            break
+        fi
+    done
+    if [[ -z "$pasta_profile_file" ]]; then
+        echo "egresslock-setup: --apparmor-add: no pasta profile found (tried: $aa_d/usr.bin.pasta, $aa_d/pasta)" >&2
+        echo "  the profile file is distro-dependent and may be missing if the pasta" >&2
+        echo "  package's conffile was removed; recover with:" >&2
+        echo "    sudo apt-get install --reinstall -o Dpkg::Options::=\"--force-confmiss\" pasta" >&2
+        echo "  then re-run: sudo egresslock-setup --apparmor-add" >&2
+        return 1
+    fi
+    inc="$(sed -n 's/^[[:space:]]*#\{0,1\}include[[:space:]]*<local\/\(usr\.bin\.pasta\|pasta\)>[[:space:]]*$/\1/p' "$pasta_profile_file" | head -1)"
+    if [[ -n "$inc" ]]; then
+        pasta_local_file="$aa_d/local/$inc"
+        pasta_had_include=1
+    else
+        pasta_local_file="$aa_d/local/usr.bin.pasta"
+        pasta_had_include=0
+    fi
+}
+
+# EGL-20-D2 / R-EGL-20-1 finding 1: a legacy EGL-14 apply left a
+# LOADABLE non-dot `<prof>.egresslock-bak` beside the distro profile.
+# It must not survive any touch of that profile: move it to the dot
+# path when possible, else delete it. Idempotent; no-op when no legacy
+# name exists. Runs on the apply path even when the marker is already
+# present (pasta_had_include=1 → install_compat_include is never
+# called), and inside strip/unapply.
+migrate_legacy_backup() {
+    local prof="$1" backup
+    [[ -f "$prof" ]] || return 0
+    backup="$(dirname "$prof")/.$(basename "$prof").egresslock-bak"
+    if [[ -f "$prof.egresslock-bak" ]]; then
+        if [[ -f "$backup" ]]; then
+            # both exist — the dot one is the current backup; drop the
+            # loadable legacy name.
+            rm -f "$prof.egresslock-bak"
+        else
+            mv -f "$prof.egresslock-bak" "$backup"
+        fi
+    fi
+}
+
+# EGL-14-D1: insert a marked `#include <local/<frag>>` into the distro
+# profile (backed up first) so a local rule the profile does not
+# natively reference will load. Idempotent: already-marked (or
+# natively-included) profiles are left alone. EGL-20-D2: the backup is a
+# leading-dot file in the same directory (directory load skips dot
+# files) — never a loadable `<prof>.egresslock-bak`. EGL-26-D1
+# (supersedes EGL-20-D4): the marked block is inserted immediately
+# before the `}` that CLOSES the profile whose header mentions
+# /usr/bin/pasta — after hats (`^foo { … }`) — not after the opening
+# `{`. Brace-depth is tracked so the matching close is found, never the
+# first `}` anywhere (preamble `{` in comments/abi is legal). Returns 1
+# when the profile has no such header/open/close (nothing written —
+# resolve-before-write still holds).
+install_compat_include() {
+    local prof="$1" frag="$2" tmp backup inserted backup_pre
+    pasta_profile_changed=0
+    [[ -f "$prof" ]] || return 0
+    backup="$(dirname "$prof")/.$(basename "$prof").egresslock-bak"
+    # R-EGL-20-1 finding 1: migrate any legacy non-dot backup BEFORE the
+    # marker early-return — a legacy EGL-14-patched host has the marker
+    # present and must still shed its loadable backup.
+    migrate_legacy_backup "$prof"
+    if grep -q "$apparmor_patch_begin" "$prof"; then
+        return 0
+    fi
+    if grep -qE "^[[:space:]]*#?[[:space:]]*include[[:space:]]*<local/$frag>" "$prof"; then
+        return 0
+    fi
+    backup_pre=0
+    [[ -f "$backup" ]] && backup_pre=1
+    cp -a "$prof" "$backup"
+    tmp="$(mktemp "$(dirname "$prof")/.pasta.patch.XXXXXX")"
+    inserted=0
+    # EGL-26-D1: find the pasta header, its opening `{`, then brace-depth
+    # to the matching close; insert the marked block immediately before
+    # that closing line (after any hat subprofiles).
+    if awk -v begin="$apparmor_patch_begin" -v end="$apparmor_patch_end" -v frag="$frag" '
+        /usr\/bin\/pasta/ { header=1 }
+        header && !open && /{/ { open=1 }
+        open && !done {
+            nb = gsub(/{/, "{")
+            nc = gsub(/}/, "}")
+            depth += nb - nc
+            if (depth <= 0) {
+                print begin
+                print "  #include <local/" frag ">"
+                print end
+                done=1
+            }
+        }
+        { print }
+        END { exit !done }
+    ' "$prof" > "$tmp"; then
+        inserted=1
+    else
+        inserted=0
+    fi
+    if (( inserted )); then
+        cat "$tmp" > "$prof"
+        pasta_profile_changed=1
+    else
+        # EGL-20-D4: no brace attached to the pasta header — refuse, and
+        # drop ONLY the backup this run made (never a pre-existing dot
+        # backup we did not create; R-EGL-20-1 finding 3).
+        if (( backup_pre == 0 )); then
+            rm -f "$backup"
+        fi
+    fi
+    rm -f "$tmp"
+    return $(( 1 - inserted ))
+}
+
+# EGL-14-D1: strip the marked compatibility include from the distro
+# profile (the precise inverse of install_compat_include) and drop the
+# dot backup once our block is gone. Sets pasta_profile_changed.
+# EGL-20-D3: never truncate the distro profile — after stripping, the
+# result must still contain /usr/bin/pasta and an opening `{`; if not,
+# leave the live file and backup untouched, rc 1, name the file.
+strip_compat_include() {
+    local prof="$1" tmp backup
+    pasta_profile_changed=0
+    [[ -f "$prof" ]] || return 0
+    if ! grep -q "$apparmor_patch_begin" "$prof"; then
+        return 0
+    fi
+    tmp="$(mktemp "$(dirname "$prof")/.pasta.unpatch.XXXXXX")"
+    if awk -v begin="$apparmor_patch_begin" -v end="$apparmor_patch_end" '
+        index($0, begin) == 1 { inblk=1; next }
+        inblk && index($0, end) == 1 { inblk=0; next }
+        inblk { next }
+        { print }
+    ' "$prof" > "$tmp"; then
+        if grep -q '/usr/bin/pasta' "$tmp" && grep -q '{' "$tmp"; then
+            # R-EGL-20-1 finding 2: the stripped result always has
+            # non-whitespace content once the header+brace guards pass,
+            # so the old ARC-69 empty-truncate else-arm is gone here.
+            cat "$tmp" > "$prof"
+            pasta_profile_changed=1
+            backup="$(dirname "$prof")/.$(basename "$prof").egresslock-bak"
+            rm -f "$backup"
+            # R-EGL-20-1 finding 1 (remove path): a legacy non-dot backup
+            # is loadable — remove it too, never leave it behind.
+            rm -f "$prof.egresslock-bak"
+        else
+            # EGL-20-D3: a strip that would destroy the profile (e.g. the
+            # marker block somehow contained the header/brace) must not
+            # write. Leave live file + backup untouched.
+            rm -f "$tmp"
+            echo "egresslock-setup: --apparmor-remove: refusing to strip the compatibility patch from $prof" >&2
+            echo "  the stripped result would not be a valid pasta profile (no /usr/bin/pasta / opening brace);" >&2
+            echo "  edit the file by hand." >&2
+            return 1
+        fi
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+# EGL-14-D2: after reload, confirm the signal rule is actually in the
+# LOADED profile (parser rc alone proves nothing — an unreferenced local
+# fragment loads silently, ARC-72/EGL-14). EGL-20-D1: `apparmor_parser
+# -p` flattens includes into the dumped profile on stdout (parse-time;
+# exactly the check that catches an unreferenced fragment).
+# EGL-56: pass ONE action — `-p` alone. `-p` and `--preprocess` are the
+# same option; passing both makes AppArmor 5 abort with "Too many
+# actions" (stdout empty, and 2>/dev/null hid the reason), so the check
+# false-negatived on a labeled host while the kernel reload had succeeded.
+# Do not invent `--print` (no such real flag); do not read the kernel
+# policy store (ARC-72-D3 holds — kernel proof is the account netns
+# probe).
+pasta_rule_loaded() {
+    local prof="$1"
+    command -v apparmor_parser >/dev/null 2>&1 || return 1
+    apparmor_parser -p "$prof" 2>/dev/null | grep -Eq "$apparmor_signal_re"
+}
+
+setup_apparmor() {
+    local aa_d already installed_patch
+    aa_d="${EGRESSLOCK_APPARMOR_D:-/etc/apparmor.d}"   # test hook (mock harness)
+    # EGL-22-D2: apply skips ONLY on known not-enforced. Unknown
+    # enforcement refuses (rc 1) — a host whose pasta profile we cannot
+    # confirm is unenforced must not silently skip the amendment.
+    pasta_enforced || true
+    # EGL-39/D39-1: podman label state is informational only — it never
+    # gates the apply (unlabeled hosts still get the amendment,
+    # future-proofing; D39-1). Only the pasta side can skip/refuse
+    # (EGL-22-D2, unchanged).
+    podman_labeled || true
+    if (( pasta_enforce_state == 1 )); then
+        echo "AppArmor: pasta not enforced; skipping"
+        return 0
+    fi
+    if (( pasta_enforce_state == 2 )); then
+        echo "egresslock-setup: --apparmor-add: cannot determine whether pasta is AppArmor-enforced" >&2
+        echo "  (${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles} unreadable by this user — root-only on this kernel);" >&2
+        echo "  refusing to skip — run as root, then re-run." >&2
+        return 1
+    fi
+    if (( pasta_enforce_state == 3 )); then
+        echo "AppArmor: not enabled; skipping"
+        return 0
+    fi
+    if [[ ! -f "$apparmor_dir/usr.bin.pasta.local" ]]; then
+        echo "egresslock-setup: --apparmor-add: no pasta snippet at $apparmor_dir/usr.bin.pasta.local" >&2
+        echo "  the resolved share tree is incomplete; run from a complete kit tree" >&2
+        echo "  (checkout, tarball extraction, .deb, or a full install-kit prefix deploy)" >&2
+        return 1
+    fi
+    # ARC-72-D2: resolve BEFORE any write — never half-apply the way the
+    # dogfood host did (rule in a local file, reload target missing).
+    if ! resolve_pasta_profile "$aa_d"; then
+        return 1
+    fi
+    # R-EGL-20-1 finding 1 (apply path): a legacy EGL-14-patched host
+    # resolves with pasta_had_include=1, so install_compat_include never
+    # runs — shed its loadable non-dot backup here instead.
+    migrate_legacy_backup "$pasta_profile_file"
+    # EGL-14-D1: if the distro profile has no local include, install a
+    # marked compatibility include so the rule we write actually loads.
+    # EGL-20-D4: a profile with no brace attached to the pasta header
+    # refuses here (nothing written — resolve-before-write still holds).
+    installed_patch=0
+    if [[ "$pasta_had_include" == 0 ]]; then
+        if ! install_compat_include "$pasta_profile_file" usr.bin.pasta; then
+            return 1
+        fi
+        installed_patch=1
+    fi
+    already=0
+    if [[ -f "$pasta_local_file" ]] && grep -Eq "$apparmor_signal_re" "$pasta_local_file"; then
+        already=1
+    fi
+    if (( already && installed_patch == 0 )); then
+        echo "AppArmor: pasta local profile already allows podman SIGTERM ($pasta_local_file)"
+        podman_noop_note
+        return 0
+    fi
+    if (( ! already )); then
+        echo "AppArmor: updating pasta local profile ($pasta_local_file) to allow podman SIGTERM"
+        mkdir -p "$(dirname "$pasta_local_file")"
+        # ARC-69-D5: a blank separator only when appending after existing
+        # non-empty content — an empty (or missing) local file must not
+        # start with a stray blank line (finding 7).
+        if [[ -s "$pasta_local_file" ]] && grep -q '[^[:space:]]' "$pasta_local_file"; then
+            echo "" >> "$pasta_local_file"
+        fi
+        {
+            # ARC-66-D2: marker-scoped block so `--apparmor-remove` can
+            # strip exactly our lines and leave operator lines alone.
+            echo "$apparmor_block_begin"
+            echo "$apparmor_legacy_start"
+            cat "$apparmor_dir/usr.bin.pasta.local"
+            echo "$apparmor_block_end"
+        } >> "$pasta_local_file"
+    fi
+    if ! command -v apparmor_parser >/dev/null 2>&1; then
+        echo "egresslock-setup: --apparmor-add: apparmor_parser not found; rule written but NOT reloaded" >&2
+        return 1
+    fi
+    if ! apparmor_parser -r "$pasta_profile_file"; then
+        echo "egresslock-setup: --apparmor-add: apparmor_parser failed for $pasta_profile_file; rule written but NOT reloaded" >&2
+        return 1
+    fi
+    # ARC-72-D3: setup does not read the kernel AppArmor state or probe
+    # podman's store (root's store is the wrong one); the kernel took the
+    # rule when the ACCOUNT's netns probe succeeds.
+    # EGL-14-D2: parser rc alone proves nothing — confirm the rule is in
+    # the loaded profile before claiming success.
+    if ! pasta_rule_loaded "$pasta_profile_file"; then
+        echo "egresslock-setup: --apparmor-add: reloaded but the signal rule is NOT present in the loaded profile ($pasta_profile_file)" >&2
+        echo "  the profile may not reference its local fragment; the netns probe is the final check" >&2
+        return 1
+    fi
+    echo "AppArmor: pasta profile reloaded ($pasta_profile_file). Confirm with: sudo egresslock-setup --apparmor-check"
+    podman_noop_note
+    return 0
+}
+
+# ARC-66-D1: the inverse of apply. Strips ONLY the marker-scoped block
+# (new begin/end markers, or the legacy single start-line shape already
+# on lab hosts) from the RESOLVED local include (ARC-72-D1) and, when
+# different, the legacy local/usr.bin.pasta path; never rm's the files
+# (often an apparmor conffile holding operator lines); an unmarked
+# `signal (receive) ... peer=podman` is never guessed at (rc 1, file
+# unchanged). Idempotent: already gone -> rc 0. Works without pasta
+# enforcement, without the shipped snippet, and without the distro
+# profile (ARC-72-D4: unapply is file cleanup — a missing profile only
+# means the reload is skipped with a warning, rc stays 0).
+unapply_apparmor() {
+    local aa_d tmp rc
+    local -a targets=()
+    aa_d="${EGRESSLOCK_APPARMOR_D:-/etc/apparmor.d}"   # test hook (mock harness)
+    resolve_pasta_profile "$aa_d" >/dev/null 2>&1 || true
+    [[ -n "$pasta_local_file" && -f "$pasta_local_file" ]] && targets+=("$pasta_local_file")
+    if [[ -f "$aa_d/local/usr.bin.pasta" && "$aa_d/local/usr.bin.pasta" != "$pasta_local_file" ]]; then
+        targets+=("$aa_d/local/usr.bin.pasta")
+    fi
+    if (( ${#targets[@]} == 0 )) \
+        && ! { [[ -n "$pasta_profile_file" && -f "$pasta_profile_file" ]] \
+               && grep -q "$apparmor_patch_begin" "$pasta_profile_file"; }; then
+        echo "AppArmor: no pasta local include under $aa_d (already gone)"
+        return 0
+    fi
+    local target changed_any=0 refused=0
+    for target in "${targets[@]}"; do
+        if ! grep -q -e "$apparmor_block_begin" -e "$apparmor_legacy_start" "$target"; then
+            if grep -Eq "$apparmor_signal_re" "$target"; then
+                echo "egresslock-setup: --apparmor-remove: found an unmarked 'signal (receive) ... peer=podman'" >&2
+                echo "  rule in $target with no egresslock block marker; not guessing —" >&2
+                echo "  edit the file by hand (keep any rule you wrote yourself), then re-run." >&2
+                refused=1
+            fi
+            continue
+        fi
+        tmp="$(mktemp "$(dirname "$target")/.pasta.strip.XXXXXX")"
+        awk -v begin="$apparmor_block_begin" -v end="$apparmor_block_end" \
+            -v legacy="$apparmor_legacy_start" -v sig="$apparmor_signal_re" '
+            $0 == begin || index($0, begin) == 1 { inblk=1; changed=1; next }
+            inblk && (index($0, end) == 1) { inblk=0; next }
+            inblk { next }
+            index($0, legacy) == 1 { inold=1; changed=1; next }
+            inold && $0 ~ sig { inold=0; next }
+            inold { next }
+            { print }
+            END { exit !changed }
+        ' "$target" > "$tmp" || { rm -f "$tmp"; continue; }
+        # ARC-69-D5: drop a single blank line immediately before the
+        # begin (or legacy start) marker — the separator the old apply
+        # unconditionally wrote (finding 7).
+        awk -v begin="$apparmor_block_begin" -v legacy="$apparmor_legacy_start" '
+            { l[NR] = $0 }
+            END {
+                for (i = 1; i <= NR; i++) {
+                    if (l[i] == "" && i < NR \
+                        && (index(l[i+1], begin) == 1 || index(l[i+1], legacy) == 1)) continue
+                    print l[i]
+                }
+            }
+        ' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+        if grep -Eq "$apparmor_signal_re" "$tmp"; then
+            # Our block is gone but another (unmarked) signal rule remains:
+            # ambiguous ownership — do not write, point at the file.
+            rm -f "$tmp"
+            echo "egresslock-setup: --apparmor-remove: $target still has an unmarked 'signal (receive) peer=podman'" >&2
+            echo "  rule after stripping the egresslock block; leaving the file untouched —" >&2
+            echo "  edit it by hand if that rule is not yours." >&2
+            refused=1
+            continue
+        fi
+        # ARC-69-D5: write INTO the existing file — mv would replace the
+        # inode (and clobber the mode/owner of a dpkg conffile, finding
+        # 6); whitespace-only residue truncates to 0 bytes.
+        if grep -q '[^[:space:]]' "$tmp"; then
+            cat "$tmp" > "$target"
+        else
+            : > "$target"
+        fi
+        rm -f "$tmp"
+        changed_any=1
+        echo "AppArmor: removed the egresslock pasta amendment from $target"
+    done
+    # EGL-14-D1: also strip any compatibility include we added to the
+    # distro profile, and reload if that changed it. EGL-20-D3: a strip
+    # that would destroy the profile refuses (rc 1) — nothing further.
+    local prof_changed=0
+    if [[ -n "$pasta_profile_file" && -f "$pasta_profile_file" ]]; then
+        if ! strip_compat_include "$pasta_profile_file"; then
+            refused=1
+        fi
+        prof_changed=$pasta_profile_changed
+    fi
+    if (( refused )); then
+        return 1
+    fi
+    if (( changed_any == 0 && prof_changed == 0 )); then
+        echo "AppArmor: no egresslock pasta amendment under $aa_d (already gone)"
+        return 0
+    fi
+    if command -v apparmor_parser >/dev/null 2>&1 && [[ -n "$pasta_profile_file" && -f "$pasta_profile_file" ]]; then
+        # EGL-23-D2: skip the read cache so a stale compiled profile
+        # cannot keep the old (amended) policy after a successful strip.
+        if ! apparmor_parser -r -T -- "$pasta_profile_file"; then
+            # EGL-23-D1: a failed reload must not look like success.
+            echo "egresslock-setup: --apparmor-remove: apparmor_parser failed for $pasta_profile_file; rule stripped but NOT reloaded" >&2
+            return 1
+        fi
+        # EGL-23-D3: negative file check — the signal rule must be
+        # ABSENT from the flattened profile now. Parse-time only; the
+        # kernel proof is the account tearing down its rootless netns
+        # then re-probing.
+        if pasta_rule_loaded "$pasta_profile_file"; then
+            echo "egresslock-setup: --apparmor-remove: the signal rule is STILL present in the profile after remove ($pasta_profile_file)" >&2
+            echo "  the amendment may not have been stripped; leaving the files as-is — inspect by hand." >&2
+            return 1
+        fi
+        echo "AppArmor: pasta profile reloaded ($pasta_profile_file)"
+    else
+        # ARC-72-D4: missing profile / parser must not fail the cleanup.
+        echo "AppArmor: apparmor_parser or pasta profile missing; file updated but NOT reloaded" >&2
+    fi
+    return 0
+}
+
+# EGL-14-D3: read-only AppArmor/pasta amendment health report. Works
+# without root (files are world-readable; aa-status --enabled needs no
+# privilege). Exits nonzero when a required element is missing.
+# EGL-21-D1: always emits the greppable extension + patch pair; the
+# patch is detected by marker in the resolved profile, independent of
+# pasta_had_include. `pasta profile: found` means the file exists, never
+# "loaded" (only the kernel knows that).
+doctor_apparmor() {
+    local aa_d rc=0
+    aa_d="${EGRESSLOCK_APPARMOR_D:-/etc/apparmor.d}"
+    # R-EGL-22-1 Finding 1: the predicate returns rc 1 for states 2/3;
+    # a bare call under set -euo pipefail aborts BEFORE any echo, so
+    # --apparmor-check would print nothing on unknown/not-enabled. Use a
+    # condition context; the state variable drives the message.
+    pasta_enforced || true
+    # EGL-29-D1: two separate greppable lines — "is AppArmor on?" and
+    # "is pasta enforced?" have different epistemic status on hosts
+    # where the kernel listing is root-only (the EGL-22 labeled-host
+    # amendment).
+    if (( pasta_enforce_state == 0 )); then
+        echo "AppArmor: enabled"
+        echo "pasta enforcement: enforced"
+    elif (( pasta_enforce_state == 1 )); then
+        echo "AppArmor: enabled"
+        echo "pasta enforcement: NOT enforced"
+        rc=1
+    elif (( pasta_enforce_state == 2 )); then
+        echo "AppArmor: enabled"
+        echo "pasta enforcement: unknown"
+        rc=1
+    else
+        echo "AppArmor: not enabled"
+        echo "pasta enforcement: n/a"
+        rc=1
+    fi
+    # EGL-39 / D39-3: podman label tri-state + amendment verdict. The
+    # verdict needs the pasta state (above) and the label state; the
+    # doctor is read-only (EGL-24-D1): it NAMES the probe, never runs
+    # it. Never claim "not needed" from an UNKNOWN component
+    # (EGL-22-D2 polarity).
+    podman_labeled || true
+    local verdict
+    if (( pasta_enforce_state == 0 )) && (( podman_label_state == 0 )); then
+        verdict="required on this host"
+    elif (( pasta_enforce_state == 1 || pasta_enforce_state == 3 )); then
+        verdict="not required on this host (pasta not enforced)"
+    elif (( podman_label_state == 1 )); then
+        verdict="not required on this host (podman unlabeled)"
+    else
+        verdict="condition unknown (verify: podman unshare --rootless-netns true as the account)"
+    fi
+    if (( podman_label_state == 0 )); then
+        echo "podman label: labeled"
+    elif (( podman_label_state == 1 )); then
+        echo "podman label: unlabeled"
+    else
+        echo "podman label: unknown"
+    fi
+    echo "pasta amendment: $verdict"
+    local ext_state="MISSING" rule_state="absent"
+    if ! resolve_pasta_profile "$aa_d" >/dev/null 2>&1; then
+        echo "pasta profile: missing file (tried $aa_d/usr.bin.pasta, $aa_d/pasta)"
+        rc=1
+    else
+        echo "pasta profile: found ($pasta_profile_file)"
+        # EGL-32 / D32-1: two lines, each with ownership; the separate
+        # `egresslock compatibility patch:` line is dropped (it was the
+        # egresslock variant of the extension line).
+        if grep -q "$apparmor_patch_begin" "$pasta_profile_file"; then
+            ext_state="present"
+            echo "pasta local extension: present (egresslock)"
+        elif [[ "$pasta_had_include" == 1 ]]; then
+            ext_state="present"
+            echo "pasta local extension: present (stock)"
+        else
+            echo "pasta local extension: MISSING"
+            # EGL-60 / D60-2 (amending EGL-39 / D39-4): a missing local
+            # extension is unhealthy (rc 1) only when the amendment is
+            # REQUIRED or the condition is UNKNOWN. On a KNOWN-unlabeled
+            # host the verdict above is already "not required on this
+            # host" and the stock shape (no local include, no rule) is
+            # the healthy state, so rc stays 0 and the D50-3
+            # `elif (( rc == 0 ))` Summary path prints CHECK OK (not
+            # needed). The MISSING detail line stays as evidence; the
+            # EGL-14 silently-inert-rule landmine is an --apparmor-add
+            # (apply) concern (D39-1), not a check verdict.
+            if [[ "$verdict" == "not required on this host"* ]]; then
+                :
+            else
+                rc=1
+            fi
+        fi
+        if [[ -f "$pasta_local_file" ]] && grep -Eq "$apparmor_signal_re" "$pasta_local_file"; then
+            rule_state="present"
+            if grep -q -e "$apparmor_block_begin" -e "$apparmor_legacy_start" "$pasta_local_file"; then
+                echo "egresslock rule in local file: present (egresslock)"
+            else
+                echo "egresslock rule in local file: present (stock)"
+            fi
+        else
+            echo "egresslock rule in local file: absent"
+            # EGL-39 / D39-4 (amended by EGL-60 / D60-2): an absent rule
+            # is HEALTHY (rc stays 0) when the verdict is a KNOWN
+            # "not needed" and the pasta side is fully healthy — profile
+            # found, and the extension either present or, since EGL-60,
+            # MISSING only on a known-unlabeled host (the MISSING branch
+            # above leaves rc 0 there). Labeled or UNKNOWN with the rule
+            # absent stays rc 1 (the EGL-14 fixture is now
+            # labeled+enforced missing-ext, D60-2). rc==0 here also
+            # implies the enforcement pair set no rc 1 (pasta
+            # known-enforced), so "not needed" can only be the
+            # podman-unlabeled case.
+            if (( rc == 0 )) && [[ "$verdict" == "not required on this host"* ]]; then
+                :
+            else
+                rc=1
+            fi
+        fi
+    fi
+    # EGL-50 / D50-3 + D50-6.4: final Summary line — one unambiguous
+    # verdict the user can act on; exit code agrees with the summary
+    # (EGL-14-D3 rc contract; UNKNOWN is rc 1, never rc 0 — EGL-22-D2
+    # polarity — and never rc 2, which stays usage-error). First match
+    # wins; the detail lines above are unchanged evidence.
+    if (( pasta_enforce_state == 2 )) || (( podman_label_state == 2 )) || [[ "$verdict" == "condition unknown"* ]]; then
+        echo "Summary: CHECK UNKNOWN (run as root if apparmor policy not visible to current user)"
+        rc=1
+    elif [[ "$verdict" == "required on this host" ]]; then
+        if [[ "$ext_state" == "present" && "$rule_state" == "present" ]]; then
+            echo "Summary: CHECK OK (AppArmor patch applied)"
+            rc=0
+        elif [[ "$ext_state" == "MISSING" && "$rule_state" == "absent" ]]; then
+            echo "Summary: CHECK FAILED (AppArmor patch needed)"
+            rc=1
+        else
+            echo "Summary: CHECK FAILED (AppArmor patch incomplete)"
+            rc=1
+        fi
+    elif (( rc == 0 )); then
+        echo "Summary: CHECK OK (AppArmor patch not needed)"
+        rc=0
+    else
+        echo "Summary: CHECK FAILED (AppArmor patch incomplete)"
+        rc=1
+    fi
+    return $rc
+}
+
+if [[ "$aa_check" == 1 ]]; then
+    doctor_apparmor
+    exit $?
+fi
+
+if [[ "$apparmor" == 1 ]]; then
+    if [[ "$aa_remove" == 1 ]]; then
+        unapply_apparmor || exit 1
+    else
+        setup_apparmor || exit 1
+    fi
+else
+    pasta_enforced || true
+    podman_labeled || true
+    if (( pasta_enforce_state == 0 )) && (( podman_label_state != 1 )); then
+        # ARC-22-D3: one stderr hint when the flag was not passed; never
+        # aa-complain, never an automatic write. Known-enforced only.
+        # EGL-39 / D39-5: suppressed when podman is KNOWN-unlabeled —
+        # the denial cannot fire there (the hint is noise on stock
+        # Debian). UNKNOWN keeps the hint (conservative).
+        echo "egresslock-setup: hint: pasta is AppArmor-enforced; if the netns probe fails, apply the shipped rule with --apparmor-add (snippet: $apparmor_dir/usr.bin.pasta.local)" >&2
+    elif (( podman_label_state == 1 )) && (( pasta_enforce_state != 2 )); then
+        # EGL-39 / D39-2 surface 1: the account-setup path states the
+        # conditionality in one line when the answer is KNOWN
+        # (silence on UNKNOWN — D39-2). The amendment itself stays
+        # opt-in (ARC-22-D3); this line never applies anything.
+        echo "AppArmor: podman unlabeled; pasta amendment not needed on this host (--apparmor-add applies anyway — future-proofing)"
+    fi
+fi
+
+if [[ -z "$account" ]]; then
+    # EGL-25-D1: apparmor-only runs already printed their outcome line;
+    # the ARC-69-D6 "no account setup requested" closer is dropped for
+    # them (it read as if an account step was expected). Account runs
+    # continue below. --doctor / --build-gateway without an account are
+    # their own read-only / account-shell actions (D38-2, D38-3): they
+    # dispatch after the run_as_account definition below, so fall
+    # through here instead of taking the closer.
+    if [[ "$apparmor" == 1 ]]; then
+        exit 0
+    fi
+    if [[ "$doctor" == 0 && "$buildgw" == 0 ]]; then
+        # No account AND no apparmor subcommand ran — keep the original
+        # ARC-69-D6 closer wording.
+        echo "egresslock-setup: no account setup requested"
+        exit 0
+    fi
+fi
+
+# ARC-19-D2: --init-conf without --conf uses the README well-known path
+# (~/.config/egresslock/main.conf) inside the account's home.
+if [[ -n "$account" && -z "$conf" ]]; then
+    conf="$home/.config/egresslock/main.conf"
+fi
+
+# Account-side scripts. Root mode: as the account (runuser). Hook mode
+# (non-root tests): directly, into EGRESSLOCK_ACCOUNT_HOME.
+# shellcheck disable=SC2016  # $A18_*/$A19_* expand at RUNTIME inside the dispatched script, not here
+init_conf_script='
+set -euo pipefail
+mkdir -p "$(dirname "$A19_DST_CONF")"
+cp "$A19_EXAMPLES/main.conf" "$A19_DST_CONF"
+if [[ ! -e "$(dirname "$A19_DST_CONF")/main-allowlist" ]]; then
+    cp "$A19_EXAMPLES/main-allowlist" "$(dirname "$A19_DST_CONF")/main-allowlist"
+fi
+'
+# shellcheck disable=SC2016  # $A18_* expand at RUNTIME inside the dispatched script, not here
+write_unit_env='
+set -euo pipefail
+mkdir -p "$A18_NET_DIR"
+{
+    printf "EGRESSLOCK_CONF=%s\n" "$A18_CONF"
+    if [[ -n "${A18_PROFILE:-}" ]]; then printf "EGRESSLOCK_PROFILE=%s\n" "$A18_PROFILE"; fi
+} > "$A18_NET_DIR/unit.env"
+chmod 600 "$A18_NET_DIR/unit.env"
+'
+# shellcheck disable=SC2016  # $A18_* expand at RUNTIME inside the dispatched script, not here
+build_gw='
+set -euo pipefail
+if podman image exists "$A18_GW_IMG" 2>/dev/null; then
+    echo "egresslock-setup: gateway image present"
+else
+    podman build -t "$A18_GW_IMG" -f "$A18_PREFIX/gateway/Containerfile" "$A18_PREFIX/gateway"
+fi
+'
+# shellcheck disable=SC2016  # $A60_* expand at RUNTIME inside the dispatched script, not here
+migrate_confdir='
+set -euo pipefail
+mv "$A60_OLD" "$A60_NEW"
+echo "migrated: $A60_OLD → $A60_NEW"
+shopt -s nullglob
+for f in "$A60_NEW"/*.conf; do
+    echo "  $(basename "$f")"
+done
+'
+
+run_as_account() { # $@ = command words
+    if [[ "$(id -u)" == 0 ]]; then
+        # runuser inherits the CALLER's CWD and tries to chdir into it
+        # AS THE ACCOUNT. Invoked from an operator checkout the account
+        # cannot traverse (a 0700 home), that chdir fails — the on-host
+        # 'cannot chdir ...: Permission denied' failure (ARC-19). Run
+        # from the account's own home instead; every path this script
+        # passes is absolute, so the CWD is irrelevant to the commands.
+        ( cd "$home" && runuser -u "$account" -- env \
+            A18_NET_DIR="$home/.config/egresslock" \
+            A18_CONF="$conf" A18_PROFILE="$profile_name" \
+            A18_PREFIX="$prefix" A18_GW_IMG="$gw_img" \
+            A19_EXAMPLES="$examples_dir" A19_DST_CONF="$conf" \
+            A60_OLD="$home/.config/agent-network" \
+            A60_NEW="$home/.config/egresslock" \
+            "$@" )
+    else
+        env A18_NET_DIR="$EGRESSLOCK_ACCOUNT_HOME/.config/egresslock" \
+            A18_CONF="$conf" A18_PROFILE="$profile_name" \
+            A18_PREFIX="$prefix" A18_GW_IMG="$gw_img" \
+            A19_EXAMPLES="$examples_dir" A19_DST_CONF="$conf" \
+            A60_OLD="$home/.config/agent-network" \
+            A60_NEW="$home/.config/egresslock" \
+            "$@"
+    fi
+}
+
+# EGL-38-D2/D38-5/D38-7.2: full-state doctor — read-only; one
+# `key: value` line per check (greppable, like the engine's doctor,
+# EGL-45/D45-2), each missing required item followed by the command
+# that fixes it. Host slice (no --account): engine + unit templates.
+# Account slice adds conf parse, unit.env match, timer, linger, and
+# (for gateway confs) the user manager and the gateway image, plus one
+# advisory profile-networks row (EGL-55-D1; rc-neutral). AppArmor
+# is one pointer line — the pasta slice stays --apparmor-check's
+# (EGL-32 strings are never duplicated here). rc 1 when any required
+# item is missing.
+doctor_kit() {
+    local rc=0 list_out lg ud duid conf_ok=0
+    if [[ -f "$prefix/egresslock" ]]; then
+        echo "kit engine: present ($prefix)"
+    else
+        echo "kit engine: MISSING ($prefix/egresslock)"
+        echo "  fix: .deb hosts: reinstall the current package; prefix installs: re-run install-kit.sh (or pass --prefix)"
+        rc=1
+    fi
+    ud="${EGRESSLOCK_UNIT_DIR:-${EGRESSLOCK_DEFAULT_UNIT_DIR:-/etc/systemd/system}}"
+    if [[ -f "$ud/egresslock-verify@.service" && -f "$ud/egresslock-verify@.timer" ]]; then
+        echo "unit templates: installed ($ud)"
+    elif [[ -z "${EGRESSLOCK_UNIT_DIR:-}" \
+            && -f "${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.service" \
+            && -f "${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.timer" ]]; then
+        echo "unit templates: installed (${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system})"
+    else
+        echo "unit templates: MISSING (no egresslock-verify@.service/.timer)"
+        echo "  fix: re-run install-kit.sh (installs the verify unit templates)"
+        rc=1
+    fi
+    echo "AppArmor: see egresslock-setup --apparmor-check (pasta slice)"
+    if [[ -z "$account" ]]; then
+        return $rc
+    fi
+    if list_out="$(run_as_account "$prefix/egresslock" --config "$conf" list 2>&1)"; then
+        echo "conf parse: ok ($conf)"
+        conf_ok=1
+    else
+        echo "conf parse: FAIL ($conf)"
+        printf '%s\n' "$list_out" | sed 's/^/  /'
+        echo "  fix: correct the conf (see the engine output above)"
+        rc=1
+    fi
+    if [[ ! -f "$home/.config/egresslock/unit.env" ]]; then
+        echo "unit.env: missing ($home/.config/egresslock/unit.env)"
+        echo "  fix: sudo egresslock-setup --account $account --conf $conf${profile_name:+ --profile $profile_name}"
+        rc=1
+    elif ! grep -qx "EGRESSLOCK_CONF=$conf" "$home/.config/egresslock/unit.env" \
+            || { [[ -n "$profile_name" ]] && ! grep -qx "EGRESSLOCK_PROFILE=$profile_name" "$home/.config/egresslock/unit.env"; }; then
+        echo "unit.env: MISMATCH (does not match --conf${profile_name:+/--profile}; see $home/.config/egresslock/unit.env)"
+        echo "  fix: sudo egresslock-setup --account $account --conf $conf${profile_name:+ --profile $profile_name}"
+        rc=1
+    else
+        echo "unit.env: matches ($home/.config/egresslock/unit.env)"
+    fi
+    if systemctl is-enabled --quiet "egresslock-verify@$account.timer" 2>/dev/null; then
+        echo "timer: enabled (egresslock-verify@$account.timer)"
+    else
+        echo "timer: not enabled"
+        echo "  fix: sudo egresslock-setup --account $account --enable"
+        rc=1
+    fi
+    lg="$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)"
+    if [[ "$lg" == "yes" ]]; then
+        echo "linger: on"
+    else
+        echo "linger: off"
+        echo "  fix: sudo loginctl enable-linger $account  (or re-run setup with --enable)"
+        rc=1
+    fi
+    if grep -qE '^[[:space:]]*gateway[[:space:]]' "$conf"; then
+        if [[ "$(id -u)" == 0 ]]; then
+            duid="$(getent passwd "$account" 2>/dev/null | cut -d: -f3)"
+        else
+            duid="$(id -u)"   # hook mode: the invoking process IS the account
+        fi
+        if [[ -n "$duid" ]] && systemctl is-active --quiet "user@${duid}.service" 2>/dev/null; then
+            echo "user manager: active (user@${duid}.service)"
+        else
+            echo "user manager: not active (user@${duid:-?}.service)"
+            echo "  fix: sudo systemctl start user@${duid:-<uid>}.service"
+            rc=1
+        fi
+        if run_as_account podman image exists "$gw_img" 2>/dev/null; then
+            echo "gateway image: present ($gw_img)"
+        else
+            echo "gateway image: missing ($gw_img)"
+            echo "  fix: sudo egresslock-setup --account $account --conf $conf (the bundle builds it), or in the account shell: egresslock-setup --build-gateway"
+            rc=1
+        fi
+    else
+        echo "user manager: n/a (no gateway line in $conf)"
+        echo "gateway image: n/a (no gateway line in $conf)"
+    fi
+    # EGL-55-D1: advisory runtime peek — has the account's `ensure`
+    # created the conf's profile networks? Network existence is a proxy
+    # for "ensure ran", not "policy is live" (that stays `egresslock
+    # verify`); the row is rc-neutral (fresh pre-ensure is normal),
+    # never runs `ensure`, and never starts user@ (read-only). Skipped
+    # when the conf itself does not parse. Says "missing", never
+    # "never ensured": `network ls` cannot tell teardown from first-run.
+    if [[ "$conf_ok" == 1 ]]; then
+        local acct_nets p netname p2 runs
+        local -a acct_miss=() acct_have=()
+        if acct_nets="$(run_as_account podman network ls --format '{{.Name}}' 2>/dev/null)"; then
+            while IFS= read -r p; do
+                [[ -z "$p" ]] && continue
+                if netname="$(run_as_account "$prefix/egresslock" --config "$conf" network "$p" 2>/dev/null)" \
+                        && grep -qxF -- "$netname" <<<"$acct_nets"; then
+                    acct_have+=("$p")
+                else
+                    acct_miss+=("$p")
+                fi
+            done < <(printf '%s\n' "$list_out" | tail -n +2 | awk '{print $1}')
+            if (( ${#acct_miss[@]} == 0 )); then
+                echo "profile networks: present ($(IFS=', '; echo "${acct_have[*]}"))"
+            else
+                runs=""
+                for p2 in "${acct_miss[@]}"; do
+                    [[ -n "$runs" ]] && runs+="; "
+                    runs+="egresslock ensure $p2"
+                done
+                echo "profile networks: missing (${acct_miss[*]}) — run: $runs"
+            fi
+        else
+            # No session / user@ down: unknown, not failure; never start
+            # user@ from this read-only row.
+            echo "profile networks: unknown"
+        fi
+    fi
+    return $rc
+}
+
+# EGL-38-D3/D38-7.3: --build-gateway — the account-shell build form.
+# Runs as the INVOKING user (no --account, no runuser), builds from the
+# deployed/share prefix (never the checkout CWD rules of build-gateway),
+# never starts user@ and never enables linger: the user manager must
+# already be active (session or linger), else fail closed with the
+# EGL-51-D1 stderr and no build. Root --account bundles keep the
+# D1 start-then-build helper.
+build_gw_standalone() {
+    local uid lg gdir
+    uid="$(id -u)"
+    if ! systemctl is-active --quiet "user@${uid}.service" 2>/dev/null; then
+        echo "egresslock-setup: no systemd user manager for '$(id -un)' (user@${uid}.service inactive). As root: systemctl start user@${uid}.service" >&2
+        lg="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+        [[ "$lg" == "yes" ]] || \
+            echo "egresslock-setup: ... and: loginctl enable-linger $(id -un)  (or re-run the account bundle setup with --enable)" >&2
+        exit 1
+    fi
+    if [[ -n "${EGRESSLOCK_SHARE:-}" && -f "$EGRESSLOCK_SHARE/gateway/Containerfile" ]]; then
+        gdir="$EGRESSLOCK_SHARE/gateway"
+    elif [[ -f "$prefix/gateway/Containerfile" ]]; then
+        gdir="$prefix/gateway"
+    else
+        echo "egresslock-setup: --build-gateway: no gateway build context (tried ${EGRESSLOCK_SHARE:-$prefix}/gateway and $prefix/gateway); install-kit.sh deploys it to the prefix" >&2
+        exit 1
+    fi
+    if podman image exists "$gw_img" 2>/dev/null; then
+        echo "egresslock-setup: gateway image present"
+    else
+        podman build -t "$gw_img" -f "$gdir/Containerfile" "$gdir"
+    fi
+}
+
+# EGL-38-D5: --doctor is the kit/account state check (D38-2); the
+# engine's `egresslock doctor` (EGL-45) is the separate host
+# environment probe. Account-less runs are the host slice only.
+kit_rc=0
+if [[ "$doctor" == 1 ]]; then
+    doctor_kit || kit_rc=$?
+    exit "$kit_rc"
+fi
+if [[ "$buildgw" == 1 ]]; then
+    build_gw_standalone
+    exit $?
+fi
+
+# ARC-60-D2: confdir migration — before anything is written or validated.
+# Old confdir present + new absent: mv it (as the account, so ownership
+# stays the account's) and print what moved. BOTH present: refuse (rc 1),
+# name both paths, never merge, never overwrite — the operator picks.
+# The engine never reads the old confdir as a fallback (ARC-47-D3).
+old_confdir="$home/.config/agent-network"
+new_confdir="$home/.config/egresslock"
+if [[ -d "$old_confdir" ]]; then
+    if [[ -e "$new_confdir" ]]; then
+        echo "egresslock-setup: both confdirs exist; refusing to guess (no merge, no overwrite):" >&2
+        echo "  $old_confdir (pre-rename)" >&2
+        echo "  $new_confdir (current)" >&2
+        echo "  pick one by hand (mv aside or merge the files), then re-run." >&2
+        exit 1
+    fi
+    run_as_account bash -c "$migrate_confdir"
+fi
+
+# ARC-19-D2: --init-conf copies the shipped starter pair from the
+# deployed prefix, ONLY when the dest conf is missing. Never overwrites;
+# never heals an existing operator conf's missing allowlist (that would
+# be the ARC-17-D1 / R-007-1 F5 hole). Missing examples fail closed.
+if [[ "$init_conf" == 1 ]]; then
+    if [[ -e "$conf" ]]; then
+        echo "egresslock-setup: --init-conf: conf exists ($conf); leaving conf and allowlist untouched"
+    else
+        [[ -f "$examples_dir/main.conf" ]] || {
+            echo "egresslock-setup: --init-conf: no starter conf at $examples_dir/main.conf" >&2
+            echo "  the examples were not deployed to this prefix - re-run install-kit.sh" >&2
+            exit 1
+        }
+        [[ -f "$examples_dir/main-allowlist" ]] || {
+            echo "egresslock-setup: --init-conf: no starter allowlist at $examples_dir/main-allowlist" >&2
+            echo "  the examples were not deployed to this prefix - re-run install-kit.sh" >&2
+            exit 1
+        }
+        run_as_account bash -c "$init_conf_script"
+        echo "egresslock-setup: --init-conf: wrote starter $conf (+ $(dirname "$conf")/main-allowlist)"
+    fi
+fi
+
+# EGL-38-D1/D38-6/D38-7: numbered progress — one stdout line per step,
+# in execution order; SKIP when the step was not requested; FAIL is the
+# last printed numbered step (fail-closed stop). --init-conf, confdir
+# migration, and AppArmor are not numbered.
+step_line() {
+    echo "$1) $2 … $3"
+}
+
+# 1. Conf validation (fail closed BEFORE anything is written).
+[[ -f "$conf" ]] || {
+    step_line 1 "validate conf" FAIL
+    echo "egresslock-setup: conf not found: $conf" >&2
+    echo "  first run? --init-conf ships the starter conf (or point --conf" >&2
+    echo "  at a conf from your copy step). See README 'Account setup'." >&2
+    exit 1
+}
+if [[ "$(id -u)" == 0 ]]; then
+    ( cd "$home" && runuser -u "$account" -- test -r "$conf" ) || {
+        step_line 1 "validate conf" FAIL
+        echo "egresslock-setup: account $account cannot read $conf (owner/permissions?)" >&2
+        exit 1
+    }
+else
+    test -r "$conf" || {
+        step_line 1 "validate conf" FAIL
+        echo "egresslock-setup: conf not readable: $conf" >&2
+        exit 1
+    }
+fi
+list_out="$(run_as_account "$prefix/egresslock" --config "$conf" list 2>&1)" || {
+    step_line 1 "validate conf" FAIL
+    echo "egresslock-setup: conf failed to parse under the deployed engine:" >&2
+    printf '%s\n' "$list_out" >&2
+    exit 1
+}
+if [[ -n "$profile_name" ]] && ! grep -q "^$profile_name " <<<"$list_out"; then
+    step_line 1 "validate conf" FAIL
+    echo "egresslock-setup: profile '$profile_name' not in conf $conf (have: $(awk '{printf "%s ", $1}' <<<"$list_out"))" >&2
+    exit 1
+fi
+step_line 1 "validate conf" OK
+
+# 2. unit.env — exactly the wiring lines, nothing else.
+if ! run_as_account bash -c "$write_unit_env"; then
+    step_line 2 "write unit.env" FAIL
+    echo "egresslock-setup: could not write $home/.config/egresslock/unit.env as the account" >&2
+    exit 1
+fi
+step_line 2 "write unit.env" OK
+
+# 3. Optional linger (ARC-28), moved BEFORE the gateway build (EGL-51-D2):
+#    the invocation that passes --enable must not run the account-side
+#    podman build linger-less (2026-09-11 transcript: --enable
+#    built first and still had no session/linger during the build).
+#    Fail closed if linger does not stick. Without --enable: no linger
+#    (ARC-28-D3); the skip hint stays at the end (ARC-70-D2). Linger is
+#    called at most once per run.
+if [[ "$enable" == 1 ]]; then
+    echo "enabling linger for $account"
+    if ! loginctl enable-linger "$account"; then
+        step_line 3 "linger" FAIL
+        echo "egresslock-setup: ERROR loginctl enable-linger failed for '$account'. Run manually: loginctl enable-linger $account" >&2
+        exit 1
+    fi
+    linger="$(loginctl show-user "$account" -p Linger --value)"
+    if [[ "$linger" != "yes" ]]; then
+        step_line 3 "linger" FAIL
+        echo "egresslock-setup: ERROR linger for '$account' did not stick (show-user Linger=$linger). The verify timer needs /run/user/<uid> outside login sessions. Run manually: loginctl enable-linger $account" >&2
+        exit 1
+    fi
+    step_line 3 "linger" OK
+else
+    step_line 3 "linger" SKIP
+fi
+
+# 4+5. User manager + gateway image (only profiles that declare one).
+#    EGL-51-D1: a never-logged-in account has no systemd user manager
+#    (user@<uid>.service): account-side podman falls back to cgroupfs
+#    and still dies on the sd-bus create call (2026-09-11: crun
+#    "Access denied ... requires interactive authentication"). Start the
+#    user manager (start, never restart — EGL-36; already-active is a
+#    no-op) and fail closed before the first account-side podman call.
+#    D38-7: these are numbered steps 4 and 5, in this order; the
+#    gateway image is never reached when the user manager FAILs.
+if grep -qE '^[[:space:]]*gateway[[:space:]]' "$conf"; then
+    if [[ "$(id -u)" == 0 ]]; then
+        uid="$(getent passwd "$account" 2>/dev/null | cut -d: -f3)"
+    else
+        uid="$(id -u)"   # hook mode: the invoking process IS the account
+    fi
+    if [[ -z "$uid" ]]; then
+        step_line 4 "user manager" FAIL
+        echo "egresslock-setup: cannot resolve the uid of '$account' (getent passwd failed); cannot start user@.service" >&2
+        exit 1
+    fi
+    if ! systemctl start "user@${uid}.service"; then
+        step_line 4 "user manager" FAIL
+        echo "egresslock-setup: systemctl start user@${uid}.service failed for '$account'" >&2
+        exit 1
+    fi
+    if ! systemctl is-active --quiet "user@${uid}.service"; then
+        step_line 4 "user manager" FAIL
+        echo "egresslock-setup: no systemd user manager for '$account' (user@${uid}.service inactive). As root: systemctl start user@${uid}.service" >&2
+        linger="$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)"
+        [[ "$linger" == "yes" ]] || \
+            echo "egresslock-setup: ... and: loginctl enable-linger ${account}  (or re-run setup with --enable)" >&2
+        exit 1
+    fi
+    step_line 4 "user manager" OK
+    if ! run_as_account bash -c "$build_gw"; then
+        step_line 5 "gateway image" FAIL
+        echo "egresslock-setup: gateway image build failed for '$account' (see the podman output above)" >&2
+        exit 1
+    fi
+    step_line 5 "gateway image" OK
+else
+    echo "egresslock-setup: no gateway profiles in conf; skipping image build"
+    step_line 4 "user manager" SKIP
+    step_line 5 "gateway image" SKIP
+fi
+
+# 6. Optional timer enable. --enable arms the verify timer; the linger
+#    half of the old --enable block (ARC-28) moved above, before the
+#    gateway build (EGL-51-D2), so this step only arms the timer.
+if [[ "$enable" == 1 ]]; then
+    # Post-ARC-70-R-070-2 (maintainer): system-wide changes are never
+    # silent — announce before acting, same honesty rule as the teardown
+    # vocabulary (ARC-69-D1).
+    echo "enabling verify timer for $account (egresslock-verify@$account.timer)"
+    if ! systemctl enable --now "egresslock-verify@$account.timer"; then
+        step_line 6 "timer" FAIL
+        echo "egresslock-setup: systemctl enable --now egresslock-verify@$account.timer failed for '$account'" >&2
+        exit 1
+    fi
+    step_line 6 "timer" OK
+else
+    step_line 6 "timer" SKIP
+    # ARC-70-D2: the skip must not be silent. Staying explicit (no
+    # --no-enable / auto-default, ARC-70-D1) is fine — hiding it is not.
+    echo "egresslock-setup: timer NOT enabled — drift checks are off (linger not set). Re-run: sudo egresslock-setup --account $account --enable"
+fi
+
+echo "egresslock-setup: unit.env written for $account -> $home/.config/egresslock/unit.env"
+[[ -n "$profile_name" ]] \
+    && echo "egresslock-setup: verify mode: named ($profile_name)" \
+    || echo "egresslock-setup: verify mode: --ensured"
+echo "egresslock-setup: account '$account' is ready — it can ensure profiles now"

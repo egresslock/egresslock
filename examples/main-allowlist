@@ -1,0 +1,11 @@
+# main-allowlist — the gateway's allowed destinations, one host[:port]
+# per line.
+#
+# EMPTY by design: with no entries the gateway denies everything
+# (fail-closed starter). Grow it with:
+#   egresslock allow main <host>[:<port>]
+# or hand-edit this file and re-run: egresslock ensure main
+#
+# Note: entries are HOSTNAMES the gateway resolves (squid dstdomain).
+# Literal IPs and CIDR ranges are not accepted here — see main.conf's
+# rule shapes (allow-host takes a hostname or IPv4 literal).

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# build-gateway — build the egresslock-gateway allowlist proxy image.
+# Independent of the dev-base chain: debian:13-slim + distro squid.
+#
+# Supply chain: the base is pinned by digest in gateway/Containerfile
+# (docker.io/library/debian:13-slim@sha256:...) so a rebuild cannot
+# silently float to new base content. The `squid` apt package stays
+# UNPINNED on purpose: rebuilds take distro security updates. Update
+# the pin deliberately (new digest = new recorded review).
+#
+# Options:
+#   -h, --help   print this help
+#
+# Environment:
+#   IMAGE   gateway image tag (default: localhost/egresslock-gateway:latest)
+#
+# Defaults that are not parameter-changeable:
+#   - builds with --format docker: the OCI image format silently drops
+#     HEALTHCHECK (on-host finding)
+#   - build context: the gateway/ directory NEXT TO THIS SCRIPT
+#     (Containerfile, squid.conf, entrypoint) — the repo root, an
+#     installed prefix, or a tarball tree, whatever the script is
+#     deployed in — never the caller's current directory
+
+set -euo pipefail
+
+usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+IMAGE="${IMAGE:-localhost/egresslock-gateway:latest}"
+gw_dir="$(cd "$(dirname "$0")" && pwd)/gateway"
+[[ -f "$gw_dir/Containerfile" ]] || {
+    echo "build-gateway: no Containerfile at $gw_dir/Containerfile" >&2
+    echo "  (the gateway/ build context must sit next to this script)" >&2
+    exit 1
+}
+
+echo ">> Building ${IMAGE} FROM debian:13-slim"
+# --format docker: HEALTHCHECK is not supported by the OCI image format
+# and would be silently ignored (on-host finding, ARC-5).
+podman build \
+    --format docker \
+    -t "${IMAGE}" \
+    -f "$gw_dir/Containerfile" \
+    "$gw_dir"
+
+echo ">> Done: ${IMAGE}"

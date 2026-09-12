@@ -1,0 +1,29 @@
+# Agent container for the agentic-tool-opencode recipe.
+#
+# Built on the DEFAULT rootless network — the profile's fail-closed
+# policy applies at runtime (`podman run --network=agent-main`), not at
+# build time. No proxy/network args needed here.
+FROM docker.io/library/debian:13-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        coreutils \
+        curl \
+        git \
+        wget \
+        xz-utils \
+        openssh-client \
+        build-essential \
+        jq \
+        less \
+        procps \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ripgrep \
+        tmux \
+        vim \
+        nodejs \
+        npm \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install -g opencode-ai
+WORKDIR /workspace

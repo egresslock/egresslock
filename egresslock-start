@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+#
+# egresslock-start — daemon-start wrapper for network-profile accounts
+# (Decision ARC-7-D5; genericized ARC-16-D2/D4).
+#
+# Runs `egresslock ensure <profile>` BEFORE exec'ing the account's
+# daemon, so the profile network, anchor, gateway, and nftables policy
+# exist and are verified before any job container can start. The runner
+# account has no per-job hook to run `ensure`; the anchor container
+# keeps the rootless netns (and therefore the policy) alive across job
+# churn. If ensure fails, the daemon does not start — the designed
+# fail-closed mode.
+#
+# Deployment: this wrapper is deployed ROOT-owned into the shared kit
+# (default /opt/egresslock/, via install-kit.sh); the account's
+# policy data lives OUTSIDE any container mount in
+# ~/.config/egresslock/.
+#
+# Usage: egresslock-start <daemon args...>
+#
+# There is deliberately NO -h/--help: every argument is passed through
+# to the daemon unchanged (e.g. `egresslock-start daemon -c ...`),
+# so the wrapper cannot consume flags. This header is the reference.
+#
+# Environment (ARC-16-D2: explicit-only, no site defaults):
+#   EGRESSLOCK_DIR     dir holding egresslock. Resolution order
+#                         (ARC-16-D4): this var > /opt/egresslock >
+#                         this script's directory.
+#   EGRESSLOCK_CONF   profile config. REQUIRED.
+#   EGRESSLOCK_PROFILE         profile name to ensure. REQUIRED.
+#   RUNNER_BIN            daemon binary to exec. REQUIRED (no site
+#                         default — the unit or caller supplies it).
+#
+# Defaults that are not parameter-changeable:
+#   - XDG_RUNTIME_DIR is forced to /run/user/$(id -u) (systemd %U does
+#     not expand per-User=; rootless Podman needs the account's own
+#     runtime dir, kept alive by linger)
+#   - the daemon is exec'd ONLY after `egresslock ensure` succeeds
+#     (fail closed: no healthy policy, no daemon)
+#
+# systemd (system unit, User=<account>): ExecStart runs this wrapper,
+# which execs the daemon with its args, e.g.:
+#   Environment=RUNNER_BIN=/usr/local/bin/<daemon>
+#   ExecStart=/opt/egresslock/egresslock-start daemon -c <conf>
+
+set -euo pipefail
+
+# ARC-16-D9.1 (amended, on-host gate finding): resolve XDG_RUNTIME_DIR
+# from the executing uid — systemd's %U did not expand per-User= on the
+# gate host, and rootless Podman requires the account's own runtime dir.
+# (Assigned before export so an id -u failure cannot silently mask a void
+# XDG_RUNTIME_DIR under set -eou pipefail — SC2155.)
+_euid="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$_euid"
+
+# ARC-16-D4 engine resolution: explicit dir > installed kit > script dir.
+if [[ -n "${EGRESSLOCK_DIR:-}" ]]; then
+    kit_dir="$EGRESSLOCK_DIR"
+elif [[ -x /opt/egresslock/egresslock ]]; then
+    kit_dir=/opt/egresslock
+else
+    kit_dir="$(cd "$(dirname "$0")" && pwd)"
+fi
+tool="$kit_dir/egresslock"
+
+# ARC-16-D2: no site defaults — the unit (or caller) supplies ALL of the
+# conf, the profile, and the daemon binary (R-049 hygiene: the wrapper
+# used to default RUNNER_BIN to a site-specific daemon name; the site
+# unit has always set it explicitly).
+[[ -n "${EGRESSLOCK_PROFILE:-}" ]] || { echo "egresslock-start: EGRESSLOCK_PROFILE is required (no site default)" >&2; exit 1; }
+[[ -n "${EGRESSLOCK_CONF:-}" ]] || { echo "egresslock-start: EGRESSLOCK_CONF is required (no site default)" >&2; exit 1; }
+[[ -n "${RUNNER_BIN:-}" ]] || { echo "egresslock-start: RUNNER_BIN is required (no site default)" >&2; exit 1; }
+conf="$EGRESSLOCK_CONF"
+profile="$EGRESSLOCK_PROFILE"
+
+[[ -x "$tool" ]] || { echo "egresslock-start: egresslock not found/executable: $tool" >&2; exit 1; }
+[[ -f "$conf" ]] || { echo "egresslock-start: profile config not found: $conf" >&2; exit 1; }
+
+# Fail the daemon start (and every restart) unless the profile is fully
+# ensured: network + anchor + gateway + nftables policy, verified.
+"$tool" --config "$conf" ensure "$profile"
+
+echo "egresslock-start: profile '$profile' ensured and verified; starting daemon" >&2
+exec "$RUNNER_BIN" "$@"
