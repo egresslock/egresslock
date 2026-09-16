@@ -244,18 +244,23 @@ chmod 0644 "$prefix/VERSION"
 #     installed units' rewritten ExecStart and stay unwrapped.
 #     D3: refuse to co-install with the .deb (ARC-22-D1) and refuse to
 #     clobber a dest file that is not this prefix's own wrapper.
+#     EGL-80-L2: the deb-shape guard's /usr/bin path is hookable
+#     (EGRESSLOCK_UB_BIN, default /usr/bin/egresslock) — same pattern as
+#     the other destination hooks — so the guard is testable on hosts
+#     where the .deb is actually installed.
 path_bindir="${EGRESSLOCK_PATH_BINDIR:-/usr/local/bin}"
 path_sbindir="${EGRESSLOCK_PATH_SBINDIR:-/usr/local/sbin}"
+ub_bin="${EGRESSLOCK_UB_BIN:-/usr/bin/egresslock}"
 deb_status="$(dpkg-query -W -f='${Status}' egresslock 2>/dev/null || true)"
 if [[ "$deb_status" == *'installed'* ]]; then
     echo "install-kit: the egresslock .deb is installed on this host ($deb_status);" >&2
     echo "  never run both installs at once — 'apt remove egresslock' first (ARC-22-D1)." >&2
     exit 1
 fi
-if [[ -e /usr/bin/egresslock ]]; then
-    _ub_marker="$(sed -n '2p' /usr/bin/egresslock 2>/dev/null || true)"
+if [[ -e "$ub_bin" ]]; then
+    _ub_marker="$(sed -n '2p' "$ub_bin" 2>/dev/null || true)"
     if [[ "$_ub_marker" != '# egresslock-path-wrapper prefix='* ]]; then
-        echo "install-kit: /usr/bin/egresslock exists and is not an egresslock kit PATH" >&2
+        echo "install-kit: $ub_bin exists and is not an egresslock kit PATH" >&2
         echo "  wrapper (deb shape?); remove it first — install-kit will not clobber it." >&2
         exit 1
     fi

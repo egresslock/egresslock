@@ -293,9 +293,28 @@ netns_nft() {
 # actually touch the netns (ensure/verify/allow/teardown — ARC-26-D1).
 # Skippable for the mock harness (no real podman rootless netns) via
 # EGRESSLOCK_SKIP_NETNS_PROBE=1.
+#
+# EGL-78-D1: the probe is fail-closed with a bounded wait — a wedged
+# `podman unshare --rootless-netns true` (hung pasta, stuck unshare) must
+# be a named failure after 5s, never an indefinite block in every
+# ensure/verify/allow/teardown. timeout(1) (coreutils) is required
+# (EGL-78-D6); without it the probe fails closed with a named error.
 netns_probe() {
     [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" == "1" ]] && return 0
-    if ! podman unshare --rootless-netns true 2>/dev/null; then
+    if ! command -v timeout >/dev/null 2>&1; then
+        echo "Error: timeout(1) (coreutils) is required for the netns probe but was not found in PATH" >&2
+        return 1
+    fi
+    local prc=0
+    timeout 5 podman unshare --rootless-netns true 2>/dev/null || prc=$?
+    if (( prc == 0 )); then
+        return 0
+    fi
+    if (( prc == 124 )); then
+        # EGL-78-D1/D3: bounded probe — a hang is a named failure, not a wedge.
+        echo "Error: netns probe timed out after 5s (probe: 'timeout 5 podman unshare --rootless-netns true'); the rootless netns is not answering — check pasta/podman health before retrying" >&2
+        return 1
+    fi
         # EGL-35 (EGL-33/D39-7 wording): the probe is ground truth; the
         # cause names the LABEL (any profile mode), never "confined
         # podman"; the shipped command leads. Deep diagnosis (aa-status,
@@ -306,7 +325,6 @@ netns_probe() {
         echo "Then re-run the probe. If it still fails, see docs/troubleshooting/pasta-apparmor" >&2
         echo "(EGL-16 Debian report context). Do NOT reinstall the kit — nothing is installed wrong." >&2
         return 1
-    fi
 }
 
 anchor_image() {
@@ -3143,9 +3161,12 @@ cmd_doctor() {
     fi
 
     # Required: unprivileged user namespaces (file is 1; kernels without
-    # the sysctl always allow).
-    if [[ -r /proc/sys/kernel/unprivileged_userns_clone ]]; then
-        if [[ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" == "1" ]]; then
+    # the sysctl always allow). EGRESSLOCK_USERNS_SYSCTL is a harness
+    # override (tests pin the row to fixture files); unset = the real
+    # kernel sysctl path.
+    local userns_sysctl="${EGRESSLOCK_USERNS_SYSCTL:-/proc/sys/kernel/unprivileged_userns_clone}"
+    if [[ -r $userns_sysctl ]]; then
+        if [[ "$(cat "$userns_sysctl")" == "1" ]]; then
             echo "userns: enabled"
         else
             echo "userns: disabled"
@@ -3168,9 +3189,20 @@ cmd_doctor() {
         echo "rootless_netns: skipped (podman MISSING)"
     else
         local nerr="" nrc=0
-        nerr="$(podman unshare --rootless-netns true 2>&1)" && nrc=0 || nrc=$?
+        # EGL-78-D1/D3: bound the doctor's probe the same way the engine's
+        # netns_probe is bounded. Advisory only — doctor's other rc policy
+        # is unchanged.
+        if ! command -v timeout >/dev/null 2>&1; then
+            nerr="timeout(1) (coreutils) not found in PATH"
+            nrc=1
+        else
+            nerr="$(timeout 5 podman unshare --rootless-netns true 2>&1)" && nrc=0 || nrc=$?
+        fi
         if (( nrc == 0 )); then
             echo "rootless_netns: ok"
+        elif (( nrc == 124 )); then
+            echo "rootless_netns: fail: probe timed out after 5s ('timeout 5 podman unshare --rootless-netns true'); the rootless netns is not answering"
+            echo "Hint: run as the dedicated account; see docs/troubleshooting/netns-inspection.md." >&2
         else
             # D2 scopes the AppArmor pointer to the AppArmor-shaped
             # failure (rc 126 / permission denied); any other netns

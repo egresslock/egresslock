@@ -383,11 +383,17 @@ fi
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 if [[ -n "${EGRESSLOCK_SHARE:-}" ]]; then
     share_dir="$EGRESSLOCK_SHARE"
+elif [[ "$prefix_explicit" == 1 ]]; then
+    # EGL-80-L7 / ARC-19-D3: an explicit-prefix deploy is self-contained —
+    # its own examples or fail closed. The host's /usr/share (a .deb on
+    # the same machine) must never silently feed a prefix deploy: that
+    # would mix deb share data with a prefix engine (version skew).
+    share_dir="$prefix"
 elif [[ -d "/usr/share/egresslock/examples" ]]; then
     share_dir="/usr/share/egresslock"
 elif [[ -d "$prefix/examples" ]]; then
     share_dir="$prefix"
-elif [[ "$prefix_explicit" == 0 && -d "$script_dir/examples" ]]; then
+elif [[ -d "$script_dir/examples" ]]; then
     # A kit-tree run (checkout / tarball extraction) with no explicit
     # --prefix. An EXPLICIT prefix deploy must provide its own examples:
     # no checkout fallback for a broken deploy (ARC-19-D3 fail closed).

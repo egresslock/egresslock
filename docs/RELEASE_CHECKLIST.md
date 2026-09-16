@@ -17,14 +17,23 @@ This page is the public gates list. It is not a pentest claim.
 
 ## Review depth
 
-* **Initial public release and major/minor releases** — full review
-  of enforcement, parsing, privilege, gateway, DNS, packaging, and
-  docs vs the current tree.
-* **Point/patch releases** — focused regression review of the diff
-  and the security boundaries it touches.
-* Escalate to a full review whenever the change set touches core
-  enforcement, parsing, privilege boundaries, gateway policy, DNS
-  behavior, packaging security, or other trust-boundary code —
+Review depth is chosen from the **product delta since the last full
+review** (the last published snapshot's review), not from the version
+number alone:
+
+* **Full review** — the initial public release; any later cut whose
+  product delta touches core enforcement, parsing, privilege
+  boundaries, gateway policy, DNS behavior, packaging security, or
+  other trust-boundary code; or a major version. Instrument:
+  `internal_docs/PRE_RELEASE_REVIEW_INSTRUCTIONS.md` (private; the
+  brief below under "Review areas" summarizes its shape).
+* **Focused review** — point/patch releases **and** 0.x snapshot
+  refreshes whose product delta does **not** hit that list. Inspect
+  the diff and the security boundaries it touches; re-run the publish
+  gates; do not re-execute the full 17-section brief unless a finding
+  forces escalation. A focused cut may rely on the last full review
+  for untouched surfaces, and says so on its release ticket.
+* **Escalate to full** whenever the change set hits the list above,
   regardless of version number.
 
 This tree does **not** ship a workload launcher. Missing

@@ -62,6 +62,7 @@ a16_x=1
 [[ -x "$TREE_ROOT/egresslock-verify" ]] || { a16_x=0; a16 fail "egresslock-verify is executable in git (F6)"; }
 if (( a16_x )); then a16 pass; fi
 i_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$OPT/wbin" EGRESSLOCK_PATH_SBINDIR="$OPT/wsbin" \
     "$KIT" --prefix "$OPT" 2>&1)"; i_rc=$?
 if [[ "$i_rc" == 0 ]]; then a16 pass; else a16 fail "install-kit run (rc=$i_rc, out: $i_out)"; fi
 for f in egresslock egresslock-start egresslock-verify VERSION egresslock-setup; do
@@ -96,12 +97,14 @@ v_out="$("$OPT/egresslock" --version 2>&1)"
 grep -q "^commit: " <<<"$v_out" && a16 pass || a16 fail "--version prints kit stamp (D5): $v_out"
 # ARC-18-D4: --account is no longer an install-kit argument.
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$OPT/wbin" EGRESSLOCK_PATH_SBINDIR="$OPT/wsbin" \
     "$KIT" --prefix "$OPT" --account root >/dev/null 2>&1
 [[ $? == 2 ]] && a16 pass || a16 fail "install-kit rejects --account (rc 2)"
 # ARC-47-D3: a leftover pre-rename kit prefix triggers the warning.
 LEGACY="$STATE/legacy-prefix"; mkdir -p "$LEGACY"
 l_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
-    EGRESSLOCK_LEGACY_PREFIX="$LEGACY" "$KIT" --prefix "$OPT" 2>&1)"; l_rc=$?
+    EGRESSLOCK_LEGACY_PREFIX="$LEGACY" EGRESSLOCK_PATH_BINDIR="$OPT/wbin" EGRESSLOCK_PATH_SBINDIR="$OPT/wsbin" \
+    "$KIT" --prefix "$OPT" 2>&1)"; l_rc=$?
 [[ "$l_rc" == 0 && "$l_out" == *"leftover pre-rename kit"* ]] \
     && a16 pass || a16 fail "leftover-prefix warning (rc=$l_rc, out: $l_out)"
 
@@ -185,11 +188,13 @@ cp "$OPT/egresslock" "$u17/prefix/" 2>/dev/null || : > "$u17/prefix/egresslock"
 # R-017-1 F5: a marker-less prefix must NOT be rm -rf'd.
 mkdir -p "$u17/notakit"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
+    EGRESSLOCK_PATH_BINDIR="$u17/wbin" EGRESSLOCK_PATH_SBINDIR="$u17/wbin" \
     "$UKIT" --prefix "$u17/notakit" --account root >/dev/null 2>&1
 [[ -d "$u17/notakit" ]] && a17 pass || a17 fail "uninstall refuses a marker-less prefix"
 
 u_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
     EGRESSLOCK_ACCOUNT_HOME="$u17/home/runner" EGRESSLOCK_LEGACY_PREFIX="$u17/oldprefix" \
+    EGRESSLOCK_PATH_BINDIR="$u17/wbin" EGRESSLOCK_PATH_SBINDIR="$u17/wbin" \
     "$UKIT" --prefix "$u17/prefix" --account root 2>&1)"; u_rc=$?
 [[ "$u_rc" == 0 ]] && a17 pass || a17 fail "uninstall-kit run (rc=$u_rc, out: $u_out)"
 [[ ! -e "$u17/units/egresslock-verify@.service" && ! -e "$u17/units/egresslock-verify@.timer" ]] \
@@ -205,6 +210,7 @@ u_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
 # ARC-60-D3: a marker-less legacy dir is warned and kept.
 n_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
     EGRESSLOCK_ACCOUNT_HOME="$u17/home/runner" EGRESSLOCK_LEGACY_PREFIX="$u17/notold" \
+    EGRESSLOCK_PATH_BINDIR="$u17/wbin" EGRESSLOCK_PATH_SBINDIR="$u17/wbin" \
     "$UKIT" --prefix "$u17/prefix" --account root 2>&1)"
 [[ -d "$u17/notold" && "$n_out" == *"no pre-rename kit markers"* ]] \
     && a17 pass || a17 fail "marker-less legacy prefix warned and kept (out: $n_out)"
@@ -237,12 +243,14 @@ mkdir -p "$u17/home/runner/.config/egresslock" "$u17/home/runner/.config/agent-n
 : > "$u17/home/runner/.config/agent-network/main.conf"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
     EGRESSLOCK_ACCOUNT_HOME="$u17/home/runner" EGRESSLOCK_LEGACY_PREFIX="$u17/oldprefix" \
+    EGRESSLOCK_PATH_BINDIR="$u17/wbin" EGRESSLOCK_PATH_SBINDIR="$u17/wbin" \
     "$UKIT" --prefix "$u17/prefix" --account root --purge-account-data >/dev/null 2>&1
 [[ ! -e "$u17/home/runner/.config/egresslock" && ! -e "$u17/home/runner/.config/agent-network" ]] \
     && a17 pass || a17 fail "--purge-account-data removes both confdirs"
 
 # Unknown account fails closed; missing value is a usage error (exit 2).
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
+    EGRESSLOCK_PATH_BINDIR="$u17/wbin" EGRESSLOCK_PATH_SBINDIR="$u17/wbin" \
     "$UKIT" --prefix "$u17/prefix" --account nosuch-user >/dev/null 2>&1
 [[ $? == 1 ]] && a17 pass || a17 fail "uninstall-kit fails on unknown account"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 "$UKIT" --account >/dev/null 2>&1
@@ -306,6 +314,20 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$p43/units" \
     "$TREE_ROOT/install-kit.sh" --prefix "$p43/opt" 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$o" == *'apt remove egresslock'* ]] \
     && a43 pass || a43 fail "deb co-install refused (rc=$rc, out: $o)"
+
+# 5b. EGL-80-L2: the deb-shape guard is env-pinnable — a NON-wrapper
+#     file at EGRESSLOCK_UB_BIN refuses rc 1. Hermetic coverage for the
+#     guard that previously read the real /usr/bin/egresslock (present
+#     on deployed hosts, where it made every install-kit run refuse).
+mkdir -p "$p43/ub"
+printf '#!/bin/sh\n# the deb engine, not a kit PATH wrapper\n' > "$p43/ub/egresslock"
+chmod 0755 "$p43/ub/egresslock"
+o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$p43/units" \
+    EGRESSLOCK_PATH_BINDIR="$p43/bin" EGRESSLOCK_PATH_SBINDIR="$p43/sbin" \
+    EGRESSLOCK_UB_BIN="$p43/ub/egresslock" \
+    "$TREE_ROOT/install-kit.sh" --prefix "$p43/opt" 2>&1)"; rc=$?
+[[ "$rc" == 1 && "$o" == *"exists and is not an egresslock kit PATH"* ]] \
+    && a43 pass || a43 fail "deb-shape /usr/bin guard refused (rc=$rc, out: $o)"
 
 # 6. Uninstall removes only THIS prefix's wrappers (D4); another
 #    prefix's wrapper in the same dir is kept.
@@ -673,10 +695,12 @@ build_i="$(grep -n 'podman build' "$STATE/callorder.log" | head -1 | cut -d: -f1
     && e51 pass || e51 fail "ARC-70-D2 skip hint still printed"
 
 # 3. Conf with no gateway line: no user@ start (D1 skip).
+#    EGL-80: grep -s — the negative assert legitimately targets a file
+#    that rm just removed; the stderr "No such file" line is noise.
 rm -f "$STATE/callorder.log"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e51d/home/gacct" \
     $SKIT --prefix "$SKITP" --account gacct --conf "$e51d/plain.conf" >/dev/null 2>&1
-grep -q 'start user@' "$STATE/callorder.log" \
+grep -s -q 'start user@' "$STATE/callorder.log" \
     && e51 fail "no-gateway conf started user@" \
     || e51 pass
 
@@ -719,6 +743,7 @@ rm -rf "$STATE/a19"; mkdir -p "$a19p" "$a19h"
 
 # 1. install-kit deploys examples/ into the prefix (D3), root-owned files.
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$a19p/wbin" EGRESSLOCK_PATH_SBINDIR="$a19p/wsbin" \
     "$KIT" --prefix "$a19p" >/dev/null 2>&1
 [[ -f "$a19p/examples/main.conf" && -f "$a19p/examples/main-allowlist" ]] \
     && a19 pass || a19 fail "install-kit deploys examples/ (main.conf + main-allowlist)"
@@ -804,6 +829,7 @@ e38() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); ech
 e38p="$STATE/e38/prefix"   # fresh deployed kit prefix (engine + gateway + examples)
 rm -rf "$STATE/e38"; mkdir -p "$e38p"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e38p/wbin" EGRESSLOCK_PATH_SBINDIR="$e38p/wsbin" \
     "$KIT" --prefix "$e38p" >/dev/null 2>&1
 [[ -f "$e38p/egresslock" && -f "$e38p/gateway/Containerfile" && -f "$e38p/examples/main.conf" ]] \
     && e38 pass || e38 fail "e38 fixture: kit deployed to $e38p"
@@ -1033,8 +1059,11 @@ fi
 
 # Tarball flow: install-kit.sh from the extracted tree deploys the full
 # prefix set with the prefix-substituted ExecStart (in-kit templates).
+# EGL-80-1-F1: explicit wrapper hooks (lib.sh defaults also exist; these
+# make the tarball-flow call sites self-evidently non-host-writing).
 u22="$p22/units"
 i_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u22" \
+    EGRESSLOCK_PATH_BINDIR="$p22/wbin" EGRESSLOCK_PATH_SBINDIR="$p22/wsbin" \
     bash "$p22/x/egresslock/install-kit.sh" --prefix "$p22/opt" 2>&1)"; i_rc=$?
 for f in egresslock egresslock-start egresslock-verify egresslock-setup VERSION; do
     [[ -f "$p22/opt/$f" ]] && a22 pass || a22 fail "tarball install deployed $f (rc=$i_rc, out: $i_out)"
@@ -1050,8 +1079,10 @@ grep -q "ExecStart=$p22/opt/egresslock-verify" "$u22/egresslock-verify@.service"
 [[ "$(tr -d ' \n' < "$p22/x/egresslock/KIT_VERSION")" == "$(sed -n 's/^version: //p' "$p22/opt/VERSION")" ]] \
     && a22 pass || a22 fail "EGL-72 tarball install uses KIT_VERSION as version:"
 
-# ... and uninstall-kit.sh from the same tree removes it.
+# ... and uninstall-kit.sh from the same tree removes it (same explicit
+# wrapper hooks — EGL-80-1-F1).
 u_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u22" \
+    EGRESSLOCK_PATH_BINDIR="$p22/wbin" EGRESSLOCK_PATH_SBINDIR="$p22/wsbin" \
     EGRESSLOCK_LEGACY_PREFIX="$p22/no-legacy" \
     bash "$p22/x/egresslock/uninstall-kit.sh" --prefix "$p22/opt" 2>&1)"; u_rc=$?
 [[ "$u_rc" == 0 && ! -d "$p22/opt" ]] \
@@ -1281,6 +1312,12 @@ else
 fi
 EOF
 chmod +x "$aa22/bin/aa-status" "$aa22/bin/apparmor_parser"
+# EGL-80-L5: a FAILING aa-status stub — the deterministic stand-in for
+# "AppArmor not enabled" (state 3 needs `aa-status --enabled` to fail or
+# be missing; the real host binary may be present and succeed).
+mkdir -p "$aa22/bin-noaa"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$aa22/bin-noaa/aa-status"
+chmod +x "$aa22/bin-noaa/aa-status"
 cp "$TREE_ROOT/apparmor/usr.bin.pasta.local" "$aa22/share/apparmor/"
 # ARC-72-D1: the resolved profile file must mention /usr/bin/pasta.
 printf '/usr/bin/pasta {\n  #include <local/usr.bin.pasta>\n}\n' > "$aa22/aad/usr.bin.pasta"
@@ -1329,8 +1366,12 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin:$PATH" \
     && a22 pass || a22 fail "D3 known-not-enforced skip path (rc=$rc, out: $o)"
 
 # 4b. AppArmor not enabled at all: skip rc 0 (no profiles, no aa-status).
-o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_SHARE="$aa22/share" \
-    EGRESSLOCK_APPARMOR_D="$aa22/aad" "$SKIT" --apparmor-add 2>&1)"; rc=$?
+#     EGL-80-L5: pin the profiles path to an absent file and shadow the
+#     host's real aa-status (which may exist and succeed) with the
+#     failing stub, so state 3 is deterministic on any host.
+o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin-noaa:$PATH" \
+    EGRESSLOCK_SHARE="$aa22/share" EGRESSLOCK_APPARMOR_D="$aa22/aad" \
+    EGRESSLOCK_APPARMOR_PROFILES="$aa22/nosuchprofiles" "$SKIT" --apparmor-add 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"AppArmor: not enabled; skipping"* ]] \
     && a22 pass || a22 fail "D3 apparmor-not-enabled skip path (rc=$rc, out: $o)"
 
@@ -1357,8 +1398,10 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin:$PATH" \
 # 4e. R-EGL-22-1 Finding 1 test gap: --apparmor-check on state 3
 #     (AppArmor not enabled) must PRINT `AppArmor: not enabled` and the
 #     rest, rc 1 — not abort silently under set -e.
-o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_SHARE="$aa22/share" \
-    EGRESSLOCK_APPARMOR_D="$aa22/aad-empty" \
+#     EGL-80-L5: failing aa-status stub on PATH (the host's real
+#     aa-status may exist and report enabled -> state 2, not 3).
+o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin-noaa:$PATH" \
+    EGRESSLOCK_SHARE="$aa22/share" EGRESSLOCK_APPARMOR_D="$aa22/aad-empty" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/nosuchprofiles" "$SKIT" --apparmor-check 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$o" == *"AppArmor: not enabled"* \
     && "$o" == *"pasta enforcement: n/a"* \
@@ -1701,19 +1744,39 @@ if command -v dpkg >/dev/null 2>&1; then
     else
         a22 fail "EGL-72 base bump alone not an upgrade under dpkg ordering"
     fi
+    # EGL-82-D4 cross-base pin: the 0.2.0 base bump (same timestamp,
+    # same sha — worst case) must also compare as an upgrade over a
+    # 0.1.0 stamp; 0.1.0 -> 0.2.0 is never a dpkg downgrade.
+    if dpkg --compare-versions "0.1.0+git20260911045959.e05db24d86f0" \
+            lt "0.2.0+git20260911045959.e05db24d86f0"; then
+        a22 pass
+    else
+        a22 fail "EGL-82 0.1.0 -> 0.2.0 base bump not an upgrade under dpkg ordering"
+    fi
 else
     echo "SKIP: EGL-27 dpkg not available; skipping compare-versions assert"
 fi
 
 # A real build stamps the artifact with the new scheme (the redirected
 # output name is fixed, so the stamp is read from the build log line).
-# EGL-72-D4: the base is 0.1.0 (the first versioned release base).
+# EGL-72-D4: the base is the first versioned release base (0.1.0 at the
+# time); EGL-82-D4: the live-base pin moves to 0.2.0 with the VERSION_BASE
+# bump and adds the 0.1.0+git lt 0.2.0+git cross-base assert above.
+# EGL-80-L8: the stamp embeds the git commit — in a tree WITHOUT .git
+# (the exported/staged public snapshot shape, or a plain export)
+# build-tarball legitimately falls back to 'unknown' (EGL-74
+# skip-when-absent pattern: named SKIP instead of a host-shape FAIL).
+# Full assert runs in the private tree and in public git clones.
 b27="$p22/egl27"; rm -rf "$b27"; mkdir -p "$b27"
-t27_rc=0
-env EGRESSLOCK_TARBALL_OUT="$b27/k.tgz" "$TARSH" >"$b27/log" 2>&1 || t27_rc=$?
-v27_real="$(grep -oE '0\.1\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
-[[ "$t27_rc" == 0 && -f "$b27/k.tgz" && -n "$v27_real" ]] \
-    && a22 pass || a22 fail "EGL-27 tarball build stamps new scheme (rc=$t27_rc, log: $(cat "$b27/log"))"
+if [[ -d "$TREE_ROOT/.git" ]]; then
+    t27_rc=0
+    env EGRESSLOCK_TARBALL_OUT="$b27/k.tgz" "$TARSH" >"$b27/log" 2>&1 || t27_rc=$?
+    v27_real="$(grep -oE '0\.2\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
+    [[ "$t27_rc" == 0 && -f "$b27/k.tgz" && -n "$v27_real" ]] \
+        && a22 pass || a22 fail "EGL-27 tarball build stamps new scheme (rc=$t27_rc, log: $(cat "$b27/log"))"
+else
+    echo "SKIP: EGL-27 tarball stamp assert needs .git metadata (absent in exported/staged trees); build-tarball falls back to 'unknown' by design"
+fi
 
 # D2: the warn is warn-only — build-deb.sh must print the version and
 # must not gate on dpkg-query (builds succeed without it). The compare
@@ -1750,22 +1813,26 @@ a39() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); ech
 ik39="$STATE/ik39"
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
     EGRESSLOCK_UNIT_DIR="$ik39/units" EGRESSLOCK_LEGACY_PREFIX="$ik39/no-legacy" \
-    EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles" "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
+    EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles" EGRESSLOCK_PATH_BINDIR="$ik39/wbin" EGRESSLOCK_PATH_SBINDIR="$ik39/wbin" \
+    "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"AppArmor: podman labeled; confirm pasta compatibility: sudo $ik39/opt/egresslock-setup --apparmor-check"* ]] \
     && a39 pass || a39 fail "EGL-39 install-kit labeled advisory (rc=$rc, out: $o)"
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
     EGRESSLOCK_UNIT_DIR="$ik39/units" EGRESSLOCK_LEGACY_PREFIX="$ik39/no-legacy" \
-    EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles.nopodman" "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
+    EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles.nopodman" EGRESSLOCK_PATH_BINDIR="$ik39/wbin" EGRESSLOCK_PATH_SBINDIR="$ik39/wbin" \
+    "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"AppArmor: podman unlabeled; --apparmor-add not needed on this host"* ]] \
     && a39 pass || a39 fail "EGL-39 install-kit unlabeled advisory (rc=$rc, out: $o)"
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
     EGRESSLOCK_UNIT_DIR="$ik39/units" EGRESSLOCK_LEGACY_PREFIX="$ik39/no-legacy" \
-    EGRESSLOCK_APPARMOR_PROFILES="$ik39/no-such-profiles" "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
+    EGRESSLOCK_APPARMOR_PROFILES="$ik39/no-such-profiles" EGRESSLOCK_PATH_BINDIR="$ik39/wbin" EGRESSLOCK_PATH_SBINDIR="$ik39/wbin" \
+    "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" != *"AppArmor: podman"* ]] \
     && a39 pass || a39 fail "EGL-39 install-kit silent on UNKNOWN (rc=$rc, out: $o)"
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
     EGRESSLOCK_UNIT_DIR="$ik39/units" EGRESSLOCK_LEGACY_PREFIX="$ik39/no-legacy" \
-    EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles.hats" "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
+    EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles.hats" EGRESSLOCK_PATH_BINDIR="$ik39/wbin" EGRESSLOCK_PATH_SBINDIR="$ik39/wbin" \
+    "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"AppArmor: podman unlabeled; --apparmor-add not needed on this host"* ]] \
     && a39 pass || a39 fail "EGL-39 install-kit hats do not count as labeled (rc=$rc, out: $o)"
 a39_pass=$pass; a39_fail=$fail
@@ -2597,6 +2664,7 @@ e68() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); ech
 e68p="$STATE/e68/foreign"; rm -rf "$STATE/e68"; mkdir -p "$e68p/gateway"
 printf 'not a kit\n' > "$e68p/gateway/Makefile"
 e68o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e68p/wbin" EGRESSLOCK_PATH_SBINDIR="$e68p/wsbin" \
     "$KIT" --prefix "$e68p" 2>&1)"; e68_rc=$?
 [[ "$e68_rc" == 1 && "$e68o" == *"refusing to delete $e68p/gateway"* ]] \
     && e68 pass || e68 fail "foreign gateway/ refused rc 1 (rc=$e68_rc, out: $e68o)"
@@ -2607,6 +2675,7 @@ e68o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
 e68r="$STATE/e68/foreign-recipes"; mkdir -p "$e68r/examples/recipes"
 printf 'keep\n' > "$e68r/examples/recipes/keep.txt"
 e68o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e68r/wbin" EGRESSLOCK_PATH_SBINDIR="$e68r/wsbin" \
     "$KIT" --prefix "$e68r" 2>&1)"; e68_rc=$?
 [[ "$e68_rc" == 1 && -f "$e68r/examples/recipes/keep.txt" && ! -e "$e68r/egresslock" ]] \
     && e68 pass || e68 fail "foreign recipes/ refused, untouched (rc=$e68_rc, out: $e68o)"
@@ -2615,6 +2684,7 @@ e68o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
 e68k="$STATE/e68/kitshaped"; mkdir -p "$e68k/gateway"
 : > "$e68k/gateway/Containerfile"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e68k/wbin" EGRESSLOCK_PATH_SBINDIR="$e68k/wsbin" \
     "$KIT" --prefix "$e68k" >/dev/null 2>&1; e68_rc=$?
 [[ "$e68_rc" == 0 && -f "$e68k/egresslock" && -f "$e68k/gateway/Containerfile" ]] \
     && e68 pass || e68 fail "kit-shaped tree (gateway/Containerfile) installs (rc=$e68_rc)"
@@ -2622,11 +2692,13 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
 # (the rm path is taken; stale files do not survive an upgrade).
 e68m="$STATE/e68/marked"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e68m/wbin" EGRESSLOCK_PATH_SBINDIR="$e68m/wsbin" \
     "$KIT" --prefix "$e68m" >/dev/null 2>&1
 [[ -f "$e68m/VERSION" ]] \
     && e68 pass || e68 fail "marked prefix fixture (VERSION present)"
 printf 'stale\n' > "$e68m/gateway/Containerfile.stale"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e68m/wbin" EGRESSLOCK_PATH_SBINDIR="$e68m/wsbin" \
     "$KIT" --prefix "$e68m" >/dev/null 2>&1; e68_rc=$?
 [[ "$e68_rc" == 0 && -f "$e68m/gateway/Containerfile" \
     && ! -e "$e68m/gateway/Containerfile.stale" ]] \
@@ -2634,6 +2706,7 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
 # EGL-69-D2: a fresh prefix ships apparmor/usr.bin.pasta.local.
 e68a="$STATE/e68/aaprefix"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e68a/wbin" EGRESSLOCK_PATH_SBINDIR="$e68a/wsbin" \
     "$KIT" --prefix "$e68a" >/dev/null 2>&1; e68_rc=$?
 [[ "$e68_rc" == 0 && -f "$e68a/apparmor/usr.bin.pasta.local" ]] \
     && e68 pass || e68 fail "install-kit prefix ships apparmor/usr.bin.pasta.local (rc=$e68_rc)"

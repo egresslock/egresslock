@@ -72,8 +72,20 @@ tool="$kit_dir/egresslock"
 # drift-signal failure is not misread as policy drift when the real
 # cause is a broken shared netns (e.g. enforce-mode AppArmor pasta
 # profile). Skippable in the mock harness.
+# EGL-78-D1/D3: bound the probe the same way the engine does — a wedged
+# `podman unshare --rootless-netns true` is a named failure after 5s,
+# never an indefinite block of the drift timer.
 if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
-    if ! podman unshare --rootless-netns true 2>/dev/null; then
+    if ! command -v timeout >/dev/null 2>&1; then
+        echo "egresslock-verify: timeout(1) (coreutils) is required for the netns probe but was not found in PATH" >&2
+        exit 1
+    fi
+    vprc=0
+    timeout 5 podman unshare --rootless-netns true 2>/dev/null || vprc=$?
+    if (( vprc == 124 )); then
+        echo "egresslock-verify: netns probe timed out after 5s (probe: 'timeout 5 podman unshare --rootless-netns true'); the rootless netns is not answering — check pasta/podman health before retrying" >&2
+        exit 1
+    elif (( vprc != 0 )); then
         echo "egresslock-verify: podman rootless-netns is broken for this user (probe: 'podman unshare --rootless-netns true'). Check whether AppArmor blocks pasta:" >&2
         echo "  sudo aa-status | grep -i pasta        # enforced profile?" >&2
         echo "  # primary fix (ARC-27-D2/EGL-15): add 'signal (receive) set=(term) peer=podman,' to the pasta profile, then" >&2

@@ -573,7 +573,23 @@ case "$cmd" in
     *) echo "mock podman: unsupported op $cmd" >&2; exit 2 ;;
 esac
 EOF
-chmod +x "$TESTROOT/bin/nft" "$TESTROOT/bin/getent" "$TESTROOT/bin/podman" "$EGRESSLOCK_PROFILES"
+# EGL-80-L1: hermetic dpkg-query — the host dpkg database must not leak
+# into the harness. On a host where the egresslock .deb is installed,
+# install-kit's real dpkg-query call answered "install ok installed" and
+# its ARC-22-D1 refusal failed ~30 prefix-install tests. Mock emulates
+# dpkg-query for an UNKNOWN package: rc 1, no stdout (exactly what the
+# real tool prints for a package it does not know), so install-kit's
+# `deb_status` is empty and it proceeds. Tests that need an
+# installed-deb answer (the p43 refusal case) stub their own dpkg-query
+# earlier on PATH and still win.
+cat > "$TESTROOT/bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+# EGL-80-L1 mock: egresslock is never installed in the harness world.
+exit 1
+EOF
+
+chmod +x "$TESTROOT/bin/nft" "$TESTROOT/bin/getent" "$TESTROOT/bin/podman" \
+         "$TESTROOT/bin/dpkg-query" "$EGRESSLOCK_PROFILES"
 
 # Mock systemctl for kit-install tests (ARC-16): records every call.
 # EGL-51: every call is also mirrored into callorder.log so tests can
@@ -619,6 +635,19 @@ export HOME="$TESTROOT/home"
 export USER="testuser"
 export EGRESSLOCK_ANCHOR_IMAGE="docker.io/library/alpine:latest"
 export AGENTS_ROOT="$TESTROOT/agents"
+# EGL-80-L2: the kit's deb-shape guard must not see the host's real
+# /usr/bin/egresslock (present on deployed hosts; the .deb's engine is
+# not a kit PATH wrapper, so install-kit would refuse). Default to an
+# absent path; tests that exercise the refusal point the hook at a
+# fixture file.
+export EGRESSLOCK_UB_BIN="$TESTROOT/ub/egresslock"
+# EGL-80-1-F1 note: EGRESSLOCK_PATH_BINDIR/SBINDIR are deliberately NOT
+# defaulted here. The battery installs many distinct prefixes; a single
+# shared wrapper dir would trip install-kit's ARC-22-D1 foreign-marker
+# refusal ("two prefix installs must not fight over PATH"). Instead,
+# every install-kit/uninstall-kit test invocation sets explicit
+# per-prefix wrapper hooks (grep EGRESSLOCK_PATH_BINDIR in
+# tests/test-kit.sh).
 # Gateway image exists in the mock (created below); keep the real default
 # name so the ensure flow exercises the image-exists check.
 mkdir -p "$STATE/images"

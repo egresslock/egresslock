@@ -20,7 +20,12 @@ export PATH="$TESTROOT/bin:$TREE_ROOT:$PATH"
 # Run a command with stdout attached to a PTY (script(1)) so the
 # TTY-gated 'using config' probe hint (ARC-45) is emitted. Takes ONE
 # string; stderr redirections inside still apply (only fd 1 is the PTY).
-pty() { script -qec "$1" /dev/null; }
+# EGL-78-1-F1: script's stdin is cut off from the caller's terminal
+# (</dev/null). With a live TTY stdin, script's stdin-relay has no EOF
+# and can block forever after the child exits (interactive-run wedge);
+# the child still gets a PTY on both fds, so TTY-gated behavior is
+# unchanged — only script's own stdin-relay gets immediate EOF.
+pty() { script -qec "$1" /dev/null </dev/null; }
 
 pass=0; fail=0
 
@@ -628,6 +633,33 @@ else
     a26 fail "EGRESSLOCK_SKIP_NETNS_PROBE=1 bypasses probe (rc=$s_rc, out: $s_out)"
 fi
 
+# EGL-78-D1/D3 regression: a probe that HANGS (wedged pasta, stuck
+# unshare) must be a named failure after the 5s bound, not a wedge of
+# every ensure/verify/teardown. Shim podman so
+# `unshare --rootless-netns true` sleeps 60s; ensure must return
+# non-zero with the timeout-specific message, well under the harness's
+# 300s bound. SKIP is deliberately NOT set on this call (D4: the bound,
+# not the SKIP env, is the hang-prevention mechanism).
+mkdir -p "$TESTROOT/bin-hang"
+cat > "$TESTROOT/bin-hang/podman" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "unshare" && "\$2" == "--rootless-netns" && "\$3" == "true" ]]; then
+    sleep 60
+    exit 0
+fi
+# Everything else: delegate to the healthy mock.
+exec "$TESTROOT/bin/podman" "\$@"
+EOF
+chmod +x "$TESTROOT/bin-hang/podman"
+h_start=$SECONDS
+h_out="$(PATH="$TESTROOT/bin-hang:$PATH" npc ensure ci 2>&1)"; h_rc=$?
+h_elapsed=$(( SECONDS - h_start ))
+if [[ "$h_rc" == 1 && "$h_out" == *"netns probe timed out after 5s"* && "$h_elapsed" -lt 15 ]]; then
+    pass=$((pass+1)); echo "PASS: ARC-26 hanging probe is a named timeout failure (rc=1, ${h_elapsed}s)"
+else
+    fail=$((fail+1)); echo "FAIL: ARC-26 hanging probe not bounded (rc=$h_rc, elapsed=${h_elapsed}s, out: $h_out)"
+fi
+
 arc26_pass=$pass; arc26_fail=$fail
 
 # --- ARC-49 R-049-1 F1: no /tmp/agent-policy.* leak on a failed nft -f -
@@ -684,11 +716,11 @@ a24() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); ech
 # and stdout stays pure payload. A lone main.conf still lists.
 mkdir -p "$TESTROOT/h24/.config/egresslock"
 printf 'profile v 10.50.9.0/24\n' > "$TESTROOT/h24/.config/egresslock/main.conf"
-d_out="$(pty "env -u EGRESSLOCK_CONF HOME='$TESTROOT/h24' egresslock list 2>/tmp/agent24.err")"; d_rc=$?
-if [[ "$d_rc" == 0 && "$d_out" == *"egresslock-v"* && "$(cat /tmp/agent24.err)" == *"using configs in"*"$TESTROOT/h24/.config/egresslock"* ]]; then
+d_out="$(pty "env -u EGRESSLOCK_CONF HOME='$TESTROOT/h24' egresslock list 2>$TESTROOT/agent24.err")"; d_rc=$?
+if [[ "$d_rc" == 0 && "$d_out" == *"egresslock-v"* && "$(cat $TESTROOT/agent24.err)" == *"using configs in"*"$TESTROOT/h24/.config/egresslock"* ]]; then
     a24 pass
 else
-    a24 fail "default probe resolves + prints using configs in (rc=$d_rc, out: $d_out, err: $(cat /tmp/agent24.err))"
+    a24 fail "default probe resolves + prints using configs in (rc=$d_rc, out: $d_out, err: $(cat $TESTROOT/agent24.err))"
 fi
 
 # ARC-49-D3: HOME containing a space must still resolve the default conf
@@ -696,20 +728,20 @@ fi
 # space in the account home must not break the probe (or any named path).
 mkdir -p "$TESTROOT/home with space/.config/egresslock"
 printf 'profile hsp 10.50.11.0/24\n' > "$TESTROOT/home with space/.config/egresslock/main.conf"
-sp_out="$(pty "env -u EGRESSLOCK_CONF HOME='$TESTROOT/home with space' egresslock list 2>/tmp/agent24sp.err")"; sp_rc=$?
-if [[ "$sp_rc" == 0 && "$sp_out" == *"egresslock-hsp"* && "$(cat /tmp/agent24sp.err)" == *"using configs in"*"$TESTROOT/home with space/.config/egresslock"* ]]; then
+sp_out="$(pty "env -u EGRESSLOCK_CONF HOME='$TESTROOT/home with space' egresslock list 2>$TESTROOT/agent24sp.err")"; sp_rc=$?
+if [[ "$sp_rc" == 0 && "$sp_out" == *"egresslock-hsp"* && "$(cat $TESTROOT/agent24sp.err)" == *"using configs in"*"$TESTROOT/home with space/.config/egresslock"* ]]; then
     a24 pass
 else
-    a24 fail "HOME with a space resolves default conf (rc=$sp_rc, out: $sp_out, err: $(cat /tmp/agent24sp.err))"
+    a24 fail "HOME with a space resolves default conf (rc=$sp_rc, out: $sp_out, err: $(cat $TESTROOT/agent24sp.err))"
 fi
 
 # ARC-45: stdout NOT a terminal (captured/substituted) -> the hint is
 # suppressed; stderr stays empty and rc/stdout are unchanged.
-q_out="$(env -u EGRESSLOCK_CONF HOME="$TESTROOT/h24" egresslock list 2>/tmp/agent24q.err)"; q_rc=$?
-if [[ "$q_rc" == 0 && "$q_out" == *"egresslock-v"* && ! -s /tmp/agent24q.err ]]; then
+q_out="$(env -u EGRESSLOCK_CONF HOME="$TESTROOT/h24" egresslock list 2>$TESTROOT/agent24q.err)"; q_rc=$?
+if [[ "$q_rc" == 0 && "$q_out" == *"egresslock-v"* && ! -s $TESTROOT/agent24q.err ]]; then
     a24 pass
 else
-    a24 fail "ARC-45: probe hint suppressed when stdout is not a TTY (rc=$q_rc, out: $q_out, err: $(cat /tmp/agent24q.err))"
+    a24 fail "ARC-45: probe hint suppressed when stdout is not a TTY (rc=$q_rc, out: $q_out, err: $(cat $TESTROOT/agent24q.err))"
 fi
 
 # stderr only: stdout payload (list) unchanged.
@@ -730,19 +762,19 @@ else
 fi
 
 # Explicit --config beats the default (no 'using config' line).
-x_out="$(env -u EGRESSLOCK_CONF HOME="$TESTROOT/h24" egresslock --config "$TESTROOT/validconf/ok.conf" list 2>/tmp/agent24x.err)"; x_rc=$?
-if [[ "$x_rc" == 0 && ! -s /tmp/agent24x.err ]]; then
+x_out="$(env -u EGRESSLOCK_CONF HOME="$TESTROOT/h24" egresslock --config "$TESTROOT/validconf/ok.conf" list 2>$TESTROOT/agent24x.err)"; x_rc=$?
+if [[ "$x_rc" == 0 && ! -s $TESTROOT/agent24x.err ]]; then
     a24 pass
 else
-    a24 fail "explicit --config wins, no using-config line (rc=$x_rc, err: $(cat /tmp/agent24x.err))"
+    a24 fail "explicit --config wins, no using-config line (rc=$x_rc, err: $(cat $TESTROOT/agent24x.err))"
 fi
 
 # Explicit EGRESSLOCK_CONF beats the default.
-y_out="$(env EGRESSLOCK_CONF="$TESTROOT/validconf/ok.conf" HOME="$TESTROOT/h24" egresslock list 2>/tmp/agent24y.err)"; y_rc=$?
-if [[ "$y_rc" == 0 && ! -s /tmp/agent24y.err ]]; then
+y_out="$(env EGRESSLOCK_CONF="$TESTROOT/validconf/ok.conf" HOME="$TESTROOT/h24" egresslock list 2>$TESTROOT/agent24y.err)"; y_rc=$?
+if [[ "$y_rc" == 0 && ! -s $TESTROOT/agent24y.err ]]; then
     a24 pass
 else
-    a24 fail "EGRESSLOCK_CONF wins, no using-config line (rc=$y_rc, err: $(cat /tmp/agent24y.err))"
+    a24 fail "EGRESSLOCK_CONF wins, no using-config line (rc=$y_rc, err: $(cat $TESTROOT/agent24y.err))"
 fi
 
 # HOME unset: the getent passwd fallback resolves the account home and
@@ -750,19 +782,19 @@ fi
 # confdir_default's ${HOME:-$(getent passwd ...)} path).
 mkdir -p "$TESTROOT/h24-nohome/.config/egresslock"
 printf 'profile w 10.50.10.0/24\n' > "$TESTROOT/h24-nohome/.config/egresslock/main.conf"
-g_out="$(pty "env -u HOME -u EGRESSLOCK_CONF ARCMOCK_PASSWD_HOME='$TESTROOT/h24-nohome' egresslock list 2>/tmp/agent24g.err")"; g_rc=$?
-if [[ "$g_rc" == 0 && "$g_out" == *"egresslock-w"* && "$(cat /tmp/agent24g.err)" == *"using configs in"*"$TESTROOT/h24-nohome/.config/egresslock"* ]]; then
+g_out="$(pty "env -u HOME -u EGRESSLOCK_CONF ARCMOCK_PASSWD_HOME='$TESTROOT/h24-nohome' egresslock list 2>$TESTROOT/agent24g.err")"; g_rc=$?
+if [[ "$g_rc" == 0 && "$g_out" == *"egresslock-w"* && "$(cat $TESTROOT/agent24g.err)" == *"using configs in"*"$TESTROOT/h24-nohome/.config/egresslock"* ]]; then
     a24 pass
 else
-    a24 fail "HOME-unset getent fallback resolves default conf (rc=$g_rc, out: $g_out, err: $(cat /tmp/agent24g.err))"
+    a24 fail "HOME-unset getent fallback resolves default conf (rc=$g_rc, out: $g_out, err: $(cat $TESTROOT/agent24g.err))"
 fi
 
 # HOME empty (''): the :- operator treats it as unset, same fallback.
-g2_out="$(pty "env -u EGRESSLOCK_CONF HOME= ARCMOCK_PASSWD_HOME='$TESTROOT/h24-nohome' egresslock list 2>/tmp/agent24g2.err")"; g2_rc=$?
-if [[ "$g2_rc" == 0 && "$g2_out" == *"egresslock-w"* && "$(cat /tmp/agent24g2.err)" == *"using configs in"*"$TESTROOT/h24-nohome/.config/egresslock"* ]]; then
+g2_out="$(pty "env -u EGRESSLOCK_CONF HOME= ARCMOCK_PASSWD_HOME='$TESTROOT/h24-nohome' egresslock list 2>$TESTROOT/agent24g2.err")"; g2_rc=$?
+if [[ "$g2_rc" == 0 && "$g2_out" == *"egresslock-w"* && "$(cat $TESTROOT/agent24g2.err)" == *"using configs in"*"$TESTROOT/h24-nohome/.config/egresslock"* ]]; then
     a24 pass
 else
-    a24 fail "HOME-empty getent fallback resolves default conf (rc=$g2_rc, out: $g2_out, err: $(cat /tmp/agent24g2.err))"
+    a24 fail "HOME-empty getent fallback resolves default conf (rc=$g2_rc, out: $g2_out, err: $(cat $TESTROOT/agent24g2.err))"
 fi
 
 # getent home pointing at a nonexistent dir: probe miss stays fail-closed.
@@ -923,31 +955,31 @@ run46() { env EGRESSLOCK_CONF="$AD46/m.conf" EGRESSLOCK_SKIP_NETNS_PROBE=1 egres
 
 # 1. multi-arg allow: all three added, one ensure (stderr has ONE
 #    re-ensuring line), stdout has three result lines.
-ml_out="$(run46 allow mm a.example:443 b.example c.example:8080 2>/tmp/a46.err)"; ml_rc=$?
+ml_out="$(run46 allow mm a.example:443 b.example c.example:8080 2>$TESTROOT/a46.err)"; ml_rc=$?
 ml_added="$(grep -c 'added:' <<<"$ml_out")"
-ml_re="$(grep -c 're-ensuring profile' /tmp/a46.err)"
+ml_re="$(grep -c 're-ensuring profile' $TESTROOT/a46.err)"
 if [[ "$ml_rc" == 0 && "$ml_added" == 3 && "$ml_re" == 1 ]] \
    && grep -q '^a.example:443$' "$AD46/mm-allowlist" \
    && grep -q '^b.example$' "$AD46/mm-allowlist" \
    && grep -q '^c.example:8080$' "$AD46/mm-allowlist"; then
     a46 pass
 else
-    a46 fail "multi-arg allow: 3 added, 1 re-ensure (rc=$ml_rc, added=$ml_added re=$ml_re, out: $ml_out, err: $(cat /tmp/a46.err))"
+    a46 fail "multi-arg allow: 3 added, 1 re-ensure (rc=$ml_rc, added=$ml_added re=$ml_re, out: $ml_out, err: $(cat $TESTROOT/a46.err))"
 fi
 
 # 2. duplicate argv (entry already seeded by test 1): both already
 #    present, still ONE re-ensure.
-dp_out="$(run46 allow mm a.example:443 a.example:443 2>/tmp/a46b.err)"; dp_rc=$?
+dp_out="$(run46 allow mm a.example:443 a.example:443 2>$TESTROOT/a46b.err)"; dp_rc=$?
 dp_added="$(grep -c 'added:' <<<"$dp_out")"
 dp_present="$(grep -c 'entry already present:' <<<"$dp_out")"
-dp_re="$(grep -c 're-ensuring profile' /tmp/a46b.err)"
+dp_re="$(grep -c 're-ensuring profile' $TESTROOT/a46b.err)"
 if [[ "$dp_rc" == 0 \
       && "$dp_added" == 0 \
       && "$dp_present" == 2 \
       && "$dp_re" == 1 ]]; then
     a46 pass
 else
-    a46 fail "allow duplicate argv (rc=$dp_rc, added=$dp_added present=$dp_present re=$dp_re, out: $dp_out, err: $(cat /tmp/a46b.err))"
+    a46 fail "allow duplicate argv (rc=$dp_rc, added=$dp_added present=$dp_present re=$dp_re, out: $dp_out, err: $(cat $TESTROOT/a46b.err))"
 fi
 
 # 3. invalid arg -> exit 2, allowlist unchanged, no ensure, no re-ensuring.
@@ -962,24 +994,24 @@ else
 fi
 
 # 4. single allow still re-ensures even when already present.
-pr_out="$(run46 allow mm a.example:443 2>/tmp/a46c.err)"; pr_rc=$?
-pr_re="$(grep -c 're-ensuring profile' /tmp/a46c.err)"
+pr_out="$(run46 allow mm a.example:443 2>$TESTROOT/a46c.err)"; pr_rc=$?
+pr_re="$(grep -c 're-ensuring profile' $TESTROOT/a46c.err)"
 [[ "$pr_rc" == 0 && "$pr_out" == *"entry already present"* \
   && "$pr_re" == 1 ]] \
     && a46 pass || a46 fail "single allow already-present re-ensures (rc=$pr_rc, out: $pr_out)"
 
 # 5. multi-arg disallow: all present -> removed, one ensure.
 printf 'x.example\ny.example:443\nz.example:8080\n' > "$AD46/mm-allowlist"
-dm_out="$(run46 disallow mm x.example z.example:8080 2>/tmp/a46d.err)"; dm_rc=$?
+dm_out="$(run46 disallow mm x.example z.example:8080 2>$TESTROOT/a46d.err)"; dm_rc=$?
 dm_removed="$(grep -c 'removed:' <<<"$dm_out")"
-dm_re="$(grep -c 're-ensuring profile' /tmp/a46d.err)"
+dm_re="$(grep -c 're-ensuring profile' $TESTROOT/a46d.err)"
 if [[ "$dm_rc" == 0 && "$dm_removed" == 2 && "$dm_re" == 1 ]] \
    && ! grep -q '^x.example$' "$AD46/mm-allowlist" \
    && ! grep -q '^z.example:8080$' "$AD46/mm-allowlist" \
    && grep -q '^y.example:443$' "$AD46/mm-allowlist"; then
     a46 pass
 else
-    a46 fail "multi-arg disallow removes all present, one ensure (rc=$dm_rc, removed=$dm_removed re=$dm_re, out: $dm_out, err: $(cat /tmp/a46d.err))"
+    a46 fail "multi-arg disallow removes all present, one ensure (rc=$dm_rc, removed=$dm_removed re=$dm_re, out: $dm_out, err: $(cat $TESTROOT/a46d.err))"
 fi
 
 # 6. disallow with an absent entry -> exit 1, nothing changed.
@@ -996,9 +1028,9 @@ profile mm 10.199.23.0/24
     rule gateway-only
     gateway 10.199.23.2 3128 mm-allowlist
 EOF
-ah_out="$(run46 allow-host mm git.example.test:2222 2>/tmp/a46e.err)"; ah_rc=$?
-[[ "$ah_rc" == 0 && "$(grep -c 're-ensuring profile' /tmp/a46e.err)" == 1 ]] \
-    && a46 pass || a46 fail "allow-host re-ensures (rc=$ah_rc, out: $ah_out, err: $(cat /tmp/a46e.err))"
+ah_out="$(run46 allow-host mm git.example.test:2222 2>$TESTROOT/a46e.err)"; ah_rc=$?
+[[ "$ah_rc" == 0 && "$(grep -c 're-ensuring profile' $TESTROOT/a46e.err)" == 1 ]] \
+    && a46 pass || a46 fail "allow-host re-ensures (rc=$ah_rc, out: $ah_out, err: $(cat $TESTROOT/a46e.err))"
 ahx_out="$(run46 allow-host mm git.example.test:2222 extra 2>&1)"; ahx_rc=$?
 [[ "$ahx_rc" == 2 && "$ahx_out" == *"exactly one"* ]] \
     && a46 pass || a46 fail "allow-host extra arg (rc=$ahx_rc, out: $ahx_out)"
@@ -1249,18 +1281,18 @@ printf 'profile a 10.199.1.0/24\n    rule public-only\n' > "$H37/.config/egressl
 printf 'profile b 10.199.2.0/24\n    rule public-only\n' > "$H37/.config/egresslock/b.conf"
 
 # 1. bare list aggregates every *.conf (main + a + b).
-l_out="$(pty "env -u EGRESSLOCK_CONF HOME='$H37' egresslock list 2>/tmp/a37.err")"; l_rc=$?
+l_out="$(pty "env -u EGRESSLOCK_CONF HOME='$H37' egresslock list 2>$TESTROOT/a37.err")"; l_rc=$?
 if [[ "$l_rc" == 0 && "$l_out" == *"main"* && "$l_out" == *"a"* && "$l_out" == *"b"* \
-      && "$(cat /tmp/a37.err)" == *"using configs in"*"$H37/.config/egresslock"* ]]; then
+      && "$(cat $TESTROOT/a37.err)" == *"using configs in"*"$H37/.config/egresslock"* ]]; then
     a37 pass
 else
-    a37 fail "bare list aggregates main+a+b (rc=$l_rc, out: $l_out, err: $(cat /tmp/a37.err))"
+    a37 fail "bare list aggregates main+a+b (rc=$l_rc, out: $l_out, err: $(cat $TESTROOT/a37.err))"
 fi
 
 # 2. named probe: <profile>.conf wins over main.conf.
-n_out="$(pty "env -u EGRESSLOCK_CONF HOME='$H37' egresslock network a 2>/tmp/a37n.err")"; n_rc=$?
-[[ "$n_rc" == 0 && "$n_out" == *"egresslock-a"* && "$(cat /tmp/a37n.err)" == *"using config"*"a.conf"* ]] \
-    && a37 pass || a37 fail "named probe uses <profile>.conf (rc=$n_rc, out: $n_out, err: $(cat /tmp/a37n.err))"
+n_out="$(pty "env -u EGRESSLOCK_CONF HOME='$H37' egresslock network a 2>$TESTROOT/a37n.err")"; n_rc=$?
+[[ "$n_rc" == 0 && "$n_out" == *"egresslock-a"* && "$(cat $TESTROOT/a37n.err)" == *"using config"*"a.conf"* ]] \
+    && a37 pass || a37 fail "named probe uses <profile>.conf (rc=$n_rc, out: $n_out, err: $(cat $TESTROOT/a37n.err))"
 
 # 3. fallback to main.conf when <profile>.conf is absent; a name missing
 #    from main.conf must fail require_profile, not 'no profile config'.
@@ -1302,8 +1334,8 @@ i37_out="$(env -u EGRESSLOCK_CONF HOME="$H37" egresslock init x 2>&1)"; i37_rc=$
     && a37 pass || a37 fail "init hint teaches bare ensure (rc=$i37_rc, out: $i37_out)"
 
 # 8. explicit --config stays single-file (site multi-block conf).
-x37_out="$(env -u EGRESSLOCK_CONF HOME="$H37" egresslock --config "$H37/.config/egresslock/a.conf" list 2>/tmp/a37x.err)"; x37_rc=$?
-[[ "$x37_rc" == 0 && "$x37_out" == *"a"* && "$x37_out" != *"main"* && ! -s /tmp/a37x.err ]] \
+x37_out="$(env -u EGRESSLOCK_CONF HOME="$H37" egresslock --config "$H37/.config/egresslock/a.conf" list 2>$TESTROOT/a37x.err)"; x37_rc=$?
+[[ "$x37_rc" == 0 && "$x37_out" == *"a"* && "$x37_out" != *"main"* && ! -s $TESTROOT/a37x.err ]] \
     && a37 pass || a37 fail "explicit --config stays single-file (rc=$x37_rc, out: $x37_out)"
 
 arc37_pass=$pass; arc37_fail=$fail
@@ -1969,7 +2001,9 @@ a58() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); ech
 
 S58="$TESTROOT/s58"; rm -rf "$S58"; mkdir -p "$S58"
 for bad in '../other/secret' 'foo/bar' '..'; do
-    cat > "$S58/$bad.conf" 2>/dev/null || true
+    # EGL-78-D5: the old noisy `cat > "$S58/$bad.conf"` (which always
+    # failed with "No such file or directory" for the two bad paths) is
+    # gone — the test only reads the sanitized-basename conf written below.
     # sanitize the filename for the .conf suffix
     safe="$(printf %s "$bad" | tr '/.' '__')"
     printf 'profile g 10.199.73.0/24\n    rule gateway-only\n    gateway 10.199.73.2 3128 %s\n' "$bad" > "$S58/$safe.conf"
@@ -1988,12 +2022,15 @@ EOF
 a58_out="$(egresslock --config "$S58/ok.conf" list 2>&1)"; a58_rc=$?
 [[ "$a58_rc" == 0 && "$a58_out" == *"g"* ]] && a58 pass || a58 fail "D normal relative basename loads (rc=$a58_rc, out: $a58_out)"
 
-cat > "$S58/abs.conf" <<'EOF'
+# EGL-80-L6: absolute allowlist path — but under TESTROOT, not a fixed
+# shared /tmp file (no real-environment write, no cross-run collision).
+abs58="$TESTROOT/s58-abs-allowlist"
+cat > "$S58/abs.conf" <<EOF
 profile a2 10.199.75.0/24
     rule gateway-only
-    gateway 10.199.75.2 3128 /tmp/s58-abs-allowlist
+    gateway 10.199.75.2 3128 $abs58
 EOF
-: > "/tmp/s58-abs-allowlist"
+: > "$abs58"
 a58_out="$(egresslock --config "$S58/abs.conf" list 2>&1)"; a58_rc=$?
 [[ "$a58_rc" == 0 && "$a58_out" == *"a2"* ]] && a58 pass || a58 fail "D absolute path loads (rc=$a58_rc, out: $a58_out)"
 
@@ -2523,12 +2560,12 @@ EOF
 mklog32 "$now32"
 cap32="$(head -1 "$STATE/containers-$GW32.access.log" | wc -c)"; cap32=$(( cap32 + 5 ))
 d32_out="$(env EGRESSLOCK_CONF="$A32/gw.conf" EGRESSLOCK_DENIED_MAX_BYTES="$cap32" \
-    egresslock denied s32 --days 0 2>/tmp/agent32a.err)"; d32_rc=$?
-d32_err="$(cat /tmp/agent32a.err)"
+    egresslock denied s32 --days 0 2>$TESTROOT/agent32a.err)"; d32_rc=$?
+d32_err="$(cat $TESTROOT/agent32a.err)"
 if [[ "$d32_rc" == 0 && "$d32_out" == *"a32-one.example.test"* \
       && "$d32_out" != *"a32-two.example.test"* && "$d32_out" != *"a32-three.example.test"* \
       && "$d32_err" == *"EGRESSLOCK_DENIED_MAX_BYTES"* && "$d32_err" == *"stopped at ${cap32} bytes"* ]] \
-   && [[ "$(grep -c . /tmp/agent32a.err)" == 1 ]]; then
+   && [[ "$(grep -c . $TESTROOT/agent32a.err)" == 1 ]]; then
     a32 pass
 else
     a32 fail "D1.1 denied byte cap (rc=$d32_rc out=[$d32_out] err=[$d32_err])"
@@ -2540,8 +2577,8 @@ fi
 mklog32 "$old32"
 cap32="$(head -1 "$STATE/containers-$GW32.access.log" | wc -c)"; cap32=$(( cap32 + 5 ))
 d32_out="$(env EGRESSLOCK_CONF="$A32/gw.conf" EGRESSLOCK_DENIED_MAX_BYTES="$cap32" \
-    egresslock denied s32 2>/tmp/agent32b.err)"; d32_rc=$?
-d32_err="$(cat /tmp/agent32b.err)"
+    egresslock denied s32 2>$TESTROOT/agent32b.err)"; d32_rc=$?
+d32_err="$(cat $TESTROOT/agent32b.err)"
 if [[ "$d32_rc" == 0 && -z "$d32_out" \
       && "$d32_err" == *"EGRESSLOCK_DENIED_MAX_BYTES"* \
       && "$d32_err" == *"no denials in the last 14 days"* ]]; then
@@ -2553,8 +2590,8 @@ fi
 # D1.3 — cap 0 is uncapped: all three entries, no note.
 mklog32 "$now32"
 d32_out="$(env EGRESSLOCK_CONF="$A32/gw.conf" EGRESSLOCK_DENIED_MAX_BYTES=0 \
-    egresslock denied s32 --days 0 2>/tmp/agent32c.err)"; d32_rc=$?
-d32_err="$(cat /tmp/agent32c.err)"
+    egresslock denied s32 --days 0 2>$TESTROOT/agent32c.err)"; d32_rc=$?
+d32_err="$(cat $TESTROOT/agent32c.err)"
 if [[ "$d32_rc" == 0 && "$d32_out" == *"a32-one.example.test"* && "$d32_out" == *"a32-three.example.test"* \
       && "$d32_err" != *"EGRESSLOCK_DENIED_MAX_BYTES"* ]]; then
     a32 pass
@@ -2598,8 +2635,8 @@ d32_out="$(egresslock --config "$A32/gw.conf" ensure s32 2>&1)"; d32_rc=$?
 printf '%s\n' "$(printf 'c%.0s' $(seq 1 90))" > "$STATE/containers-$GW32.cache.log"
 mklog32 "$now32"
 v32_out="$(env EGRESSLOCK_CONF="$A32/gw.conf" EGRESSLOCK_GW_LOG_MAX_BYTES=50 \
-    egresslock verify s32 2>/tmp/agent32d.err)"; v32_rc=$?
-v32_err="$(cat /tmp/agent32d.err)"
+    egresslock verify s32 2>$TESTROOT/agent32d.err)"; v32_rc=$?
+v32_err="$(cat $TESTROOT/agent32d.err)"
 if [[ "$v32_rc" == 0 \
       && "$(grep -c "exec $GW32 mv /var/log/squid/access.log /var/log/squid/access.log.1" "$STATE/execlog")" == 1 \
       && "$(grep -c "exec $GW32 squid -k rotate" "$STATE/execlog")" == 1 \
@@ -2622,8 +2659,8 @@ fi
 mklog32 "$now32"
 touch "$STATE/rotate-fails"
 v32_out="$(env EGRESSLOCK_CONF="$A32/gw.conf" EGRESSLOCK_GW_LOG_MAX_BYTES=50 \
-    egresslock verify s32 2>/tmp/agent32e.err)"; v32_rc=$?
-v32_err="$(cat /tmp/agent32e.err)"
+    egresslock verify s32 2>$TESTROOT/agent32e.err)"; v32_rc=$?
+v32_err="$(cat $TESTROOT/agent32e.err)"
 rm -f "$STATE/rotate-fails"
 if [[ "$v32_rc" == 0 \
       && "$(grep -c "exec $GW32 mv /var/log/squid/access.log /var/log/squid/access.log.1" "$STATE/execlog")" == 1 \
@@ -2665,10 +2702,10 @@ tmplog32="$STATE/containers-$GW32.access.log.new"
         "$now32" "$(printf 'b%.0s' $(seq 1 300))"
 } > "$tmplog32"
 mv "$tmplog32" "$STATE/containers-$GW32.access.log"
-d32_out="$(env EGRESSLOCK_CONF="$A32/gw.conf" egresslock denied s32 --days 0 2>/tmp/agent32f.err)"; d32_rc=$?
+d32_out="$(env EGRESSLOCK_CONF="$A32/gw.conf" egresslock denied s32 --days 0 2>$TESTROOT/agent32f.err)"; d32_rc=$?
 if [[ "$d32_rc" == 0 && "$d32_out" == *"a32-one.example.test"* \
       && "$d32_out" != *"$(printf 'b%.0s' $(seq 1 300))"* ]] \
-   && ! grep -q 'invalid allowlist entry' /tmp/agent32f.err; then
+   && ! grep -q 'invalid allowlist entry' $TESTROOT/agent32f.err; then
     a32 pass
 else
     a32 fail "D2.2 denied skips oversize candidate (rc=$d32_rc out=[$d32_out])"
@@ -3012,13 +3049,27 @@ a45() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); ech
 none45="$TESTROOT/bin-doctor-none"
 rm -rf "$none45"; mkdir -p "$none45"
 for t in env bash cat id head dirname; do ln -s "$(command -v "$t")" "$none45/$t"; done
-d_out="$(env -u EGRESSLOCK_CONF PATH="$none45:$TREE_ROOT" egresslock doctor 2>&1)"; d_rc=$?
+# EGL-80-L3: NFT_BIN is pinned to an absent path so the nft row reports
+# MISSING regardless of the host's /usr/sbin/nft (the doctor's absolute
+# resolution fallback; the host may legitimately have nftables installed).
+d_out="$(env -u EGRESSLOCK_CONF NFT_BIN=/nonexistent PATH="$none45:$TREE_ROOT" egresslock doctor 2>&1)"; d_rc=$?
 [[ "$d_rc" == 1 && "$d_out" == *"podman: MISSING"* \
     && "$d_out" == *"netavark: MISSING"* && "$d_out" == *"nft: MISSING"* \
     && "$d_out" != *"no profile config"* ]] \
     && a45 pass || a45 fail "doctor without conf, missing tools (rc=$d_rc, out: $d_out)"
 [[ "$d_out" == *"rootless_netns: skipped (podman MISSING)"* ]] \
     && a45 pass || a45 fail "netns probe skipped when podman missing"
+
+# 2/3/4b. EGL-81-D1: the rc-0 asserts below are hermetic — doctor's
+# `userns:` row is pinned via the EGRESSLOCK_USERNS_SYSCTL harness
+# override (default unset = the real /proc sysctl), so doctor's rc never
+# depends on the host's userns state. Fixture: $TESTROOT/userns-on holds
+# `1` (enabled). The EGL-80 SHIP NOTE is resolved: all three doctor rc-0
+# cases are back, plus dedicated row-state coverage in 4c/4d/4e.
+
+# userns fixtures for the row-state coverage (EGL-81-D2).
+printf '1' > "$TESTROOT/userns-on"
+printf '0' > "$TESTROOT/userns-off"
 
 # 2. All required present (stub PATH) -> rc 0 + advisory lines.
 stub45="$TESTROOT/bin-doctor-stub"
@@ -3035,7 +3086,8 @@ EOF
 printf '#!/bin/sh\n' > "$stub45/netavark"
 printf '#!/usr/bin/env bash\ncase "$1" in --version) echo "nftables v1.1.3" ;; *) exit 0 ;; esac\n' > "$stub45/nft"
 chmod +x "$stub45"/*
-d_out="$(env -u EGRESSLOCK_CONF PATH="$stub45:$PATH" egresslock doctor 2>&1)"; d_rc=$?
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+    PATH="$stub45:$PATH" egresslock doctor 2>&1)"; d_rc=$?
 [[ "$d_rc" == 0 && "$d_out" == *"podman: podman version 5.4.2"* \
     && "$d_out" == *"netavark: "* && "$d_out" == *"nft: nftables v1.1.3"* \
     && "$d_out" == *"userns: enabled"* \
@@ -3045,6 +3097,7 @@ d_out="$(env -u EGRESSLOCK_CONF PATH="$stub45:$PATH" egresslock doctor 2>&1)"; d
 # 3. Advisory lines never affect rc: netns failure (rc 126 AppArmor
 #    shape) + no pasta/slirp on PATH -> rc stays 0, fail line + stderr
 #    hint name the apparmor check.
+d_err="$TESTROOT/doctor-stderr"
 rm -f "$stub45/pasta" "$stub45/slirp4netns"
 cat > "$stub45/podman" <<'EOF'
 #!/usr/bin/env bash
@@ -3056,16 +3109,22 @@ case "$1" in
 esac
 EOF
 chmod +x "$stub45/podman"
-d_err="$TESTROOT/doctor-stderr"
-d_out="$(env -u EGRESSLOCK_CONF PATH="$stub45:$PATH" egresslock doctor 2>"$d_err")"; d_rc=$?
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+    PATH="$stub45:$PATH" egresslock doctor 2>"$d_err")"; d_rc=$?
+# EGL-80-L4: the old `network_backend: unknown` sub-assert asserted HOST
+# state (no pasta/slirp4netns on the inherited PATH), not engine behavior
+# — on a deployed host with pasta installed it fails while the behavior
+# under test (advisory fail row + rc 0 + hint) is correct. The pasta
+# branch is covered hermetically by case 4 below (its own stub pasta);
+# the `unknown` branch stays covered on hosts without pasta. Restored
+# without the sub-assert (EGL-81: the EGL-80-L4 decision stands).
 [[ "$d_rc" == 0 && "$d_out" == *"rootless_netns: fail:kill network process: permission denied"* \
-    && "$d_out" == *"network_backend: unknown"* \
     && "$(grep -c 'apparmor-check' "$d_err")" -ge 1 ]] \
     && a45 pass || a45 fail "advisory netns fail keeps rc 0 + apparmor hint (rc=$d_rc, out: $d_out)"
 
 # 4. pasta on PATH -> advisory network_backend: pasta.
 printf '#!/bin/sh\n' > "$stub45/pasta"; chmod +x "$stub45/pasta"
-d_out="$(env -u EGRESSLOCK_CONF PATH="$stub45:$PATH" egresslock doctor 2>/dev/null)"
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" PATH="$stub45:$PATH" egresslock doctor 2>/dev/null)"
 [[ "$d_out" == *"network_backend: pasta"* ]] \
     && a45 pass || a45 fail "advisory network_backend pasta (out: $d_out)"
 
@@ -3081,10 +3140,47 @@ case "$1" in
 esac
 EOF
 chmod +x "$stub45/podman"
-d_out="$(env -u EGRESSLOCK_CONF PATH="$stub45:$PATH" egresslock doctor 2>"$d_err")"; d_rc=$?
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+    PATH="$stub45:$PATH" egresslock doctor 2>"$d_err")"; d_rc=$?
 [[ "$d_rc" == 0 && "$d_out" == *"rootless_netns: fail:cgroup manager died unexpectedly"* \
     && "$(grep -c 'apparmor-check' "$d_err")" == 0 ]] \
     && a45 pass || a45 fail "non-apparmor netns failure keeps rc 0, no apparmor hint (rc=$d_rc, err: $(cat "$d_err"))"
+
+# 4c/4d/4e. EGL-81-D2: dedicated hermetic coverage of all three userns
+# row states (enabled / disabled / gateless), around the rc policy:
+# `disabled` is a required-row failure (rc 1), the other two rows do not
+# force rc. Same all-present stub PATH (the good podman stub restored)
+# so every other required tool passes and the row under test is the only
+# rc variable.
+cat > "$stub45/podman" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    --version) echo "podman version 5.4.2" ;;
+    info) echo "netavark" ;;
+    unshare) exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+chmod +x "$stub45/podman"
+
+# 4c. hook -> fixture `1` -> `userns: enabled`, row does not force rc 1.
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+    PATH="$stub45:$PATH" egresslock doctor 2>&1)"; d_rc=$?
+[[ "$d_rc" == 0 && "$d_out" == *"userns: enabled"* ]] \
+    && a45 pass || a45 fail "userns row enabled, rc not forced (rc=$d_rc, out: $d_out)"
+
+# 4d. hook -> fixture `0` -> `userns: disabled`, doctor rc 1.
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-off" \
+    PATH="$stub45:$PATH" egresslock doctor 2>&1)"; d_rc=$?
+[[ "$d_rc" == 1 && "$d_out" == *"userns: disabled"* ]] \
+    && a45 pass || a45 fail "userns row disabled forces rc 1 (rc=$d_rc, out: $d_out)"
+
+# 4e. hook -> absent path -> gateless message, row does not force rc 1.
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-absent/gate" \
+    PATH="$stub45:$PATH" egresslock doctor 2>&1)"; d_rc=$?
+[[ "$d_rc" == 0 \
+    && "$d_out" == *"userns: enabled (kernel has no unprivileged_userns_clone gate)"* ]] \
+    && a45 pass || a45 fail "userns row gateless, rc not forced (rc=$d_rc, out: $d_out)"
 
 # 5. Extra argument -> rc 2 (usage class).
 env -u EGRESSLOCK_CONF egresslock doctor something >/dev/null 2>&1
