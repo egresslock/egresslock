@@ -83,6 +83,14 @@ case "$cmd" in
         # exclude 'flush chain' directive lines from chain-block parsing
         chains="$(grep -v '^flush chain ' "$file" | grep -oE 'chain [A-Za-z0-9_]+' | awk '{print $2}')"
         [[ -n "$chains" ]] || { echo "mock nft: no chain in $file" >&2; exit 1; }
+        # EGL-91: cross-tool ordering probe — one summary line per -f
+        # transaction into callorder.log (chains touched, flush
+        # directives, rule-line count) so tests can assert policy-vs-
+        # gateway-start ordering and that a first-create transaction
+        # already carries rules. Existing callorder consumers are
+        # grep-based and unaffected by the extra line type.
+        echo "nft -f chains=$(echo "$chains" | paste -sd, -) flush=$(grep -c '^flush chain ' "$file" || true) rules=$(grep -c 'counter' "$file" || true)" \
+            >> "$ARCMOCK_STATE/callorder.log"
         # Store or append each chain's own section (additive semantics).
         for ch in $chains; do
             sect="$(awk -v ch="$ch" '
@@ -342,6 +350,10 @@ case "$cmd" in
         ;;
     run)
         echo "run $*" >> "$D/runlog"
+        # EGL-91: mirror container starts into callorder.log so tests
+        # can assert policy-vs-gateway ordering (grep-based consumers
+        # of the other markers are unaffected by the extra line type).
+        echo "podman run $*" >> "$D/callorder.log"
         name=""; net=""; ip=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -609,6 +621,43 @@ fi
 # account slice (start/enable calls still log).
 if [[ -f "$D/systemctl-timer-off" && "$*" == "is-enabled --quiet egresslock-verify@"* ]]; then
     exit 1
+fi
+# EGL-84: --doctor unit-health probes answer from fixture files.
+# Absent fixtures = a HEALTHY host (is-failed says active; show/list-units
+# return nothing) so the pre-EGL-84 doctor behavior is unchanged.
+# EGL-102-D6: (a) FragmentPath queries for a .timer unit answer from
+# systemctl-fragpath-timer when present (the service/shared fixture
+# otherwise, so older cases behave exactly as before); (b) a NON-EMPTY
+# systemctl-health-failed is a unit-glob list — is-failed fails only for
+# matching units (an EMPTY file keeps failing every unit, as before).
+if [[ "$1" == "is-failed" ]]; then
+    if [[ -f "$D/systemctl-health-failed" ]]; then
+        if [[ ! -s "$D/systemctl-health-failed" ]]; then echo failed; exit 0; fi
+        u="${!#}"
+        while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            # shellcheck disable=SC2254  # deliberate glob match
+            case "$u" in $m) echo failed; exit 0 ;; esac
+        done < "$D/systemctl-health-failed"
+    fi
+    echo active
+    exit 1
+fi
+if [[ "$1" == "show" && "$*" == *"ExecMainStatus"* ]]; then
+    [[ -f "$D/systemctl-mainstatus" ]] && cat "$D/systemctl-mainstatus"
+    exit 0
+fi
+if [[ "$1" == "show" && "$*" == *"FragmentPath"* ]]; then
+    if [[ "$*" == *".timer" && -f "$D/systemctl-fragpath-timer" ]]; then
+        cat "$D/systemctl-fragpath-timer"
+    else
+        [[ -f "$D/systemctl-fragpath" ]] && cat "$D/systemctl-fragpath"
+    fi
+    exit 0
+fi
+if [[ "$1" == "list-units" ]]; then
+    [[ -f "$D/systemctl-list-units" ]] && cat "$D/systemctl-list-units"
+    exit 0
 fi
 exit 0
 EOF

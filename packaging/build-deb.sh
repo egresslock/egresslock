@@ -20,10 +20,13 @@
 #                                    (ExecStart rewritten to libdir)
 #
 # Maintainer scripts (ARC-22-D2): postinst retires the pre-ARC-16 global
-# unit names, daemon-reloads and prints the next step — no timer enable,
-# no AppArmor apply, no account touch. postrm daemon-reloads only; it
-# never tears down Podman state, never deletes ~/.config/egresslock (not
-# even on purge — ARC-7-D5), never removes the pasta local snippet.
+# unit names, fails the install while a live prefix kit still shadows
+# the deb's units via /etc, removes the STALE /etc prefix-install
+# templates (EGL-83-D1), daemon-reloads and prints the next step — no
+# timer enable, no AppArmor apply, no account touch. postrm
+# daemon-reloads only; it never tears down Podman state, never deletes
+# ~/.config/egresslock (not even on purge — ARC-7-D5), never removes
+# the pasta local snippet.
 #
 # Every input comes from the kit root next to this script (the repo
 # root since the EGL-1 flatten), so the packaging works unchanged if
@@ -234,7 +237,97 @@ cat > "$root/DEBIAN/postinst" <<'EOF'
 # ARC-22-D2: reload, retire the pre-ARC-16 global unit names (same as
 # install-kit.sh, so an apt upgrade retires them too), print the next
 # step. NO timer enable, NO AppArmor apply, NO account touch.
+# EGL-83-D1 (on-host 203/EXEC finding): a leftover prefix-install
+# instanced template in /etc shadows the deb's /usr/lib unit (systemd
+# load precedence: /etc/systemd/system > /usr/lib/systemd/system) and
+# 203/EXECs every verify instance once the prefix is gone. While the
+# prefix kit is live, FAIL the install (warning-only is what failed
+# on-host); when the prefix is gone, stale PRODUCT templates are
+# removed.
+# EGL-102-D6-R5 (modification awareness, classified): an /etc template
+# is removed only when it is recognizable as THIS product's — the
+# service ExecStart targets the deb libdir (stale deb copy) or a
+# product-shaped kit path (…/egresslock/egresslock-verify; live markers
+# there mean a LIVE prefix kit, default /opt or a custom --prefix —
+# FAIL either way), or the timer is byte-identical to the package's.
+# Anything else is possibly-user: it is KEPT with a disclosure naming
+# the consequence and the manual next action — never silently removed,
+# never dropped on the floor silently either.
 set -e
+etc_svc=/etc/systemd/system/egresslock-verify@.service
+etc_tmr=/etc/systemd/system/egresslock-verify@.timer
+svc_state=absent
+if [ -f "$etc_svc" ]; then
+    if grep -q '/usr/lib/egresslock/egresslock-verify' "$etc_svc"; then
+        svc_state=deb-copy
+    else
+        es_dir="$(sed -n 's/^ExecStart=//p' "$etc_svc" | head -n 1 | awk '{print $1}')"
+        es_dir="${es_dir%/*}"
+        if [ -n "$es_dir" ] && { [ -e "$es_dir/egresslock" ] || [ -e "$es_dir/VERSION" ]; }; then
+            svc_state=prefix-live
+        elif printf '%s\n' "$es_dir" | grep -q '/egresslock$'; then
+            svc_state=stale-product
+        else
+            svc_state=unknown
+        fi
+    fi
+fi
+tmr_state=absent
+if [ -f "$etc_tmr" ]; then
+    if cmp -s "$etc_tmr" /usr/lib/systemd/system/egresslock-verify@.timer; then
+        tmr_state=deb-copy
+    else
+        tmr_state=unknown
+    fi
+fi
+live_prefix=""
+if [ -e /opt/egresslock/egresslock ] || [ -e /opt/egresslock/VERSION ]; then
+    live_prefix=/opt/egresslock
+elif [ "$svc_state" = prefix-live ]; then
+    live_prefix="$es_dir"
+fi
+if [ "$svc_state" != absent ] || [ "$tmr_state" != absent ]; then
+    if [ -n "$live_prefix" ]; then
+        echo "FAIL: a prefix kit is still installed at $live_prefix AND its /etc" >&2
+        echo "  systemd templates shadow this package's egresslock-verify@.* units" >&2
+        echo "  (systemd load precedence: /etc/systemd/system > /usr/lib/systemd/system;" >&2
+        echo "  every verify instance would fail with 203/EXEC). The two install" >&2
+        echo "  channels must never co-exist. Remediation: remove the prefix kit" >&2
+        echo "  with uninstall-kit.sh --prefix $live_prefix (from the checkout/" >&2
+        echo "  tarball that installed it; it also removes the stale /etc" >&2
+        echo "  templates), then finish this install with" >&2
+        echo "  'sudo dpkg --configure egresslock'; or remove $etc_svc and $etc_tmr" >&2
+        echo "  by hand, then 'sudo dpkg --configure egresslock'." >&2
+        exit 1
+    fi
+    removed=""
+    if [ "$svc_state" = deb-copy ] || [ "$svc_state" = stale-product ]; then
+        rm -f "$etc_svc"
+        removed=1
+    fi
+    if [ "$tmr_state" = deb-copy ]; then
+        rm -f "$etc_tmr"
+        removed=1
+    fi
+    if [ -n "$removed" ]; then
+        systemctl daemon-reload || true
+        systemctl reset-failed 'egresslock-verify@*' >/dev/null 2>&1 || true
+        echo "removed stale prefix-install unit shadowing the deb's egresslock-verify@.service/.timer templates"
+    fi
+    if [ "$svc_state" = unknown ]; then
+        echo "kept $etc_svc — not recognizable as an egresslock product template" >&2
+        echo "  (ExecStart outside a kit directory); it may be yours. Inspect it: if it" >&2
+        echo "  is not yours, remove it by hand and run 'systemctl daemon-reload'; while" >&2
+        echo "  it shadows this package's unit, the package's ExecStart is not in effect." >&2
+    fi
+    if [ "$tmr_state" = unknown ]; then
+        echo "kept $etc_tmr — its content matches neither this package's timer" >&2
+        echo "  template nor a prefix-install copy; it may be yours (a custom OnCalendar," >&2
+        echo "  for example). Inspect it: if it is not yours, remove it by hand and run" >&2
+        echo "  'systemctl daemon-reload'; while it shadows the package's timer, the" >&2
+        echo "  package's schedule is not in effect." >&2
+    fi
+fi
 if [ -e /opt/egresslock/egresslock ]; then
     # ARC-22-D1: never run both installs at once on a host.
     echo "WARNING: a prefix kit also exists at /opt/egresslock — do not" >&2

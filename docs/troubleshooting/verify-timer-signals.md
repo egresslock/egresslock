@@ -19,7 +19,15 @@ Signal semantics (learned the hard way — check for these):
 - Healthy: `profile '<name>' verified (ensured)` lines, exit 0.
 - `verify: ... FAILED` / exit 1: policy drift or a half-dead profile
   (e.g. gateway container down). Heal with `ensure <profile>` **as the
-  account**; verify never auto-fixes.
+  account**; verify never auto-fixes. (The kit's
+  `egresslock-setup --doctor` reports the same exit-1 instance as
+  "verify drift, or the entry wrapper failed" — the journal line above
+  tells you which.)
+- `status=203/EXEC` (systemd start failure, no verify output at all):
+  the unit file itself is broken — e.g. a stale template left in
+  `/etc/systemd/system` shadowing the package's unit after a
+  prefix→deb switch. Run `sudo egresslock-setup --doctor`: it names
+  the shadowing file (or missing ExecStart target) and the exact fix.
 - `drift: host <name> resolved to <new> but the policy pins <old>`:
   DNS moved; policy is unchanged; `ensure` heals on the next run.
 - SILENT exit 0 from `--ensured` means "no profiles ensured" — if you

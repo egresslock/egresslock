@@ -142,9 +142,12 @@ are clearer (each `ensure <profile>` targets one conf).
   bare `teardown all` only ever touches `main.conf`, never sibling
   confs.
 - `teardown --runtime` is the no-conf recovery sweep: it
-  name-scans this store for kit containers and networks of BOTH naming
-  generations (`agent-*` / `egresslock-*`) and removes them — for
-  leftovers whose conf is already gone; `all` stays main.conf /
+  name-scans this store for kit containers and networks of the
+  **current** naming generation (`egresslock-*`) only and removes
+  them — for leftovers whose conf is already gone. Pre-rename
+  `agent-*` kit objects are NOT swept; remove any by hand
+  (`podman rm -f` / `podman network rm` — see
+  `docs/setup/uninstall.md`). `all` stays main.conf /
   explicit-conf only.
 
 ### Delete a profile

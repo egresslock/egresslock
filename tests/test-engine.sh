@@ -3197,6 +3197,50 @@ egresslock --help | grep -q "egresslock doctor" \
 egresslock 2>&1 | grep -q "doctor" \
     && a45 pass || a45 fail "short usage lists doctor"
 
+# 8/9. EGL-85-D1: the two bounded branches of the doctor's advisory
+#      netns probe (EGL-78) that no earlier case covers: timeout(1)
+#      absent and probe expiry (rc 124). A refactor could reintroduce
+#      an unbounded probe or misroute the rc-124 hint to the
+#      --apparmor-check pointer; these pin both.
+# 8. timeout(1) absent: isolated PATH (bin-doctor-none technique) with
+#    the healthy stub tools but NO timeout. The fail row must name
+#    coreutils, carry the generic hint (not the apparmor pointer), and
+#    doctor's rc stays 0 (advisory row policy unchanged).
+nt45="$TESTROOT/bin-doctor-notimeout"
+rm -rf "$nt45"; mkdir -p "$nt45"
+for t in env bash cat id head dirname; do ln -s "$(command -v "$t")" "$nt45/$t"; done
+cp "$stub45/podman" "$stub45/netavark" "$stub45/nft" "$nt45/"
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+    PATH="$nt45:$TREE_ROOT" egresslock doctor 2>"$d_err")"; d_rc=$?
+[[ "$d_rc" == 0 \
+    && "$d_out" == *"rootless_netns: fail:timeout(1) (coreutils) not found in PATH"* \
+    && "$(grep -c 'apparmor-check' "$d_err")" == 0 ]] \
+    && a45 pass || a45 fail "doctor timeout-absent advisory row, rc 0 (rc=$d_rc, out: $d_out)"
+
+# 9. probe expiry: podman shim sleeps 60s on the probe command only,
+#    delegating everything else to the healthy stub. The rc-124 branch
+#    must produce the named 5s-timeout row with the GENERIC
+#    run-as-the-dedicated-account hint (deliberately NOT
+#    --apparmor-check) and keep rc 0, well under the harness bound.
+mkdir -p "$TESTROOT/bin-doctor-hang"
+cat > "$TESTROOT/bin-doctor-hang/podman" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "unshare" && "\$2" == "--rootless-netns" && "\$3" == "true" ]]; then
+    sleep 60
+    exit 0
+fi
+exec "$stub45/podman" "\$@"
+EOF
+chmod +x "$TESTROOT/bin-doctor-hang/podman"
+d_start=$SECONDS
+d_out="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+    PATH="$TESTROOT/bin-doctor-hang:$stub45:$PATH" egresslock doctor 2>"$d_err")"; d_rc=$?
+d_elapsed=$(( SECONDS - d_start ))
+[[ "$d_rc" == 0 && "$d_out" == *"rootless_netns: fail: probe timed out after 5s"* \
+    && "$(grep -c 'run as the dedicated account' "$d_err")" -ge 1 \
+    && "$(grep -c 'apparmor-check' "$d_err")" == 0 && "$d_elapsed" -lt 15 ]] \
+    && a45 pass || a45 fail "doctor probe expiry: 5s row + generic hint, rc 0 (rc=$d_rc, elapsed=${d_elapsed}s, out: $d_out, err: $(cat "$d_err"))"
+
 egl45_pass=$pass; egl45_fail=$fail
 
 # --- ARC-74: deep state semantics (relocated from the site harness and
@@ -3350,7 +3394,11 @@ check "ensure restarts anchor + verifies" 0 egresslock ensure local-dev
 
 # The site battery's agent-run wrapper ensured this chain silently on its
 # way here; re-ensure it (uncounted) so the R-003-7 assertions exercise
-# the reorder, not the missing chain.
+# the reorder, not the missing chain. EGL-91-D2: a FIRST ensure now ends
+# on the create-with-rules transaction (no flush); the second call is a
+# warm ensure whose last transaction is the flush+re-add refresh these
+# assertions target.
+egresslock ensure internet-only >/dev/null 2>&1
 egresslock ensure internet-only >/dev/null 2>&1
 
 # --- R-003-7 regressions ---
@@ -3526,6 +3574,69 @@ egresslock --config "$S66/anch.conf" teardown s66 >/dev/null 2>&1 || true
 egl66_pass=$pass; egl66_fail=$fail
 
 echo
+# --- EGL-91: anchor is the netns holder and starts first (D4); policy
+#     lands after the holder, before the gateway; first create is ONE
+#     transaction with rules (audit G-06/I-06, EGL-93 live finding) ---
+pass=0; fail=0
+a91() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+
+S91="$TESTROOT/s91"; rm -rf "$S91"; mkdir -p "$S91"
+: > "$STATE/images/localhost_egresslock-gateway_latest"
+cat > "$S91/gw.conf" <<'EOF'
+profile s91 10.199.95.0/24
+    rule gateway-only
+    gateway 10.199.95.2 3128 s91-allowlist
+EOF
+printf 'git.example.test\n' > "$S91/s91-allowlist"
+
+# D3.1/D3.2 (amended by D4): on a FIRST ensure of a gateway profile the
+# call order is: podman run (ANCHOR — the netns holder), then the nft
+# transaction that installs the profile chain already carrying the
+# rules (no empty policy-accept base, no flush directive), then podman
+# run (GATEWAY). A pre-container nft write would land in an unheld
+# netns and be discarded with it (EGL-93). callorder.log carries the
+# mock's nft -f summary lines and podman run lines in call order.
+: > "$STATE/callorder.log"
+a91_out="$(egresslock --config "$S91/gw.conf" ensure s91 2>&1)"; a91_rc=$?
+p91_first="$(grep -n 'chains=.*p_s91' "$STATE/callorder.log" | head -1 | cut -d: -f1)"
+p91_entry="$(grep 'chains=.*p_s91' "$STATE/callorder.log" | head -1)"
+mapfile -t p91_runs < <(grep -n '^podman run' "$STATE/callorder.log" | cut -d: -f1)
+if [[ "$a91_rc" == 0 && ${#p91_runs[@]} -ge 2 && -n "$p91_first" \
+      && "$p91_first" -gt "${p91_runs[0]}" && "$p91_first" -lt "${p91_runs[1]}" \
+      && "$p91_entry" == *"flush=0"* && "${p91_entry##*rules=}" != 0 ]]; then
+    a91 pass
+else
+    a91 fail "first-ensure order: anchor run, then create-with-rules, then gateway run (rc=$a91_rc entry=[$p91_entry] nft@$p91_first runs=${p91_runs[*]:-none} out=$a91_out)"
+fi
+# D3.1 (cont.): the first-create file is ONE transaction — the whole
+# first ensure has exactly TWO -f transactions (profile create + the
+# v6-deny), not the old three (empty base + v6-deny + refresh).
+n91_txn="$(grep -c '^nft -f ' "$STATE/callorder.log" || true)"
+if [[ "$n91_txn" == 2 ]] && grep -q '^nft -f chains=p_v6deny ' "$STATE/callorder.log"; then
+    a91 pass
+else
+    a91 fail "first-ensure = 2 transactions (create + v6deny), got $n91_txn: $(grep '^nft -f ' "$STATE/callorder.log" | tr '\n' '|')"
+fi
+# ... and the created chain state carries the terminal per-subnet drop
+# (policy_rules inside the create transaction, end state verified by
+# the ensure's own strict verify already).
+grep -q 'counter drop' "$STATE/nft/egresslock.p_s91" \
+    && a91 pass || a91 fail "created p_s91 chain carries rules (find: $(ls "$STATE/nft" | tr '\n' ' '))"
+
+# D3.4: warm ensure (chain present) is the atomic flush+re-add refresh
+# in ONE file — flush=1 with rules, and no create-style flush=0 entry.
+: > "$STATE/callorder.log"
+a91_out="$(egresslock --config "$S91/gw.conf" ensure s91 2>&1)"; a91_rc=$?
+w91_entry="$(grep 'chains=.*p_s91' "$STATE/callorder.log" | head -1)"
+if [[ "$a91_rc" == 0 && "$w91_entry" == *"flush=1"* && "${w91_entry##*rules=}" != 0 ]] \
+      && ! grep -q 'chains=.*p_s91.*flush=0' "$STATE/callorder.log"; then
+    a91 pass
+else
+    a91 fail "warm ensure = atomic flush+re-add (rc=$a91_rc entry=[$w91_entry])"
+fi
+
+arc91_pass=$pass; arc91_fail=$fail
+
 echo "RESULTS (engine config validation): $extra_pass passed, $extra_fail failed"
 echo "RESULTS (ARC-11 subnet hygiene): $arc11_pass passed, $arc11_fail failed"
 echo "RESULTS (ARC-12 DNS drift): $arc12_pass passed, $arc12_fail failed"
@@ -3567,6 +3678,6 @@ echo "RESULTS (EGL-59 help operator-UI): $egl59_pass passed, $egl59_fail failed"
 echo "RESULTS (ARC-74 deep state semantics, synthetic): $deep_pass passed, $deep_fail failed"
 echo "RESULTS (EGL-55 verify missing-network hint): $egl55_pass passed, $egl55_fail failed"
 echo "RESULTS (EGL-66 anchor hardening + digest pin): $egl66_pass passed, $egl66_fail failed"
-total_fail=$((extra_fail + arc11_fail + arc12_fail + arc14_fail + arc16_fail + arc20_fail + arc25_fail + arc26_fail + arc49_fail + arc24_fail + arc35_fail + arc30_fail + arc46_fail + arc_b2_fail + arc37_fail + arc38_fail + arc31_fail + arc41_fail + arc42_fail + arc43_fail + arc44_fail + arc50_fail + arc56_fail + arc58_fail + arc51_fail + arc59_fail + arc57_fail + egl18_fail + egl45_fail + arc54_fail + arc52_fail + arc60_fail + arc32_fail + arc66_fail + arc67_fail + arc71_fail + arc69_fail + egl31_fail + deep_fail + egl55_fail + egl59_fail + egl66_fail))
-echo "RESULTS TOTAL: $((extra_pass + arc11_pass + arc12_pass + arc14_pass + arc16_pass + arc20_pass + arc25_pass + arc26_pass + arc49_pass + arc24_pass + arc35_pass + arc30_pass + arc46_pass + arc_b2_pass + arc37_pass + arc38_pass + arc31_pass + arc41_pass + arc42_pass + arc43_pass + arc44_pass + arc50_pass + arc56_pass + arc58_pass + arc51_pass + arc59_pass + arc57_pass + egl18_pass + arc54_pass + arc52_pass + arc60_pass + arc32_pass + arc66_pass + arc67_pass + arc71_pass + arc69_pass + egl31_pass + egl45_pass + egl59_pass + deep_pass + egl55_pass + egl66_pass)) passed, $total_fail failed"
+total_fail=$((extra_fail + arc11_fail + arc12_fail + arc14_fail + arc16_fail + arc20_fail + arc25_fail + arc26_fail + arc49_fail + arc91_fail + arc24_fail + arc35_fail + arc30_fail + arc46_fail + arc_b2_fail + arc37_fail + arc38_fail + arc31_fail + arc41_fail + arc42_fail + arc43_fail + arc44_fail + arc50_fail + arc56_fail + arc58_fail + arc51_fail + arc59_fail + arc57_fail + egl18_fail + egl45_fail + arc54_fail + arc52_fail + arc60_fail + arc32_fail + arc66_fail + arc67_fail + arc71_fail + arc69_fail + egl31_fail + deep_fail + egl55_fail + egl59_fail + egl66_fail))
+echo "RESULTS TOTAL: $((extra_pass + arc11_pass + arc12_pass + arc14_pass + arc16_pass + arc20_pass + arc25_pass + arc26_pass + arc49_pass + arc91_pass + arc24_pass + arc35_pass + arc30_pass + arc46_pass + arc_b2_pass + arc37_pass + arc38_pass + arc31_pass + arc41_pass + arc42_pass + arc43_pass + arc44_pass + arc50_pass + arc56_pass + arc58_pass + arc51_pass + arc59_pass + arc57_pass + egl18_pass + arc54_pass + arc52_pass + arc60_pass + arc32_pass + arc66_pass + arc67_pass + arc71_pass + arc69_pass + egl31_pass + egl45_pass + egl59_pass + deep_pass + egl55_pass + egl66_pass)) passed, $total_fail failed"
 [[ "$total_fail" -eq 0 ]]

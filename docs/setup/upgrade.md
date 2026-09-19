@@ -33,10 +33,13 @@ invoking the old engine under the new prefix).
 
 ```sh
 # 1. As the account, tear down runtime state. If the NEW engine is
-#    already installed, prefer its no-conf sweep — it sees BOTH name
-#    generations and needs no conf, so it also retires a sibling
-#    profile (dev.conf) whose runtime the old binary's conf-scoped
-#    teardown would leave running:
+#    already installed, prefer its no-conf sweep — it sweeps the
+#    current (`egresslock-*`) naming generation and needs no conf, so
+#    it also retires a sibling profile (dev.conf) whose runtime the
+#    old binary's conf-scoped teardown would leave running.
+#    Pre-rename `agent-*` kit objects are NOT swept: if any remain,
+#    remove them by hand (`podman rm -f` / `podman network rm`) — see
+#    docs/setup/uninstall.md:
 sudo -iu <account> -- /opt/egresslock/egresslock teardown --runtime
 #    Only when the new engine is NOT there yet, tear down with the old
 #    binary — per profile, NEVER `teardown all` (it is conf-scoped:

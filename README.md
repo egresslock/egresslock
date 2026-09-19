@@ -18,7 +18,9 @@ anchor keeps the rootless network namespace and its policy alive between
 workloads, and a systemd timer re-verifies the live ruleset every 15 minutes.
 
 Designed for AI agents, CI runners, build environments, and other
-semi-trusted workloads.
+semi-trusted workloads. See [CHANGELOG.md](CHANGELOG.md) for what
+changed between releases — the public repository ships without
+history, so the changelog is that record.
 
 > **Alpha software:** egresslock is early and evolving — CLI flags,
 > file layout, and behavior may change between releases.

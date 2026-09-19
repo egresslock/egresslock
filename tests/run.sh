@@ -17,13 +17,23 @@
 # `--harness engine|kit|all` selects a subset (default `all` = today's
 # `test-*.sh` glob). Unknown options / bad values exit 2.
 #
+# EGL-86-D1/D2: the battery is a non-root battery — refused, not
+# skipped, under uid 0 (exit 2 after flag parsing, before harness
+# selection). `--help` still wins over the root gate (parsed first).
+#
+# EGL-86-D3: each harness's output is teed to a temp log; at suite end
+# the `^SKIP:` lines are counted, bucketed by free-text reason, and
+# summarized as one `run.sh: skips` line plus a fixed note of what the
+# public tree still covers. Skips never change the exit code.
+#
 # Run:  bash tests/run.sh [--help] [--harness engine|kit|all]
 #                                      [--no-foreground]
 #
 # Exit codes: 0 all harnesses green; 1 one or more harnesses failed
 # (failing harnesses' rc 0 with FAIL lines are caught through the
 # harnesses' final test; a harness timeout is also rc 1); 2 usage error
-# (bad flags, no harnesses found, or timeout(1) missing).
+# (bad flags, no harnesses found, timeout(1) missing, or root uid —
+# run the battery as an unprivileged account).
 
 tests_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -41,12 +51,24 @@ Usage: bash tests/run.sh [options]
                           whole battery and a wedged harness is
                           SIGKILLed 15s after the TERM.
 
+The battery must run as an unprivileged account (its mocked root-guard
+and non-root-hook cases are structurally invalid under uid 0 and root
+execution is refused, not skipped). In a root-only container, run it
+mapped, e.g.:
+
+  setpriv --reuid=nobody --regid=nogroup --clear-groups env HOME=/tmp bash tests/run.sh
+
+(the repo must be world-readable; the harness tempdirs already live in
+/tmp). Intentional security-test skips (private fixtures absent on the
+public tree, host-shape gaps) are summarized as a `run.sh: skips` line
+at suite end; they never change the exit code.
+
 Layers (taxonomy; not selectable flags in this ticket):
   1 public unit/integration  — test-engine.sh + test-kit.sh
   2 public security regs.    — mixed into those harnesses
   3 private/adversarial      — not in this tree (must not ship)
 
-Exit: 0 all green; 1 a harness failed; 2 usage / no harnesses
+Exit: 0 all green; 1 a harness failed; 2 usage / no harnesses / root
 EOF
 }
 
@@ -107,6 +129,20 @@ while (( $# )); do
     shift
 done
 
+# EGL-86-D1/D2: root preflight — refuse, do not skip. Running the
+# battery under uid 0 turns the mocked root-guard cases and the
+# non-root-hook kit asserts into a cascade of structural failures that
+# look like product bugs; per-section skip classification would leave a
+# thin residue falsely reporting "all applicable tests passed" and
+# could mask a real root-guard regression. Same exit class as a usage
+# error (documented 0/1/2 contract). `--help` already exited above, so
+# the root gate never hides the usage text.
+if [[ "$(id -u)" == "0" ]]; then
+    echo "run.sh: FAIL run tests as an unprivileged account — the battery's mocked root-guard and non-root-hook cases are structurally invalid under uid 0, so root execution is refused, not skipped (EGL-86-D2)" >&2
+    echo "run.sh: in a root-only container, run mapped: setpriv --reuid=nobody --regid=nogroup --clear-groups env HOME=/tmp bash tests/run.sh" >&2
+    exit 2
+fi
+
 shopt -s nullglob
 case "$harness_sel" in
     engine)
@@ -138,6 +174,8 @@ fi
 
 HARNESS_TIMEOUT=300
 
+# EGL-86-D3: per-harness tee logs for the end-of-suite skip summary.
+skip_logs=()
 rc=0
 for h in "${harnesses[@]}"; do
     if [[ ! -x "$h" ]]; then
@@ -147,15 +185,23 @@ for h in "${harnesses[@]}"; do
     fi
     echo "== egresslock tests: $h =="
     hrc=0
+    h_log="$(mktemp /tmp/egl86-run-log.XXXXXX)"
+    skip_logs+=( "$h_log" )
     # EGL-78-1-F1: each harness's stdin is /dev/null — a harness must not
     # inherit the caller's interactive terminal (a script(1) inside the
     # harness can otherwise wedge on the never-EOF stdin relay even after
     # its child exits, which also defeats the timeout bound because bash
     # defers SIGTERM while waiting on a foreground child).
+    # EGL-86-D3: stdout+stderr are merged through tee so the visible run
+    # keeps every byte while the `^SKIP:` lines land in the log for the
+    # suite-end summary; PIPESTATUS[0] preserves the harness/timeout rc
+    # (tee must not mask a failure).
     if command -v stdbuf >/dev/null 2>&1; then
-        timeout "${tf_args[@]}" "$HARNESS_TIMEOUT" stdbuf -oL -eL bash "$h" </dev/null || hrc=$?
+        timeout "${tf_args[@]}" "$HARNESS_TIMEOUT" stdbuf -oL -eL bash "$h" </dev/null 2>&1 | tee "$h_log"
+        hrc=${PIPESTATUS[0]}
     else
-        timeout "${tf_args[@]}" "$HARNESS_TIMEOUT" bash "$h" </dev/null || hrc=$?
+        timeout "${tf_args[@]}" "$HARNESS_TIMEOUT" bash "$h" </dev/null 2>&1 | tee "$h_log"
+        hrc=${PIPESTATUS[0]}
     fi
     if (( hrc == 124 )); then
         # EGL-78-D3: a timeout is a FAIL, never a skip; name it for the
@@ -174,6 +220,33 @@ for h in "${harnesses[@]}"; do
         rc=$hrc; echo "run.sh: FAIL $h (rc=$rc)" >&2
     fi
 done
+
+# EGL-86-D3: skip summary — "N passed, 0 failed" must be distinguishable
+# from "all applicable tests ran". Count `^SKIP:` lines across the teed
+# logs, bucket them by (truncated) free-text reason, and state what the
+# public tree still covers. Skips never change the exit code: this is a
+# words-level distinction, not a new rc.
+skip_total=0
+declare -A skip_counts=()
+for h_log in "${skip_logs[@]}"; do
+    while IFS= read -r skip_line; do
+        skip_total=$(( skip_total + 1 ))
+        reason="${skip_line#SKIP: }"
+        (( ${#reason} > 72 )) && reason="${reason:0:69}..."
+        skip_counts["$reason"]=$(( ${skip_counts["$reason"]:-0} + 1 ))
+    done < <(grep '^SKIP:' "$h_log" || true)
+done
+rm -f "${skip_logs[@]}"
+skip_detail=""
+for reason in "${!skip_counts[@]}"; do
+    skip_detail+="${skip_detail:+; }${reason}: ${skip_counts["$reason"]}"
+done
+if (( skip_total > 0 )); then
+    echo "run.sh: skips — ${skip_total} (${skip_detail})"
+else
+    echo "run.sh: skips — 0"
+fi
+echo "run.sh: public-tree coverage still includes .deb staging asserts, tarball staging, and prefix guards; skipped items above are the private-fixture / host-shape checks that need a tree with those fixtures present"
 
 echo "run.sh: egresslock tests done (rc=$rc)"
 exit "$rc"

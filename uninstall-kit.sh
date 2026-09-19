@@ -27,9 +27,12 @@
 #     account's job, run while the engine still exists:
 #       egresslock teardown --runtime
 #     (as the account; no conf needed — it sweeps kit containers and
-#     networks of BOTH name generations. If the engine is
+#     networks of the CURRENT (egresslock-*) naming generation only.
+#     Pre-rename agent-* kit objects are NOT swept: if any remain,
+#     remove them by hand (podman rm -f / podman network rm) — see
+#     docs/setup/uninstall.md. If the engine is
 #     already gone, reinstall the kit and run `teardown --runtime` to
-#     recover the leftovers.)
+#     recover the current-generation leftovers.)
 #
 # Options:
 #   --prefix <path>         kit prefix to remove (default:
@@ -58,9 +61,14 @@
 #                                /usr/local/sbin)
 #
 # Defaults that are not parameter-changeable:
-#   - a kit prefix (new or pre-rename) is rm -rf'd ONLY when it carries
-#     kit markers (egresslock/agent-profiles or VERSION) — a marker-less
-#     dir is warned and kept
+#   - a --prefix or EGRESSLOCK_LEGACY_PREFIX that is not an absolute,
+#     charset-clean kit path (no //, no /./ or /../ segments, not /,
+#     ., or ..) exits 2 before anything is removed
+#   - a kit prefix (new or pre-rename) is rm -rf'd ONLY when it is such
+#     a path AND carries the REAL kit markers — egresslock (executable),
+#     egresslock-verify, VERSION, and gateway/Containerfile (pre-rename
+#     legacy: agent-profiles AND VERSION) — anything else is warned
+#     and kept (a lone VERSION or egresslock file is not a kit)
 #   - account data (conf, allowlist, unit.env) is preserved by default;
 #     only --purge-account-data removes it (both confdirs)
 #   - Podman state (anchors/gateways/networks/images) is never touched;
@@ -98,6 +106,35 @@ for acct in "${accounts[@]:-}"; do
     id "$acct" >/dev/null 2>&1 || { echo "uninstall-kit: no such account: $acct" >&2; exit 1; }
 done
 
+# EGL-89-D1: validate prefix path shapes BEFORE anything is removed.
+# A kit path must be absolute and charset-clean: ^/[A-Za-z0-9._/-]+$,
+# no //, no /./ or /../ segment (incl. a trailing /. or /..), never
+# /, ., or .. — GNU rm's "." / ".." refusal is not a security boundary.
+_check_kit_path_shape() {
+    local p="$1" what="$2" bad=0
+    if [[ "$p" == "/" || "$p" == "." || "$p" == ".." ]]; then
+        bad=1
+    elif [[ "$p" != /* ]]; then
+        bad=1
+    elif [[ "$p" == *$'\n'* ]]; then
+        # a newline would smuggle a second operand past the line-anchored
+        # charset grep below — reject before it can match
+        bad=1
+    elif ! LC_ALL=C grep -qE '^/[A-Za-z0-9._/-]+$' <<<"$p"; then
+        bad=1
+    elif [[ "$p" == *"//"* || "$p" == *"/./"* || "$p" == *"/../"* \
+            || "$p" == *"/." || "$p" == *"/.." ]]; then
+        bad=1
+    fi
+    if (( bad )); then
+        echo "uninstall-kit: $what must be an absolute kit path (no relative/./.. or illegal characters; got: $p)" >&2
+        exit 2
+    fi
+}
+_check_kit_path_shape "$prefix" "--prefix"
+legacy_prefix="${EGRESSLOCK_LEGACY_PREFIX:-/opt/agent-network}"
+_check_kit_path_shape "$legacy_prefix" "EGRESSLOCK_LEGACY_PREFIX"
+
 # 1. Stop/disable the per-account timers (D2: conservative, explicit).
 for acct in "${accounts[@]:-}"; do
     [[ -n "$acct" ]] || continue
@@ -126,12 +163,33 @@ rm -f "$unit_dest/agent-network-verify.service" \
 systemctl disable --now egresslock-verify.timer 2>/dev/null || true
 rm -f "$unit_dest/egresslock-verify.service" \
       "$unit_dest/egresslock-verify.timer"
-# R-017-1 F5: only rm -rf a directory that actually IS a kit prefix
-# (marker files), never a bare/mis-resolved path.
-if [[ -d "$prefix" && ( -f "$prefix/egresslock" || -f "$prefix/VERSION" ) ]]; then
+# EGL-102-D6-R2 (remediate within authority): a timers.target.wants
+# symlink whose template is already gone cannot be cleared by disable
+# and would leave a not-found timer forever after this uninstall. These
+# are the kit's own enablement symlinks (both name generations) — sweep
+# the dangling ones here. Anything else in wants/ is not ours.
+for _want in "$unit_dest"/timers.target.wants/egresslock-verify@*.timer \
+             "$unit_dest"/timers.target.wants/agent-network-verify@*.timer; do
+    [[ -L "$_want" && ! -e "$_want" ]] || continue
+    rm -f "$_want"
+    echo "uninstall-kit: removed dangling timer enablement: $_want"
+done
+unset _want
+# R-017-1 F5 / EGL-89-D1: only rm -rf a directory that actually IS a
+# kit prefix — an absolute, charset-clean path (checked above) carrying
+# the REAL kit markers: all four regular files. A checkout of this repo
+# has egresslock but no VERSION; a scratch dir may have only VERSION;
+# neither is a kit. A path missing any marker is warned and kept.
+prefix_removed=0
+if [[ -d "$prefix" \
+      && -f "$prefix/egresslock" && -x "$prefix/egresslock" \
+      && -f "$prefix/egresslock-verify" \
+      && -f "$prefix/VERSION" \
+      && -f "$prefix/gateway/Containerfile" ]]; then
     rm -rf "$prefix"
+    prefix_removed=1
 elif [[ -e "$prefix" ]]; then
-    echo "uninstall-kit: WARNING - $prefix exists but has no kit markers; not removing" >&2
+    echo "uninstall-kit: WARNING - $prefix exists but is not a real kit prefix (missing real-kit markers: egresslock, egresslock-verify, VERSION, gateway/Containerfile); not removing" >&2
 fi
 
 # EGL-43-D4: remove THIS prefix's PATH wrappers only — the marker
@@ -148,17 +206,17 @@ for _wdest in "$path_bindir/egresslock" "$path_sbindir/egresslock-setup"; do
         echo "uninstall-kit: removed PATH wrapper $_wdest"
     fi
 done
-# ARC-60-D3: the pre-rename prefix, same marker guard as above (old kit
-# markers: agent-profiles or VERSION). A marker-less dir is warned and
-# kept, never silently destroyed (ARC-47-D3).
-legacy_prefix="${EGRESSLOCK_LEGACY_PREFIX:-/opt/agent-network}"
+# ARC-60-D3 / EGL-89-D1: the pre-rename prefix, same shape check and a
+# tightened marker guard (old kit markers: agent-profiles AND VERSION,
+# both required — a lone VERSION file is not the legacy kit). A
+# marker-less dir is warned and kept, never silently destroyed
+# (ARC-47-D3).
 if [[ "$legacy_prefix" != "$prefix" ]]; then
-    if [[ -d "$legacy_prefix" \
-          && ( -f "$legacy_prefix/agent-profiles" || -f "$legacy_prefix/VERSION" ) ]]; then
+    if [[ -d "$legacy_prefix" && -f "$legacy_prefix/agent-profiles" && -f "$legacy_prefix/VERSION" ]]; then
         rm -rf "$legacy_prefix"
         echo "uninstall-kit: removed leftover pre-rename kit at $legacy_prefix"
     elif [[ -e "$legacy_prefix" ]]; then
-        echo "uninstall-kit: WARNING - $legacy_prefix exists but has no pre-rename kit markers; not removing" >&2
+        echo "uninstall-kit: WARNING - $legacy_prefix exists but has no pre-rename kit markers (agent-profiles + VERSION); not removing" >&2
     fi
 fi
 systemctl daemon-reload
@@ -184,13 +242,20 @@ for acct in "${accounts[@]:-}"; do
         done
     else
         # ARC-60-D3: the reminder names `teardown --runtime` (no conf,
-        # both generations), run as the account while the engine still
-        # exists — `teardown all` is conf-scoped and the conf may be gone.
+        # both generations), run as the account. EGL-102-D6-R4 honesty:
+        # by this point the engine is already removed, so the reminder
+        # must say so instead of prescribing an unrunnable command.
         [[ -e "$home/.config/egresslock" ]] && \
-            echo "uninstall-kit: kept $home/.config/egresslock (account-owned policy data; Podman state untouched — run 'egresslock teardown --runtime' as the account, while the engine still exists, to remove kit containers/networks)"
+            echo "uninstall-kit: kept $home/.config/egresslock (account-owned policy data; Podman state untouched — run 'egresslock teardown --runtime' as the account to remove kit containers/networks; it needs the engine, so reinstall the kit first if it is already gone)"
         [[ -e "$home/.config/agent-network" ]] && \
             echo "uninstall-kit: kept $home/.config/agent-network (pre-rename account data; mv it to $home/.config/egresslock or purge with --purge-account-data)"
     fi
 done
 
-echo "uninstall-kit: kit removed from $prefix; instanced templates removed; timers stopped"
+if (( prefix_removed )); then
+    echo "uninstall-kit: kit removed from $prefix; instanced templates removed; timers stopped"
+elif [[ -e "$prefix" ]]; then
+    echo "uninstall-kit: done — $prefix left in place (see warning above); instanced templates removed; timers stopped"
+else
+    echo "uninstall-kit: done — no kit at $prefix; instanced templates removed; timers stopped"
+fi

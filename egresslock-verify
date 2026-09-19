@@ -88,7 +88,7 @@ if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
     elif (( vprc != 0 )); then
         echo "egresslock-verify: podman rootless-netns is broken for this user (probe: 'podman unshare --rootless-netns true'). Check whether AppArmor blocks pasta:" >&2
         echo "  sudo aa-status | grep -i pasta        # enforced profile?" >&2
-        echo "  # primary fix (ARC-27-D2/EGL-15): add 'signal (receive) set=(term) peer=podman,' to the pasta profile, then" >&2
+        echo "  # primary fix: add 'signal (receive) set=(term) peer=podman,' to the pasta profile, then" >&2
         echo "  sudo apparmor_parser -r /etc/apparmor.d/usr.bin.pasta" >&2
         echo "  # alternate but less secure workaround: sudo aa-complain /usr/bin/pasta" >&2
         echo "Then re-run the probe. On some hosts this is instead a session problem:" >&2

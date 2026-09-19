@@ -92,15 +92,39 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ARC-49-D3: a prefix with whitespace would silently break the systemd
-# unit ExecStart (sed substitutes it unquoted into
-# `ExecStart=__EGRESSLOCK_PREFIX__/egresslock-verify`, and systemd splits
-# ExecStart on whitespace). Fail closed rather than half-install.
-[[ "$prefix" != *[[:space:]]* ]] || {
-    echo "install-kit: --prefix must not contain whitespace (got: '$prefix');" >&2
-    echo "  systemd ExecStart cannot handle a space in the kit path." >&2
-    exit 2
+# EGL-90-D1 (audit I-02/I-03): the --prefix path shape is validated at
+# parse. It must be an absolute, charset-clean kit path: ^/[A-Za-z0-9._/-]+$
+# under LC_ALL=C, no //, no /./ or /../ segment (incl. a trailing /. or
+# /..), never /, ., or .. — and (the old ARC-49-D3 rule, subsumed here)
+# no whitespace: the unit template's ExecStart is substituted with sed
+# and systemd splits ExecStart on whitespace, while the PATH wrapper
+# embeds the prefix into an sh file — metacharacters in a prefix are
+# either a broken install or code-exec in the wrapper. Fail closed rc 2
+# rather than half-install. Same rule as uninstall-kit.sh (EGL-89-D1);
+# duplicated by design, not a shared library.
+_check_kit_path_shape() {
+    local p="$1" bad=0
+    if [[ "$p" == "/" || "$p" == "." || "$p" == ".." ]]; then
+        bad=1
+    elif [[ "$p" != /* ]]; then
+        bad=1
+    elif [[ "$p" == *[[:space:]]* ]]; then
+        # ARC-49-D3 (subsumed by the charset, kept explicit): a newline
+        # would also smuggle a second operand past the line-anchored
+        # charset grep below, and systemd ExecStart splits on whitespace
+        bad=1
+    elif ! LC_ALL=C grep -qE '^/[A-Za-z0-9._/-]+$' <<<"$p"; then
+        bad=1
+    elif [[ "$p" == *"//"* || "$p" == *"/./"* || "$p" == *"/../"* \
+            || "$p" == *"/." || "$p" == *"/.." ]]; then
+        bad=1
+    fi
+    if (( bad )); then
+        echo "install-kit: --prefix must be an absolute kit path (no relative/./.., whitespace, or metacharacters; got: $p)" >&2
+        exit 2
+    fi
 }
+_check_kit_path_shape "$prefix"
 
 # Testability hook: the mock harness runs as non-root. Fail closed
 # outside tests.
@@ -109,10 +133,10 @@ done
     exit 1
 }
 
-# EGL-68-D1: never rm -rf through a mistyped --prefix. The install
-# replaces "$prefix/gateway" and "$prefix/examples/recipes" wholesale;
-# that must only ever delete kit-shaped content. For EACH such path,
-# deleting is allowed only when:
+# EGL-68-D1 / EGL-90-D3: never rm -rf through a mistyped --prefix. The
+# install replaces "$prefix/gateway", "$prefix/apparmor" and
+# "$prefix/examples/recipes" wholesale; that must only ever delete
+# kit-shaped content. For EACH such path, deleting is allowed only when:
 #   - the path does not exist (first install), or
 #   - $prefix carries a kit marker (VERSION or the egresslock
 #     executable) — a reinstall over this kit's own deploy, or
@@ -120,7 +144,7 @@ done
 # Otherwise fail closed naming the path; nothing is written and nothing
 # is deleted. The check runs BEFORE any copy so a refused run leaves a
 # foreign tree untouched (no engine binary smeared into it first).
-for _dest in "$prefix/gateway" "$prefix/examples/recipes"; do
+for _dest in "$prefix/gateway" "$prefix/apparmor" "$prefix/examples/recipes"; do
     if [[ ! -e "$_dest" ]]; then
         continue                                   # first install
     fi
@@ -130,8 +154,8 @@ for _dest in "$prefix/gateway" "$prefix/examples/recipes"; do
     fi
     echo "install-kit: FAIL - refusing to delete $_dest" >&2
     echo "  $prefix has no kit marker (VERSION, egresslock executable) and" >&2
-    echo "  gateway/ is not kit-shaped (no Containerfile): a mistyped --prefix" >&2
-    echo "  would destroy a foreign tree. Remove it or name the real kit prefix." >&2
+    echo "  the dest path is not kit-shaped (no gateway/Containerfile): a mistyped" >&2
+    echo "  --prefix would destroy a foreign tree. Remove it or name the real kit prefix." >&2
     exit 1
 done
 unset _dest
@@ -140,14 +164,49 @@ unset _dest
 # (repo root or extracted tarball). Fail closed BEFORE any copy if it
 # is missing or empty — a versionless deploy is not deployable.
 [[ -s "$src/VERSION_BASE" ]] || {
-    echo "install-kit: FAIL - VERSION_BASE missing or empty at $src/VERSION_BASE (EGL-72-D1)" >&2
+    echo "install-kit: FAIL - VERSION_BASE missing or empty at $src/VERSION_BASE (a versionless deploy is not deployable)" >&2
     exit 1
 }
 base="$(tr -d ' \t\n' < "$src/VERSION_BASE")"
 [[ -n "$base" ]] || {
-    echo "install-kit: FAIL - VERSION_BASE is empty (EGL-72-D1)" >&2
+    echo "install-kit: FAIL - VERSION_BASE is empty (a versionless deploy is not deployable)" >&2
     exit 1
 }
+
+# EGL-102-D6-R2 (partial-completion disclosure, fail-closed form): the
+# whole source set must exist BEFORE any copy — a mid-deploy
+# `install: cannot stat` used to leave a partial prefix (binaries or
+# templates missing, no next action). This gate fails closed naming the
+# missing files; nothing has been written yet.
+_kit_missing=""
+# EGL-102-D6-F3: the enumeration must cover the WHOLE unconditional copy
+# list (binaries, gateway/, apparmor/, examples incl. recipes/, unit
+# templates) — `examples/recipes` and the gateway/apparmor side files
+# are copied unconditionally below, so a tree missing only one of them
+# would still die mid-deploy on a bare `cp: cannot stat` (partial
+# prefix, no next action). Keep this list in lockstep with the copy
+# list; the EGL-47-D3 tripwire below guards the shipped set, this
+# guards the copied set.
+for _src in egresslock egresslock-start egresslock-verify egresslock-setup \
+            gateway/Containerfile gateway/entrypoint.sh gateway/squid.conf \
+            apparmor/usr.bin.pasta.local apparmor/README.md \
+            examples/main.conf examples/main-allowlist examples/recipes; do
+    [[ -e "$src/$_src" ]] || _kit_missing+="$_src "
+done
+if [[ -n "${EGRESSLOCK_UNIT_SRC:-}" ]]; then
+    _unit_src_chk="$EGRESSLOCK_UNIT_SRC"
+else
+    _unit_src_chk="$src/systemd"
+fi
+for _ut in egresslock-verify@.service egresslock-verify@.timer; do
+    [[ -f "$_unit_src_chk/$_ut" ]] || _kit_missing+="systemd/$_ut "
+done
+if [[ -n "$_kit_missing" ]]; then
+    echo "install-kit: FAIL - incomplete kit tree at $src (missing: ${_kit_missing% })" >&2
+    echo "  restore the full checkout or re-extract the release tarball, then re-run; nothing was written." >&2
+    exit 1
+fi
+unset _kit_missing _src _unit_src_chk _ut
 
 # EGL-72-D3: the version: line. A tarball install carries KIT_VERSION
 # (the build-time version string written by build-tarball.sh) — use it
@@ -254,7 +313,21 @@ ub_bin="${EGRESSLOCK_UB_BIN:-/usr/bin/egresslock}"
 deb_status="$(dpkg-query -W -f='${Status}' egresslock 2>/dev/null || true)"
 if [[ "$deb_status" == *'installed'* ]]; then
     echo "install-kit: the egresslock .deb is installed on this host ($deb_status);" >&2
-    echo "  never run both installs at once — 'apt remove egresslock' first (ARC-22-D1)." >&2
+    echo "  never run both installs at once — 'apt remove egresslock' first." >&2
+    exit 1
+fi
+# EGL-83-D2: dpkg-query can be missing or wrong (non-dpkg cleanup,
+# foreign host) while the deb's libdir kit is still present — the
+# PATH-wrapper check above misses a libdir-only leftover. Refuse on the
+# deb libdir's VERSION marker too (hookable for tests). Refuse, never
+# auto-remove the deb (same never-co-install policy as above).
+deb_libdir="${EGRESSLOCK_DEB_LIBDIR:-/usr/lib/egresslock}"
+if [[ -e "$deb_libdir/VERSION" ]]; then
+    echo "install-kit: FAIL - an egresslock .deb kit exists at $deb_libdir" >&2
+    echo "  (dpkg-query did not report an installed egresslock, but the libdir kit" >&2
+    echo "  is present); never run both install channels. If dpkg still lists the" >&2
+    echo "  package, remove it: 'apt remove egresslock'; otherwise remove the" >&2
+    echo "  leftover kit dir: sudo rm -r $deb_libdir." >&2
     exit 1
 fi
 if [[ -e "$ub_bin" ]]; then
@@ -276,15 +349,21 @@ for _wl in "$path_bindir/egresslock:$prefix/egresslock" \
             : # this prefix's own wrapper — upgrade, overwrite below
         elif [[ "$_wmarker" == '# egresslock-path-wrapper prefix='* ]]; then
             echo "install-kit: $_wdest wraps a DIFFERENT prefix; two prefix installs" >&2
-            echo "  must not fight over PATH (ARC-22-D1). Remove one first." >&2
+            echo "  must not fight over PATH. Remove one first." >&2
             exit 1
         else
             echo "install-kit: $_wdest exists and is not an egresslock PATH wrapper;" >&2
-            echo "  not clobbering it." >&2
+            echo "  not clobbering it — remove it first if it is stale." >&2
             exit 1
         fi
     fi
-    if printf '#!/bin/sh\n# egresslock-path-wrapper prefix=%s\nexec %s "$@"\n' \
+    # EGL-90-D1.2 (audit I-03): the exec target is double-quoted so a
+    # prefix can never become wrapper code even if a future regression
+    # reintroduces a permissive charset (the charset check above is the
+    # primary lock; this is the second). The marker comment on line 2
+    # stays unquoted (`prefix=$prefix`) — EGL-43 uninstall matching and
+    # EGL-90's charset make that safe.
+    if printf '#!/bin/sh\n# egresslock-path-wrapper prefix=%s\nexec "%s" "$@"\n' \
             "$prefix" "$_wtarget" > "$_wdest" 2>/dev/null \
             && chmod 0755 "$_wdest" 2>/dev/null; then
         echo "PATH wrapper installed: $_wdest -> $_wtarget"

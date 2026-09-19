@@ -1033,35 +1033,6 @@ allowlist_src() {
 }
 
 #
-# Emit the nftables file for the profile's forward chain. Rules are scoped
-# by the profile subnet: other networks sharing the rootless netns are
-# untouched, and an unscoped drop is only present for IPv6 (all restricted
-# profiles are IPv4-only).
-#
-# The file is a SINGLE nftables transaction that adds the table (no-op if
-# it already exists), the shared v6-deny chain (only when missing — an
-# 'add chain' over an existing chain fails the whole transaction), and the
-# profile chain (the caller flush+deletes it first so this is a clean
-# create). See install_policy and review attempt R-003-2.
-#
-# Emit a transaction that creates the profile's base chain WITHOUT
-# rules. Used only when the chain does not exist yet (fresh network —
-# no agents can be running yet), so the empty interval is safe.
-policy_chain_base_file() {
-    local profile="$1" chain
-    chain="$(chain_of "$profile")"
-    local tmp
-    tmp="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
-    cat > "$tmp" <<EOF
-table inet ${TABLE} {
-    chain ${chain} {
-        type filter hook forward priority -150; policy accept;
-    }
-}
-EOF
-    echo "$tmp"
-}
-
 # Emit ONE nftables transaction that atomically replaces the profile
 # chain's rules: `flush chain` + the re-added rules in the same file.
 # R-003-7 finding 1: flushing and re-creating in separate invocations
@@ -1089,25 +1060,17 @@ policy_refresh_file() {
 install_policy() {
     local profile="$1" chain f
     chain="$(chain_of "$profile")"
-    # 1) Base chain, create-if-missing. On first install the network is
-    #    brand new (no agents yet), so the empty interval is safe; on
-    #    refresh the chain already exists and this is a no-op.
-    if ! netns_nft list chain inet "$TABLE" "$chain" >/dev/null 2>&1; then
-        f="$(policy_chain_base_file "$profile")"
-        if ! netns_nft -f "$f"; then
-            rm -f "$f"
-            die "nft policy base-chain install failed for profile '$profile' (fail closed)"
-        fi
-        rm -f "$f"
-    fi
-    # 1b) Shared unscoped IPv6 deny chain: create-if-missing, then an
+    # Shared unscoped IPv6 deny chain first: create-if-missing, then an
     #     ATOMIC refresh in the same transaction style as the profile
     #     chain. Older versions re-emitted this chain on every install
     #     and real additive semantics APPENDED a duplicate drop rule
     #     each time (on-host finding: stacked 'meta nfproto ipv6 counter
     #     drop' rules); the strict ordered verify fails closed on such
     #     a chain, so install must self-heal it. flush+re-add in one
-    #     file means observers never see an empty chain.
+    #     file means observers never see an empty chain. This lands
+    #     BEFORE the profile chain so the profile transaction stays the
+    #     LAST -f of the install (the R-003-7 regression fixture reads
+    #     the last transaction).
     f="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
     if netns_nft list chain inet "$TABLE" p_v6deny >/dev/null 2>&1; then
         echo "flush chain inet ${TABLE} p_v6deny" > "$f"
@@ -1125,17 +1088,44 @@ EOF
         die "nft policy v6-deny install failed for profile '$profile' (fail closed)"
     fi
     rm -f "$f"
-    # 2) Atomic refresh (R-003-7 finding 1): flush + re-added rules in
-    #    ONE transaction — running agents never observe an empty chain.
-    #    The old separate flush/delete/recreate left a fail-open window
-    #    for concurrent agent-run on the shared class network.
-    f="$(policy_refresh_file "$profile")"
-    if ! netns_nft -f "$f"; then
+    # EGL-91-D2 (audit G-06/I-06): first create emits ONE transaction
+    # that creates the profile chain WITH its real rules already in it —
+    # no empty policy-accept base step. The old base's "no agents can
+    # be running yet" assumption was the hole (audit I-06): any
+    # concurrent forward traffic on the brand-new network (a parallel
+    # podman run, the gateway start) passed unfiltered during the
+    # window. No `flush chain` in the create file — flush fails when
+    # the chain is missing. When the chain exists, the refresh path
+    # keeps the atomic flush+re-add (R-003-7): observers see the old or
+    # the new ruleset, never an empty chain.
+    if netns_nft list chain inet "$TABLE" "$chain" >/dev/null 2>&1; then
+        # Atomic refresh (R-003-7 finding 1): flush + re-added rules in
+        # ONE transaction — running agents never observe an empty chain.
+        # The old separate flush/delete/recreate left a fail-open window
+        # for concurrent agent-run on the shared class network.
+        f="$(policy_refresh_file "$profile")"
+        if ! netns_nft -f "$f"; then
+            rm -f "$f"
+            die "nft policy refresh failed for profile '$profile' (fail closed)"
+        fi
         rm -f "$f"
-        die "nft policy refresh failed for profile '$profile' (fail closed)"
+    else
+        f="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
+        {
+            echo "table inet ${TABLE} {"
+            echo "    chain ${chain} {"
+            echo "        type filter hook forward priority -150; policy accept;"
+            policy_rules "$profile"
+            echo "    }"
+            echo "}"
+        } > "$f"
+        if ! netns_nft -f "$f"; then
+            rm -f "$f"
+            die "nft policy install failed for profile '$profile' (fail closed)"
+        fi
+        rm -f "$f"
     fi
-    rm -f "$f"
-    # 3) Remove the deprecated separate exemption chain (pre-ARC-5-D4
+    # Remove the deprecated separate exemption chain (pre-ARC-5-D4
     #    layout) from hosts that installed it. Safe at any time: the
     #    exemption now lives inside the class chain itself.
     if is_gateway_profile "$profile"; then
@@ -1733,23 +1723,31 @@ drop_legacy_table() {
 }
 
 cmd_ensure() {
-     require_profile "${1:-}" ensure
-     netns_probe || exit 1
-     drop_legacy_table
-     ensure_network "$1"
-    # Gateway-first on gateway profiles: the static IP must be claimed
-    # before any dynamic allocation can take it (on-host IPAM finding,
-    # ARC-5).
-    if is_gateway_profile "$1"; then
-        ensure_gateway "$1"
-        gw_apply_allowlist "$1"
-        # ARC-32-D1: the gateway is confirmed healthy here — rotate any
-        # oversize overlay logs before the policy work continues.
-        gw_log_cap "$1"
-        ensure_anchor "$1"
-    else
-        ensure_anchor "$1"
-    fi
+    require_profile "${1:-}" ensure
+    netns_probe || exit 1
+    drop_legacy_table
+    ensure_network "$1"
+    # EGL-91-D4 (EGL-93 live finding, amends D1): the anchor is the
+    # rootless-netns HOLDER — start it before any nft write. A
+    # pre-container `podman unshare --rootless-netns nft` lands in a
+    # netns nothing holds: pasta exits and the first `podman run`
+    # (gateway or anchor) creates a FRESH netns without those rules, so
+    # verify_policy fails on the missing v6-deny chain and the G-06
+    # window is not actually closed. Anchor start is the cheap holder:
+    # it takes the LAST usable host address (ARC-11-D3), not dynamic
+    # IPAM, so ARC-5 gateway-first IPAM still holds — nothing else is
+    # started and the gateway claims its configured static IP next.
+    ensure_anchor "$1"
+    # EGL-91-D1/D2 (audit G-06/I-06): install the nft policy BEFORE the
+    # gateway start. The long window is the gateway health loop (up to
+    # 60s); until the profile chain exists, the bridge (and any
+    # concurrent `podman run --network <profile>`) forwards under
+    # Netavark's default accept. The rules are built from
+    # PROFILE_SUBNET / GW_IP in the conf, not a live gateway inspect,
+    # so nft can go first; the `saddr GW_IP accept` exemption is inert
+    # until that IP speaks, which is fine. First create is ONE
+    # create-with-rules transaction (D2); refreshes flush+re-add
+    # atomically.
     # ARC-12-D2: snapshot the pre-refresh allow-host pins so a DNS
     # change the refresh just healed is announced (refreshed: lines).
     # No chain yet (first ensure) = nothing to announce.
@@ -1763,6 +1761,16 @@ cmd_ensure() {
         done
     fi
     install_policy "$1"
+    # The policy is live (D4); now start the gateway — gateway profiles
+    # only. The static IP was never at risk: the anchor pinned the LAST
+    # usable address, not a dynamic one (ARC-5/ARC-11-D3).
+    if is_gateway_profile "$1"; then
+        ensure_gateway "$1"
+        gw_apply_allowlist "$1"
+        # ARC-32-D1: the gateway is confirmed healthy here — rotate any
+        # oversize overlay logs before the policy work continues.
+        gw_log_cap "$1"
+    fi
     verify_policy "$1" || die "policy verification failed for profile '$1' (fail closed)"
     # D2: announce healed drift (exactly ONE line per HOST, first-A
     # semantics — before is keyed host|port, so dedupe by host).

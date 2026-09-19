@@ -186,7 +186,7 @@ attacks table or an explicit non-goal.
 
 | ID | Invariant | If broken |
 |---|---|---|
-| I1 | Default drop for the profile subnet, except established/related flows, DNS to the bridge gateway `:53`, explicit `allow-host` pins, the gateway's own port, and the gateway's source address going out | direct internet or LAN reach from the workload |
+| I1 | Default drop for the profile subnet, except established/related flows, DNS to the bridge gateway `:53`, explicit `allow-host` pins, the gateway's own port, and the gateway's source address going out. DNS has two paths by design: (a) workload DNS to the bridge gateway `:53`; (b) the **gateway process's own DNS**, which pasta forwards to `169.254.1.1` — i.e. the **host resolver, for any name** | direct internet or LAN reach from the workload. (b) is not a workload bypass — the gateway's connects are still Squid-allowlisted — but its DNS egress is host-resolver-wide by design |
 | I2 | The proxy env is not the boundary: nftables is | an operator believes unsetting the proxy stops egress, or setting it grants egress |
 | I3 | On a gateway-only profile the gateway being down means no direct internet (nothing else is accepted) | fail-open when Squid dies |
 | I4 | Forwarded IPv6 is dropped (`p_v6deny`, before Netavark) | IPv6 bypass of an IPv4-only policy |
@@ -242,6 +242,13 @@ attacks table or an explicit non-goal.
   permits DNS only to the bridge resolver, so query names leave the
   netns unimpeded — allowlist granularity, same family as
   DoH-through-an-allowlisted-host above.
+- **Gateway DNS through pasta is a second exfil/leak surface (I1b):**
+  the gateway's own resolver is pasta's forwarder at `169.254.1.1`,
+  which ends at the host resolver for **any name** — so DNS names
+  queried from the gateway's position (while resolving allowlisted
+  dstdomains, for instance) also leave unimpeded, without a profile
+  chain in between. Not a workload bypass: Squid still allowlists the
+  gateway's connects; the queries themselves are not gated.
 - **Two paths, one destination, different verdicts (T18 neighbor):**
   on a gateway profile an `allow-host` IP is an nft-direct rule, but a
   proxied HTTP(S) request to that same literal IP never reaches it —
@@ -274,7 +281,7 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T14 | `public-only` profile | public IPv4; RFC1918 + 169.254/16 + 224/4 + broadcast dropped | LAN RFC1918 blocked. Not CGNAT/loopback | lab-verified (RFC1918) |
 | T15 | Another account's `podman network ls` | cannot see this account's nets | empty / other store | design-intent |
 | T16 | Engine run as root | refuse | error; root's store unused | design-intent |
-| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + `saddr GW_IP` accept. LAN IPs the operator meant stay `allow-host`. | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
+| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + `saddr GW_IP` accept. A rebind can reach **cloud metadata (`169.254.169.254`)** and **LAN services**, not only a generic private address. LAN IPs the operator meant stay `allow-host`. | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
 | T18 | Literal `http://127.0.0.1` (or other IPv4 URL) via proxy | Squid 403 (dstdomain is names). `allow` of an IPv4 literal is rejected. Use `allow-host` for addresses. | 403; `allow` exit 2 | lab-verified (unlisted literals); grammar: literals rejected |
 
 Rows read as "what should happen", not a pentest report:
