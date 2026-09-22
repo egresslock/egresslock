@@ -4,6 +4,46 @@ All notable changes between egresslock releases. The public repository
 ships without history (each release is a fresh snapshot tree), so this
 file is the record of what changed since the previous release.
 
+## 0.4.0 - 2026-09-21
+
+### Security
+
+- A co-located container holding elevated capabilities could bypass
+  the egress policy by spoofing the gateway's source IP address. The
+  gateway exemption is now bound to the gateway's MAC address as well,
+  so the gateway IP alone no longer satisfies it.
+
+### Fixes
+
+- `ensure` on an already-converged profile no longer restarts gateways
+  or severs proxied sessions — an unchanged profile is a no-op.
+- First-time policy creation is now a single atomic nft transaction:
+  no unprotected window between creating the policy and installing its
+  rules.
+- The drift-check timer now verifies all profiles in the account
+  confdir, not just the wired one.
+- `allow-host` with an unresolvable name fails with one clean error
+  plus a remediation hint instead of raw nft output.
+
+### Added
+
+- New per-profile conf knob `read-timeout <seconds>` (default 900,
+  always emitted) for long silent non-streaming calls through the
+  proxy.
+- Commands now disclose which config and profiles they resolved to on
+  stderr — every time, including piped output.
+
+### Kit
+
+- Shipped systemd units carry generated-file/do-not-modify comments,
+  and the deb installer discloses every systemd unit mutation it
+  performs.
+
+### Docs
+
+- Threat-model updated with live adversarial-probe evidence; new
+  host-service connectivity page.
+
 ## 0.3.0 - 2026-09-19
 
 ### Security

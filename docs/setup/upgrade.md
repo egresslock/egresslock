@@ -13,11 +13,19 @@ The re-run deploys the new kit files and reinstalls the verify unit
 templates (rewriting `ExecStart` with the prefix). It does **not** touch
 accounts — account data, allowlists, and enabled timers survive.
 
-After upgrading:
+After updating, re-ensure each profile (`egresslock ensure <profile>`).
+An unchanged profile no-ops without disruption; a changed one restarts
+its gateway and briefly severs proxied sessions. The 0.3.0 → 0.4.0
+transition specifically forces one gateway replacement per gateway
+profile on the first ensure (pre-0.4.0 gateways have a random MAC; the
+new `read_timeout` line also changes unchanged profiles), so expect a
+brief proxied-session severance once per profile on upgrade day —
+steady-state ensures after that no-op.
 
 1. Confirm the deployed commit: `/opt/egresslock/egresslock --version`
-2. Run one `ensure` + `verify` cycle as the account before relying on
-   the new build (see [check-everything](../reference/check-everything.md)).
+2. Re-ensure each profile as the account, then run one `verify` cycle
+   before relying on the new build (see
+   [check-everything](../reference/check-everything.md)).
 
 ## Cutover from the pre-rename kit (agent-network / agent-profiles → egresslock)
 

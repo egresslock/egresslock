@@ -78,6 +78,20 @@ cmp -s "$TREE_ROOT/egresslock-setup" "$OPT/egresslock-setup" \
     && a16 pass || a16 fail "apparmor snippet deployed to prefix (EGL-69-D2)"
 [[ -f "$UNITS/egresslock-verify@.service" && -f "$UNITS/egresslock-verify@.timer" ]] \
     && a16 pass || a16 fail "instanced templates installed (D1)"
+# EGL-103-D1: shipped unit text carries the generated-file notice and
+# short comments — no internal ticket IDs ride along.
+if grep -q "do not edit" "$UNITS/egresslock-verify@.service" \
+   && grep -q "do not edit" "$UNITS/egresslock-verify@.timer"; then
+    a16 pass
+else
+    a16 fail "installed unit files carry the generated-file notice (EGL-103)"
+fi
+if grep -qE 'EGL-|ARC-' "$UNITS/egresslock-verify@.service" \
+                        "$UNITS/egresslock-verify@.timer"; then
+    a16 fail "shipped unit text leaks ticket IDs (EGL-103)"
+else
+    a16 pass
+fi
 [[ ! -e "$UNITS/egresslock-verify.service" && ! -e "$UNITS/egresslock-verify.timer" ]] \
     && a16 pass || a16 fail "global units retired on upgrade (D9.3)"
 # ARC-47-D3: pre-rename old templates are retired too, instanced + global.
@@ -143,7 +157,14 @@ va_out="$(env EGRESSLOCK_PROFILE=local-dev EGRESSLOCK_CONF="$KITCONF" \
     "$OPT/egresslock-verify" 2>&1)"; va_rc=$?
 [[ "$va_rc" == 0 && "$va_out" == *"policy verified"* ]] \
     && a16 pass || a16 fail "egresslock-verify named mode (rc=$va_rc, out: $va_out)"
-# ensured mode (PROFILE unset): the ensured profile is verified.
+# ensured mode (PROFILE unset): the sweep runs bare `verify --ensured`
+# against the DEFAULT confdir aggregate (EGL-115-D1: EGRESSLOCK_CONF is
+# a wiring witness, stripped from the engine child). It is set here on
+# purpose — the sweep must still verify the wired account. main.conf in
+# the default confdir defines the same local-dev profile the named-mode
+# step ensured.
+mkdir -p "$HOME/.config/egresslock"
+cp "$KITCONF" "$HOME/.config/egresslock/main.conf"
 va_out="$(env -u EGRESSLOCK_PROFILE EGRESSLOCK_CONF="$KITCONF" \
     "$OPT/egresslock-verify" 2>&1)"; va_rc=$?
 [[ "$va_rc" == 0 && "$va_out" == *"verified (ensured)"* ]] \
@@ -200,6 +221,86 @@ v_elapsed=$(( SECONDS - v_start ))
     && a85 pass || a85 fail "verify probe expiry is a named 5s failure (rc=$v_rc, elapsed=${v_elapsed}s, out: $v_out)"
 
 egl85_pass=$pass; egl85_fail=$fail
+
+# --- EGL-115: sweep-mode wrapper scoping (deployed copy) ----------------
+# The timer's sweep must exec the BARE `verify --ensured` with
+# EGRESSLOCK_CONF stripped from the engine child: the engine then
+# default-probes the default confdir and aggregates every *.conf there.
+# An explicit --config or a leaked EGRESSLOCK_CONF would silently scope
+# the whole sweep to one file (the EGL-115 bug). Named mode stays wired
+# to EGRESSLOCK_CONF.
+pass=0; fail=0
+a115() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+
+# Recording engine: EGRESSLOCK_DIR wins the kit-dir resolution, so the
+# wrapper execs this instead of the real engine and we can pin the
+# exact argv + child env. Netns probe skipped (argv is the subject).
+mk115="$STATE/mockkit115"; rm -rf "$mk115"; mkdir -p "$mk115"
+cat > "$mk115/egresslock" <<EOF
+#!/usr/bin/env bash
+{
+    printf 'argv:'
+    for a in "\$@"; do printf ' <%s>' "\$a"; done
+    printf '\n'
+    printf 'conf-env:%s\n' "\${EGRESSLOCK_CONF:-<unset>}"
+} >> "$mk115/record"
+exit 0
+EOF
+chmod +x "$mk115/egresslock"
+
+# 1. Sweep mode: PROFILE unset, EGRESSLOCK_CONF set on the wrapper
+#    (worst case) -> argv is exactly `verify --ensured`, no --config,
+#    and the child env has NO EGRESSLOCK_CONF.
+: > "$mk115/record"
+v_out="$(env -u EGRESSLOCK_PROFILE EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+    EGRESSLOCK_DIR="$mk115" EGRESSLOCK_CONF="$KITCONF" \
+    "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+if [[ "$v_rc" == 0 \
+      && "$(sed -n 1p "$mk115/record")" == "argv: <verify> <--ensured>" \
+      && "$(sed -n 2p "$mk115/record")" == "conf-env:<unset>" ]]; then
+    a115 pass
+else
+    a115 fail "sweep argv is bare --ensured with EGRESSLOCK_CONF stripped (rc=$v_rc, record: $(cat "$mk115/record"), out: $v_out)"
+fi
+
+# 2. Named mode: unchanged — --config + EGRESSLOCK_CONF both reach the
+#    engine child.
+: > "$mk115/record"
+v_out="$(env EGRESSLOCK_PROFILE=local-dev EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+    EGRESSLOCK_DIR="$mk115" EGRESSLOCK_CONF="$KITCONF" \
+    "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+if [[ "$v_rc" == 0 \
+      && "$(sed -n 1p "$mk115/record")" == "argv: <--config> <$KITCONF> <verify> <local-dev>" \
+      && "$(sed -n 2p "$mk115/record")" == "conf-env:$KITCONF" ]]; then
+    a115 pass
+else
+    a115 fail "named mode still passes --config + env (rc=$v_rc, record: $(cat "$mk115/record"), out: $v_out)"
+fi
+
+# 3. End-to-end aggregate: two *.conf in the default confdir, both
+#    anchors ensured -> the sweep verifies BOTH profiles (and the
+#    engine's aggregate disclosure names the confdir).
+cat > "$HOME/.config/egresslock/second.conf" <<'EOF'
+profile second 10.50.1.0/24
+    rule allow-host git.example.test:443
+EOF
+env -u EGRESSLOCK_CONF "$TREE_ROOT/egresslock" ensure second >/dev/null 2>&1
+v_out="$(env -u EGRESSLOCK_PROFILE EGRESSLOCK_CONF="$KITCONF" \
+    "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+if [[ "$v_rc" == 0 \
+      && "$v_out" == *"profile 'local-dev' verified (ensured)"* \
+      && "$v_out" == *"profile 'second' verified (ensured)"* \
+      && "$v_out" == *"using configs in"*"(2 profiles)"* ]]; then
+    a115 pass
+else
+    a115 fail "sweep verifies every ensured profile in the confdir (rc=$v_rc, out: $v_out)"
+fi
+
+# Cleanup: restore the harness's default-confdir and profile state.
+env -u EGRESSLOCK_CONF "$TREE_ROOT/egresslock" teardown second >/dev/null 2>&1 || true
+rm -f "$HOME/.config/egresslock/main.conf" "$HOME/.config/egresslock/second.conf"
+
+egl115_pass=$pass; egl115_fail=$fail
 
 # --- ARC-17: uninstall-kit --------------------------------------------------
 pass=0; fail=0
@@ -490,9 +591,18 @@ pass=0; fail=0   # EGL-43: reset before ARC-18 (that block never resets)
 SNAP_PUBLIC="$TREE_ROOT/packaging/snapshot-public.sh"
 HAVE_SNAPSHOT=0; [[ -f "$SNAP_PUBLIC" ]] && HAVE_SNAPSHOT=1
 HAVE_INTERNAL_DOCS=0; [[ -d "$TREE_ROOT/internal_docs" ]] && HAVE_INTERNAL_DOCS=1
+# EGL-107-D1: third tree shape (extracted manual-install tarball) — the
+# tarball excludes ./packaging by design (ARC-22-D4), so the two build
+# scripts are absent there and every check that invokes, greps, or
+# consumes their artifacts skips with a named cause instead of rc-127.
+# Independent of HAVE_SNAPSHOT: the public snapshot tree SHIPS the build
+# scripts (EGL-74-D2) and must keep running those checks.
+HAVE_BUILD_DEB=0; [[ -f "$TREE_ROOT/packaging/build-deb.sh" ]] && HAVE_BUILD_DEB=1
+HAVE_BUILD_TARBALL=0; [[ -f "$TREE_ROOT/packaging/build-tarball.sh" ]] && HAVE_BUILD_TARBALL=1
+PKG_SKIP_TAG="packaging-build-scripts absent"
 
 if [[ "$HAVE_SNAPSHOT" == 0 ]]; then
-    echo "SKIP: EGL-12 public snapshot staging — packaging/snapshot-public.sh is not on the public tree (EGL-74-D1)"
+    skip "snapshot-public.sh absent" "EGL-12 public snapshot staging — packaging/snapshot-public.sh is not on the public tree (EGL-74-D1)"
     egl12_pass=0; egl12_fail=0
 else
 pass=0; fail=0
@@ -574,7 +684,7 @@ if [[ "$HAVE_INTERNAL_DOCS" == 1 ]]; then
     [[ -e "$p47/kit/internal_docs" ]] \
         && a47 pass || a47 fail "fixture sanity: kit copy contains internal_docs"
 else
-    echo "SKIP: EGL-47 fixture sanity — internal_docs/ is not on the public tree (EGL-74-D1)"
+    skip "internal_docs absent" "EGL-47 fixture sanity — internal_docs/ is not on the public tree (EGL-74-D1)"
 fi
 
 # 1. Snapshot --dry-run: internal_docs present at source, absent in stage.
@@ -584,15 +694,19 @@ o="$(bash "$p47/kit/packaging/snapshot-public.sh" --dry-run "$p47/stage" 2>&1)";
 [[ "$rc" == 0 && ! -e "$p47/stage/internal_docs" ]] \
     && a47 pass || a47 fail "snapshot stage has no internal_docs (rc=$rc, out: $o)"
 else
-    echo "SKIP: EGL-47 snapshot dry-run — publisher/internal_docs not on the public tree (EGL-74-D1)"
+    skip "internal_docs absent" "EGL-47 snapshot dry-run — publisher/internal_docs not on the public tree (EGL-74-D1)"
 fi
 
 # 2. Deb staging (KEEP_STAGE): no staged path contains internal_docs.
 s47="$p47/debstage"
-o="$(env EGRESSLOCK_DEB_KEEP_STAGE="$s47" EGRESSLOCK_DEB_OUT="$p47/deb" \
-    "$p47/kit/packaging/build-deb.sh" 2>&1)"; rc=$?
-[[ "$rc" == 0 ]] && ! find "$s47" -name 'internal_docs' | grep -q . \
-    && a47 pass || a47 fail "deb stage has no internal_docs (rc=$rc, out: $o)"
+if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
+    o="$(env EGRESSLOCK_DEB_KEEP_STAGE="$s47" EGRESSLOCK_DEB_OUT="$p47/deb" \
+        "$p47/kit/packaging/build-deb.sh" 2>&1)"; rc=$?
+    [[ "$rc" == 0 ]] && ! find "$s47" -name 'internal_docs' | grep -q . \
+        && a47 pass || a47 fail "deb stage has no internal_docs (rc=$rc, out: $o)"
+else
+    skip "$PKG_SKIP_TAG" "EGL-47 deb stage tripwire — packaging/build-deb.sh is not on this tree (extracted kit)"
+fi
 
 # 3. Prefix install (non-root hook): internal_docs absent from prefix.
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$p47/units" \
@@ -603,9 +717,13 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$p47/units" \
 
 # 4. Tarball: listing has no internal_docs path.
 t47rc=0
-env EGRESSLOCK_TARBALL_OUT="$p47/k.tgz" "$p47/kit/packaging/build-tarball.sh" >"$p47/tlog" 2>&1 || t47rc=$?
-[[ "$t47rc" == 0 ]] && ! tar -tzf "$p47/k.tgz" | grep -q 'internal_docs' \
-    && a47 pass || a47 fail "tarball listing has no internal_docs (rc=$t47rc, log: $(cat "$p47/tlog"))"
+if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
+    env EGRESSLOCK_TARBALL_OUT="$p47/k.tgz" "$p47/kit/packaging/build-tarball.sh" >"$p47/tlog" 2>&1 || t47rc=$?
+    [[ "$t47rc" == 0 ]] && ! tar -tzf "$p47/k.tgz" | grep -q 'internal_docs' \
+        && a47 pass || a47 fail "tarball listing has no internal_docs (rc=$t47rc, log: $(cat "$p47/tlog"))"
+else
+    skip "$PKG_SKIP_TAG" "EGL-47 tarball listing tripwire — packaging/build-tarball.sh is not on this tree (extracted kit)"
+fi
 
 # 5. The guards are explicit in the scripts (not layout accidents).
 #    build-tarball.sh / build-deb.sh / install-kit.sh ship on the public
@@ -615,26 +733,41 @@ if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
 grep -q 'internal_docs' "$TREE_ROOT/packaging/snapshot-public.sh" \
     && a47 pass || a47 fail "snapshot-public.sh names internal_docs (D1)"
 else
-    echo "SKIP: EGL-47 publisher grep — packaging/snapshot-public.sh not on the public tree (EGL-74-D1)"
+    skip "snapshot-public.sh absent" "EGL-47 publisher grep — packaging/snapshot-public.sh not on the public tree (EGL-74-D1)"
 fi
+# EGL-107-D1: the build-script greps skip on the extracted kit (scripts
+# absent there); the install-kit half always runs (shipped kit file).
+if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
 grep -q -- '--exclude=./internal_docs' "$TREE_ROOT/packaging/build-tarball.sh" \
     && a47 pass || a47 fail "build-tarball.sh excludes internal_docs (D2)"
+else
+    skip "$PKG_SKIP_TAG" "EGL-47 build-tarball exclude grep — packaging/build-tarball.sh is not on this tree (extracted kit)"
+fi
+grep -q 'internal_docs' "$TREE_ROOT/install-kit.sh" \
+    && a47 pass || a47 fail "prefix tripwire names internal_docs (D3)"
+if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
 grep -q 'internal_docs' "$TREE_ROOT/packaging/build-deb.sh" \
-    && grep -q 'internal_docs' "$TREE_ROOT/install-kit.sh" \
-    && a47 pass || a47 fail "deb + prefix tripwires name internal_docs (D3)"
+    && a47 pass || a47 fail "deb tripwire names internal_docs (D3)"
+else
+    skip "$PKG_SKIP_TAG" "EGL-47 build-deb tripwire grep — packaging/build-deb.sh is not on this tree (extracted kit)"
+fi
 
 # 6. Tripwires fire: plant internal_docs into the tarball flow —
 #    simulate a widened copy rule by removing the exclude from the kit
 #    copy's own build-tarball.sh (it must stay in packaging/ so its
 #    src resolution is unchanged) and re-run: guard must fail closed.
-if [[ "$HAVE_INTERNAL_DOCS" == 1 ]]; then
+#    EGL-107-D1: needs BOTH the build script and the internal_docs
+#    fixture; on the extracted kit the script absence is the reason.
+if [[ "$HAVE_BUILD_TARBALL" == 0 ]]; then
+    skip "$PKG_SKIP_TAG" "EGL-47 widened-tarball tripwire — packaging/build-tarball.sh is not on this tree (extracted kit)"
+elif [[ "$HAVE_INTERNAL_DOCS" == 1 ]]; then
 sed 's/--exclude=\.\/internal_docs//' "$p47/kit/packaging/build-tarball.sh" > "$p47/kit/packaging/build-tarball-widened.sh"
 mv "$p47/kit/packaging/build-tarball-widened.sh" "$p47/kit/packaging/build-tarball.sh"
 o="$(env EGRESSLOCK_TARBALL_OUT="$p47/k2.tgz" bash "$p47/kit/packaging/build-tarball.sh" 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$o" == *"internal_docs leaked"* ]] \
     && a47 pass || a47 fail "widened tarball copy trips the guard (rc=$rc, out: $o)"
 else
-    echo "SKIP: EGL-47 widened-tarball tripwire — internal_docs/ is not on the public tree (EGL-74-D1)"
+    skip "internal_docs absent" "EGL-47 widened-tarball tripwire — internal_docs/ is not on the public tree (EGL-74-D1)"
 fi
 
 egl47_pass=$pass; egl47_fail=$fail
@@ -643,7 +776,7 @@ pass=0; fail=0
 # --- EGL-49: .deb other-readable for apt's _apt sandbox (D1) ----------------
 pass=0; fail=0
 a49() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
-if command -v dpkg-deb >/dev/null 2>&1; then
+if command -v dpkg-deb >/dev/null 2>&1 && [[ "$HAVE_BUILD_DEB" == 1 ]]; then
     p49="$STATE/egl49"; rm -rf "$p49"; mkdir -p "$p49"
     # Build under umask 077 (the defect shape).
     o="$(env EGRESSLOCK_DEB_OUT="$p49/e2.deb" bash -c 'umask 077; bash "$1" 2>&1' _ "$TREE_ROOT/packaging/build-deb.sh")"; rc=$?
@@ -656,8 +789,10 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     fi
     # D1: KEEP_STAGE exits before the build (no artifact, no chmod) —
     # pinned by the earlier ARC-22 flow.
+elif [[ "$HAVE_BUILD_DEB" == 0 ]]; then
+    skip "$PKG_SKIP_TAG" "EGL-49 umask build assert — packaging/build-deb.sh is not on this tree (extracted kit)"
 else
-    echo "SKIP: EGL-49 dpkg-deb not available; skipping mode assert"
+    skip "dpkg-deb absent" "EGL-49 dpkg-deb not available; skipping mode assert"
 fi
 
 egl49_pass=$pass; egl49_fail=$fail
@@ -1179,6 +1314,11 @@ p22="$STATE/a22"; rm -rf "$p22"; mkdir -p "$p22"
 
 # D4: the tarball is the self-contained kit tree (incl. uninstall-kit.sh
 # and the unit templates) + a README fragment.
+# EGL-107-D1: the whole tarball flow (build, content asserts, extracted-
+# tree install/uninstall) skips on the extracted kit — the producer and
+# its artifacts are packaging/build-tarball.sh's; the f1*/AppArmor parts
+# of this counter (no packaging deps) still run.
+if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
 t_out="$(env EGRESSLOCK_TARBALL_OUT="$p22/k.tgz" "$TARSH" 2>&1)"; t_rc=$?
 [[ "$t_rc" == 0 && -f "$p22/k.tgz" ]] \
     && a22 pass || a22 fail "tarball build (rc=$t_rc, out: $t_out)"
@@ -1230,8 +1370,13 @@ u_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u22" \
     bash "$p22/x/egresslock/uninstall-kit.sh" --prefix "$p22/opt" 2>&1)"; u_rc=$?
 [[ "$u_rc" == 0 && ! -d "$p22/opt" ]] \
     && a22 pass || a22 fail "tarball uninstall removes the prefix (rc=$u_rc, out: $u_out)"
+else
+    skip "$PKG_SKIP_TAG" "ARC-22 tarball flow (build + content asserts + extracted-tree install/uninstall) — packaging/build-tarball.sh is not on this tree (extracted kit)"
+fi
 
 # D1/D2: the staged .deb tree (file-set assert; dpkg optional below).
+# EGL-107-D1: staging + every staged-tree assert skip with the producer.
+if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
 s_out="$(env EGRESSLOCK_DEB_KEEP_STAGE="$p22/stage" \
     EGRESSLOCK_DEB_OUT="$p22/deb" "$DEBSH" 2>&1)"; s_rc=$?
 [[ "$s_rc" == 0 ]] && a22 pass || a22 fail "deb staging run (rc=$s_rc, out: $s_out)"
@@ -1258,6 +1403,20 @@ grep -q 'exec /usr/lib/egresslock/egresslock' "$p22/stage/usr/bin/egresslock" \
 grep -q 'ExecStart=/usr/lib/egresslock/egresslock-verify' \
     "$p22/stage/usr/lib/systemd/system/egresslock-verify@.service" \
     && a22 pass || a22 fail "deb unit ExecStart uses libdir (D1)"
+# EGL-103-D1: the deb's unit copies keep the generated-file notice and
+# stay ticket-ID-free.
+if grep -q "do not edit" "$p22/stage/usr/lib/systemd/system/egresslock-verify@.service" \
+   && grep -q "do not edit" "$p22/stage/usr/lib/systemd/system/egresslock-verify@.timer"; then
+    a22 pass
+else
+    a22 fail "deb unit copies carry the generated-file notice (EGL-103)"
+fi
+if grep -qE 'EGL-|ARC-' "$p22/stage/usr/lib/systemd/system/egresslock-verify@.service" \
+                        "$p22/stage/usr/lib/systemd/system/egresslock-verify@.timer"; then
+    a22 fail "deb unit text leaks ticket IDs (EGL-103)"
+else
+    a22 pass
+fi
 grep -q '^Package: egresslock$' "$p22/stage/DEBIAN/control" \
     && grep -q '^Architecture: all$' "$p22/stage/DEBIAN/control" \
     && grep -q '^Depends:.*podman' "$p22/stage/DEBIAN/control" \
@@ -1284,6 +1443,9 @@ fi
 # actually checks for the prefix kit.
 grep -q '/opt/egresslock/egresslock' "$p22/stage/DEBIAN/postinst" \
     && a22 pass || a22 fail "postinst warns on /opt dual install (R-022-1 F2)"
+else
+    skip "$PKG_SKIP_TAG" "ARC-22 deb staging + staged-tree asserts — packaging/build-deb.sh is not on this tree (extracted kit)"
+fi
 
 # R-022-1 F1: a fresh .deb-only host — no /etc template, no --prefix —
 # derives the prefix from the deb unit template (/usr/lib/systemd/system),
@@ -1380,8 +1542,9 @@ f1w_conf="$(grep -o 'EGRESSLOCK_CONF=.*' "$f1w/home/uacct/.config/egresslock/uni
 [[ "$f1w_rc" == 0 && "$f1w_out" != *"no engine at"* ]] \
     && a22 pass || a22 fail "D37-1 working default-/etc prefix wins over live deb (rc=$f1w_rc, out: $f1w_out)"
 
-# dpkg-deb smoke test (when dpkg-deb exists; stage asserts already ran).
-if command -v dpkg-deb >/dev/null 2>&1; then
+# dpkg-deb smoke test (when dpkg-deb exists and the producer is present;
+# stage asserts already ran).
+if command -v dpkg-deb >/dev/null 2>&1 && [[ "$HAVE_BUILD_DEB" == 1 ]]; then
     d_out="$(env EGRESSLOCK_DEB_OUT="$p22/egresslock_test_all.deb" "$DEBSH" 2>&1)"; d_rc=$?
     [[ "$d_rc" == 0 && -f "$p22/egresslock_test_all.deb" ]] \
         && a22 pass || a22 fail "dpkg-deb build smoke (rc=$d_rc, out: $d_out)"
@@ -1391,6 +1554,8 @@ if command -v dpkg-deb >/dev/null 2>&1; then
         && a22 pass || a22 fail "dpkg-deb -c lists /usr/bin/egresslock"
     dpkg-deb -f "$p22/egresslock_test_all.deb" Architecture 2>/dev/null | grep -qx 'all' \
         && a22 pass || a22 fail "dpkg-deb -f Architecture=all"
+elif [[ "$HAVE_BUILD_DEB" == 0 ]]; then
+    skip "$PKG_SKIP_TAG" "ARC-22 dpkg-deb smoke — packaging/build-deb.sh is not on this tree (extracted kit)"
 else
     echo "note: dpkg-deb not available; stage-only asserts ran (ARC-22)"
 fi
@@ -1853,7 +2018,9 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_SHARE="$aa22/share" \
 # --- EGL-27: monotonic version stamps (dpkg ordering) ----------------------
 # D1: version = <VERSION_BASE>+git<YYYYMMDDHHMMSS>.<12-char-sha> in BOTH
 # build scripts; the second-resolution UTC stamp is the ordering key, the sha
-# is identification only.
+# is identification only. EGL-107-D1: the script-shape greps skip on the
+# extracted kit (scripts absent there); the dpkg-ordering pins below stay.
+if [[ "$HAVE_BUILD_DEB" == 1 && "$HAVE_BUILD_TARBALL" == 1 ]]; then
 grep -q "%Y%m%d%H%M%S" "$DEBSH" && grep -q "rev-parse --short=12" "$DEBSH" \
     && a22 pass || a22 fail "EGL-27 build-deb.sh stamps second-resolution + short12"
 grep -q "%Y%m%d%H%M%S" "$TARSH" && grep -q "rev-parse --short=12" "$TARSH" \
@@ -1862,6 +2029,9 @@ if ! grep -q "%Y%m%d')." "$DEBSH" && ! grep -q "%Y%m%d')." "$TARSH"; then
     a22 pass
 else
     a22 fail "EGL-27 old date-only stamp still present"
+fi
+else
+    skip "$PKG_SKIP_TAG" "EGL-27 build-script stamp-shape greps — packaging/build-*.sh are not on this tree (extracted kit)"
 fi
 
 # The point of the fix: two stamps from the NEW scheme, second timestamp
@@ -1905,8 +2075,17 @@ if command -v dpkg >/dev/null 2>&1; then
     else
         a22 fail "EGL-88 0.2.0 -> 0.3.0 base bump not an upgrade under dpkg ordering"
     fi
+    # EGL-118-D8 cross-base pin: the 0.4.0 base bump (same timestamp,
+    # same sha — worst case) must also compare as an upgrade over a
+    # 0.3.0 stamp; 0.3.0 -> 0.4.0 is never a dpkg downgrade.
+    if dpkg --compare-versions "0.3.0+git20260911045959.e05db24d86f0" \
+            lt "0.4.0+git20260911045959.e05db24d86f0"; then
+        a22 pass
+    else
+        a22 fail "EGL-118 0.3.0 -> 0.4.0 base bump not an upgrade under dpkg ordering"
+    fi
 else
-    echo "SKIP: EGL-27 dpkg not available; skipping compare-versions assert"
+    skip "dpkg absent" "EGL-27 dpkg not available; skipping compare-versions assert"
 fi
 
 # A real build stamps the artifact with the new scheme (the redirected
@@ -1916,20 +2095,26 @@ fi
 # bump and adds the 0.1.0+git lt 0.2.0+git cross-base assert above.
 # EGL-88-D8: the live-base pin moves to 0.3.0 with the VERSION_BASE bump
 # and adds the 0.2.0+git lt 0.3.0+git cross-base assert above.
+# EGL-118-D8: the live-base pin moves to 0.4.0 with the VERSION_BASE bump
+# and adds the 0.3.0+git lt 0.4.0+git cross-base assert above.
 # EGL-80-L8: the stamp embeds the git commit — in a tree WITHOUT .git
 # (the exported/staged public snapshot shape, or a plain export)
 # build-tarball legitimately falls back to 'unknown' (EGL-74
 # skip-when-absent pattern: named SKIP instead of a host-shape FAIL).
 # Full assert runs in the private tree and in public git clones.
 b27="$p22/egl27"; rm -rf "$b27"; mkdir -p "$b27"
-if [[ -d "$TREE_ROOT/.git" ]]; then
+if [[ "$HAVE_BUILD_TARBALL" == 0 ]]; then
+    # EGL-107-D1: the producer is absent (extracted kit) — the shape
+    # cause names the real reason; .git shape is irrelevant here.
+    skip "$PKG_SKIP_TAG" "EGL-27 tarball stamp assert — packaging/build-tarball.sh is not on this tree (extracted kit)"
+elif [[ ! -d "$TREE_ROOT/.git" ]]; then
+    skip "git-metadata absent" "EGL-27 tarball stamp assert needs .git metadata (absent in exported/staged trees); build-tarball falls back to 'unknown' by design"
+else
     t27_rc=0
     env EGRESSLOCK_TARBALL_OUT="$b27/k.tgz" "$TARSH" >"$b27/log" 2>&1 || t27_rc=$?
-    v27_real="$(grep -oE '0\.3\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
+    v27_real="$(grep -oE '0\.4\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
     [[ "$t27_rc" == 0 && -f "$b27/k.tgz" && -n "$v27_real" ]] \
         && a22 pass || a22 fail "EGL-27 tarball build stamps new scheme (rc=$t27_rc, log: $(cat "$b27/log"))"
-else
-    echo "SKIP: EGL-27 tarball stamp assert needs .git metadata (absent in exported/staged trees); build-tarball falls back to 'unknown' by design"
 fi
 
 # D2: the warn is warn-only — build-deb.sh must print the version and
@@ -1937,11 +2122,15 @@ fi
 # path only fires when an installed package exists; here assert the
 # code shape (echo + dpkg-query + --compare-versions ... ge + stderr
 # WARNING) rather than an installed package in the test container.
+if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
 grep -q 'build-deb: version \$version' "$DEBSH" \
     && grep -q "dpkg-query -W -f='\${Version}' egresslock" "$DEBSH" \
     && grep -q 'dpkg --compare-versions "\$installed" ge "\$version"' "$DEBSH" \
     && grep -q 'WARNING - installed egresslock' "$DEBSH" \
     && a22 pass || a22 fail "EGL-27 build-deb.sh prints version + downgrade warn (D2)"
+else
+    skip "$PKG_SKIP_TAG" "EGL-27 build-deb warn-shape grep — packaging/build-deb.sh is not on this tree (extracted kit)"
+fi
 
 # --- EGL-72: VERSION_BASE 0.1.0 + release-aware stamps ---------------------
 # D1: one VERSION_BASE at the repo root, fail-closed in all three
@@ -1951,12 +2140,22 @@ grep -q 'build-deb: version \$version' "$DEBSH" \
 # uninstall removes the prefix). D4: the base asserts + pins.
 [[ -s "$TREE_ROOT/VERSION_BASE" ]] \
     && a22 pass || a22 fail "EGL-72 VERSION_BASE exists at the repo root"
+# EGL-72-D3 stage/tarball VERSION consumers (EGL-107-D1: skip with the
+# producers on the extracted kit; the install-kit stamp assert stays).
+if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
 grep -q '^version: ' "$p22/stage/usr/lib/egresslock/VERSION" \
     && a22 pass || a22 fail "EGL-72 deb VERSION stamp has a version: line"
+else
+    skip "$PKG_SKIP_TAG" "EGL-72 deb-stage VERSION stamp assert — packaging/build-deb.sh is not on this tree (extracted kit)"
+fi
 grep -q '^version: ' "$OPT/VERSION" \
     && a22 pass || a22 fail "EGL-72 install-kit VERSION stamp has a version: line"
+if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
 [[ -f "$p22/x/egresslock/VERSION_BASE" && -f "$p22/x/egresslock/KIT_VERSION" ]] \
     && a22 pass || a22 fail "EGL-72 tarball ships VERSION_BASE + KIT_VERSION"
+else
+    skip "$PKG_SKIP_TAG" "EGL-72 tarball VERSION_BASE/KIT_VERSION assert — packaging/build-tarball.sh is not on this tree (extracted kit)"
+fi
 
 arc22_pass=$pass; arc22_fail=$fail
 
@@ -2581,10 +2780,15 @@ else
 fi
 
 # 8. D50-4: no `[--enable]` bracket presentation anywhere operator-facing.
+#    EGL-107-D1: packaging files skip per-file on the extracted kit; the
+#    shipped kit scripts always assert (an absent file must not turn
+#    the grep into a vacuous pass).
 for f in "$TREE_ROOT/egresslock-setup" "$TREE_ROOT/install-kit.sh" \
          "$TREE_ROOT/packaging/build-deb.sh" "$TREE_ROOT/packaging/build-tarball.sh" \
          "$TREE_ROOT/packaging/README.md"; do
-    if grep -qF -- '[--enable]' "$f"; then
+    if [[ ! -f "$f" ]]; then
+        skip "$PKG_SKIP_TAG" "D50-4 [--enable] sweep — $f is not on this tree (extracted kit)"
+    elif grep -qF -- '[--enable]' "$f"; then
         e50 fail "D50-4 [--enable] bracket in $f"
     else
         e50 pass
@@ -2594,6 +2798,9 @@ done
 # 9. D50-5: shipped install output speaks product — the generated
 #    postinst and the tarball README fragment carry no internal ticket
 #    IDs and point at --apparmor-check; no [--enable] either.
+#    EGL-107-D1: both artifacts are packaging producers' outputs; skip
+#    with them on the extracted kit.
+if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
 if grep -qF 'ARC-22-D3' "$p22/stage/DEBIAN/postinst"; then
     e50 fail "D50-5 postinst leaks ARC-22-D3"
 else
@@ -2603,6 +2810,10 @@ grep -q -- '--apparmor-check' "$p22/stage/DEBIAN/postinst" \
     && e50 pass || e50 fail "postinst points at --apparmor-check"
 grep -qF -- '[--enable]' "$p22/stage/DEBIAN/postinst" \
     && e50 fail "postinst still shows [--enable]" || e50 pass
+else
+    skip "$PKG_SKIP_TAG" "D50-5 postinst hygiene greps — packaging/build-deb.sh is not on this tree (extracted kit)"
+fi
+if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
 if grep -qF 'ARC-22-D3' "$p22/x/README.txt"; then
     e50 fail "tarball README fragment carries ARC-22-D3"
 else
@@ -2612,6 +2823,9 @@ grep -q -- '--apparmor-check' "$p22/x/README.txt" \
     && e50 pass || e50 fail "tarball README fragment points at --apparmor-check"
 grep -qF -- '[--enable]' "$p22/x/README.txt" \
     && e50 fail "tarball README still shows [--enable]" || e50 pass
+else
+    skip "$PKG_SKIP_TAG" "D50-5 tarball README hygiene greps — packaging/build-tarball.sh is not on this tree (extracted kit)"
+fi
 
 egl50_pass=$pass; egl50_fail=$fail
 
@@ -2703,7 +2917,7 @@ entries59=("egresslock-setup:-h" "egresslock-verify:-h" \
 if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
     entries59+=("packaging/snapshot-public.sh:-h")
 else
-    echo "SKIP: packaging/snapshot-public.sh -h — not on the public tree (EGL-74-D1)"
+    skip "snapshot-public.sh absent" "packaging/snapshot-public.sh -h — not on the public tree (EGL-74-D1)"
 fi
 for entry in "${entries59[@]}"; do
     f="${entry%%:*}"; flag="${entry##*:}"
@@ -2971,6 +3185,10 @@ e83() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); ech
 e83="$STATE/e83"; rm -rf "$e83"; mkdir -p "$e83"
 
 # D3: the staged (not built) postinst carries the shadow guard.
+# EGL-107-D1: staging + the staged-text asserts skip with the producer
+# on the extracted kit; the deb-libdir refusal assert below is
+# packaging-independent and still runs.
+if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
 s_out="$(env EGRESSLOCK_DEB_KEEP_STAGE="$e83/stage" \
     EGRESSLOCK_DEB_OUT="$e83/deb" "$DEBSH" 2>&1)"; s_rc=$?
 [[ "$s_rc" == 0 && -f "$e83/stage/DEBIAN/postinst" ]] \
@@ -3003,6 +3221,9 @@ if grep -vE '^\s*(#|$)' "$e83pi" | grep -qE 'systemctl enable|apparmor_parser'; 
 else
     e83 pass
 fi
+else
+    skip "$PKG_SKIP_TAG" "EGL-83 staged-postinst asserts — packaging/build-deb.sh is not on this tree (extracted kit)"
+fi
 
 # D3: install-kit refuses a deb-libdir kit (EGRESSLOCK_DEB_LIBDIR/VERSION
 # present, no dpkg-query needed) rc 1, and writes NO units and NO PATH
@@ -3020,6 +3241,52 @@ e83o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e83d/units" \
     && e83 pass || e83 fail "deb-libdir kit refuses install-kit rc 1 (rc=$e83_rc, out: $e83o)"
 
 egl83_pass=$pass; egl83_fail=$fail
+
+# --- EGL-103-D3: postinst/postrm print one line per unit mutate ---------
+# R2 disclosure bounded to unit mutates (staged-text asserts; the mock
+# battery cannot run dpkg/postinst). Reuses the EGL-83 staged deb tree:
+# every postinst/postrm systemctl/unit-file mutate has a matching
+# operator line in the same run, except no-op disables of missing
+# units; at most one `postinst: systemd daemon-reload` per run (the
+# classified shadow-rm branch keeps its single combined line).
+pass=0; fail=0
+e103() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+# EGL-107-D1: every assert here reads the EGL-83 staged postinst/postrm
+# (a build-deb.sh artifact) — skip the section with the producer.
+if [[ "$HAVE_BUILD_DEB" == 0 ]]; then
+    skip "$PKG_SKIP_TAG" "EGL-103 postinst/postrm disclosure asserts — packaging/build-deb.sh is not on this tree (extracted kit)"
+    egl103_pass=0; egl103_fail=0
+else
+e103pi="$e83/stage/DEBIAN/postinst"
+e103prm="$e83/stage/DEBIAN/postrm"
+# The always-run reload discloses exactly once (dedupe: the shadow-rm
+# branch must not print a second daemon-reload line).
+[[ "$(grep -cF 'postinst: systemd daemon-reload' "$e103pi")" == 1 ]] \
+    && e103 pass || e103 fail "postinst prints the daemon-reload line exactly once"
+grep -qF 'postrm: systemd daemon-reload' "$e103prm" \
+    && e103 pass || e103 fail "postrm prints the daemon-reload line"
+# Legacy retirement: per-path removal lines, existence-guarded so a
+# no-op rm stays quiet.
+grep -qF 'postinst: removed legacy unit $f' "$e103pi" \
+    && e103 pass || e103 fail "postinst prints a removal line per legacy unit"
+grep -qF 'legacy_unit_rm /etc/systemd/system/egresslock-verify.service' "$e103pi" \
+    && e103 pass || e103 fail "postinst retires the global units via the disclosed rm path"
+grep -qF 'legacy_unit_rm /etc/systemd/system/agent-network-verify@.service' "$e103pi" \
+    && e103 pass || e103 fail "postinst retires the pre-rename units via the disclosed rm path"
+grep -qE '^\s*\[ -f "\$f" \] \|\| continue' "$e103pi" \
+    && e103 pass || e103 fail "removal line is guarded (no-op rm stays quiet)"
+# The classified shadow-rm branch keeps its single combined line and
+# prints no second daemon-reload (dedupe pin above enforces the count).
+grep -qF 'removed stale prefix-install unit shadowing' "$e103pi" \
+    && e103 pass || e103 fail "EGL-83 classified-rm combined line preserved"
+# postrm stays a reload-only script (ARC-22-D2 boundary re-check).
+if grep -vE '^\s*(#|$)' "$e103prm" | grep -qE 'rm -rf|rm -f|podman|config/egresslock|apparmor_parser'; then
+    e103 fail "postrm deletes state or touches podman/AppArmor"
+else
+    e103 pass
+fi
+egl103_pass=$pass; egl103_fail=$fail
+fi
 
 # --- EGL-102-D6-R2: install-kit source-completeness preflight -----------
 # An incomplete kit tree fails closed BEFORE any copy (nothing written,
@@ -3337,7 +3604,9 @@ p65="$STATE/egl65"; rm -rf "$p65"; mkdir -p "$p65/kit"
 printf '# security policy (staged fixture for the snapshot gate)\n' > "$p65/kit/SECURITY.md"
 
 # 1. (D1) the tarball excludes the internal bug-report drafts; docs
-#    otherwise ship.
+#    otherwise ship. EGL-107-D1: skips with the producer on the
+#    extracted kit.
+if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
 env EGRESSLOCK_TARBALL_OUT="$p65/k.tgz" "$TARSH" >/dev/null 2>&1; e65_rc=$?
 [[ "$e65_rc" == 0 && -f "$p65/k.tgz" ]] \
     && e65 pass || e65 fail "tarball build (rc=$e65_rc)"
@@ -3348,6 +3617,9 @@ else
 fi
 tar -tzf "$p65/k.tgz" | grep -q 'docs/README.md' \
     && e65 pass || e65 fail "tarball still ships docs (sanity)"
+else
+    skip "$PKG_SKIP_TAG" "EGL-65 tarball listing asserts — packaging/build-tarball.sh is not on this tree (extracted kit)"
+fi
 
 # 2. (D2) the widened fleet grep fails closed on each widened name,
 #    naming the file and removing the stage. Decoys are assembled from
@@ -3366,7 +3638,7 @@ o="$(bash "$p65/kit/packaging/snapshot-public.sh" --dry-run "$p65/stage-b" 2>&1)
     && e65 pass || e65 fail "widened grep catches second nickname (rc=$e65_rc, out: $o)"
 rm -f "$p65/kit/docs/leak-decoy-b.md"
 else
-    echo "SKIP: EGL-65 widened-fleet-grep dry-runs — packaging/snapshot-public.sh not on the public tree (EGL-74-D1)"
+    skip "snapshot-public.sh absent" "EGL-65 widened-fleet-grep dry-runs — packaging/snapshot-public.sh not on the public tree (EGL-74-D1)"
 fi
 
 # 3. (D2) the scrubbed product tree carries no fleet nickname outside
@@ -3436,8 +3708,13 @@ echo "RESULTS (EGL-60 unlabeled-not-required doctor verdict): $egl60_pass passed
 echo "RESULTS (EGL-68/69 install-kit guard + build-gateway + apparmor prefix): $egl68_pass passed, $egl68_fail failed"
 echo "RESULTS (EGL-90 prefix charset + quoted wrapper + apparmor guard): $egl90_pass passed, $egl90_fail failed"
 echo "RESULTS (EGL-83 co-install guard: postinst /etc shadow + deb-libdir refuse): $egl83_pass passed, $egl83_fail failed"
+echo "RESULTS (EGL-115 sweep-mode wrapper scoping): $egl115_pass passed, $egl115_fail failed"
+echo "RESULTS (EGL-103 postinst/postrm unit-mutate disclosure): $egl103_pass passed, $egl103_fail failed"
 echo "RESULTS (EGL-84 doctor verify-unit health): $egl84_pass passed, $egl84_fail failed"
 echo "RESULTS (EGL-65 artifact hygiene): $egl65_pass passed, $egl65_fail failed"
-total_fail=$((arc16_fail + egl85_fail + arc17_fail + egl43_fail + egl12_fail + egl47_fail + egl49_fail + arc18_fail + egl51_fail + arc19_fail + egl38_fail + arc60_fail + arc22_fail + a39_fail + arc72_fail + arc14_fail + arc20_fail + arc23_fail + arc70_fail + arc69s_fail + egl50_fail + egl55_fail + egl59_fail + egl60_fail + egl68_fail + egl90_fail + egl83_fail + egl84_fail + egl65_fail))
-echo "RESULTS TOTAL: $((arc16_pass + egl85_pass + arc17_pass + egl43_pass + egl12_pass + egl47_pass + egl49_pass + arc18_pass + egl51_pass + arc19_pass + egl38_pass + arc60_pass + arc22_pass + a39_pass + arc72_pass + arc14_pass + arc20_pass + arc23_pass + arc70_pass + arc69s_pass + egl50_pass + egl55_pass + egl59_pass + egl60_pass + egl68_pass + egl90_pass + egl83_pass + egl84_pass + egl65_pass)) passed, $total_fail failed"
+total_fail=$((arc16_fail + egl85_fail + egl115_fail + arc17_fail + egl43_fail + egl12_fail + egl47_fail + egl49_fail + arc18_fail + egl51_fail + arc19_fail + egl38_fail + arc60_fail + arc22_fail + a39_fail + arc72_fail + arc14_fail + arc20_fail + arc23_fail + arc70_fail + arc69s_fail + egl50_fail + egl55_fail + egl59_fail + egl60_fail + egl68_fail + egl90_fail + egl83_fail + egl103_fail + egl84_fail + egl65_fail))
+# EGL-99: the TOTAL line counts skips by named cause and records the
+# tree shape, so checkout vs detached-review-worktree totals compare 1:1
+# (a shape-gated assert shows up as a named skip, not a silent 1-off).
+echo "RESULTS TOTAL: $((arc16_pass + egl85_pass + egl115_pass + arc17_pass + egl43_pass + egl12_pass + egl47_pass + egl49_pass + arc18_pass + egl51_pass + arc19_pass + egl38_pass + arc60_pass + arc22_pass + a39_pass + arc72_pass + arc14_pass + arc20_pass + arc23_pass + arc70_pass + arc69s_pass + egl50_pass + egl55_pass + egl59_pass + egl60_pass + egl68_pass + egl90_pass + egl83_pass + egl103_pass + egl84_pass + egl65_pass)) passed, $total_fail failed$(skip_summary) ($(tree_shape_tag))"
 [[ "$total_fail" -eq 0 ]]

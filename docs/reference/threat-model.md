@@ -10,11 +10,18 @@ status: `lab-verified` (probed on a dogfood host), `code-verified`
 behavior, not yet probed), or `open-by-design` (a known, accepted gap).
 Nothing here is a pentest claim. The input paths this model assumes
 (allowlist grammar, log parsing) have had a completed hardening review
-and a completed input→sink review; the live
-egress-bypass exercise has run on a throwaway account. It was
-not a pentest, and it found no undocumented general egress.
+and a completed input→sink review. Two live adversarial exercises have
+run on throwaway accounts: the original egress-bypass exercise (no
+undocumented general egress found), and the 2026-09-19 adversarial VM
+probe (a co-located privileged-sibling attacker), which live-confirmed
+one bypass — the source-address-keyed gateway exemption — closed on
+2026-09-21 by keying that exemption on the gateway's source address
+*and* its pinned MAC. The surviving residuals are recorded in the
+[attacks table](#attacks-table) and
+[accepted risks](#non-goals--accepted-risks). Neither exercise was a
+pentest.
 
-Last reviewed: 2026-09-11. The claims below are scoped to the dogfood
+Last reviewed: 2026-09-21. The claims below are scoped to the dogfood
 hosts in the [version matrix](#version-matrix), not to "any rootless
 Podman" install.
 
@@ -76,7 +83,9 @@ workload container (A1)      sibling container on same profile network (A2)
       * DNS -> bridge-ip:53
       * allow-host destination pins
       * daddr gateway-ip:proxy-port
-      * saddr gateway-ip (gateway's own egress)
+      * saddr gateway-ip + ether saddr gateway-MAC
+        (the gateway's own egress; saddr+MAC since the 2026-09-21
+        anti-spoof fix — the address alone no longer matches)
                            |
             +--------------+--------------+
             |                             |
@@ -186,7 +195,7 @@ attacks table or an explicit non-goal.
 
 | ID | Invariant | If broken |
 |---|---|---|
-| I1 | Default drop for the profile subnet, except established/related flows, DNS to the bridge gateway `:53`, explicit `allow-host` pins, the gateway's own port, and the gateway's source address going out. DNS has two paths by design: (a) workload DNS to the bridge gateway `:53`; (b) the **gateway process's own DNS**, which pasta forwards to `169.254.1.1` — i.e. the **host resolver, for any name** | direct internet or LAN reach from the workload. (b) is not a workload bypass — the gateway's connects are still Squid-allowlisted — but its DNS egress is host-resolver-wide by design |
+| I1 | Default drop for the profile subnet, except established/related flows, DNS to the bridge gateway `:53`, explicit `allow-host` pins, the gateway's own port, and the gateway's own egress — keyed on the gateway's source address **and** its pinned MAC since 2026-09-21 (the address alone no longer satisfies it). DNS has two paths by design: (a) workload DNS to the bridge gateway `:53`; (b) the **gateway process's own DNS**, which pasta forwards to `169.254.1.1` — i.e. the **host resolver, for any name** | direct internet or LAN reach from the workload. (b) is not a workload bypass — the gateway's connects are still Squid-allowlisted — but its DNS egress is host-resolver-wide by design |
 | I2 | The proxy env is not the boundary: nftables is | an operator believes unsetting the proxy stops egress, or setting it grants egress |
 | I3 | On a gateway-only profile the gateway being down means no direct internet (nothing else is accepted) | fail-open when Squid dies |
 | I4 | Forwarded IPv6 is dropped (`p_v6deny`, before Netavark) | IPv6 bypass of an IPv4-only policy |
@@ -228,11 +237,28 @@ attacks table or an explicit non-goal.
   to allow directly stay on `allow-host`; `disallow` closes the hole.
 - **Profile rules are source-scoped; cap-drop is what makes them bite
   (T9 neighbor):** the profile chain matches `ip saddr <profile subnet>`
-  over a base accept policy, so a workload that retains `CAP_NET_RAW` can
-  emit packets with a source address outside that subnet (e.g. the
-  gateway's) that never match those rules. Dropping capabilities on
-  workloads is the same operator obligation as T9 — when the operator's
-  launcher drops caps, this is not a bypass.
+  over a base accept policy. The probe's controls confirmed the drop
+  side: an in-subnet spoof that is *not* the gateway's address is
+  silently dropped by the terminal rule, and the gateway's address
+  alone no longer opens anything (the exemption also requires the
+  gateway's pinned MAC). What still rides the base accept is an
+  **out-of-subnet source** — next bullet. Dropping capabilities on
+  workloads remains the operator obligation — when the operator's
+  launcher drops caps, the spoof attempts above are not reachable at
+  all.
+- **Out-of-profile sources ride the chain's base accept (C-5/E-01
+  neighbor; ruled an accepted boundary 2026-09-21):** profile chains
+  are `policy accept` with `ip saddr <subnet>`-scoped rules — required
+  for multi-profile coexistence in one rootless netns (every profile
+  chain hooks the same forward point; a `policy drop` on one profile's
+  chain would drop the other profiles' traffic too). Probed live: an
+  out-of-subnet source on the profile bridge, and a workload on a
+  non-profile network in the same account, both get answered
+  round-trips with no profile rule involved (the out-of-subnet return
+  path is typically unroutable, so this is not a working bypass).
+  The ruling: **"not our traffic"** — the kit locks profile networks;
+  it does not lock every network the account can create. Fencing
+  unknown sources on a profile bridge would be a different design.
 - **DoH through an allowlisted host is allowlist granularity, not a
   bypass:** the chain only ever permits DNS to the bridge resolver, but
   if the operator allowlists a host that serves DoH, arbitrary name
@@ -271,9 +297,9 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T4 | `allow` of T3's host **without** `:80` | still denied on 80 (no-port group is 443) | `denied` still shows `:80` | design-intent |
 | T5 | UDP/TCP to 8.8.8.8:53; DoT 853; direct DoH 443 | drop (DNS only to bridge gw) | hang; no gateway log | lab-verified |
 | T6 | IPv6 destination | `p_v6deny` | fail; IPv4-only kit | lab-verified |
-| T7 | Sibling on same profile: connect to peer:22 | **allowed** (L2) | n/a — accepted risk | lab-verified (open L2; still accepted) |
-| T8 | Sibling: gateway:3128; other gateway ports; cache manager | 3128 allowed + Squid ACL; other ports nft-dropped; mgr 403 | can probe Squid; cannot widen nft | lab-verified |
-| T9 | Spoof source IP = gateway IP | fails without `CAP_NET_RAW`. Kit forces cap-drop on the **gateway**. Workloads: launcher policy. Profile nft still applied to a default-caps container. | if spoofed `saddr GW_IP` is forwarded, I1 is broken | code-verified (flags); spoof itself untested; live exercise: a default-caps `debian:13-slim` workload got `SOCK_RAW` `EPERM` — the forwarded-spoof path was **not** demonstrated; not closed |
+| T7 | Sibling on same profile: connect to peer:22 | **allowed** (L2) | n/a — accepted risk | lab-verified (open L2; still accepted — 2026-09-21 ruling; the probe confirmed the strongest form: sibling↔sibling traffic never touches the IP-forward hook, it is pure L2 bridging, so *every* profile-internal port is open at L2) |
+| T8 | Sibling: gateway:3128; other gateway ports; cache manager | 3128 allowed + Squid ACL; other ports: nothing listens on them — **L2 does not filter them** (a service bound on one would be sibling-reachable); mgr 403 | can probe Squid; cannot widen nft | lab-verified (framing corrected by the probe: "other ports nft-dropped" was inaccurate — see T7) |
+| T9 | Co-located sibling holding `CAP_NET_ADMIN`/`CAP_NET_RAW` spoofs source IP = gateway IP (adds the gateway's address to its interface) | the kit forces cap-drop on the **gateway**; workloads are launcher policy — a default-caps or cap-holding sibling can attempt the spoof, and the profile chain still sees the packet | if a spoofed `saddr GW_IP` packet is forwarded past the terminal drop, I1 is broken | lab-verified both ways. Bypass confirmed live 2026-09-19: the spoofed SYN matched the then-address-only gateway-exemption rule, `established,related` grew a full bidirectional flow, the terminal drop never moved, and the outer endpoint answered — a complete bypass. Closed for the IP-only spoof on 2026-09-21 (exemption now also requires the gateway's pinned MAC); re-probed at the fix commit: exemption counter stays 0, no new established flow, the terminal drop counts the SYN+retries, outer endpoint unreachable. **Residual (recorded, accepted):** a sibling that clones *both* the gateway's MAC and IP still matches the exemption — same cap set, same obligation; closing it needs a non-spoofable bridge-port match (out of scope). A default-caps workload cannot attempt the spoof at all (`SOCK_RAW` → `EPERM`); cap-drop on workloads remains the operator obligation |
 | T10 | Workload reads `~/.config/egresslock/` | not mounted by the kit; the operator's launcher is the only path in | empty of policy files unless the operator bind-mounts `$HOME` or the confdir | code-verified (kit paths) |
 | T11 | `allow 'foo; rm -rf /'` | reject, exit 2, file unchanged | usage / invalid entry | code-verified |
 | T12 | Gateway container stopped | no useful exemption for the workload; default drop | connect fail; `denied` may be empty | design-intent |
@@ -287,9 +313,13 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 Rows read as "what should happen", not a pentest report:
 `design-intent` rows are untested; `open-by-design` rows are gaps the
 model accepts on purpose. Nothing here is fuzz-tested. The hardening
-review of the input paths and the input→sink review are complete; the
-live adversarial exercise has run on a
-throwaway account, with no undocumented general egress found.
+review of the input paths and the input→sink review are complete. Live
+adversarial work has run on throwaway accounts: the original
+egress-bypass exercise (no undocumented general egress found), and the
+2026-09-19 adversarial VM probe, which live-confirmed the T9 spoof
+bypass — closed on 2026-09-21 (see T9). The probe's T17 name-rebind
+cases never exercised their intended path (a harness limitation, to be
+re-run); T17 remains `open-by-design` as recorded.
 
 ## Version matrix
 
@@ -301,9 +331,13 @@ podman/pasta/netavark upgrade.
 |---|---|---|---|---|---|---|---|
 | 1 | 2026-09-02 | Debian 13.6 | 6.12.101 | 5.4.2 | 1.14.0 | 1.1.3 | 6.x (banner 6.13) |
 | 2 | 2026-09-07 | Kubuntu 26.04 | 7.0.0-31 | 5.7.0 | 1.16.1 | live nft | 6.13 (image) |
-| 3 | 2026-09-11 | Debian (unlabeled podman) | | | | | |
+| 3 | 2026-09-11 | Debian (unlabeled podman) | not recorded | not recorded | not recorded | not recorded | not recorded |
+| 4 (VM harness) | 2026-09-19 + 2026-09-21 | Debian 13 (VM) | not recorded | 5.4.2 (2026-09-21 re-run) | not recorded | 1.1.3 | image |
 
-pasta is the rootless netns holder on all three.
+pasta is the rootless netns holder on all four. Host 4 is the
+provisioned VM harness: the 2026-09-19 adversarial probe and the
+2026-09-21 post-fix re-run ran there; the T7/T8/T9 evidence and the
+C-5/E-01 characterization above are host-4-scoped.
 
 Host 2 runs podman under an AppArmor label (AppArmor 5.0), so the pasta
 amendment is required there; host 3 is stock Debian with unlabeled
@@ -330,6 +364,12 @@ it is not a license to generalize the matrix to "any rootless Podman".
   the engine scripts.
 - Live egress-bypass adversarial exercise — **completed**: it has run;
   no undocumented general egress found (not a pentest claim).
+- Adversarial VM probe (2026-09-19) and post-fix re-run (2026-09-21) —
+  **completed**: a co-located privileged sibling was live-confirmed to
+  bypass the profile chain by spoofing the gateway's source address;
+  the fix keys the exemption on the source address *and* the gateway's
+  pinned MAC, and the re-run proves the IP-only spoof fails closed
+  while the deny baseline holds.
 - Leftover early forward-hook chains: the
   competing-chain hazard described under
   [Trust boundaries](#trust-boundaries).

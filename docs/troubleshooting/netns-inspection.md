@@ -9,10 +9,11 @@ podman >= 4.6, `slirp4netns` on older). All of the user's podman
 networks live inside it; the nftables chains apply to every network
 in it at once — that is the single enforcement point.
 
-Per-container `--network=slirp4netns` (used by the agent containers)
-creates a SEPARATE private netns per container and does not touch the
-shared one. That is why those containers keep working when the shared
-netns breaks.
+Per-container `--network=slirp4netns` (a per-container network-mode
+override a container starter can set — not one of the kit's profile
+bridge networks) creates a SEPARATE private netns per container and
+does not touch the shared one. That is why those containers keep
+working when the shared netns breaks.
 
 ## Inspection
 

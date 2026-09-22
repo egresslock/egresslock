@@ -1455,13 +1455,21 @@ doctor_kit() {
     if [[ -z "$account" ]]; then
         return $rc
     fi
-    if list_out="$(run_as_account "$prefix/egresslock" --config "$conf" list 2>&1)"; then
+    # EGL-117: the engine's resolution line is stderr-only now (ARC-45
+    # lifted), so the PARSE reads stdout alone; the parse errors keep
+    # their own capture for the FAIL display.
+    local list_err
+    list_err="$(mktemp)"
+    if list_out="$(run_as_account "$prefix/egresslock" --config "$conf" list 2>"$list_err")"; then
+        rm -f "$list_err"
         echo "conf parse: ok ($conf)"
         conf_ok=1
     else
         echo "conf parse: FAIL ($conf)"
         printf '%s\n' "$list_out" | sed 's/^/  /'
+        sed 's/^/  /' "$list_err" 2>/dev/null
         echo "  fix: correct the conf (see the engine output above)"
+        rm -f "$list_err"
         rc=1
     fi
     if [[ ! -f "$home/.config/egresslock/unit.env" ]]; then
@@ -1683,12 +1691,18 @@ else
         exit 1
     }
 fi
-list_out="$(run_as_account "$prefix/egresslock" --config "$conf" list 2>&1)" || {
+# EGL-117: the engine's resolution line is stderr-only now, so the
+# profile list is parsed from stdout alone; parse errors (stderr) keep
+# their own capture for the FAIL display.
+list_err="$(mktemp)"
+list_out="$(run_as_account "$prefix/egresslock" --config "$conf" list 2>"$list_err")" || {
     step_line 1 "validate conf" FAIL
     echo "egresslock-setup: conf failed to parse under the deployed engine:" >&2
-    printf '%s\n' "$list_out" >&2
+    cat "$list_err" >&2
+    rm -f "$list_err"
     exit 1
 }
+rm -f "$list_err"
 if [[ -n "$profile_name" ]] && ! grep -q "^$profile_name " <<<"$list_out"; then
     step_line 1 "validate conf" FAIL
     echo "egresslock-setup: profile '$profile_name' not in conf $conf (have: $(awk '{printf "%s ", $1}' <<<"$list_out"))" >&2

@@ -45,6 +45,9 @@ docs/
     grow-the-policy.md       allow/allow-host flows, removal
     allow-non-http.md        allow-host recipes (git-over-SSH example,
                              raw IPs, same-host pointer)
+    reach-a-host-service.md  reach a service on the host (localhost):
+                             the two supported patterns + the
+                             pasta-hairpin trap
     first-run-checks.md      brief checks right after initial setup
     test-your-container.md   prove the policy allows and blocks as expected
   setup/

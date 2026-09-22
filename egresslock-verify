@@ -5,12 +5,24 @@
 # `egresslock-verify@<account>.service` runs this as the account.
 #
 # Hybrid verify modes:
-#   - EGRESSLOCK_PROFILE set    -> verify exactly that profile (a missing
-#                             network FAILS: drift/teardown signal).
-#   - EGRESSLOCK_PROFILE unset  -> `egresslock verify --ensured`:
+#   - EGRESSLOCK_PROFILE set    -> verify exactly that profile, wired to
+#                             EGRESSLOCK_CONF (a missing network FAILS:
+#                             drift/teardown signal).
+#   - EGRESSLOCK_PROFILE unset  -> bare `egresslock verify --ensured`:
 #                             verify every profile whose anchor is
 #                             running; none running exits 0 silently.
-# EGRESSLOCK_CONF is always REQUIRED (fail closed).
+#                             The engine aggregates every *.conf in the
+#                             account's DEFAULT confdir
+#                             (~/.config/egresslock): EGRESSLOCK_CONF is
+#                             neither passed as --config nor exported to
+#                             the engine child, or the sweep would
+#                             silently cover a single profile.
+# EGRESSLOCK_CONF is always REQUIRED here (fail-closed "account is
+# wired" sanity), but in sweep mode it is a wiring witness, not the
+# sweep scope: the engine probes the default confdir itself. Standard
+# kit layout always wires ~/.config/egresslock/<name>.conf; if unit.env
+# points at a conf OUTSIDE that directory, the sweep covers the default
+# confdir only and may not include that file.
 #
 # Environment:
 #   EGRESSLOCK_DIR     engine resolution: this var >
@@ -102,4 +114,8 @@ fi
 if [[ -n "${EGRESSLOCK_PROFILE:-}" ]]; then
     exec "$tool" --config "$EGRESSLOCK_CONF" verify "$EGRESSLOCK_PROFILE"
 fi
-exec "$tool" --config "$EGRESSLOCK_CONF" verify --ensured
+# Sweep mode: bare --ensured with EGRESSLOCK_CONF stripped from the
+# child env — the engine default-probes the default confdir and
+# aggregates every *.conf (passing --config or leaking EGRESSLOCK_CONF
+# would scope the whole sweep to that one file; EGL-115-D1).
+exec env -u EGRESSLOCK_CONF "$tool" verify --ensured

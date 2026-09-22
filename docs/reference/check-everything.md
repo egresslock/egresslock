@@ -46,9 +46,8 @@ podman unshare --rootless-netns /usr/sbin/nft list tables | grep egresslock
 ```
 
 Want a one-off from your own shell? Prefix them with
-`sudo -iu <account> --` (see the README's [Running commands as the
-account](../../README.md#running-commands-as-the-account) for the tilde
-trap).
+`sudo -iu <account> --` (see [The tilde trap](who-runs-what.md#the-tilde-trap)
+in the reference for why the tilde must stay unexpanded).
 
 ### 2. Per profile (needs the profile name — `main` below; one set per profile)
 

@@ -21,8 +21,8 @@ and which mechanism allows which destination?"** For the practical
 | domain, HTTP(S), non-standard port | Squid allowlist, explicit port | `allow main example.com:8443` | becomes its own per-port dstdomain group; a plain-HTTP GET denial needs an explicit `:80` entry (a bare 443 entry does NOT cover port 80) |
 | domain, non-HTTP protocol (ssh, git-over-SSH, rsync) | nft allow-host (direct) | `allow-host main git.example.test:2222` | bypasses the gateway; ssh ignores HTTP(S)_PROXY so no no-proxy needed; DNS pin drift until next `ensure` (T13) |
 | IPv4 literal, any port/protocol | nft allow-host (direct) | `allow-host main 192.0.2.24:11434` | literals are REJECTED by `allow`; never drifts; `proxy-env` unions the pin into NO_PROXY — check `proxy-env main noproxy`, and **recreate** the workload; see [allow-non-http](../quickstart/allow-non-http.md) |
-| HTTP(S) service on the SAME host | Squid allowlist | `allow main host.containers.internal:8000` | proxied; the gateway resolves the podman-injected name; the host's LAN IP itself can never work (pasta hairpin — [paths-and-signatures](paths-and-signatures.md)) |
-| non-HTTP service on the SAME host | nft allow-host, IP literal | `allow-host main 169.254.1.2:8000` | `169.254.1.2` is pasta's host address (podman map-guest-addr); the NAME cannot be pinned — [paths-and-signatures](paths-and-signatures.md) |
+| HTTP(S) service on the SAME host | Squid allowlist | `allow main host.containers.internal:8000` | proxied; the gateway resolves the podman-injected name; the host's LAN IP itself can never work (pasta hairpin — [paths-and-signatures](paths-and-signatures.md); recipe: [reach-a-host-service](../quickstart/reach-a-host-service.md)) |
+| non-HTTP service on the SAME host | nft allow-host, IP literal | `allow-host main 169.254.1.2:8000` | `169.254.1.2` is pasta's host address (podman map-guest-addr); the NAME cannot be pinned — [paths-and-signatures](paths-and-signatures.md); recipe: [reach-a-host-service](../quickstart/reach-a-host-service.md) |
 | domain that must NOT go through the proxy | nft allow-host + `no-proxy` | `allow-host` + `no-proxy <host>` in the conf | for gateway profiles whose clients honor proxy env |
 | IP/CIDR range | not yet supported | — | (planned: conf rule, nft-only — dstdomain cannot express CIDRs) |
 | all public IPv4 | `rule public-only` | conf | still drops RFC1918/link-local/etc.; CGNAT/bogon gap remains |
@@ -44,6 +44,7 @@ content fails closed with exit 2. Host fields may use `${VAR}` /
 | `rule gateway-only` | egress only through the profile's gateway (requires a `gateway` directive) |
 | `gateway <ip> <port> <file>` | static gateway IP inside the subnet + Squid port + allowlist file (conf-relative unless absolute) |
 | `no-proxy <host,...>` | extra NO_PROXY entries (hosts the profile may reach directly) |
+| `read-timeout <seconds>` | gateway profiles: Squid `read_timeout` override, positive integer seconds (default 900 — Squid's stock 15 minutes). Raise it for long silent non-streaming calls (LLM completions); lower it for CI-style tight failure timing. The generated gateway config always carries the explicit `read_timeout <N> seconds` line. See [troubleshooting: long request dies at exactly 15m00](../troubleshooting/long-request-15m.md) |
 
 ## `rule public-only` in detail
 
@@ -83,6 +84,16 @@ anchor, starts or refreshes the gateway when configured, installs the
 nftables policy, and verifies the result before a workload should start. The
 anchor keeps the account's rootless network namespace and policy alive between
 workloads.
+
+`ensure` on an already-converged profile is **non-disruptive**: healthy
+containers are kept and no session is severed. Converged means the anchor is
+running, the gateway is running and answers its probe, and the newly
+generated gateway config and allowlist files are byte-identical to what is
+deployed — such an ensure skips the restart (the ready line says `already
+converged, not restarted`). The nftables policy refresh (atomic) and
+DNS-pin healing still run on every ensure; those never sever sessions. An
+unhealthy container or a genuinely changed config takes the replace/restart
+path as before — `ensure` remains the crash-recovery command.
 
 `verify <profile>` compares the live nftables chain with the rules expected
 from the profile. Structural drift or a missing healthy runtime fails
@@ -224,7 +235,7 @@ accept` rule enforced independently of the HTTP gateway.
 Non-HTTP denials therefore look like a **hang**, not a 403, and never
 show up in `denied` (the gateway never saw the packet). Confirm a
 direct allow with `rules` and a real client (e.g. `ssh -T
-git@<forgejo-host>`). This is a deliberate trade: Squid is the
+git@git.example.test`). This is a deliberate trade: Squid is the
 HTTP(S) gateway; non-HTTP stays a direct nftables rule.
 
 ### Combining with a gateway

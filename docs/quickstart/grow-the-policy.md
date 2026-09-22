@@ -25,7 +25,7 @@ Short version: **HTTP(S) by domain → the allowlist; everything else →
 |---|---|---|
 | HTTP(S) by domain | `allow` (gateway allowlist) | [allow-a-domain](allow-a-domain.md) |
 | raw IPs, ssh/other non-HTTP, same-host non-HTTP | `allow-host` (direct rule) | [allow-non-http](allow-non-http.md) |
-| HTTP(S) service on the SAME host | `allow` with `host.containers.internal` | [paths-and-signatures](../reference/paths-and-signatures.md) |
+| HTTP(S) service on the SAME host | `allow` with `host.containers.internal` | [reach-a-host-service](reach-a-host-service.md) |
 
 The full decision table — non-standard ports, same-host services,
 CIDR and `public-only` status — lives in the

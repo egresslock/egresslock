@@ -28,6 +28,12 @@ Signal semantics (learned the hard way — check for these):
   `/etc/systemd/system` shadowing the package's unit after a
   prefix→deb switch. Run `sudo egresslock-setup --doctor`: it names
   the shadowing file (or missing ExecStart target) and the exact fix.
+  If the shadow is the postinst co-install refusal (the `.deb` install
+  FAILED because a prefix kit was still installed): remove the prefix
+  kit with `uninstall-kit.sh`, then finish the install with
+  `sudo dpkg -i <deb>` or `sudo apt-get install -f` — **not**
+  `apt-get install --reinstall egresslock`, which cannot resolve the
+  half-installed (`iF`) state ("No file name for egresslock").
 - `drift: host <name> resolved to <new> but the policy pins <old>`:
   DNS moved; policy is unchanged; `ensure` heals on the next run.
 - SILENT exit 0 from `--ensured` means "no profiles ensured" — if you

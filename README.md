@@ -99,8 +99,9 @@ Requirements above):
 1. **Install the kit (.deb) and set up the account**:
 
    ```sh
-   # Build from a checkout (no root needed) or download the .deb, then:
-   git clone git@github.com:egresslock/egresslock.git
+   # Build the .deb from a checkout (no root needed; there is no
+   # hosted .deb to download), then install it:
+   git clone https://github.com/egresslock/egresslock
    cd egresslock
    ./packaging/build-deb.sh
    sudo dpkg -i packaging/egresslock_<VERSION>_all.deb
@@ -180,8 +181,9 @@ detailed material; [troubleshooting](docs/troubleshooting.md) is the
 2. [Allow a domain (and see what's blocked)](docs/quickstart/allow-a-domain.md) <span style="color:#6a737d">(<1 minute)</span> — run a workload, 403 → `allow example.com` → re-run → `denied` → remove an entry.
 3. [Grow the policy](docs/quickstart/grow-the-policy.md) <span style="color:#6a737d">(<1 minute)</span> — the allow/allow-host flows and removing entries.
 4. [Allow non-HTTP egress](docs/quickstart/allow-non-http.md) <span style="color:#6a737d">(<1 minute)</span> — `allow-host` for git-over-SSH, raw IPs, and same-host services (recipes; the why lives in the reference).
-5. [First-run checks](docs/quickstart/first-run-checks.md) <span style="color:#6a737d">(<1 minute)</span> — the things that commonly go wrong right after initial setup.
-6. [Test your container](docs/quickstart/test-your-container.md) — a five-minute pass proving the policy allows and blocks what you expect.
+5. [Reach a service on the host (localhost) from a container](docs/quickstart/reach-a-host-service.md) <span style="color:#6a737d">(<1 minute)</span> — the two supported patterns (proxied name, direct literal) and the pasta-hairpin trap.
+6. [First-run checks](docs/quickstart/first-run-checks.md) <span style="color:#6a737d">(<1 minute)</span> — the things that commonly go wrong right after initial setup.
+7. [Test your container](docs/quickstart/test-your-container.md) — a five-minute pass proving the policy allows and blocks what you expect.
 
 ## Recipes
 

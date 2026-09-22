@@ -69,22 +69,23 @@ The `.deb` is the FHS-layout channel: the engine lands on `PATH` as
 
 ### 1. Get the kit
 
-Pick one way to obtain the kit:
+The kit ships as source: there is **no hosted `.deb` or tarball** to
+download. Clone the checkout and build the channel you want
+(both build scripts ship in the tree):
 
 ```sh
-# Option A — download the .deb (FHS layout, engine on PATH):
-#   egresslock_<VERSION>_all.deb
+git clone https://github.com/egresslock/egresslock && cd egresslock
 
-# Option B — download the tarball (self-contained, manual install):
-#   egresslock_<VERSION>.tar.gz
+# .deb (FHS layout, engine on PATH):
+./packaging/build-deb.sh        # → packaging/egresslock_<VERSION>_all.deb
 
-# Option C — clone the repo (primary, what the harness tests):
-git clone <repo> && cd <repo>
+# or tarball (self-contained, manual install):
+./packaging/build-tarball.sh    # → packaging/egresslock_<VERSION>.tar.gz
 ```
 
 ### 2. Install the package
 
-Build from a checkout (no root needed) or download the `.deb`, then:
+Build from a checkout (no root needed), then:
 
 ```sh
 sudo dpkg -i ./egresslock_<VERSION>_all.deb
@@ -315,10 +316,12 @@ warns and skips — call the full path instead).
 
 ```sh
 # Option A — clone the repo (primary, what the harness tests):
-git clone <repo> && cd <repo>
+git clone https://github.com/egresslock/egresslock && cd egresslock
 
-# Option B — download the tarball (self-contained, no repo needed):
-tar -xzf egresslock_<VERSION>.tar.gz && cd egresslock
+# Option B — build the tarball, then unpack it (self-contained, no
+# repo needed afterwards):
+./packaging/build-tarball.sh
+tar -xzf packaging/egresslock_<VERSION>.tar.gz && cd egresslock
 ```
 
 ### 2. Install the kit (root)
@@ -644,11 +647,12 @@ The kit is deployed ROOT-owned to `--prefix` (default
 
 | File / dir | What it is |
 |---|---|
-| `egresslock` | the engine CLI (`ensure`, `verify`, `list`, `denied`, `allow`, ...) |
+| `egresslock` | the engine CLI (`ensure`, `verify`, `list`, `network`, `rules`, `allowlist`, `denied`, `allow`/`disallow`, `allow-host`/`disallow-host`, `init`, `doctor`, `teardown`, ...) |
 | `egresslock-start` | daemon-start wrapper: `ensure` the profile, then exec the daemon |
 | `egresslock-verify` | entry point for the verify timer (named or `--ensured`) |
 | `egresslock-setup` | per-account bootstrap: ship starter conf, validate, write `unit.env`, build gateway, enable timer |
 | `gateway/` | build context for the Squid gateway image (`Containerfile`, `squid.conf`, entrypoint) |
+| `apparmor/` | pasta AppArmor snippet + profiles shipped root-owned with the prefix (distribution only — applying stays the explicit `egresslock-setup --apparmor-add`; see `apparmor/README.md`) |
 | `examples/` | starter conf + empty allowlist for `egresslock-setup --init-conf`; `recipes/` deployed so accounts build from the prefix |
 | `VERSION` | `commit:` SHA + `deployed:` UTC date (+ `-dirty` marker) of what is installed |
 
@@ -667,7 +671,7 @@ repository root:
 
 | Path | What it is |
 |---|---|
-| `egresslock` | The engine CLI: `ensure`, `verify` (incl. `--ensured`), `list`, `network`, `proxy-env` (tokens: `proxyip`/`proxyport`/`noproxy`), `rules`, `allowlist`, `denied` (`--all`, `--days N`), `allow`, `teardown`, `--version` |
+| `egresslock` | The engine CLI: `ensure`, `verify` (incl. `--ensured`), `list`, `network`, `proxy-env` (tokens: `proxyip`/`proxyport`/`noproxy`), `rules`, `allowlist`, `denied` (`--all`, `--days N`), `allow`/`disallow`, `allow-host`/`disallow-host`, `init`, `doctor`, `teardown` (incl. `--runtime`), `--version` |
 | `install-kit.sh` | (root) Deploy the kit to a prefix and install the instanced verify unit templates (no account changes) |
 | `egresslock-setup` | (root) One-command per-account setup: ship the starter conf with `--init-conf`, validate conf, write `unit.env`, build the gateway image, optionally enable the timer |
 | `uninstall-kit.sh` | (root) Remove the kit; account data is preserved unless `--purge-account-data` |
@@ -676,7 +680,7 @@ repository root:
 | `gateway/` | Build context for the Squid gateway image (`Containerfile`, `squid.conf`, entrypoint) |
 | `examples/` | Starter conf + empty allowlist shipped by `install-kit.sh` for `egresslock-setup --init-conf`; recipes under `recipes/` |
 | `build-gateway` | Build the gateway image into the current user's store (checkout use) |
-| `tests/` | Engine-only mock test harness (`lib.sh`, `test-engine.sh`; no root/Podman needed) |
+| `tests/` | Mock battery: `bash tests/run.sh` runs `lib.sh` + `test-engine.sh` + `test-kit.sh` (engine and kit harnesses; no root/Podman needed) |
 | `packaging/` | `build-deb.sh` (FHS `.deb`, thin `dpkg-deb` build) and `build-tarball.sh` (self-contained manual-install tar.gz incl. `uninstall-kit.sh`); `README.md` (the packaging guide) |
 | `docs/quickstart/` | Post-install quickstart guides (allow a domain, allow non-HTTP, grow the policy, first-run checks, test your container) |
 | `docs/setup/` | install / upgrade / uninstall references |

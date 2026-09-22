@@ -354,13 +354,21 @@ case "$cmd" in
         # can assert policy-vs-gateway ordering (grep-based consumers
         # of the other markers are unaffected by the extra line type).
         echo "podman run $*" >> "$D/callorder.log"
-        name=""; net=""; ip=""
+        # EGL-114: opslog mirror (rm/restart/run argv for the
+        # converged-ensure pins; opslog has no other consumers).
+        echo "podman run $*" >> "$D/opslog"
+        name=""; net=""; ip=""; mac=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --name) name="$2"; shift 2 ;;
                 --network) net="$2"; shift 2 ;;
                 --network=*) net="${1#--network=}"; shift ;;
                 --ip) ip="$2"; shift 2 ;;
+                # EGL-123-D3: the gateway run carries the kit-derived
+                # pinned MAC; store it in container state so inspect
+                # can answer the MacAddress template (without this,
+                # the MAC value would be left as the image name).
+                --mac-address) mac="$2"; shift 2 ;;
                 -*) shift ;;
                 *) break ;;
             esac
@@ -377,6 +385,7 @@ case "$cmd" in
         : > "$D/running/$name"
         echo "$net" > "$D/containers/$name.net"
         [[ -n "$ip" ]] && { echo "$ip" > "$D/containers/$name.ip"; echo "$name" > "$D/ips/$ip"; }
+        [[ -n "$mac" ]] && echo "$mac" > "$D/containers/$name.mac"
         echo "$name"
         ;;
     ps)
@@ -419,6 +428,17 @@ case "$cmd" in
                 # Static-ip containers report their stored IP.
                 if [[ -f "$D/containers/$name.ip" ]]; then
                     cat "$D/containers/$name.ip"
+                else
+                    echo ""
+                fi
+                ;;
+            *'MacAddress}}'*)
+                # EGL-123-D3: mirror the IPAddress template — a
+                # --mac-address run stores the pinned MAC; containers
+                # without one report empty (like the real per-network
+                # field for an unset MAC).
+                if [[ -f "$D/containers/$name.mac" ]]; then
+                    cat "$D/containers/$name.mac"
                 else
                     echo ""
                 fi
@@ -504,8 +524,33 @@ case "$cmd" in
                 ;;
             cat)
                 # ARC-7: cmd_denied reads the gateway's access log.
-                [[ "${2:-}" == /var/log/squid/access.log ]] \
-                    && cat "$D/containers-$name.access.log" 2>/dev/null || true
+                if [[ "${2:-}" == /var/log/squid/access.log ]]; then
+                    cat "$D/containers-$name.access.log" 2>/dev/null || true
+                    exit 0
+                fi
+                # EGL-114: the converged-ensure compare reads DEPLOYED
+                # files back from the gateway. The mock models the
+                # container FS with the files podman cp staged (stored
+                # by src basename); a missing file fails like a real
+                # missing path (a missing live file is a DIFFER, never a
+                # skip).
+                if [[ "${2:-}" == /etc/squid/agent/* ]]; then
+                    deployed="${2##*/}"
+                    # The candidate is stored by its STAGING name
+                    # (squid-gw.conf — podman cp records the src
+                    # basename) but deployed as squid.conf (the mv
+                    # swap); serve the payload under either name.
+                    f="$D/containers-$name.$deployed"
+                    if [[ "$deployed" == squid.conf && -f "$D/containers-$name.squid-gw.conf" ]]; then
+                        f="$D/containers-$name.squid-gw.conf"
+                    fi
+                    if [[ -f "$f" ]]; then
+                        cat "$f"
+                        exit 0
+                    fi
+                    echo "cat: ${2}: No such file or directory" >&2
+                    exit 1
+                fi
                 exit 0
                 ;;
             bash) exit 0 ;;   # gw_probe /dev/tcp check
@@ -527,6 +572,9 @@ case "$cmd" in
         # rm [-f] [-t N] <name>: remove container state, releasing any
         # IPAM allocation it holds. ARC-69: $D/rm-container-fails makes
         # the rm fail like a real stuck removal would.
+        # EGL-114: argv recorded (the converged-ensure pins assert no
+        # `rm -f` of the gateway/anchor on a converged profile).
+        echo "podman rm $*" >> "$D/opslog"
         name=""
         while [[ $# -gt 0 ]]; do
             case "$1" in -*) ;; *) name="$1"; break ;; esac
@@ -537,7 +585,15 @@ case "$cmd" in
             exit 1
         fi
         rm -f "$D/running/$name" "$D/containers/$name" \
-              "$D/containers/$name.net" "$D/containers/$name.ip"
+              "$D/containers/$name.net" "$D/containers/$name.ip" \
+              "$D/containers/$name.mac"
+        # EGL-114: a removed container's filesystem is gone — clear the
+        # modeled per-container files (staged squid/allowlist payloads,
+        # log fixtures) so a REPLACED gateway starts from a fresh
+        # bootstrap FS, exactly like the real image (empty
+        # /etc/squid/agent). The literal '.' keeps the glob prefix-safe
+        # (s50 cannot match s50n's files).
+        rm -f "$D/containers-$name."* 2>/dev/null || true
         if [[ -d "$D/ips" ]]; then
             for ipf in "$D/ips"/*; do
                 [[ -f "$ipf" ]] || continue
@@ -548,6 +604,10 @@ case "$cmd" in
         ;;
     restart)
         # restart [-t N] <name>
+        # EGL-114: argv recorded so the converged-ensure pins can assert
+        # NO restart of a healthy gateway (and existing pins can keep
+        # counting restarts where they already do).
+        echo "podman restart $*" >> "$D/opslog"
         name=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -690,6 +750,15 @@ export AGENTS_ROOT="$TESTROOT/agents"
 # absent path; tests that exercise the refusal point the hook at a
 # fixture file.
 export EGRESSLOCK_UB_BIN="$TESTROOT/ub/egresslock"
+# EGL-107-D2: the EGL-83-D2 deb-libdir guard must not read real host
+# state — a bare /usr/lib/egresslock leftover (dpkg has no record) made
+# every install-kit-based battery test refuse on deployed hosts. Default
+# the hook to an EMPTY harness path (never a VERSION file, so the
+# `-e "$deb_libdir/VERSION"` guard is false); the dedicated refusal test
+# overrides it to its fixture. Unset-hook production behavior is
+# unchanged: install-kit.sh still defaults to the real /usr/lib/egresslock.
+mkdir -p "$TESTROOT/deb-libdir"
+export EGRESSLOCK_DEB_LIBDIR="$TESTROOT/deb-libdir"
 # EGL-80-1-F1 note: EGRESSLOCK_PATH_BINDIR/SBINDIR are deliberately NOT
 # defaulted here. The battery installs many distinct prefixes; a single
 # shared wrapper dir would trip install-kit's ARC-22-D1 foreign-marker
@@ -701,6 +770,54 @@ export EGRESSLOCK_UB_BIN="$TESTROOT/ub/egresslock"
 # name so the ensure flow exercises the image-exists check.
 mkdir -p "$STATE/images"
 : > "$STATE/images/localhost_egresslock-gateway_latest"
+
+# EGL-99 (direction 3): named-skip accounting. Every harness skip goes
+# through skip() so the RESULTS TOTAL line reports the exact skip count
+# with each skip's named cause — a tree-shape-gated assert (e.g. the
+# EGL-27 tarball-stamp gate, which needs .git metadata) becomes visible
+# as a skip, not silently absent, so totals are exact and comparable
+# 1:1 in every tree shape. The `SKIP: ` prefix is preserved: run.sh's
+# suite-end summary counts these lines (EGL-86-D3) and is unaffected.
+skip_count=0
+declare -A skip_causes=()
+skip() { # skip <cause-tag> <free-text message...>
+    local cause="$1"; shift
+    skip_count=$(( skip_count + 1 ))
+    skip_causes["$cause"]=$(( ${skip_causes["$cause"]:-0} + 1 ))
+    echo "SKIP: $*"
+}
+# skip_summary renders the TOTAL-line skip fragment: `, 0 skipped` when
+# nothing skipped, else `, N skipped (cause[, cause: k...])` — a
+# single-count cause is named bare (`, 1 skipped (git-metadata absent)`).
+skip_summary() {
+    if (( skip_count == 0 )); then
+        printf ', 0 skipped'
+        return
+    fi
+    local detail=""
+    for cause in "${!skip_causes[@]}"; do
+        if (( skip_causes["$cause"] == 1 )); then
+            detail+="${detail:+, }$cause"
+        else
+            detail+="${detail:+, }$cause: ${skip_causes["$cause"]}"
+        fi
+    done
+    printf ', %d skipped (%s)' "$skip_count" "$detail"
+}
+# EGL-99 (direction 1, tree-shape half): the tree shape is recorded next
+# to the counts — a normal checkout (`.git` directory), a detached
+# review worktree (`.git` file), or an exported/staged tree (no `.git`)
+# — so a count delta between handoff and review shapes is attributable
+# from the TOTAL line itself instead of a bisect.
+tree_shape_tag() {
+    if [[ -d "$TREE_ROOT/.git" ]]; then
+        echo "tree: git-checkout"
+    elif [[ -f "$TREE_ROOT/.git" ]]; then
+        echo "tree: git-worktree"
+    else
+        echo "tree: no-git"
+    fi
+}
 
 pass=0; fail=0
 check() { # check <desc> <rc-expected> <cmd...>

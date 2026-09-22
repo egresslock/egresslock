@@ -17,7 +17,10 @@
 #
 # Usage:
 #   [--config <file>]                   # data-driven profile config (below)
-#   egresslock ensure <profile>     # network + anchor + policy + verify
+#   egresslock ensure <profile>     # network + anchor + policy + verify;
+#                                      # an already-converged profile is
+#                                      # non-disruptive: healthy containers
+#                                      # are kept, no session is severed
 #   egresslock verify <profile>     # verify only (exit 1 = fail closed)
 #   egresslock network <profile>    # print the Podman network name
 #   egresslock proxy-env <profile> [token]  # proxy env assignments
@@ -70,10 +73,14 @@
 # exception: it loads NO conf at all — explicit --config / EGRESSLOCK_CONF
 # are ignored — and sweeps kit containers/networks of BOTH name
 # generations by name scan (the recovery when the conf is already gone).
-# Prints `using config <path>` / `using
-# configs in <dir>` on stderr when found AND stdout is a terminal (the
-# hint is suppressed under pipes/substitution). Explicit beats
-# implicit. See examples/main.conf for a worked config grammar example.
+# Prints exactly ONE stderr resolution line on every conf-resolving
+# invocation (every time, TTY-independent): `scoped: --config
+# <file> ...` / `scoped: EGRESSLOCK_CONF=<path> ...` (the explicit
+# sources win and are named), `using config <path>` (named probe),
+# `using config <path> (named fallback: no <profile>.conf)`, or
+# `using configs in <dir> (N profiles)` (confdir aggregate). Explicit
+# beats implicit. See examples/main.conf for a worked config grammar
+# example.
 #
 # Environment overrides (for testing):
 #   EGRESSLOCK_CONF    same as --config (required for profile
@@ -128,6 +135,12 @@ declare -A GW_ALLOWLIST=()
 # excluded from proxy env vars, or proxy-honoring clients would send
 # allowed traffic into the denying Squid ACL (ARC-6 finding).
 declare -A PROFILE_NO_PROXY_EXTRA=()
+# EGL-116-D1: per-profile Squid read_timeout override (seconds). Set by
+# the conf's `read-timeout <seconds>` directive; defaulted to 900 (Squid
+# stock, 15 minutes) at block_end for every profile. The generated
+# squid.conf always emits the value explicitly — never silent stock
+# inherit.
+declare -A PROFILE_READ_TIMEOUT=()
 
 TABLE="egresslock"
 # ARC-14: site host defaults live in the CONF DATA, not the binary — the
@@ -140,12 +153,28 @@ TABLE="egresslock"
 # EGRESSLOCK_CONF environment variable. Empty is the same as unset:
 # profile subcommands then fail closed (ARC-20-D1).
 ENGINE_CONF="${EGRESSLOCK_CONF:-}"
+# EGL-117-D1: which explicit source won (argv --config vs the EGRESSLOCK_CONF
+# env var); the scoped disclosure line names the winner.
+ENGINE_CONF_SOURCE=""
 # ARC-37-D3: profile name -> conf file it was loaded from, so a
 # cross-file duplicate error can name the earlier file exactly.
 declare -A PROFILE_CONF=()
 
 gw_name() { echo "egresslock-gateway-$1"; }
 is_gateway_profile() { [[ -n "${GW_IP[$1]:-}" ]]; }
+
+# EGL-123-D3: the kit's pinned gateway MAC. Deterministically derived
+# from conf identity (profile name + gateway IP) so the nft exemption
+# can be compiled WITHOUT a running container (EGL-91: policy before
+# gateway start; never a live inspect at compile time). Material is
+# exactly "profile|GW_IP"; the MAC is 02: (locally administered,
+# unicast) + the first 5 digest bytes as lowercase colon-hex. No conf
+# grammar: the pin is derived, not configured. Hermetic — no /dev/urandom.
+gw_mac() { # gw_mac <profile>
+    local digest
+    digest="$(printf '%s' "${1}|${GW_IP[$1]}" | sha256sum | cut -d' ' -f1)"
+    echo "02:${digest:0:2}:${digest:2:2}:${digest:4:2}:${digest:6:2}:${digest:8:2}"
+}
 
 die() { echo "Error: $*" >&2; exit 1; }
 
@@ -668,6 +697,8 @@ verify_expected_rules() { # prints expected ruleset; rc 1 on zip mismatch
 #       rule gateway-only              # requires a `gateway` directive
 #       gateway <ip> <port> <file>     # static gateway IP inside the subnet
 #       no-proxy <host[,host...]>      # extra NO_PROXY entries
+#       read-timeout <seconds>         # Squid read_timeout override (EGL-116;
+#                                      # positive integer seconds, default 900)
 #
 # ARC-11: the profile subnet is any IPv4 CIDR with prefixlen 8-29 (parsed
 # with integer CIDR math); bridge gateway = first usable, anchor = last
@@ -755,6 +786,7 @@ load_config() {
         GW_PORT=()
         GW_ALLOWLIST=()
         PROFILE_NO_PROXY_EXTRA=()
+        PROFILE_READ_TIMEOUT=()
         PROFILE_CONF=()
         ENGINE_KINDS=()
         ENGINE_ARGS=()
@@ -778,6 +810,10 @@ load_config() {
         if [[ "$has_gw_only" == yes && "$has_gw" == no ]]; then
             config_error "$block_line" "profile '$cur' has 'rule gateway-only' but no 'gateway' directive" "$block_raw"
         fi
+        # EGL-116-D1: default the per-profile read_timeout at block close
+        # so every profile carries an explicit, greppable value (900 =
+        # Squid stock, 15 minutes).
+        PROFILE_READ_TIMEOUT[$cur]="${PROFILE_READ_TIMEOUT[$cur]:-900}"
         cur=""
     }
 
@@ -953,6 +989,20 @@ load_config() {
                 [[ -n "$out" ]] || config_error "$n" "empty no-proxy list" "$raw"
                 PROFILE_NO_PROXY_EXTRA[$cur]="$out"
                 ;;
+            "read-timeout "*)
+                # EGL-116-D1: per-profile Squid read_timeout (seconds).
+                # One per block; positive integer, >= 1, no suffixes, no
+                # leading zeros (R-011-1 octal discipline) — anything
+                # else fails closed like any unknown directive.
+                [[ -n "$cur" ]] || config_error "$n" "'read-timeout' outside a profile block" "$raw"
+                [[ -z "${PROFILE_READ_TIMEOUT[$cur]:-}" ]] \
+                    || config_error "$n" "duplicate 'read-timeout' directive in profile '$cur'" "$raw"
+                read -r _ val rest <<<"$line"
+                [[ -z "${rest:-}" ]] || config_error "$n" "unexpected trailing text after read-timeout" "$raw"
+                [[ "$val" =~ ^[1-9][0-9]*$ ]] \
+                    || config_error "$n" "invalid read-timeout '$val' (expected a positive integer of seconds, >= 1; no suffixes)" "$raw"
+                PROFILE_READ_TIMEOUT[$cur]="$val"
+                ;;
             *) config_error "$n" "unknown directive" "$raw" ;;
         esac
     done < "$conf"
@@ -960,6 +1010,18 @@ load_config() {
     block_end
 
     (( ${#PROFILES[@]} > 0 )) || config_error 0 "config defines no profiles"
+}
+
+# EGL-120-D1: remediation hint after an allow-host resolve failure on
+# the ensure/install path — every time (ensure is not a paste-safe feed;
+# a one-time note is missed on retry), stderr only. Verify-pin mode gets
+# NO hint: it has its own `verify: no live pin ...` message.
+allow_host_resolve_hint() { # allow_host_resolve_hint <profile> <host> <port>
+    {
+        echo "hint: allow-host pins must resolve on the HOST. For a same-host HTTP(S) service use: allow $1 ${2}:${3}"
+        echo "hint: for a same-host non-HTTP service use: allow-host $1 169.254.1.2:${3}"
+        echo "hint: this rule is already in the conf; remove it with: disallow-host $1 ${2}:${3}"
+    } >&2
 }
 
 #
@@ -991,7 +1053,24 @@ compiled_rules() {
         case "$kind" in
             allow-host)
                 hip="${arg%:*}"; hport="${arg##*:}"
-                dip="$(resolved_dest "$hip")"
+                # EGL-120-D1: capture-and-check. The substitution's die
+                # ("cannot resolve") exits only the subshell, and this
+                # compiler can run inside a set -e-inert assignment
+                # substitution (install_policy's refresh-file builder) —
+                # an unchecked failure there continued with an empty
+                # daddr and emitted a malformed nft rule for nft to
+                # reject. Catch the failure EXPLICITLY, hint, and
+                # propagate by rc so no nft -f ever runs on a partial
+                # file.
+                if ! dip="$(resolved_dest "$hip")"; then
+                    if [[ "$VERIFY_PIN_MODE" == 0 ]]; then
+                        allow_host_resolve_hint "$profile" "$hip" "$hport"
+                    fi
+                    return 1
+                fi
+                # Belt: an empty IP with rc 0 (a die swallowed again)
+                # must never render an empty daddr.
+                [[ -n "$dip" ]] || die "cannot resolve $hip"
                 echo "ip saddr ${subnet} ip daddr ${dip} tcp dport ${hport} counter accept"
                 ;;
             public-only)
@@ -1014,10 +1093,18 @@ compiled_rules() {
     if [[ "$is_public" == yes ]]; then
         echo "ip saddr ${subnet} counter accept"
     elif is_gateway_profile "$profile"; then
-        # ARC-2-D4: the gateway's own egress is exempted INSIDE this
-        # chain (a lower-priority accept chain never sees the packet),
-        # then the terminal scoped drop.
-        echo "ip saddr ${GW_IP[$profile]} counter accept"
+        # ARC-2-D4 + EGL-123-D2: the gateway's own egress is exempted
+        # INSIDE this chain (a lower-priority accept chain never sees
+        # the packet), then the terminal scoped drop. The exemption is
+        # keyed on source IP *and* the kit-derived gateway MAC
+        # (EGL-123-D2): a co-located sibling that spoofs only the
+        # gateway IP (live-confirmed C-2/T9 bypass) no longer matches
+        # and falls through to the terminal drop. The MAC comes from
+        # conf identity (gw_mac), never a live inspect — EGL-91
+        # policy-before-gateway stays intact. One line starting with
+        # `ip saddr` so canonicalize's keep-filter sees it (nft list
+        # order re-proven on the VM matrix, EGL-123-D2).
+        echo "ip saddr ${GW_IP[$profile]} ether saddr $(gw_mac "$profile") counter accept"
         echo "ip saddr ${subnet} counter drop"
     else
         echo "ip saddr ${subnet} counter drop"
@@ -1033,98 +1120,94 @@ allowlist_src() {
 }
 
 #
-# Emit ONE nftables transaction that atomically replaces the profile
-# chain's rules: `flush chain` + the re-added rules in the same file.
-# R-003-7 finding 1: flushing and re-creating in separate invocations
-# left an empty-chain window during which running agents on the shared
-# class network passed unfiltered (Netavark accepts). nft -f files are
-# a single atomic netlink transaction, so observers see either the old
-# or the new ruleset, never an empty chain.
-policy_refresh_file() {
+# EGL-106-D2: build ONE nft -f file for the whole policy install — the
+# shared p_v6deny chain and the profile chain in a SINGLE transaction.
+# nft applies a -f file as one atomic netlink batch, so observers never
+# see "v6deny installed, profile chain missing" (the inter-transaction
+# first-create window EGL-106 closes): they see the pre-install state
+# or both chains complete. Existence probes are reads; `flush chain`
+# is emitted ONLY for a chain the probe found — flush of a missing
+# chain fails the batch (D1 fail-closed). Chain blocks: p_v6deny
+# FIRST, profile chain LAST (R-003-7 intent: the profile content is
+# the last chain block; with one -f there is no "last file" anymore).
+# EGL-120-D1: a rule-generation failure deletes the temp and returns
+# rc 1 with no file — no -f, no partial transaction, no second Error
+# line (the resolve failure already reported itself).
+#
+# Four combinations fall out of the two probes:
+#   p_v6deny missing + profile missing -> create both (first install)
+#   p_v6deny exists + profile missing  -> flush v6deny, create-with-rules
+#                                         profile (typical first create)
+#   p_v6deny missing + profile exists  -> create v6deny, flush+re-add
+#                                         profile
+#   both exist                         -> flush+re-add both (warm
+#                                         ensure / R-003-7 refresh)
+#
+policy_install_file() { # policy_install_file <profile> -> tmp path; rc 1 on rule-gen failure
     local profile="$1" chain
     chain="$(chain_of "$profile")"
-    local tmp
+    local v6_exists=no profile_exists=no
+    if netns_nft list chain inet "$TABLE" p_v6deny >/dev/null 2>&1; then
+        v6_exists=yes
+    fi
+    if netns_nft list chain inet "$TABLE" "$chain" >/dev/null 2>&1; then
+        profile_exists=yes
+    fi
+    local tmp rules_rc=0
     tmp="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
     {
-        echo "flush chain inet ${TABLE} ${chain}"
+        if [[ "$v6_exists" == yes ]]; then
+            echo "flush chain inet ${TABLE} p_v6deny"
+        fi
+        if [[ "$profile_exists" == yes ]]; then
+            echo "flush chain inet ${TABLE} ${chain}"
+        fi
         echo "table inet ${TABLE} {"
+        echo "    chain p_v6deny {"
+        echo "        type filter hook forward priority -160; policy accept;"
+        echo "        meta nfproto ipv6 counter drop"
+        echo "    }"
         echo "    chain ${chain} {"
         echo "        type filter hook forward priority -150; policy accept;"
-        policy_rules "$profile"
+        # EGL-120-D1: a rule-generation failure (unresolvable allow-host)
+        # must delete the temp file and fail the builder by rc — never
+        # emit a partial file for nft to reject.
+        policy_rules "$profile" || rules_rc=1
         echo "    }"
         echo "}"
     } > "$tmp"
+    if (( rules_rc != 0 )); then
+        rm -f "$tmp"
+        return 1
+    fi
     echo "$tmp"
 }
 
 install_policy() {
     local profile="$1" chain f
     chain="$(chain_of "$profile")"
-    # Shared unscoped IPv6 deny chain first: create-if-missing, then an
-    #     ATOMIC refresh in the same transaction style as the profile
-    #     chain. Older versions re-emitted this chain on every install
-    #     and real additive semantics APPENDED a duplicate drop rule
-    #     each time (on-host finding: stacked 'meta nfproto ipv6 counter
-    #     drop' rules); the strict ordered verify fails closed on such
-    #     a chain, so install must self-heal it. flush+re-add in one
-    #     file means observers never see an empty chain. This lands
-    #     BEFORE the profile chain so the profile transaction stays the
-    #     LAST -f of the install (the R-003-7 regression fixture reads
-    #     the last transaction).
-    f="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
-    if netns_nft list chain inet "$TABLE" p_v6deny >/dev/null 2>&1; then
-        echo "flush chain inet ${TABLE} p_v6deny" > "$f"
-    fi
-    cat >> "$f" <<EOF
-table inet ${TABLE} {
-    chain p_v6deny {
-        type filter hook forward priority -160; policy accept;
-        meta nfproto ipv6 counter drop
-    }
-}
-EOF
+    # EGL-106-D1: the whole install is ONE `netns_nft -f` transaction —
+    # the shared p_v6deny chain (create-if-missing, else atomic
+    # flush+re-add) and the profile chain (first-create =
+    # create-with-rules; refresh = atomic flush+re-add) in the same
+    # file. The old two-file order left an inter-transaction window on
+    # first create (v6deny landed, profile chain not yet created: a
+    # concurrent IPv4 forward rode Netavark's default accept); one
+    # atomic -f closes it without touching the EGL-91-D4 ensure order.
+    # Older versions re-emitted p_v6deny on every install and real
+    # additive semantics APPENDED a duplicate drop rule each time
+    # (on-host finding: stacked 'meta nfproto ipv6 counter drop'
+    # rules); the strict ordered verify fails closed on such a chain,
+    # so the flush-if-exists re-add self-heals it inside the same
+    # transaction.
+    f="$(policy_install_file "$profile")" || return 1
+    # ARC-49 F1: explicit rm + die (no EXIT trap) — a failed -f leaves
+    # no /tmp/agent-policy.* behind.
     if ! netns_nft -f "$f"; then
         rm -f "$f"
-        die "nft policy v6-deny install failed for profile '$profile' (fail closed)"
+        die "nft policy install failed for profile '$profile' (fail closed)"
     fi
     rm -f "$f"
-    # EGL-91-D2 (audit G-06/I-06): first create emits ONE transaction
-    # that creates the profile chain WITH its real rules already in it —
-    # no empty policy-accept base step. The old base's "no agents can
-    # be running yet" assumption was the hole (audit I-06): any
-    # concurrent forward traffic on the brand-new network (a parallel
-    # podman run, the gateway start) passed unfiltered during the
-    # window. No `flush chain` in the create file — flush fails when
-    # the chain is missing. When the chain exists, the refresh path
-    # keeps the atomic flush+re-add (R-003-7): observers see the old or
-    # the new ruleset, never an empty chain.
-    if netns_nft list chain inet "$TABLE" "$chain" >/dev/null 2>&1; then
-        # Atomic refresh (R-003-7 finding 1): flush + re-added rules in
-        # ONE transaction — running agents never observe an empty chain.
-        # The old separate flush/delete/recreate left a fail-open window
-        # for concurrent agent-run on the shared class network.
-        f="$(policy_refresh_file "$profile")"
-        if ! netns_nft -f "$f"; then
-            rm -f "$f"
-            die "nft policy refresh failed for profile '$profile' (fail closed)"
-        fi
-        rm -f "$f"
-    else
-        f="$(mktemp /tmp/agent-policy.XXXXXX.nft)"
-        {
-            echo "table inet ${TABLE} {"
-            echo "    chain ${chain} {"
-            echo "        type filter hook forward priority -150; policy accept;"
-            policy_rules "$profile"
-            echo "    }"
-            echo "}"
-        } > "$f"
-        if ! netns_nft -f "$f"; then
-            rm -f "$f"
-            die "nft policy install failed for profile '$profile' (fail closed)"
-        fi
-        rm -f "$f"
-    fi
     # Remove the deprecated separate exemption chain (pre-ARC-5-D4
     #    layout) from hosts that installed it. Safe at any time: the
     #    exemption now lives inside the class chain itself.
@@ -1447,6 +1530,9 @@ gw_generate_config() {
     cat > "$out" <<EOF
 # Generated by egresslock from $(allowlist_src "$profile") — do not edit.
 http_port ${GW_PORT[$profile]}
+# Explicit (never silent stock inherit): the idle origin-response timer
+# that closes long silent non-streaming requests.
+read_timeout ${PROFILE_READ_TIMEOUT[$profile]} seconds
 pid_filename /tmp/squid.pid
 dns_nameservers $gw_dns
 shutdown_lifetime 2 seconds
@@ -1505,6 +1591,34 @@ EOF
     echo "http_access deny all" >> "$out"
 }
 
+# EGL-114-D2: byte-identity compare between the generated candidate set
+# and the deployed files inside a RUNNING gateway. rc 0 = converged (the
+# caller skips cp/mv/restart), rc 1 = differs (today's apply path).
+# Fail-closed direction: an exec failure or a missing live counterpart is
+# a DIFFER, never a skip. The compared set is the candidate's own files —
+# squid.conf plus every allowlist.* file the generated config references.
+# Live allowlist.* files the config does NOT reference are ignored (the
+# image entrypoint creates /etc/squid/agent/allowlist.conf on boot and
+# the engine never writes or removes it; a literal extra-file compare
+# could never converge and would restart every healthy gateway on every
+# ensure — the exact session severance this gate exists to stop. See the
+# EGL-114 Decision History).
+gw_converged() { # gw_converged <gwname> <stage-dir> <candidate-squid.conf>
+    local gwname="$1" stage="$2" candidate="$3" ref name
+    # squid.conf: missing live file (bootstrap gateway) or exec error = differ.
+    podman exec "$gwname" cat /etc/squid/agent/squid.conf 2>/dev/null \
+        | cmp -s - "$candidate" || return 1
+    # Filename-complete over the referenced allowlist set: a missing or
+    # differing live counterpart is a differ.
+    while IFS= read -r ref; do
+        [[ -n "$ref" ]] || continue
+        name="${ref##*/}"
+        podman exec "$gwname" cat "/etc/squid/agent/$name" 2>/dev/null \
+            | cmp -s - "$stage/$name" || return 1
+    done < <(grep -oE '"/etc/squid/agent/allowlist\.[A-Za-z0-9._-]+"' "$candidate" | tr -d '"' | sort -u)
+    return 0
+}
+
 #
 # Apply the generated allowlist config to the running gateway: stage
 # everything, validate the candidate with `squid -k check`, swap it in,
@@ -1512,9 +1626,18 @@ EOF
 # the process was started with, which may be the bootstrap config). Any
 # failure leaves the previous config active and fails closed.
 #
+# EGL-114-D2: on a HEALTHY gateway (running + probe answers) whose
+# deployed config set is byte-identical to the candidate, the whole
+# apply is skipped — the stock path restarted Squid on every redundant
+# ensure and severed proxied sessions on an already-converged profile.
+# `install_policy` (atomic refresh + DNS-pin healing) already ran in the
+# caller and is not affected by the skip.
+#
+GW_APPLY_SKIPPED=0
 gw_apply_allowlist() {
     local profile="$1" gwname
     gwname="$(gw_name "$profile")"
+    GW_APPLY_SKIPPED=0
     local stage
     stage="$(mktemp -d /tmp/agent-allowlist.XXXXXX)"
     local candidate="$stage/squid-gw.conf"
@@ -1524,6 +1647,18 @@ gw_apply_allowlist() {
         die "allowlist generation failed (fail closed)"
     fi
     chmod 644 "$candidate" "$stage"/allowlist.* 2>/dev/null || true
+
+    # EGL-114-D2: health-check-before-replace gate. A gateway that is
+    # not running or does not answer the probe takes today's apply path
+    # (the caller's ensure_gateway just replaced it, or it is crash
+    # recovery). A just-created gateway has bootstrap/no deployed files,
+    # so the compare differs and the first-create apply runs.
+    if gw_healthy "$gwname" "${GW_PORT[$profile]}" \
+        && gw_converged "$gwname" "$stage" "$candidate"; then
+        rm -rf "$stage"
+        GW_APPLY_SKIPPED=1
+        return 0
+    fi
 
     local f
     for f in "$stage"/allowlist.*; do
@@ -1640,20 +1775,46 @@ gw_start() {
     # propagates under set -e (command-substitution footgun).
     img="$(gw_image)"
     podman rm -f "$gwname" >/dev/null 2>&1 || true
+    # EGL-123-D3: the gateway carries the kit-derived pinned MAC — the
+    # same identity the compiled exemption is keyed on (saddr+MAC).
     podman run -d --name "$gwname" \
         --network "$net" \
         --ip "$ip" \
+        --mac-address "$(gw_mac "$profile")" \
         --restart=always \
         --cap-drop=all \
         --security-opt=no-new-privileges \
         "$img" >/dev/null
 }
 
+# EGL-123-D3: live MAC of a container on its class network (empty when
+# inspect fails). Mirrors the IPAddress template used by verify_gateway.
+gw_live_mac() { # gw_live_mac <gwname> <net>
+    podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").MacAddress}}" 2>/dev/null || true
+}
+
+# EGL-123-D3: MAC identity check. A gateway whose live MAC differs from
+# the kit-derived pin is identity drift, NOT a converged profile:
+# ensure treats it as not-healthy (replace), verify fails closed.
+gw_mac_ok() { # gw_mac_ok <profile> <gwname>
+    local net live want
+    net="$(network_of "$1")"
+    live="$(gw_live_mac "$2" "$net")"
+    want="$(gw_mac "$1")"
+    [[ "$live" == "$want" ]]
+}
+
 ensure_gateway() {
     local profile="$1" gwname port img
     gwname="$(gw_name "$profile")"
     port="${GW_PORT[$profile]}"
-    if gw_running "$gwname" && gw_probe "$gwname" "$port"; then
+    # EGL-123-D3: running + probe is no longer sufficient — the live MAC
+    # must also match the kit-derived pin. A mismatch is identity drift
+    # (e.g. a pre-upgrade gateway with a random MAC): fall through to
+    # today's replace. One-time disruption on first ensure after
+    # upgrade; afterwards the pin is stable, so the EGL-114 converged
+    # skip stays non-disruptive.
+    if gw_running "$gwname" && gw_probe "$gwname" "$port" && gw_mac_ok "$profile" "$gwname"; then
         return 0
     fi
     # Plain assignment so a die() inside gw_image (ARC-59 env guard)
@@ -1698,6 +1859,14 @@ verify_gateway() {
     cip="$(podman inspect "$gwname" --format "{{(index .NetworkSettings.Networks \"$net\").IPAddress}}" 2>/dev/null || true)"
     [[ "$cip" == "$ip" ]] \
         || { echo "verify: gateway IP is '$cip', expected $ip" >&2; return 1; }
+    # EGL-123-D3: the live MAC must equal the kit-derived pin — the
+    # compiled exemption is keyed on saddr+MAC, so a drifted MAC means
+    # the gateway's own egress would fall to the terminal drop. Timer
+    # notices a drifted MAC through this check.
+    local cmac
+    cmac="$(gw_live_mac "$gwname" "$net")"
+    [[ "$cmac" == "$(gw_mac "$profile")" ]] \
+        || { echo "verify: gateway MAC is '${cmac}', expected '$(gw_mac "$profile")'" >&2; return 1; }
     # Config sanity: parse the deployed config. `-k parse` needs no
     # running-instance PID file (unlike `-k check`); on-host finding,
     # ARC-5. Liveness itself is covered by gw_probe.
@@ -1744,8 +1913,9 @@ cmd_ensure() {
     # concurrent `podman run --network <profile>`) forwards under
     # Netavark's default accept. The rules are built from
     # PROFILE_SUBNET / GW_IP in the conf, not a live gateway inspect,
-    # so nft can go first; the `saddr GW_IP accept` exemption is inert
-    # until that IP speaks, which is fine. First create is ONE
+    # so nft can go first; the saddr+MAC exemption (EGL-123-D2, MAC
+    # derived by gw_mac) is inert until that identity speaks, which is
+    # fine. First create is ONE
     # create-with-rules transaction (D2); refreshes flush+re-add
     # atomically.
     # ARC-12-D2: snapshot the pre-refresh allow-host pins so a DNS
@@ -1791,7 +1961,13 @@ cmd_ensure() {
     fi
     if is_gateway_profile "$1"; then
         verify_gateway "$1" || die "gateway verification failed for profile '$1' (fail closed)"
-        echo "gateway '$(gw_name "$1")' ready (allowlist applied, health verified)"
+        # EGL-114-D1: the skip path must not claim "allowlist applied" —
+        # nothing was applied and nothing restarted.
+        if [[ "${GW_APPLY_SKIPPED:-0}" == 1 ]]; then
+            echo "gateway '$(gw_name "$1")' ready (already converged, not restarted)"
+        else
+            echo "gateway '$(gw_name "$1")' ready (allowlist applied, health verified)"
+        fi
     fi
     echo "profile '$1' ready (network $(network_of "$1"), policy verified)"
 }
@@ -3012,6 +3188,28 @@ confdir_has_conf() { # any *.conf in the dir?
     return 1
 }
 
+# EGL-117-D1: resolution disclosure. Every conf-resolving invocation
+# prints EXACTLY ONE stderr line naming the winning source — every
+# time, TTY-independent (this lifts ARC-45 for these lines only; the
+# old TTY gate is what hid a scoped EGRESSLOCK_CONF under pipes and
+# under the timer). Stdout contracts stay byte-stable.
+disclose_resolution() { # disclose_resolution <mode> <path> <profile|count>
+    local mode="$1" path="$2" extra="${3:-}"
+    case "$mode" in
+        scoped)
+            if [[ "$ENGINE_CONF_SOURCE" == "--config" ]]; then
+                echo "scoped: --config $path — this command uses this config only" >&2
+            else
+                echo "scoped: EGRESSLOCK_CONF=$path — this command uses this config only; unset EGRESSLOCK_CONF to sweep the confdir" >&2
+            fi
+            ;;
+        named)     echo "using config $path" >&2 ;;
+        fallback)  echo "using config $path (named fallback: no $extra.conf)" >&2 ;;
+        aggregate) echo "using configs in $path ($extra profiles)" >&2 ;;
+        *) echo "internal: unknown resolution mode $mode" >&2; return 1 ;;
+    esac
+}
+
 cutover_incomplete_msg() { # one-line hint before the generic probe error
     local legacy newdir
     legacy="$(legacy_confdir_default)"
@@ -3035,12 +3233,15 @@ probe_named_conf() { # probe_named_conf <confdir> <profile>
         echo "Checked '$confdir/$profile.conf' and '$confdir/main.conf' (the default locations). If you expected a config to be found, make sure you are running as the dedicated account (not root) and that the profile file is in place — 'egresslock init <name>' or 'egresslock-setup --init-conf' creates them." >&2
         exit 2
     fi
-    # The probe hint is a HUMAN signal: emit it only when stdout is a
-    # terminal. Under command substitution / pipes (e.g. the README's
-    # `--env HTTP_PROXY="http://$(... proxyip):$(... proxyport)"` pattern)
-    # it would be pure noise on every captured call (ARC-45).
-    if [[ -t 1 ]]; then
-        echo "using config $candidate" >&2
+    # EGL-117-D1: the winning source is disclosed EVERY time, whatever
+    # stdout is attached to (ARC-45 lifted for this line only). A named
+    # fallback to main.conf is named as such — only when the profile's
+    # OWN conf was missing (profile 'main' hitting main.conf is a plain
+    # named hit: main.conf IS <main>.conf).
+    if [[ -n "$profile" && "$profile" != "main" && "$candidate" == "$confdir/main.conf" ]]; then
+        disclose_resolution fallback "$candidate" "$profile"
+    else
+        disclose_resolution named "$candidate"
     fi
     ENGINE_CONF="$candidate"
     load_config "$ENGINE_CONF"
@@ -3065,9 +3266,10 @@ aggregate_configs() { # aggregate_configs <confdir>
         echo "Checked '$confdir' for *.conf (the default location). If you expected a config to be found, make sure you are running as the dedicated account (not root) and that the profile file is in place — 'egresslock init <name>' or 'egresslock-setup --init-conf' creates them." >&2
         exit 2
     fi
-    if [[ -t 1 ]]; then
-        echo "using configs in $confdir" >&2
-    fi
+    # EGL-117-D1: disclose the aggregate scope (one line, every time).
+    # N = the number of *.conf files the glob resolved (same glob as the
+    # loads that follow; a load that fails aborts the command fail-closed).
+    disclose_resolution aggregate "$confdir" "${#confs[@]}"
     local first=1 c
     for c in "${confs[@]}"; do
         if [[ "$first" == 1 ]]; then
@@ -3248,10 +3450,12 @@ if [[ "${1:-}" == "--version" ]]; then
 fi
 if [[ "${1:-}" == --config=* ]]; then
     ENGINE_CONF="${1#--config=}"
+    ENGINE_CONF_SOURCE="--config"
     shift
 elif [[ "${1:-}" == --config ]]; then
     [[ $# -ge 2 ]] || { echo "Error: --config requires a path argument." >&2; usage >&2; exit 2; }
     ENGINE_CONF="$2"
+    ENGINE_CONF_SOURCE="--config"
     shift 2
 fi
 case "${1:-}" in
@@ -3270,6 +3474,10 @@ case "${1:-}" in
             # EGRESSLOCK_CONF is deliberately ignored (not even loaded).
             :
         elif [[ -n "$ENGINE_CONF" ]]; then
+            # EGL-117-D1: the explicit source is disclosed every time —
+            # a scoped EGRESSLOCK_CONF silently narrowing the sweep was
+            # the live footgun this line exists to surface.
+            disclose_resolution scoped "$ENGINE_CONF"
             load_config "$ENGINE_CONF"
         else
             # ARC-24/ARC-37-D2/D3/D4: per-user default resolution. Named

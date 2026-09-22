@@ -24,9 +24,9 @@ number alone:
 * **Full review** — the initial public release; any later cut whose
   product delta touches core enforcement, parsing, privilege
   boundaries, gateway policy, DNS behavior, packaging security, or
-  other trust-boundary code; or a major version. Instrument:
-  `internal_docs/PRE_RELEASE_REVIEW_INSTRUCTIONS.md` (private; the
-  brief below under "Review areas" summarizes its shape).
+  other trust-boundary code; or a major version. Instrument: a
+  private pre-release review brief (not part of the public
+  distribution); the review areas below summarize its shape.
 * **Focused review** — point/patch releases **and** 0.x snapshot
   refreshes whose product delta does **not** hit that list. Inspect
   the diff and the security boundaries it touches; re-run the publish
