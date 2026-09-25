@@ -22,6 +22,7 @@ routine health check see
 | where are the gateway logs / what do they mean | Squid access.log + cache.log reading | [gateway-logs](troubleshooting/gateway-logs.md) |
 | `pinger| FATAL` noise in cache.log | benign (no ICMP in the gateway container) | [gateway-logs](troubleshooting/gateway-logs.md) |
 | `unable to find network ... network not found` (podman) | the profile's network is not in this user's podman store — never ensured, torn down, or wrong user | [network-not-found](troubleshooting/network-not-found.md) |
+| after a reboot, network looks fine but workloads are unprotected / verify says `network exists but policy does not` | the network object survives reboot without its volatile netns policy | [after-a-reboot](troubleshooting/after-a-reboot.md) |
 | long request dies at exactly 15m00 | squid `read_timeout` — non-streaming origin idle, not a periodic breaker | [long-request-15m](troubleshooting/long-request-15m.md) |
 
 The failure-signature model behind the first three rows (two-path

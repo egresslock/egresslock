@@ -75,10 +75,12 @@ normative security claims and their limits).
 
    - **podman** (rootless), **netavark**
    - **nftables** 1.0+ (`nft` at `/usr/sbin/nft` or `NFT_BIN`)
+   - **conntrack** (`conntrack` at `/usr/sbin/conntrack` or
+     `CONNTRACK_BIN` — required by `disallow-host`'s revocation flush)
 
    ```sh
    # example — dependency install with apt:
-   sudo apt-get install -y podman netavark nftables
+   sudo apt-get install -y podman netavark nftables conntrack
    ```
 
 3. One or more dedicated unprivileged `<account>`s to own the policies
@@ -194,10 +196,11 @@ detailed material; [troubleshooting](docs/troubleshooting.md) is the
 - [Malware analysis](examples/recipes/malware-analysis.md) — detonate samples in an isolated container with a deny-all profile, allow only the C2/sinkhole hosts you choose.
 - [CI runner (forgejo-runner)](examples/recipes/ci-runner.md) — restricted runner profile; job containers attached to the profile network with the gateway proxy.
 
-### Run a specific program
+### Specific program or configuration
 
 - [Install opencode via npm](examples/recipes/opencode-npm-install.md) — tested path: apt + npm inside a `debian:13-slim` container reaching exactly deb.debian.org / registry.npmjs.org / github.com / openrouter.ai.
 - [Install hermes via curl | bash](examples/recipes/hermes-curl-install.md) — tested path: hermes (Nous Research) inside a `debian:13-slim` container reaching its install chain (Astral/uv, PyPI CDN, github.com).
+- [Local LLM (Ollama, etc.)](examples/recipes/local-llm.md) — reach an LLM server on the host or LAN from a container: the localhost patterns, raw-IP `allow-host`, and the long-request timeout knob.
 
 ## Reference
 

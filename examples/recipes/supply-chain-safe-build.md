@@ -77,4 +77,7 @@ podman run --rm -it --name safe-build \
 Replace `<build image>` / `make` with your toolchain (e.g.
 `debian:13-slim` + `npm ci && npm run build`). The profile's policy
 applies at runtime — the build can reach only the allowlisted
-registries, nothing else.
+registries, nothing else. After a host reboot, re-run
+`egresslock ensure build` (or `egresslock-start`) before this
+`podman run` — the network object survives reboot without its policy
+([after-a-reboot](../../docs/troubleshooting/after-a-reboot.md)).

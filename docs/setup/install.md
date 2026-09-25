@@ -27,7 +27,7 @@ See [Packaging](../../packaging/README.md) for the build/install/uninstall proce
 2. **Debian packages** (install as root):
 
    ```sh
-   sudo apt-get install -y podman netavark nftables
+   sudo apt-get install -y podman netavark nftables conntrack
    ```
 
    | Package | What it is / why |
@@ -35,6 +35,7 @@ See [Packaging](../../packaging/README.md) for the build/install/uninstall proce
    | **podman** | runs the workload containers, the anchor, and the Squid gateway (validated on 5.4.2) |
    | **netavark** | Podman's rootless network backend; creates the profile bridge networks (validated on 1.14.0) |
    | **nftables** | the enforcement engine — the kit installs a fail-closed policy in the account's rootless netns (1.0+; `nft` at `/usr/sbin/nft` or set `NFT_BIN`) |
+   | **conntrack** | required by `disallow-host`'s revocation flush (the kit's `Depends:`) |
 
 3. **One or more dedicated unprivileged `<account>`s** to own the
    policies — the kit never runs policy jobs as root. **Create a new

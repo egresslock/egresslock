@@ -81,6 +81,8 @@ docs/
     gateway-logs.md              Squid access.log / cache.log / denied
     verify-timer-signals.md      verified / FAILED / drift lines
     network-not-found.md         unable to find network ... network not found
+    after-a-reboot.md            network looks fine after a reboot but
+                                 workloads are unprotected (no policy)
 ```
 
 Component-local docs stay beside their component (`apparmor/README.md`,

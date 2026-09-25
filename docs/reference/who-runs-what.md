@@ -34,6 +34,18 @@ container. It has no policy knowledge and needs none: egress is
 enforced by nftables and the gateway regardless of what the workload
 does (removing proxy env does not bypass anything).
 
+### Network modes the kit assumes
+
+Workloads must run on the profile network only. Launching a workload
+with `--network=host`, with `--network=container:<gateway>` (sharing
+the gateway's network namespace), or dual-homed onto a second network
+takes it outside the profile's guarantees: host networking and
+shared-gateway-netns both grant raw direct egress past the policy (no
+Squid), and a dual-homed container keys as an ordinary profile workload
+on its profile leg. The kit does not reject these launch modes — they
+are operator obligations, listed with the others in the [threat
+model's operator obligations](threat-model.md#operator-obligations-the-kit-does-not-enforce).
+
 ## The tilde trap (one gotcha worth knowing)
 
 For a one-off from your own shell, `sudo -iu` switches to the

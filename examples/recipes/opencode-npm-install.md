@@ -63,6 +63,11 @@ podman run --rm -it \
     sh
 ```
 
+After a host reboot, re-run `egresslock ensure main` (or
+`egresslock-start`) before this `podman run` — the network object
+survives reboot without its policy
+([after-a-reboot](../../docs/troubleshooting/after-a-reboot.md)).
+
 ## 3. Inside the container
 
 ```sh

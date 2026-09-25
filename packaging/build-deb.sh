@@ -224,7 +224,7 @@ Version: $version
 Section: net
 Priority: optional
 Architecture: all
-Depends: bash, podman, netavark, nftables
+Depends: bash, podman, netavark, nftables, conntrack
 Recommends: apparmor
 Maintainer: egresslock maintainers <onyxcoyote@users.noreply.github.com>
 Description: restricted egress for agent accounts (rootless podman + nftables + squid)

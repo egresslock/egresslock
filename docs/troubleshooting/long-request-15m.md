@@ -2,30 +2,29 @@
 
 ## Symptom
 
-A long, non-streaming request through the proxy dies at almost exactly
-15 minutes (15m00 ±1s): the client sees a dead connection or an aborted
-transfer, while the origin server may still log a completed 2xx for the
-same request. Requests shorter than 15 minutes to the same host succeed.
-Repeating long requests therefore look like egresslock "breaks my
-connection every 15 minutes" — but the interval is each request's own
-duration, not a wall-clock cadence, and it has nothing to do with the
-verify timer.
+Long requests can time out. A slow, non-streaming request through the
+proxy is cut when the origin sends no response bytes for longer than
+the profile's `read-timeout` (default 900 s, i.e. 15 minutes): the
+client sees a dead connection or an aborted transfer, while the origin
+may still log a completed 2xx. Slow local inference is the classic
+case; requests shorter than the timeout to the same host succeed.
 
 ## Cause
 
-The gateway's Squid inherits the stock **`read_timeout`** (15 minutes)
-unless the profile overrides it. For a **non-streaming** POST, the origin
-sends zero response bytes while it works; Squid counts 15:00 of idle on
-the server connection and closes it. Streaming responses keep bytes
-flowing, so they never trip the timer — which is why short requests and
-streamed calls never show this signature.
+The gateway closes the server connection after `read-timeout` seconds
+of idle — no bytes from the origin — and a non-streaming request sends
+zero bytes while the origin works. The value comes from the profile's
+`read-timeout` knob (default 900 s); the generated config always
+carries an explicit `read_timeout <N> seconds` line. Streaming
+responses keep bytes flowing, so they never trip the timer — which is
+why short requests and streamed calls never show this signature.
 
 Two things this is NOT:
 
 - Not an `ensure`-time break: a gateway replacement severs proxied
-  sessions at the moment you run `ensure`, not at a request's 15-minute
-  mark (and since the converged-ensure gate, a redundant `ensure` of a
-  healthy, unchanged profile does not restart anything).
+  sessions at the moment you run `ensure`, not at a request's
+  15-minute mark (and since the converged-ensure gate, a redundant
+  `ensure` of a healthy, unchanged profile does not restart anything).
 - Not the verify timer: `verify` is read-only and never restarts
   containers.
 
@@ -34,7 +33,9 @@ Two things this is NOT:
 Set a per-profile timeout in that profile's conf block, then re-ensure:
 
 ```text
-# in main.conf, inside the profile block
+profile main 10.199.3.0/24
+    rule gateway-only
+    gateway 10.199.3.2 3128 main-allowlist
     read-timeout 3600
 ```
 
@@ -42,15 +43,14 @@ Set a per-profile timeout in that profile's conf block, then re-ensure:
 egresslock ensure <profile>
 ```
 
-- Units are seconds: a positive integer, no suffixes (`15m` is
-  rejected). Omitted means the default **900** (Squid's stock 15
-  minutes).
-- LLM/completion profiles that need long silent non-streaming waits opt
-  in with a larger integer (`read-timeout 3600`). CI-class profiles that
-  want tight failure timing can go the other way (`read-timeout 60`).
-  There is deliberately no blanket generous default.
-- The generated gateway config always carries an explicit
-  `read_timeout <N> seconds` line, so you can confirm the live value:
+- Units are seconds: a positive integer. The default is **900**
+  (Squid's stock 15 minutes); omitted means the default.
+- LLM/completion profiles that need long silent non-streaming waits
+  opt in with a larger integer (`read-timeout 3600`). CI-class
+  profiles that want tight failure timing can go the other way
+  (`read-timeout 60`).
+- Confirm the live value — the generated gateway config always
+  carries an explicit `read_timeout <N> seconds` line:
 
   ```sh
   podman exec egresslock-gateway-<profile> \
@@ -61,4 +61,4 @@ egresslock ensure <profile>
   `connect_timeout`, and `client_lifetime` keep their stock values —
   none of them matches this hazard.
 - Streaming the request also avoids the idle window, but the profile
-  knob is the supported fix: the kit must not depend on client behavior.
+  knob is the supported fix.

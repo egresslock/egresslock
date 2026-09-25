@@ -165,6 +165,10 @@ va_out="$(env EGRESSLOCK_PROFILE=local-dev EGRESSLOCK_CONF="$KITCONF" \
 # step ensured.
 mkdir -p "$HOME/.config/egresslock"
 cp "$KITCONF" "$HOME/.config/egresslock/main.conf"
+# EGL-140-D1: the pin record is a sibling of the RESOLVED conf — a
+# relocated conf is re-ensured (as the kit launchers do) so the record
+# lands beside it; a relocated conf without its record fails closed.
+env -u EGRESSLOCK_CONF "$TREE_ROOT/egresslock" ensure local-dev >/dev/null 2>&1
 va_out="$(env -u EGRESSLOCK_PROFILE EGRESSLOCK_CONF="$KITCONF" \
     "$OPT/egresslock-verify" 2>&1)"; va_rc=$?
 [[ "$va_rc" == 0 && "$va_out" == *"verified (ensured)"* ]] \
@@ -285,6 +289,11 @@ profile second 10.50.1.0/24
     rule allow-host git.example.test:443
 EOF
 env -u EGRESSLOCK_CONF "$TREE_ROOT/egresslock" ensure second >/dev/null 2>&1
+# EGL-140-D1: relocate the record with the conf — re-ensure local-dev
+# against the default confdir so its pin record is a sibling of the
+# confdir main.conf the sweep resolves (the tamper drill below expects
+# a green sweep baseline for the tampered half only).
+env -u EGRESSLOCK_CONF "$TREE_ROOT/egresslock" ensure local-dev >/dev/null 2>&1
 v_out="$(env -u EGRESSLOCK_PROFILE EGRESSLOCK_CONF="$KITCONF" \
     "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
 if [[ "$v_rc" == 0 \
@@ -298,7 +307,8 @@ fi
 
 # Cleanup: restore the harness's default-confdir and profile state.
 env -u EGRESSLOCK_CONF "$TREE_ROOT/egresslock" teardown second >/dev/null 2>&1 || true
-rm -f "$HOME/.config/egresslock/main.conf" "$HOME/.config/egresslock/second.conf"
+rm -f "$HOME/.config/egresslock/main.conf" "$HOME/.config/egresslock/second.conf" \
+      "$HOME/.config/egresslock/local-dev.pins" "$HOME/.config/egresslock/second.pins"
 
 egl115_pass=$pass; egl115_fail=$fail
 
@@ -398,9 +408,12 @@ grep -q "teardown all" <<<"$u_out" \
 grep -q "$u17/home/runner/.config/agent-network" <<<"$u_out" \
     && a17 pass || a17 fail "kept reminder names the pre-rename confdir"
 
-# --purge-account-data removes BOTH confdirs (ARC-60-D3).
+# --purge-account-data removes BOTH confdirs (ARC-60-D3). EGL-140-D1:
+# the pin record rides the confdir — a fixture <profile>.pins is kept by
+# the default keep path and removed by the purge, never orphaned.
 mkdir -p "$u17/home/runner/.config/egresslock" "$u17/home/runner/.config/agent-network"
 : > "$u17/home/runner/.config/egresslock/unit.env"
+: > "$u17/home/runner/.config/egresslock/main.pins"
 : > "$u17/home/runner/.config/agent-network/main.conf"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
     EGRESSLOCK_ACCOUNT_HOME="$u17/home/runner" EGRESSLOCK_LEGACY_PREFIX="$u17/oldprefix" \
@@ -408,6 +421,18 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
     "$UKIT" --prefix "$u17/prefix" --account root --purge-account-data >/dev/null 2>&1
 [[ ! -e "$u17/home/runner/.config/egresslock" && ! -e "$u17/home/runner/.config/agent-network" ]] \
     && a17 pass || a17 fail "--purge-account-data removes both confdirs"
+
+# EGL-140-D1: the default (no --purge) keep path keeps the pin record
+# WITH the confdir (account data, no root-side orphans).
+mkdir -p "$u17/home/runner/.config/egresslock"
+: > "$u17/home/runner/.config/egresslock/unit.env"
+: > "$u17/home/runner/.config/egresslock/main.pins"
+env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$u17/home/runner" EGRESSLOCK_LEGACY_PREFIX="$u17/oldprefix" \
+    EGRESSLOCK_PATH_BINDIR="$u17/wbin" EGRESSLOCK_PATH_SBINDIR="$u17/wbin" \
+    "$UKIT" --prefix "$u17/prefix" --account root >/dev/null 2>&1
+[[ -f "$u17/home/runner/.config/egresslock/main.pins" ]] \
+    && a17 pass || a17 fail "uninstall-kit default keeps the pin record with the confdir (EGL-140-D1)"
 
 # Unknown account fails closed; missing value is a usage error (exit 2).
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
@@ -1420,7 +1445,8 @@ fi
 grep -q '^Package: egresslock$' "$p22/stage/DEBIAN/control" \
     && grep -q '^Architecture: all$' "$p22/stage/DEBIAN/control" \
     && grep -q '^Depends:.*podman' "$p22/stage/DEBIAN/control" \
-    && a22 pass || a22 fail "control: package/arch/depends (D2)"
+    && grep -q '^Depends:.*conntrack' "$p22/stage/DEBIAN/control" \
+    && a22 pass || a22 fail "control: package/arch/depends (D2; conntrack is the revocation-flush prerequisite)"
 # Verification gate: no site names anywhere in the package.
 if grep -RIl 'home\.arpa' "$p22/stage" >/dev/null 2>&1; then
     a22 fail "deb stage leaks site names (arc22 verification)"
@@ -2084,6 +2110,15 @@ if command -v dpkg >/dev/null 2>&1; then
     else
         a22 fail "EGL-118 0.3.0 -> 0.4.0 base bump not an upgrade under dpkg ordering"
     fi
+    # EGL-135-D8 cross-base pin: the 0.5.0 base bump (same timestamp,
+    # same sha — worst case) must also compare as an upgrade over a
+    # 0.4.0 stamp; 0.4.0 -> 0.5.0 is never a dpkg downgrade.
+    if dpkg --compare-versions "0.4.0+git20260924192516.76f1e51d345a" \
+            lt "0.5.0+git20260924192516.76f1e51d345a"; then
+        a22 pass
+    else
+        a22 fail "EGL-135 0.4.0 -> 0.5.0 base bump not an upgrade under dpkg ordering"
+    fi
 else
     skip "dpkg absent" "EGL-27 dpkg not available; skipping compare-versions assert"
 fi
@@ -2097,6 +2132,8 @@ fi
 # and adds the 0.2.0+git lt 0.3.0+git cross-base assert above.
 # EGL-118-D8: the live-base pin moves to 0.4.0 with the VERSION_BASE bump
 # and adds the 0.3.0+git lt 0.4.0+git cross-base assert above.
+# EGL-135-D8: the live-base pin moves to 0.5.0 with the VERSION_BASE bump
+# and adds the 0.4.0+git lt 0.5.0+git cross-base assert above.
 # EGL-80-L8: the stamp embeds the git commit — in a tree WITHOUT .git
 # (the exported/staged public snapshot shape, or a plain export)
 # build-tarball legitimately falls back to 'unknown' (EGL-74
@@ -2112,7 +2149,9 @@ elif [[ ! -d "$TREE_ROOT/.git" ]]; then
 else
     t27_rc=0
     env EGRESSLOCK_TARBALL_OUT="$b27/k.tgz" "$TARSH" >"$b27/log" 2>&1 || t27_rc=$?
-    v27_real="$(grep -oE '0\.4\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
+    # EGL-135-D8: the live-base pin moves to 0.5.0 with the VERSION_BASE bump
+# and adds the 0.4.0+git lt 0.5.0+git cross-base assert above.
+    v27_real="$(grep -oE '0\.5\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
     [[ "$t27_rc" == 0 && -f "$b27/k.tgz" && -n "$v27_real" ]] \
         && a22 pass || a22 fail "EGL-27 tarball build stamps new scheme (rc=$t27_rc, log: $(cat "$b27/log"))"
 fi

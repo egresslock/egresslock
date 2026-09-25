@@ -70,7 +70,10 @@ podman run --rm -it --name agent-opencode \
 The tool reaches exactly `openrouter.ai` (LLM API) + `github.com` (SSH).
 Your work persists in `~/work/agent`; the container itself is disposable
 (`--rm`). opencode starts with a blank config — log in / configure the
-LLM API inside the container.
+LLM API inside the container. After a host reboot, re-run
+`egresslock ensure main` (or `egresslock-start`) before this
+`podman run` — the network object survives reboot without its policy
+([after-a-reboot](../../docs/troubleshooting/after-a-reboot.md)).
 
 ## Notes
 

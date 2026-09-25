@@ -21,7 +21,7 @@ one bypass — the source-address-keyed gateway exemption — closed on
 [accepted risks](#non-goals--accepted-risks). Neither exercise was a
 pentest.
 
-Last reviewed: 2026-09-21. The claims below are scoped to the dogfood
+Last reviewed: 2026-09-24. The claims below are scoped to the dogfood
 hosts in the [version matrix](#version-matrix), not to "any rootless
 Podman" install.
 
@@ -187,6 +187,18 @@ Operator obligations the kit does not enforce:
   setup, so no policy is installed — a fail-closed setup error, not a
   policy bypass. Stock Debian (unlabeled podman) is unaffected. See
   [the pasta AppArmor page](../troubleshooting/pasta-apparmor.md).
+- launch workloads on the **profile network only** — not with
+  `--network=host`, not with `--network=container:<gateway>` (sharing
+  the gateway's network namespace), and not dual-homed onto a second
+  network. `--network=host` puts the workload in the account's own
+  network namespace, where the profile chain's subnet-scoped rules do
+  not match its packets. `--network=container:<gateway>` presents the
+  gateway's own source address and pinned MAC, so the gateway-egress
+  exemption matches. Either mode grants the workload raw direct egress
+  past the policy with no Squid enforcement. A dual-homed container
+  carries a genuine profile-subnet address on one leg, so every layer
+  keys it as an ordinary workload of that profile. The kit does not
+  reject these launch modes — they are operator obligations.
 
 ## Invariants
 
@@ -200,7 +212,7 @@ attacks table or an explicit non-goal.
 | I3 | On a gateway-only profile the gateway being down means no direct internet (nothing else is accepted) | fail-open when Squid dies |
 | I4 | Forwarded IPv6 is dropped (`p_v6deny`, before Netavark) | IPv6 bypass of an IPv4-only policy |
 | I5 | The conf/allowlist never enter the workload filesystem (the kit never mounts them; the operator's launcher must not bind-mount the account home or confdir) | the workload reads or edits its own policy |
-| I6 | The site must `ensure`/`verify` before workloads start; a missing or stale chain means unprotected, not safe | empty/stale chains, or a profile with no `p_<name>` chain at all, silently pass traffic |
+| I6 | The site must `ensure`/`verify` before workloads start; a missing or stale chain means unprotected, not safe — including after reboot, when the network object survives but the netns policy does not (since 0.5.0, `verify` names this state, the timer signals it, nothing auto-repairs) | empty/stale chains, or a profile with no `p_<name>` chain at all, silently pass traffic |
 
 ## Non-goals / accepted risks
 
@@ -233,7 +245,14 @@ attacks table or an explicit non-goal.
   the allowlist is name-based (dstdomain), names resolve at request
   time, and the gateway's own egress is exempt from the profile chain —
   so an allowlisted name that starts resolving to a private address is
-  connected from the gateway's position. LAN hosts the operator meant
+  connected from the gateway's position. Live probes narrow the reach
+  but do not close it: cloud metadata (`169.254.169.254`) is not
+  delivered on this pasta, hosts-file rebind is not injectable from the
+  gateway (non-root gateway, internal DNS), and LAN reach was
+  demonstrated only through an explicit IP-literal `allow-host` pin
+  (operator-intentional, nft-direct). A hostile container on the
+  profile network can answer the rebind at L2 (ARP/proxy-MITM,
+  demonstrated end-to-end). LAN hosts the operator meant
   to allow directly stay on `allow-host`; `disallow` closes the hole.
 - **Profile rules are source-scoped; cap-drop is what makes them bite
   (T9 neighbor):** the profile chain matches `ip saddr <profile subnet>`
@@ -307,8 +326,8 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T14 | `public-only` profile | public IPv4; RFC1918 + 169.254/16 + 224/4 + broadcast dropped | LAN RFC1918 blocked. Not CGNAT/loopback | lab-verified (RFC1918) |
 | T15 | Another account's `podman network ls` | cannot see this account's nets | empty / other store | design-intent |
 | T16 | Engine run as root | refuse | error; root's store unused | design-intent |
-| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + `saddr GW_IP` accept. A rebind can reach **cloud metadata (`169.254.169.254`)** and **LAN services**, not only a generic private address. LAN IPs the operator meant stay `allow-host`. | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
-| T18 | Literal `http://127.0.0.1` (or other IPv4 URL) via proxy | Squid 403 (dstdomain is names). `allow` of an IPv4 literal is rejected. Use `allow-host` for addresses. | 403; `allow` exit 2 | lab-verified (unlisted literals); grammar: literals rejected |
+| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach: cloud metadata (`169.254.169.254`) is **not delivered** on this pasta (in-lab mitigation: connection times out); hosts-file rebind is **not injectable** from the gateway (non-root gateway; Squid resolves via internal DNS, not the hosts file); LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, nft-direct, not the name-rebind path. The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
+| T18 | Literal `http://127.0.0.1` (or other IPv4 URL) via proxy | Squid 403 (dstdomain is names). `allow` of an IPv4 literal is rejected. Use `allow-host` for addresses. | 403; `allow` exit 2 | lab-verified (unlisted literals); grammar: literals rejected. Since 0.5.0: 403 holds **including when the IP's PTR equals an allowlisted name** (generated dstdomain ACLs carry `-n`) |
 
 Rows read as "what should happen", not a pentest report:
 `design-intent` rows are untested; `open-by-design` rows are gaps the
@@ -317,9 +336,15 @@ review of the input paths and the input→sink review are complete. Live
 adversarial work has run on throwaway accounts: the original
 egress-bypass exercise (no undocumented general egress found), and the
 2026-09-19 adversarial VM probe, which live-confirmed the T9 spoof
-bypass — closed on 2026-09-21 (see T9). The probe's T17 name-rebind
-cases never exercised their intended path (a harness limitation, to be
-re-run); T17 remains `open-by-design` as recorded.
+bypass — closed on 2026-09-21 (see T9). The probe's T17 cases are now
+live-recorded on both halves: the no-L2-attacker side (cloud metadata
+not delivered on this pasta; hosts-file rebind not injectable; LAN
+reach only via an explicit IP-literal `allow-host` pin —
+operator-intentional, not the name-rebind path) and the L2-attacker
+side (ARP/proxy-MITM demonstrated end-to-end, fresh-overlay re-run
+2026-09-23). The name-rebind path itself — an allowlisted name that
+starts resolving to a private address — was not live-closed; T17
+remains `open-by-design` as recorded.
 
 ## Version matrix
 
@@ -370,6 +395,12 @@ it is not a license to generalize the matrix to "any rootless Podman".
   the fix keys the exemption on the source address *and* the gateway's
   pinned MAC, and the re-run proves the IP-only spoof fails closed
   while the deny baseline holds.
+- T17 live evidence (2026-09-19 through 2026-09-23) — **recorded**:
+  the no-L2-attacker side (cloud metadata not delivered on this pasta;
+  hosts-file rebind not injectable; LAN reach only via an explicit
+  IP-literal `allow-host` pin) and the L2-attacker side (ARP/proxy-MITM
+  demonstrated end-to-end) narrow the T17 reach without closing the
+  name-rebind path; see the T17 row and the accepted-risks bullet.
 - Leftover early forward-hook chains: the
   competing-chain hazard described under
   [Trust boundaries](#trust-boundaries).

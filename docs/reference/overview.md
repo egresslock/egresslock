@@ -35,7 +35,8 @@ operator must ensure that:
 - the workload runs in a rootless container under the dedicated account;
 - it has no Podman socket or equivalent control socket mounted into it;
 - it does not use host networking or a second network namespace, and it has
-  one policy network only: the intended egresslock profile;
+  one policy network only: the intended egresslock profile (see
+  [network modes](who-runs-what.md#network-modes-the-kit-assumes));
 - no unapproved additional network attachment is present;
 - it does not receive added capabilities such as `CAP_NET_ADMIN` (the
   operator's launcher drops all capabilities and sets `no-new-privileges`;

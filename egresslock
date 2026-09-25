@@ -36,6 +36,12 @@
 #   egresslock disallow <profile> <h> [h...] # remove allowlist entries + re-ensure
 #   egresslock allow-host <profile> <host:port>  # add direct allow rule
 #   egresslock disallow-host <profile> <host:port> # remove direct allow
+#                                      # rule; the revocation kills the
+#                                      # revoked pin's established direct
+#                                      # flows (conntrack delete after the
+#                                      # atomic swap — the mutator
+#                                      # exception; ensure/refresh keep
+#                                      # direct flows)
 #   egresslock init <name> [--subnet <cidr>]  # write a starter conf pair
 #   egresslock list                 # list profiles
 #   egresslock doctor               # host environment probe: podman,
@@ -87,6 +93,9 @@
 #                          subcommands; unset or empty = fail closed)
 #   NFT_BIN                absolute path to nft (default: /usr/sbin/nft,
 #                          then $PATH)
+#   CONNTRACK_BIN          absolute path to conntrack (default:
+#                          /usr/sbin/conntrack, then $PATH) — required
+#                          by `disallow-host`'s revocation flush
 #   EGRESSLOCK_ANCHOR_IMAGE     anchor image (default: base image or alpine)
 #   EGRESSLOCK_GW_IMAGE         gateway image (default:
 #                          localhost/egresslock-gateway:latest)
@@ -312,6 +321,73 @@ netns_nft() {
     # gw_generate_config note).
     bin="$(nft_bin)"
     podman unshare --rootless-netns "$bin" "$@"
+}
+
+# EGL-139-D2: conntrack seam, parallel to netns_nft. Same privilege
+# class as the engine's nft -f (the unshare grants CAP_NET_ADMIN in the
+# netns's owning userns); no nat-table access needed (ctnetlink delete
+# operates on entries). Resolution mirrors nft_bin exactly: CONNTRACK_BIN
+# (same ARC-59 leading-'-' / executable guards), then PATH, then
+# /usr/sbin/conntrack (often missing from a non-root PATH).
+conntrack_bin() {
+    if [[ -n "${CONNTRACK_BIN:-}" ]]; then
+        # ARC-59-D1: a value that starts with '-' would read as a flag
+        # in `podman unshare ... "$(conntrack_bin)"`. Empty stays the default.
+        [[ "$CONNTRACK_BIN" == -* ]] && die "CONNTRACK_BIN value must not start with '-' (got '$CONNTRACK_BIN')"
+        [[ -x "$CONNTRACK_BIN" ]] || die "CONNTRACK_BIN='$CONNTRACK_BIN' is not executable"
+        echo "$CONNTRACK_BIN"
+        return
+    fi
+    if command -v conntrack >/dev/null 2>&1; then
+        command -v conntrack
+    elif [[ -x /usr/sbin/conntrack ]]; then
+        echo /usr/sbin/conntrack
+    else
+        die "conntrack not found; install it: sudo apt install conntrack"
+    fi
+}
+
+netns_conntrack() {
+    local bin
+    # Plain assignment so a die() inside conntrack_bin (ARC-59 env guard)
+    # propagates under set -e instead of being swallowed by the
+    # inline-command-substitution pattern.
+    bin="$(conntrack_bin)"
+    podman unshare --rootless-netns "$bin" "$@"
+}
+
+# EGL-139-D2 step 2: fail-closed conntrack probe for `disallow-host`,
+# run BEFORE the conf mutation (R9: a revocation that cannot prove flow
+# severance must abort with nothing changed — no conf edit, no ruleset
+# swap, no `removed:` success line). Binary resolution (named) plus a
+# cheap in-netns ctnetlink probe (-C); a denied/unavailable ctnetlink
+# (e.g. AppArmor label on the unshare, missing nf_conntrack_netlink)
+# fails closed here, at the probe, not after the mutation. Both steps
+# are explicit-rc (the caller runs this in a ||-condition, where set -e
+# is disabled — a die() inside a command substitution there would NOT
+# exit this function, the ARC-59 footgun; no reliance on set -e).
+conntrack_probe() {
+    local bin out rc=0
+    if ! bin="$(conntrack_bin)"; then
+        # conntrack_bin already named the resolution failure (its die
+        # degrades to a named stderr line + rc 1 in condition context).
+        echo "  disallow-host must prove flow severance after the revocation (EGL-139-D2); nothing was changed." >&2
+        return 1
+    fi
+    # NOTE: capture the rc BEFORE any ! negation — inside a `if !`'s
+    # then-branch, $? is the negated status (0), a named bash trap.
+    if out="$(podman unshare --rootless-netns "$bin" -C 2>&1)"; then
+        :
+    else
+        rc=$?
+    fi
+    if (( rc != 0 )); then
+        echo "Error: conntrack probe failed in the rootless netns (rc=$rc): ${out:-<no output>}" >&2
+        echo "  disallow-host must prove flow severance after the revocation (EGL-139-D2); nothing was changed." >&2
+        echo "  Install the tool and retry: sudo apt install conntrack" >&2
+        return 1
+    fi
+    return 0
 }
 
 # ARC-26-D3: netns preflight. `podman unshare --rootless-netns true` is
@@ -563,6 +639,38 @@ ensure_anchor() {
 # both to generate the install file and to build the expected rule set for
 # deep verification (review R-003-3).
 #
+# EGL-141-D1: the profile's bridge device name — the single live-resolved
+# netns-topology token (a narrow, recorded amendment to "compiled from
+# conf", EGL-91: all POLICY semantics stay conf-derived; the bridge is
+# topology netavark owns and the conf cannot know). Resolved INSIDE the
+# emit path so every refresh (R-003-7) carries the current name. The
+# name is NOT stable across network recreation (`podman<N>` slot depends
+# on creation order in the shared account netns, kit AND non-kit), so
+# nothing may cache or derive it; a stale name matches nothing for the
+# genuine bridge — verify fails closed with a named diff and ensure
+# repairs (EGL-141-D1 consequence 3; R6 warm-ensure re-resolve stays
+# byte-identical). Cross-checked against the rootless netns link list so
+# an inspect/report mismatch fails the file builder by rc (EGL-120-D1
+# pattern) — an empty `iifname ""` must never render.
+profile_bridge_if() { # profile_bridge_if <profile> -> bridge device; rc 1 on any doubt
+    local profile="$1" net ifc links
+    net="$(network_of "$profile")"
+    ifc="$(podman network inspect --format '{{.NetworkInterface}}' "$net" 2>/dev/null || true)"
+    # Kernel ifnames: <= 15 bytes, no whitespace, no quotes, no leading
+    # '-' (flag-shaped tokens, EGL-59-D1 class). Anything else (empty,
+    # missing, multi-line) fails the emit.
+    [[ "$ifc" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$ ]] || {
+        echo "Error: cannot resolve the bridge interface of $net (got '${ifc:-<empty>}'); ensure owns network creation — run: egresslock ensure $profile" >&2
+        return 1
+    }
+    links="$(podman unshare --rootless-netns ip -br link 2>/dev/null || true)"
+    if ! awk '{print $1}' <<<"$links" | grep -qx -- "$ifc"; then
+        echo "Error: bridge interface '$ifc' of $net not confirmed in the rootless netns (ip -br link); fail closed" >&2
+        return 1
+    fi
+    echo "$ifc"
+}
+
 #
 # Rule generation entry point: the generic rule compiler for the loaded
 # config (there is no legacy path — ARC-20).
@@ -594,19 +702,24 @@ profile_allow_hosts() {
 }
 
 #
-# ARC-12-D4: build the EXPECTED ruleset for verification with
-# allow-host daddrs taken from the LIVE chain's pins (not a fresh
-# resolve — a DNS change must not make verify fail or die). Re-runs
-# policy_rules with the pinned IPs injected: emits each rule through
-# the same compiler paths but with resolution replaced by the zipped
-# live pins. Returns rc=1 if the live chain has no zip-able allow-host
-# set (missing chain, count or port-order mismatch) — a structural
-# mismatch, fail closed.
+# ARC-12-D4 (as amended by EGL-140-D1): build the EXPECTED ruleset for
+# verification with allow-host daddrs taken from the ENSURE-TIME PIN
+# RECORD (not a fresh resolve — a DNS change must not make verify fail
+# or die; not the live chain — a tampered chain must not adopt its own
+# daddrs as expected). Re-runs policy_rules with the recorded IPs
+# injected. The structural zip against the live chain (count, port
+# order) still fails closed, and each live daddr is compared against the
+# record: divergence = post-ensure chain edit -> named fail (EGL-140-D2).
+# A missing/corrupt record on a profile that has allow-hosts fails
+# closed with the named re-ensure error (D3 — never silent-green, never
+# a lenient live-chain adoption). Profiles with zero allow-hosts are
+# exempt: no record, no failure.
 #
 # Implementation: rather than duplicating the compilers, pin the
-# resolution: PIN_<host>_<port> association array is consulted by a
+# resolution: the VERIFY_PINS association array is consulted by a
 # resolver shim. resolve_pin() replaces resolve_ip in the expected-
-# ruleset build only.
+# ruleset build only. VERIFY_PINS is filled by read_pin_record (the
+# confdir witness), not by the live chain.
 #
 declare -A VERIFY_PINS=()
 
@@ -621,6 +734,204 @@ resolve_pin() { # resolve_pin <host> -> pinned IP; empty = no pin
         fi
     done
     return 1
+}
+
+# EGL-140-D1: the ensure-time pin record — sibling of the resolved conf
+# file (PROFILE_CONF carries the conf-resolution result, so
+# EGRESSLOCK_CONF relocation carries the record with it). The suffix
+# must NOT match the confdir aggregation glob (*.conf) — .pins never
+# aggregates, never parses as a conf.
+pin_record_path() { # pin_record_path <profile> -> <confdir>/<profile>.pins
+    local conf="${PROFILE_CONF[$1]:-}"
+    [[ -n "$conf" ]] || die "internal: no conf file recorded for profile '$1'"
+    local dir
+    dir="$(cd "$(dirname "$conf")" && pwd)"
+    echo "$dir/$1.pins"
+}
+
+# EGL-140-D1 step 2: write the pin record from WHAT WAS JUST INSTALLED.
+# The witness is the live chain's pin accepts right after the atomic
+# install (the exact daddrs the compiler resolved and emitted — no
+# second resolve, no DNS race). Conf order, `host|port <daddr>` per
+# allow-host, first-A semantics preserved (both ports of one host carry
+# their installed daddr). Zero-allow-host profiles have NO record: a
+# stale one from a previous shape is removed. Atomic mktemp+mv beside
+# the file (the conf-RMW pattern); a SIGKILL mid-ensure leaves the old
+# record or none — both fail closed at the next verify (EGL-91 torn-
+# state class). A write failure fails the ensure closed (named; ensure
+# never claims success with a missing record).
+write_pin_record() { # write_pin_record <profile>
+    local profile="$1" rec
+    rec="$(pin_record_path "$profile")"
+    # Zero-allow-host profile: the record must not exist (exempt shape).
+    if [[ -z "$(profile_allow_hosts "$profile")" ]]; then
+        rm -f "$rec"
+        return 0
+    fi
+    # Zip the just-installed chain's pin accepts against the conf order
+    # (same parse verify_expected_rules uses, minus the record compare).
+    local chain subnet
+    chain="$(chain_of "$profile")"
+    subnet="${PROFILE_SUBNET[$profile]}"
+    local raw actual
+    raw="$(netns_nft list chain inet "$TABLE" "$chain" 2>/dev/null || true)"
+    actual="$(canonicalize <<<"$raw")"
+    local gw_ip="${GW_IP[$profile]:-}"
+    local -a want_hosts=() want_ports=() got_ips=() got_ports=()
+    local hp r ip port i
+    while IFS= read -r hp; do
+        [[ -n "$hp" ]] || continue
+        want_hosts+=("${hp%:*}")
+        want_ports+=("${hp##*:}")
+    done < <(profile_allow_hosts "$profile")
+    while IFS= read -r r; do
+        local pin_re="^ip saddr ${subnet} iifname \"[^\"]+\" ip daddr ([0-9.]+) tcp dport ([0-9]+) counter accept\$"
+        [[ "$r" =~ $pin_re ]] || continue
+        ip="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+        # Exclude the DNS-to-bridge rule and the static gateway hop.
+        [[ "$ip" == "$gw_ip" ]] && continue
+        got_ips+=("$ip")
+        got_ports+=("$port")
+    done <<<"$actual"
+    if (( ${#want_ports[@]} != ${#got_ports[@]} )); then
+        die "cannot record the installed pins for profile '$profile' (chain has ${#got_ports[@]} pin accepts, conf has ${#want_ports[@]} — fail closed)"
+    fi
+    local -a lines=()
+    for i in "${!want_ports[@]}"; do
+        lines+=("${want_hosts[$i]}|${want_ports[$i]} ${got_ips[$i]}")
+    done
+    local tmp
+    tmp="$(mktemp "$rec.XXXXXX")" || die "cannot create temp next to $rec (pin record write, fail closed)"
+    chmod 600 "$tmp" 2>/dev/null || true
+    printf '%s\n' "${lines[@]}" > "$tmp"
+    mv "$tmp" "$rec" || { rm -f "$tmp"; die "cannot write pin record $rec (fail closed)"; }
+}
+
+# EGL-140-D1 step 4 / D3: read the pin record into VERIFY_PINS. Fail
+# closed named on a missing record (the 0.4.x upgrade shape: live chains
+# but no witness — re-ensure, never a lenient live-chain adoption) and
+# on a corrupt/incomplete/unexpected-content record (same class). The
+# record must cover exactly the profile's conf allow-hosts: every conf
+# pin covered, no stale extra entries.
+read_pin_record() { # read_pin_record <profile> — fills VERIFY_PINS; rc 1 named
+    local profile="$1" rec
+    rec="$(pin_record_path "$profile")"
+    if [[ ! -f "$rec" ]]; then
+        echo "verify: pin record missing for profile '$profile' — re-run: egresslock ensure $profile" >&2
+        return 1
+    fi
+    VERIFY_PINS=()
+    local line key ip
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" =~ ^([^|[:space:]]+)\|([0-9]+)[[:space:]]+([0-9.]+)$ ]]; then
+            VERIFY_PINS["${BASH_REMATCH[1]}|${BASH_REMATCH[2]}"]="${BASH_REMATCH[3]}"
+        else
+            echo "verify: pin record corrupt for profile '$profile' ($rec, line: '$line') — re-run: egresslock ensure $profile" >&2
+            return 1
+        fi
+    done < "$rec"
+    local hp
+    while IFS= read -r hp; do
+        [[ -n "$hp" ]] || continue
+        if [[ -z "${VERIFY_PINS[${hp%:*}|${hp##*:}]:-}" ]]; then
+            echo "verify: pin record corrupt for profile '$profile' (missing entry for $hp) — re-run: egresslock ensure $profile" >&2
+            return 1
+        fi
+    done < <(profile_allow_hosts "$profile")
+    for key in "${!VERIFY_PINS[@]}"; do
+        local found=0
+        while IFS= read -r hp; do
+            [[ -n "$hp" ]] || continue
+            [[ "${hp%:*}|${hp##*:}" == "$key" ]] && { found=1; break; }
+        done < <(profile_allow_hosts "$profile")
+        if (( found == 0 )); then
+            echo "verify: pin record corrupt for profile '$profile' (stale entry for ${key%%|*}:${key##*|}) — re-run: egresslock ensure $profile" >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+# EGL-139-D2 step 3: the revoked pin's LIVE daddr, captured BEFORE the
+# conf mutation deletes the conf line (name pins carry no IP; the chain
+# is the only trustworthy scope source). Positional zip of the conf's
+# allow-host order against the live chain's pin accepts — the same
+# pairing verify_expected_rules uses, without the record compare. Empty
+# when the pin has no live rule (never ensured / chain absent / the
+# chain is structurally drifted): the caller then skips the flush after
+# the re-ensure (no tuple to kill — EGL-139-D2).
+live_pin_daddr() { # live_pin_daddr <profile> <host> <port> -> ip (empty = none)
+    local profile="$1" host="$2" port="$3" chain subnet
+    chain="$(chain_of "$profile")"
+    subnet="${PROFILE_SUBNET[$profile]}"
+    local raw actual
+    raw="$(netns_nft list chain inet "$TABLE" "$chain" 2>/dev/null || true)"
+    [[ -n "$raw" ]] || return 0
+    actual="$(canonicalize <<<"$raw")"
+    local gw_ip="${GW_IP[$profile]:-}"
+    local -a want_hosts=() want_ports=() got_ips=() got_ports=()
+    local hp r ip p i
+    while IFS= read -r hp; do
+        [[ -n "$hp" ]] || continue
+        want_hosts+=("${hp%:*}")
+        want_ports+=("${hp##*:}")
+    done < <(profile_allow_hosts "$profile")
+    while IFS= read -r r; do
+        local pin_re="^ip saddr ${subnet} iifname \"[^\"]+\" ip daddr ([0-9.]+) tcp dport ([0-9]+) counter accept\$"
+        [[ "$r" =~ $pin_re ]] || continue
+        ip="${BASH_REMATCH[1]}"
+        p="${BASH_REMATCH[2]}"
+        [[ "$ip" == "$gw_ip" ]] && continue
+        got_ips+=("$ip")
+        got_ports+=("$p")
+    done <<<"$actual"
+    (( ${#want_ports[@]} == ${#got_ports[@]} )) || return 0
+    for i in "${!want_ports[@]}"; do
+        if [[ "${want_hosts[$i]}" == "$host" && "${want_ports[$i]}" == "$port" ]]; then
+            echo "${got_ips[$i]}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# EGL-139-D2 steps 5-6: scoped conntrack delete of the revoked pin's
+# entries AFTER the atomic nft swap (never before/inside it — a pre-swap
+# flush lets in-flight packets re-mint the entry under the still-matching
+# pin rule, R-003-7), then the zero-dep post-assert that no data-path
+# (ESTABLISHED) entry remains for the tuple. The -D rc is advisory (an
+# already-dead tuple may match nothing); the post-assert is the
+# completion gate. A surviving ESTABLISHED entry after a successful
+# swap+flush dies loudly with the state disclosed — never a green rc
+# with a live revoked flow (error-loudly-lie shape, R2/R9). SYN_SENT-
+# class transients are ignored: late in-flight packets can mint them
+# even though every subsequent packet drops.
+conntrack_flush_and_assert() { # conntrack_flush_and_assert <daddr> <dport>
+    local dip="$1" dport="$2" out
+    # (a) scoped delete: original-direction tuple; the kernel drops the
+    # masqueraded reply side. Scoped to that daddr+dport — other pins,
+    # DNS, gateway-exemption traffic untouched. Side effect of also
+    # killing a gateway->internet leg to the same IP:port is accepted
+    # (EGL-139-D2; squid reopens if the allowlist still allows it).
+    if ! out="$(netns_conntrack -D -p tcp --dport "$dport" -d "$dip" 2>&1)"; then
+        echo "warn: conntrack delete for $dip:$dport failed: $(tail -1 <<<"$out")" >&2
+    fi
+    # (c) zero-dep post-assert: /proc/net/nf_conntrack (the group-B
+    # harness reader, live-proved). Unreadable table = cannot prove
+    # severance = fail closed named.
+    local rc=0
+    out="$(podman unshare --rootless-netns cat /proc/net/nf_conntrack 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+        die "cannot read the rootless netns conntrack table (rc=$rc): ${out:-<no output>}; state: conf line removed, ruleset swapped, ct unproven — retry disallow-host, or install conntrack: sudo apt install conntrack"
+    fi
+    local survivor
+    survivor="$(awk -v want_dst="dst=$dip " -v want_dport="dport=$dport " \
+        'index($0, want_dst) && index($0, want_dport) && $3 == "tcp" && /ESTABLISHED/ { print; exit }' <<<"$out")"
+    if [[ -n "$survivor" ]]; then
+        die "revoked pin $dip:$dport still has an ESTABLISHED conntrack entry after the flush: $survivor; state: conf line removed, ruleset swapped, ct entry persists — retry disallow-host (fresh packets now drop and the entry drains), or install conntrack: sudo apt install conntrack"
+    fi
 }
 
 verify_expected_rules() { # prints expected ruleset; rc 1 on zip mismatch
@@ -643,8 +954,22 @@ verify_expected_rules() { # prints expected ruleset; rc 1 on zip mismatch
         want_ports+=("${hp##*:}")
     done < <(profile_allow_hosts "$profile")
 
+    # EGL-140-D1: the daddr witness comes from the ensure-time pin
+    # record, read BEFORE the structural checks (a missing/corrupt
+    # record is its own named failure, D3). Zero-allow-host profiles are
+    # exempt (no record, no failure).
+    VERIFY_PINS=()
+    if (( ${#want_ports[@]} > 0 )); then
+        read_pin_record "$profile" || return 1
+    fi
+
     while IFS= read -r r; do
-        [[ "$r" =~ ^ip\ saddr\ ${subnet}\ ip\ daddr\ ([0-9.]+)\ tcp\ dport\ ([0-9]+)\ counter\ accept$ ]] || continue
+        # EGL-141-D1: the pinned accept is iifname-scoped (any resolved
+        # bridge name matches — the same live helper builds the expected
+        # ruleset, so expected and actual agree; the regex only unbinds
+        # the device token, it stays $-anchored and shape-strict).
+        local pin_re="^ip saddr ${subnet} iifname \"[^\"]+\" ip daddr ([0-9.]+) tcp dport ([0-9]+) counter accept\$"
+        [[ "$r" =~ $pin_re ]] || continue
         ip="${BASH_REMATCH[1]}"
         port="${BASH_REMATCH[2]}"
         # Exclude the DNS-to-bridge rule and the static gateway hop.
@@ -663,9 +988,20 @@ verify_expected_rules() { # prints expected ruleset; rc 1 on zip mismatch
             echo "verify: allow-host port order mismatch for profile '$profile' (config ${want_hosts[$i]}:${want_ports[$i]}, chain dport ${got_ports[$i]})" >&2
             return 1
         fi
-        # D5: one pin per host (first-A semantics); keyed host|firstport.
+        # EGL-140-D1 step 3: the live daddr must equal the ensure-time
+        # record — divergence is a post-ensure chain edit (tamper, torn
+        # record), fail closed named. The record, not the chain, is the
+        # expected value (the ARC-12-D4 live-pairing tautology is closed).
         local key="${want_hosts[$i]}|${want_ports[$i]}"
-        [[ -n "${VERIFY_PINS[$key]:-}" ]] || VERIFY_PINS[$key]="${got_ips[$i]}"
+        local rec_ip="${VERIFY_PINS[$key]:-}"
+        if [[ -z "$rec_ip" ]]; then
+            echo "verify: pin record corrupt for profile '$profile' (no entry for ${want_hosts[$i]}:${want_ports[$i]}) — re-run: egresslock ensure $profile" >&2
+            return 1
+        fi
+        if [[ "$rec_ip" != "${got_ips[$i]}" ]]; then
+            echo "verify: allow-host pin daddr mismatch for ${want_hosts[$i]}:${want_ports[$i]} (record: $rec_ip, chain: ${got_ips[$i]}) — re-run: egresslock ensure $profile" >&2
+            return 1
+        fi
     done
 
     # Emit the expected ruleset with pins. The zip above has filled
@@ -907,6 +1243,13 @@ load_config() {
                     # never '-'. '--help' / '-x' are flag-shaped tokens.
                     [[ "$val" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
                         || config_error "$n" "invalid host name '$val'" "$raw"
+                    # EGL-147-D2: a trailing-dot host is the same dead
+                    # shape as a trailing-dot allowlist entry (squid can
+                    # never match it) — the CLI must not mint a conf the
+                    # parser rejects (ARC-32-D2 symmetry), so the parser
+                    # names it too.
+                    [[ "$val" == *. ]] \
+                        && config_error "$n" "host '$val' has a trailing dot — entries are bare names" "$raw"
                     # ARC-32-D2: same DNS length caps as the allowlist
                     # predicate (host <= 253, labels 1..63) — the conf
                     # must not carry a token the gateway can never use.
@@ -979,6 +1322,11 @@ load_config() {
                     # alnum or '.', never '-'.
                     [[ "$expanded" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
                         || config_error "$n" "invalid NO_PROXY entry '$expanded'" "$raw"
+                    # EGL-147-D2: trailing-dot NO_PROXY entry — same
+                    # dead-or-surprising shape; named reject like
+                    # allow-host above.
+                    [[ "$expanded" == *. ]] \
+                        && config_error "$n" "host '$expanded' has a trailing dot — entries are bare names" "$raw"
                     # ARC-32-D2: same DNS length caps as the allowlist
                     # predicate (host <= 253, labels 1..63).
                     arc32_dns_len_ok "${expanded#.}" \
@@ -1034,15 +1382,40 @@ allow_host_resolve_hint() { # allow_host_resolve_hint <profile> <host> <port>
 #      the gateway-source exemption when a gateway exists (ARC-2-D4).
 #
 compiled_rules() {
-    local profile="$1" subnet gateway
+    local profile="$1" subnet gateway bridge
     subnet="${PROFILE_SUBNET[$profile]}"
     # The DNS allow targets the bridge gateway = first usable address
     # (ARC-11-D3); integer CIDR math, any supported prefix.
     cidr_parse "$subnet" || die "invalid subnet '$subnet'"
     gateway="$(cidr_ip "$CIDR_FIRST")"
+    # EGL-141-D1: the bridge device is live-resolved inside the emit
+    # path (every refresh carries the current name). A resolution
+    # failure must fail the BUILDER by rc (EGL-120-D1 pattern) — this
+    # compiler runs inside a set -e-inert substitution in the install
+    # file builder, so die() would only exit the subshell. Never emit
+    # an empty iifname.
+    bridge="$(profile_bridge_if "$profile")" || {
+        echo "Error: policy emit aborted for profile '$profile' (bridge interface unresolved, fail closed)" >&2
+        return 1
+    }
 
-    echo "ip saddr ${subnet} ct state established,related counter accept"
-    echo "ip saddr ${subnet} ip daddr ${gateway} meta l4proto { tcp, udp } th dport 53 counter accept"
+    # EGL-141-D2: counted early anti-spoof drop, FIRST (drop is
+    # terminal across base chains, ARC-52-D3). Out-of-bridge
+    # in-subnet-saddr packets are a NAMED, counted spoof verdict, not
+    # an incidental terminal hit. In-subnet-saddr keyed only: out-of-
+    # subnet sources (C-5/E-01) still ride the base accept — the D4
+    # boundary is untouched (EGL-145 re-confirms). Line starts with
+    # `iifname !=` (the design's shape); nft lists expressions in
+    # written order (live-proven at nft 1.1.3, evidence probe141), so
+    # canonicalize's keep-filter must keep `^iifname` lines.
+    echo "iifname != \"${bridge}\" ip saddr ${subnet} counter drop"
+    # EGL-141-D1: every saddr-keyed ACCEPT on this chain is scoped to
+    # the profile's own bridge. Emit `ip saddr` FIRST so the
+    # canonicalize keep-filter still sees the line, then `iifname`
+    # (the EGL-123-D2 pattern for `ether saddr`; nft 1.1.3 preserves
+    # written order — live-proven, evidence probe141).
+    echo "ip saddr ${subnet} iifname \"${bridge}\" ct state established,related counter accept"
+    echo "ip saddr ${subnet} iifname \"${bridge}\" ip daddr ${gateway} meta l4proto { tcp, udp } th dport 53 counter accept"
 
     local i kind arg pfx="${profile}|"
     local hip hport dip is_public=no
@@ -1071,7 +1444,7 @@ compiled_rules() {
                 # Belt: an empty IP with rc 0 (a die swallowed again)
                 # must never render an empty daddr.
                 [[ -n "$dip" ]] || die "cannot resolve $hip"
-                echo "ip saddr ${subnet} ip daddr ${dip} tcp dport ${hport} counter accept"
+                echo "ip saddr ${subnet} iifname \"${bridge}\" ip daddr ${dip} tcp dport ${hport} counter accept"
                 ;;
             public-only)
                 is_public=yes
@@ -1085,13 +1458,19 @@ compiled_rules() {
                 echo "ip saddr ${subnet} ip daddr 255.255.255.255 counter drop"
                 ;;
             gateway-only)
-                echo "ip saddr ${subnet} ip daddr ${GW_IP[$profile]} tcp dport ${GW_PORT[$profile]} counter accept"
+                # EGL-141-D1: the gateway-hop accept is saddr-keyed and
+                # therefore iifname-scoped like every accept.
+                echo "ip saddr ${subnet} iifname \"${bridge}\" ip daddr ${GW_IP[$profile]} tcp dport ${GW_PORT[$profile]} counter accept"
                 ;;
         esac
     done
 
     if [[ "$is_public" == yes ]]; then
-        echo "ip saddr ${subnet} counter accept"
+        # EGL-141-D1: the public-only terminal is itself a saddr-keyed
+        # accept — scoped like every accept (the mirror-miss class).
+        # The RFC1918/etc. daddr drops above stay UNscoped (already
+        # fail-closed).
+        echo "ip saddr ${subnet} iifname \"${bridge}\" counter accept"
     elif is_gateway_profile "$profile"; then
         # ARC-2-D4 + EGL-123-D2: the gateway's own egress is exempted
         # INSIDE this chain (a lower-priority accept chain never sees
@@ -1103,10 +1482,19 @@ compiled_rules() {
         # conf identity (gw_mac), never a live inspect — EGL-91
         # policy-before-gateway stays intact. One line starting with
         # `ip saddr` so canonicalize's keep-filter sees it (nft list
-        # order re-proven on the VM matrix, EGL-123-D2).
-        echo "ip saddr ${GW_IP[$profile]} ether saddr $(gw_mac "$profile") counter accept"
+        # order re-proven on the VM matrix, EGL-123-D2). EGL-141-D1:
+        # the exemption is a saddr-keyed accept — it gains the bridge
+        # scope (saddr+iifname+MAC); closures narrow, never widen (the
+        # cross-bridge MAC+IP clone, X-5, is newly closed; the
+        # same-bridge clone stays the EGL-142 residual).
+        echo "ip saddr ${GW_IP[$profile]} iifname \"${bridge}\" ether saddr $(gw_mac "$profile") counter accept"
         echo "ip saddr ${subnet} counter drop"
     else
+        # EGL-141-D1: the terminal drop stays saddr-keyed and
+        # interface-UNscoped — with D2's anti-spoof first it remains
+        # the in-bridge C-4 diagnostic; it must keep adjudicating an
+        # out-of-bridge in-subnet packet if the anti-spoof rule were
+        # absent.
         echo "ip saddr ${subnet} counter drop"
     fi
 }
@@ -1224,6 +1612,48 @@ install_policy() {
 # then compare equal iff the rule sets match (order-insensitive; the
 # order-sensitive DNS-before-drops requirement is checked separately).
 #
+# EGL-98-D2: stale-unpolicied predicate. A profile is stale when its
+# podman network OBJECT survives (on-disk state) while its policy chain
+# is absent from the shared rootless netns (volatile state) — the
+# post-reboot window, where a raw `podman run --network egresslock-<p>`
+# re-plumbs netavark and recreates the netns with NO egresslock table.
+# The chain is the scope, not the table: the table is shared
+# (ARC-66-D4), so a sibling profile's re-ensure recreates it while this
+# profile's chain is still missing — chain-absent covers both "fresh
+# netns, no table" and "sibling ensured, our chain not installed".
+# Teardown removes the network object, so a teardown'd profile is not
+# stale; a never-ensured profile has no network object and is not stale
+# (the ARC-16-D3 "never used" silent skip is preserved). Torn state
+# (chain present, anchor dead — EGL-91/EGL-97 class) is NOT this
+# predicate: callers keep the existing `verify: anchor <x> not running`
+# line for it.
+#
+# Returns: 0 = stale-unpolicied (network object exists, chain absent);
+# 1 = not stale; 2 = hard probe failure (nft missing / netns not
+# answering — anything but the "no such chain" answer) — the named R9
+# failure is emitted here and callers must never fold it into a
+# silent-success or skip path.
+profile_stale_unpolicied() { # profile_stale_unpolicied <profile>
+    local profile="$1" out rc=0
+    # (1) the on-disk half: the network object. Absent = never-ensured
+    # or teardown'd = not stale (silent skip preserved).
+    podman network inspect "$(network_of "$profile")" >/dev/null 2>&1 || return 1
+    # (2) the volatile half: the profile chain. nft answers "No such
+    # file or directory" when the chain is missing (fresh netns, no
+    # table, or sibling-ensured-without-us); any other failure is a
+    # hard probe failure — named, fail closed, never a skip (R9).
+    if out="$(netns_nft list chain inet "$TABLE" "$(chain_of "$profile")" 2>&1)"; then
+        return 1
+    else
+        rc=$?
+    fi
+    if [[ "$out" == *"No such file or directory"* ]]; then
+        return 0
+    fi
+    echo "Error: cannot probe the nft policy for profile '$profile' in the rootless netns (rc=$rc): ${out:-<no output>}; check pasta/podman health — run: egresslock ensure $profile" >&2
+    return 2
+}
+
 verify_policy() {
     local profile="$1" subnet chain anchor
     subnet="${PROFILE_SUBNET[$profile]}"
@@ -1231,6 +1661,23 @@ verify_policy() {
     anchor="$(anchor_of "$profile")"
     podman network inspect "$(network_of "$profile")" >/dev/null 2>&1 \
         || { echo "verify: network $(network_of "$profile") missing — run: egresslock ensure $profile" >&2; return 1; }
+    # EGL-98-D2: stale-unpolicied window (post-reboot: the network
+    # object survives, the netns policy is volatile). When the
+    # predicate holds, the anchor check below would fail with a true
+    # but unexplained fact ("anchor not running") — name the real state
+    # and the runnable next action (R9). When the predicate does not
+    # hold and the anchor is dead, the existing anchor line still
+    # speaks (torn-state class). A hard probe failure (rc 2) is already
+    # named by the helper; fail closed here.
+    local stale=0
+    profile_stale_unpolicied "$profile" || stale=$?
+    if (( stale == 2 )); then
+        return 1
+    fi
+    if (( stale == 0 )); then
+        echo "verify: network exists but policy does not — run: egresslock ensure $profile" >&2
+        return 1
+    fi
     anchor_running "$anchor" \
         || { echo "verify: anchor $anchor not running" >&2; return 1; }
 
@@ -1263,10 +1710,14 @@ verify_policy() {
     fi
 
     # Profile chain: hook, priority, and the exact ORDERED rule set.
-    # ARC-12-D1/D4: allow-host daddrs in the EXPECTED ruleset come from
-    # the live chain's own pins (verify_expected_rules), so DNS drift
-    # is not a verify failure; the zip's count/port checks still fail
-    # closed on structural mismatch. resolve_ip is NOT called here.
+    # ARC-12-D1 as amended by EGL-140-D1: allow-host daddrs in the
+    # EXPECTED ruleset come from the ensure-time confdir pin record
+    # (verify_expected_rules -> read_pin_record), so DNS drift is not a
+    # verify failure and a tampered chain cannot adopt its own daddrs;
+    # the zip's count/port checks still fail closed on structural
+    # mismatch, and each live daddr is compared against the record
+    # (divergence = post-ensure chain edit, named fail). resolve_ip is
+    # NOT called here.
     # NOTE: verify_expected_rules runs WITHOUT a command substitution
     # (no $() ) because it fills VERIFY_PINS for check_dns_drift; a
     # subshell would discard those assignments.
@@ -1306,11 +1757,20 @@ canonicalize() {
     # aliases ('mangle' = -150; -160 renders as 'mangle - 10'). Order
     # matters (R-003-7 finding 2): first-match semantics mean a
     # reordered accept/drop changes the policy, so NO sorting here.
+    # EGL-141-D2: the anti-spoof drop line STARTS with `iifname !=`
+    # (the design's literal shape; nft lists expressions in written
+    # order — live-proven at nft 1.1.3, evidence probe141), so the
+    # keep-filter must keep `^iifname` lines or the named spoof verdict
+    # would vanish from the expected==actual compare. This is a new
+    # named line class, NOT a reorder extension: the scoped accepts
+    # still emit `ip saddr` first (EGL-141-D1) and list ip-first
+    # (probe-proven); `^oifname` is deliberately NOT added (nothing
+    # emits it — never a general loosening, EGL-48).
     sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//
         s/counter packets [0-9]+ bytes [0-9]+/counter/
         s/priority mangle - 10/priority -160/
         s/priority mangle;/priority -150;/' \
-        | grep -E '^(type filter|ip saddr|meta nfproto)'
+        | grep -E '^(type filter|ip saddr|meta nfproto|iifname)'
 }
 
 #
@@ -1451,6 +1911,12 @@ gw_allowlist_entries() {
             if (( port < 1 || port > 65535 )); then
                 die "invalid port in allowlist entry '$entry'"
             fi
+            # EGL-147-D2: same trailing-dot reject as the CLI — a
+            # hand-edited (or stale) dead line must fail ensure closed,
+            # never deploy (the gateway can never match it; X-6 E7).
+            if [[ "$host" == *. ]]; then
+                die "allowlist entry '$entry' has a trailing dot — dstdomain entries are bare names; requests with trailing dots are normalized by the gateway"
+            fi
             # ARC-51-D1: the allowlist is names only (squid dstdomain).
             # A literal IPv4 in the file is a fail-closed error, not a
             # skipped line — the operator must move it to allow-host.
@@ -1471,6 +1937,11 @@ gw_allowlist_entries() {
                 echo "$host:$port"
             fi
         elif [[ "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            # EGL-147-D2: trailing-dot bare entry — same reject shape
+            # as the host:port branch above (fail closed on both).
+            if [[ "$entry" == *. ]]; then
+                die "allowlist entry '$entry' has a trailing dot — dstdomain entries are bare names; requests with trailing dots are normalized by the gateway"
+            fi
             probe="${entry#.}"
             if cfg_is_ipv4 "$probe"; then
                 die "allowlist entry '$entry' is an IPv4 literal; literals belong on 'allow-host' (host:port), not the gateway allowlist"
@@ -1509,7 +1980,8 @@ gw_generate_config() {
     # finding: api.openrouter.ai unresolvable while the apex name
     # worked) and use the pasta DNS forwarder, which reaches the host
     # resolver for any name. Squid's own queries are exempted in
-    # p_llm_cloud (saddr GW_IP) so they are not dropped.
+    # p_llm_cloud (saddr+MAC(+bridge) gateway exemption, EGL-123-D2 /
+    # EGL-141-D1) so they are not dropped.
     # R-005-5 nit: validate the override — it is interpolated into the
     # Squid config, so reject anything that could inject directives.
     # ARC-56-D1: the sink consumes a LIST OF IPv4 ADDRESSES, so a charset
@@ -1558,7 +2030,10 @@ EOF
     done <<<"$entries"
     if [[ "$noport" == 1 ]]; then
         {
-            echo 'acl agent_allowlist dstdomain "/etc/squid/agent/allowlist.domains"'
+            # EGL-146-D1: `-n` on EVERY generated dstdomain ACL — Squid
+            # must not adopt rDNS for IP-literal CONNECTs (X-6 E8);
+            # numeric hosts fail the name match outright.
+            echo 'acl agent_allowlist dstdomain -n "/etc/squid/agent/allowlist.domains"'
             echo 'acl agent_port_443 port 443'
             echo 'http_access allow agent_class agent_allowlist agent_port_443'
         } >> "$out"
@@ -1582,7 +2057,9 @@ EOF
             echo "${entry%:*}" >> "$stage/allowlist.p$p"
         done <<<"$entries"
         {
-            echo "acl agent_allowlist_p$p dstdomain \"/etc/squid/agent/allowlist.p$p\""
+            # EGL-146-D1: same `-n` flag as the no-port group (see
+            # above); per-port groups must not diverge.
+            echo "acl agent_allowlist_p$p dstdomain -n \"/etc/squid/agent/allowlist.p$p\""
             echo "acl agent_port_p$p port $p"
             echo "http_access allow agent_class agent_allowlist_p$p agent_port_p$p"
         } >> "$out"
@@ -1906,6 +2383,9 @@ cmd_ensure() {
     # it takes the LAST usable host address (ARC-11-D3), not dynamic
     # IPAM, so ARC-5 gateway-first IPAM still holds — nothing else is
     # started and the gateway claims its configured static IP next.
+    # (EGL-98: the post-reboot shape of this window — network object
+    # persisted, netns+policy gone — is a named verify failure via
+    # profile_stale_unpolicied until this ensure closes it.)
     ensure_anchor "$1"
     # EGL-91-D1/D2 (audit G-06/I-06): install the nft policy BEFORE the
     # gateway start. The long window is the gateway health loop (up to
@@ -1931,6 +2411,14 @@ cmd_ensure() {
         done
     fi
     install_policy "$1"
+    # EGL-140-D1: the pin record is the second witness for the
+    # allow-host daddr axis — written here, from WHAT WAS JUST INSTALLED
+    # (the live chain's pin accepts), atomically, beside the conf. A
+    # failed write fails the ensure closed (named): ensure never claims
+    # success with a missing record. Zero-allow-host profiles remove any
+    # stale record instead. The pre-refresh snapshot above may read the
+    # PREVIOUS record (ARC-12-D2 refreshed: semantics unchanged).
+    write_pin_record "$1"
     # The policy is live (D4); now start the gateway — gateway profiles
     # only. The static IP was never at risk: the anchor pinned the LAST
     # usable address, not a dynamic one (ARC-5/ARC-11-D3).
@@ -1977,6 +2465,10 @@ cmd_ensure() {
 # gateway) verification succeeded. Warn-only: DNS drift is an operator
 # signal, never an exit-code change (D1/D3). One line per drifted host
 # (D5 first-A semantics; two ports of one host share a single warn).
+# EGL-140-D1/D2: the pinned source is the ensure-time pin record
+# (VERIFY_PINS is filled from the record, not the live chain) — the warn
+# compares the record against a fresh resolve (record-vs-resolver is the
+# warn channel; chain-vs-record is the exit-code axis).
 #
 check_dns_drift() {
     local profile="$1" hp host pinned fresh
@@ -2021,29 +2513,54 @@ cmd_verify() {
     check_dns_drift "$1"
 }
 
-# ARC-16-D3: verify every profile that is CURRENTLY ensured (its anchor
-# is running); profiles without a live anchor are skipped (they are not
-# installed, not broken). No ensured profiles at all: exit 0 silently —
-# the timer's job is a drift signal for installed policy, not a
-# complaint about profiles that were never used. Any verification
-# failure exits 1 (the oneshot unit fails -> journal signal).
+# ARC-16-D3 (amended by EGL-98-D2): verify every profile that is
+# CURRENTLY ensured (its anchor is running); profiles without a live
+# anchor are skipped — they are not installed, not broken — EXCEPT the
+# stale-unpolicied exception: a conf profile whose network object
+# survives while its policy chain is absent (the post-reboot window) is
+# a named failure, never a skip. No ensured profiles AND no stale
+# leftovers: exit 0 silently (the original D3 contract, narrowed) — the
+# timer's job is a drift signal for installed policy, not a complaint
+# about profiles that were never used. Any verification failure exits 1
+# (the oneshot unit fails -> journal signal).
 cmd_verify_ensured() {
      netns_probe || exit 1
      local p failed=0
     for p in "${PROFILES[@]}"; do
-        anchor_running "$(anchor_of "$p")" || continue
-        if ! verify_policy "$p"; then
-            echo "verify: profile '$p' FAILED policy verification" >&2
+        if anchor_running "$(anchor_of "$p")"; then
+            if ! verify_policy "$p"; then
+                echo "verify: profile '$p' FAILED policy verification" >&2
+                failed=1
+                continue
+            fi
+            if is_gateway_profile "$p" && ! verify_gateway "$p"; then
+                echo "verify: profile '$p' FAILED gateway verification" >&2
+                failed=1
+                continue
+            fi
+            echo "profile '$p' verified (ensured)"
+            check_dns_drift "$p"
+            continue
+        fi
+        # EGL-98-D2 stale exception: the anchor is dead — is the network
+        # object still there without its chain (post-reboot window)?
+        # Then this is a named failure (the default sweep-mode timer's
+        # only post-reboot drift signal), not the silent ARC-16-D3
+        # skip. A hard probe failure (rc 2) is already named by the
+        # helper; both set failed=1. Never-ensured / teardown'd
+        # profiles keep the silent skip (network object absent -> not
+        # stale).
+        local stale=0
+        profile_stale_unpolicied "$p" || stale=$?
+        if (( stale == 2 )); then
             failed=1
             continue
         fi
-        if is_gateway_profile "$p" && ! verify_gateway "$p"; then
-            echo "verify: profile '$p' FAILED gateway verification" >&2
+        if (( stale == 0 )); then
+            echo "verify: network exists but policy does not — run: egresslock ensure $p" >&2
             failed=1
             continue
         fi
-        echo "profile '$p' verified (ensured)"
-        check_dns_drift "$p"
     done
     return "$failed"
 }
@@ -2404,8 +2921,12 @@ cmd_allowlist() {
 # 1035). Charset is enforced by the callers' grammars (ARC-50-D6) —
 # this is the size gate, so an oversize "hostname" is rejected at the
 # predicate instead of persisting in the allowlist until `squid -k
-# parse` fails closed at the next ensure (ARC-48 U9). Empty labels
-# ('a..b', a trailing dot) fail the 1..63 label rule as well.
+# parse` fails closed at the next ensure (ARC-48 U9). A MID-NAME empty
+# label ('a..b') fails the 1..63 label rule here; a TRAILING dot does
+# NOT fail this split (the empty trailing label is dropped by the IFS
+# word-split) — trailing-dot rejection lives in the host-field parsers
+# since EGL-147-D2 (this comment previously overstated that the length
+# gate catches it; ARC-32 review finding 1).
 arc32_dns_len_ok() { # arc32_dns_len_ok <host>
     local host="$1" label
     (( ${#host} <= 253 )) || return 1
@@ -2424,6 +2945,12 @@ arc32_dns_len_ok() { # arc32_dns_len_ok <host>
 # ARC-32-D2: the DNS length caps live here too, so `allow`,
 # `gw_allowlist_entries`, and the `denied` emit filter all inherit the
 # one predicate.
+# EGL-147-D2: a trailing dot on the HOST part is invalid — squid's
+# matchDomainName compares from the string ends with no trailing-dot
+# tolerance for the ENTRY, so `name.` can never match (live-confirmed
+# X-6 E7); reject, do not normalize, do not warn. The check is on the
+# host part BEFORE stripping a leading dot, so `.name.` is trailing-dot
+# (rejected) while `.name` stays a valid suffix (ARC-31 / X-6 E4).
 allow_entry_ok() { # allow_entry_ok <entry>
     local entry="$1"
     if [[ "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]+$ ]]; then
@@ -2433,6 +2960,7 @@ allow_entry_ok() { # allow_entry_ok <entry>
         return 1
     fi
     local probe="${entry%:*}"
+    [[ "$probe" == *. ]] && return 1
     probe="${probe#.}"
     cfg_is_ipv4 "$probe" && return 1
     arc32_dns_len_ok "$probe" || return 1
@@ -2477,6 +3005,14 @@ denied_ipv4_note() {
 validate_allow_entry() { # validate_allow_entry <entry>
     local entry="$1"
     allow_entry_ok "$entry" && return 0
+    # EGL-147-D2: the trailing-dot case is named BEFORE the IPv4 /
+    # DNS-length branches so a trailing-dot IPv4-shaped token
+    # (`1.2.3.4.`) is named for the shape the operator typed (it is
+    # not a cfg_is_ipv4 hit with the trailing dot anyway).
+    if [[ "${entry%:*}" == *. && "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*(:[0-9]+)?$ ]]; then
+        echo "Error: allowlist entry '$entry' has a trailing dot — dstdomain entries are bare names; requests with trailing dots are normalized by the gateway" >&2
+        return 1
+    fi
     if [[ "$entry" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]+$ ]]; then
         local port="${entry##*:}"
         if (( port < 1 || port > 65535 )); then
@@ -2630,6 +3166,13 @@ validate_host_port() { # validate_host_port <host:port>
     fi
     HOST_ARG="${entry%:*}"
     PORT_ARG="${entry##*:}"
+    # EGL-147-D2: a trailing-dot host in a pin is the same dead-or-
+    # surprising shape as in the allowlist — name it (CLI twins the
+    # conf parser; the conf must never mint what the CLI rejects).
+    if [[ "$HOST_ARG" == *. ]]; then
+        echo "Error: host '$HOST_ARG' has a trailing dot — entries are bare names" >&2
+        exit 2
+    fi
     if (( PORT_ARG < 1 || PORT_ARG > 65535 )); then
         echo "Error: invalid port in entry '$entry' (expected 1-65535)" >&2
         exit 2
@@ -2735,6 +3278,29 @@ conf_delete_allow_host() { # conf_delete_allow_host <conf> <profile> <host> <por
     return 0
 }
 
+# EGL-139-D2: presence pre-check with the SAME block-scoped regex
+# conf_delete_allow_host matches (no mutation). Keeps the absent-rule
+# rejection (rc 1, "rule not present", no ensure) independent of the
+# conntrack probe, so a missing-flush-tooling host keeps today's exact
+# no-op semantics for absent rules while present rules fail closed at
+# the probe.
+conf_has_allow_host() { # conf_has_allow_host <conf> <profile> <host> <port>
+    local conf="$1" profile="$2" host="$3" port="$4"
+    local host_r host_port_r
+    host_r="$(host_re "$host")"
+    host_port_r="${host_r//-/\\-}:$port"
+    local line in_block=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*profile[[:space:]]+([a-z0-9][a-z0-9-]*)[[:space:]]+ ]]; then
+            in_block=0
+            [[ "${BASH_REMATCH[1]}" == "$profile" ]] && in_block=1
+        elif [[ "$in_block" == 1 && "$line" =~ ^[[:space:]]*rule[[:space:]]+allow-host[[:space:]]+${host_port_r}[[:space:]]*$ ]]; then
+            return 0
+        fi
+    done < "$conf"
+    return 1
+}
+
 cmd_allow_host() {
     require_profile "${1:-}" allow-host
     require_engine
@@ -2793,13 +3359,40 @@ cmd_disallow_host() {
     validate_host_port "$entry"
     local conf="$ENGINE_CONF"
     [[ -f "$conf" ]] || die "config file missing: $conf"
+    # EGL-139-D2: the revocation's post-condition is provable flow
+    # severance, so the whole mutation is gated fail-closed:
+    #   1. absent rule -> today's named no-op (rc 1, nothing touched);
+    #   2. conntrack probe (tool present, ctnetlink reachable) BEFORE the
+    #      conf mutation — missing/failing tooling aborts with nothing
+    #      changed (R9: no conf edit, no ruleset swap, no success line);
+    #   3. the revoked pin's live daddr is captured from the chain
+    #      BEFORE the conf line is gone (name pins carry no IP, and the
+    #      conf is gone after the swap).
+    if ! conf_has_allow_host "$conf" "$profile" "$HOST_ARG" "$PORT_ARG"; then
+        echo "Error: rule not present: allow-host $HOST_ARG:$PORT_ARG in profile '$profile'" >&2
+        exit 1
+    fi
+    conntrack_probe || exit 1
+    local pin_ip
+    pin_ip="$(live_pin_daddr "$profile" "$HOST_ARG" "$PORT_ARG")"
+    # pin_ip empty here means the pin had no live rule (never ensured /
+    # structurally drifted chain): the re-ensure below still revokes the
+    # conf line, and there is no live tuple to flush (EGL-139-D2 step 3).
     if ! conf_delete_allow_host "$conf" "$profile" "$HOST_ARG" "$PORT_ARG"; then
         echo "Error: rule not present: allow-host $HOST_ARG:$PORT_ARG in profile '$profile'" >&2
         exit 1
     fi
-    echo "removed: rule allow-host $HOST_ARG:$PORT_ARG -> $conf"
     re_ensuring "$profile"
     cmd_ensure "$profile"
+    # EGL-139-D2 steps 5-6: the atomic -f swap succeeded (cmd_ensure died
+    # otherwise); NOW delete the revoked pin's conntrack entries and
+    # prove the data-path state is gone. Kill-at-revocation (D1): the
+    # `removed:` success line prints only after the post-condition holds
+    # — never a green rc with a surviving ESTABLISHED entry (R2/R9).
+    if [[ -n "$pin_ip" ]]; then
+        conntrack_flush_and_assert "$pin_ip" "$PORT_ARG"
+    fi
+    echo "removed: rule allow-host $HOST_ARG:$PORT_ARG -> $conf"
 }
 
 # ARC-35-D3: is a CIDR taken by (a) a `profile <name> <cidr>` line in a
@@ -3367,6 +3960,26 @@ cmd_doctor() {
         echo "nft: $("$nft_resolved" --version 2>/dev/null || echo "present ($nft_resolved)")"
     else
         echo "nft: MISSING"
+        rc=1
+    fi
+
+    # Required: conntrack — CONNTRACK_BIN, then /usr/sbin/conntrack, then
+    # PATH (the engine's own resolution order; EGL-139-D2: required by
+    # disallow-host's revocation flush). Resolved WITHOUT dying — a miss
+    # is a MISSING line, not an abort. Adjacent-layer row (EGL-139-D5):
+    # the walked egresslock-setup --doctor card does not change.
+    local ct_resolved=""
+    if [[ -n "${CONNTRACK_BIN:-}" ]]; then
+        ct_resolved="$CONNTRACK_BIN"
+    elif command -v conntrack >/dev/null 2>&1; then
+        ct_resolved="$(command -v conntrack)"
+    elif [[ -x /usr/sbin/conntrack ]]; then
+        ct_resolved=/usr/sbin/conntrack
+    fi
+    if [[ -n "$ct_resolved" && -e "$ct_resolved" ]]; then
+        echo "conntrack: $("$ct_resolved" --version 2>/dev/null || echo "present ($ct_resolved)")"
+    else
+        echo "conntrack: MISSING"
         rc=1
     fi
 

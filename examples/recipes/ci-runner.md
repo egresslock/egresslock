@@ -63,7 +63,10 @@ not egresslock flags — make job containers run under the profile:
    name with `egresslock network runner`). In a Forgejo runner
    `config.yml`, that is the `container: network:` field. Do **not**
    leave it on auto-created networks — the profile's fail-closed
-   policy only applies on the profile network.
+   policy only applies on the profile network. After a host reboot,
+   re-run `egresslock ensure runner` (or `egresslock-start`) before
+   job containers attach — the network object survives reboot without
+   its policy ([after-a-reboot](../../docs/troubleshooting/after-a-reboot.md)).
 
 2. **Give job containers the proxy env.** Proxy-honoring tools inside
    the job must point at the profile's Squid gateway: the runner

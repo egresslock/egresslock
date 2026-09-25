@@ -41,6 +41,32 @@ EGRESSLOCK_PROFILES="${EGRESSLOCK_PROFILES:-$TREE_ROOT/egresslock}"
 
 # --- mocks ------------------------------------------------------------
 mkdir -p "$TESTROOT/bin"
+cat > "$TESTROOT/bin/ip" <<'EOF'
+#!/usr/bin/env bash
+# Mock iproute2 `ip` — EGL-141-D1: the engine's profile_bridge_if
+# cross-checks the network's bridge device against the rootless netns
+# link list (`podman unshare --rootless-netns ip -br link`). Answer the
+# -br link form with a deterministic slot list podman0..podman9 (plus
+# lo), all UP: (a) every mock-resolved interface is always confirmed
+# (the cross-check then pins the INSPECT half — churn scenarios flip
+# interface= in the state file); (b) a real mismatch drill needs only
+# a hand-edit of the networks/<name> state file (drop/rename its
+# interface= line so it names a slot outside this list) — no mock-ip
+# flag surface. Any other subcommand is unsupported (fail loud, like
+# the other mocks).
+if [[ "${1:-}" == "-br" && "${2:-}" == "link" ]]; then
+    echo "lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>"
+    local_n=0
+    while (( local_n <= 9 )); do
+        printf 'podman%d          UP             02:00:00:00:00:%02x <BROADCAST,MULTICAST,UP,LOWER_UP>\n' "$local_n" "$local_n"
+        local_n=$(( local_n + 1 ))
+    done
+    exit 0
+fi
+echo "mock ip: unsupported invocation: $*" >&2
+exit 2
+EOF
+
 cat > "$TESTROOT/bin/nft" <<'EOF'
 #!/usr/bin/env bash
 # Mock nft: state dir files named <table>.<chain>. Models the real
@@ -100,7 +126,9 @@ case "$cmd" in
             ' "$file")"
             if [[ -f "$D/$table.$ch" ]]; then
                 # Append only rule lines to the existing chain.
-                grep -E '^[[:space:]]*(ip |meta )' <<<"$sect" \
+                # EGL-141: rule lines may also start with `iifname` (the
+                # anti-spoof drop is a first-class rule line now).
+                grep -E '^[[:space:]]*(ip |meta |iifname )' <<<"$sect" \
                     | sed -E 's/^[[:space:]]+//' >> "$D/$table.$ch"
             else
                 printf '%s\n' "$sect" > "$D/$table.$ch"
@@ -267,6 +295,18 @@ case "$cmd" in
             echo "kill network process: permission denied" >&2
             exit 1
         fi
+        # EGL-98: hard nft failure model — the netns answers the probe
+        # (`true`) but nft list calls fail with a netlink error, the
+        # "netns not answering" shape the stale-unpolicied predicate
+        # must never fold into its skip path (R9). "No such file or
+        # directory" is deliberately NOT used: that phrase is the
+        # missing-chain answer the engine reads as "stale". The engine
+        # passes the RESOLVED binary path (nft_bin), so match the
+        # basename.
+        if [[ -f "$D/netns-nft-fails" && "${1##*/}" == nft ]]; then
+            echo "Error: Netlink error: Socket not connected" >&2
+            exit 1
+        fi
         exec "$@"
         ;;
     network)
@@ -275,11 +315,24 @@ case "$cmd" in
                 local_args=("$@"); name="${local_args[-1]}"
                 f="$D/networks/$name"
                 [[ -f "$f" ]] || { echo "Error: unable to find network" >&2; exit 1; }
+                # EGL-141-D1: the bridge device token. interface= line
+                # when present; hand-seeded state files (mocknet) are
+                # deterministic as podman1 (the lowest slot, exactly
+                # what a fresh one-network account gets). Churn tests
+                # hand-edit interface= to pin re-resolution.
+                mock_iface_of(){ local v; v="$(grep '^interface=' "$f" | cut -d= -f2-)"; echo "${v:-podman1}"; }
+                # local_args[0] is the `inspect` verb itself (the case
+                # consumed `network`); the template pair follows it.
+                if [[ "${local_args[1]:-}" == "--format" && "${local_args[2]:-}" == "{{.NetworkInterface}}" ]]; then
+                    mock_iface_of
+                    exit 0
+                fi
                 # Mimic real podman network inspect JSON (fields the
                 # profile tool depends on). All subnet= lines become
                 # subnet entries (real podman lists each).
                 echo '['
                 echo "     \"name\": \"$name\","
+                echo "     \"network_interface\": \"$(mock_iface_of)\","
                 echo "     \"driver\": \"$(grep '^driver=' "$f" | cut -d= -f2-)\","
                 echo "     \"subnets\": ["
                 # gateway= lines (in order) override the computed value so
@@ -321,6 +374,11 @@ case "$cmd" in
                     echo "subnet=$subnet"
                     echo "gateway=${gateway:-${subnet%0/24}1}"
                     echo "ipv6_enabled=false"
+                    # EGL-141-D1: lowest-free-slot default — the mock
+                    # netns link list (lib.sh's mock `ip`) lists
+                    # podman0..podman9, so a fresh account's first
+                    # network lands on podman1 deterministically.
+                    echo "interface=podman1"
                 } > "$D/networks/$name"
                 echo "$name"
                 ;;
@@ -660,8 +718,86 @@ cat > "$TESTROOT/bin/dpkg-query" <<'EOF'
 exit 1
 EOF
 
+# EGL-139-D2 mock seam: a state-file conntrack mirroring the ctnetlink
+# verbs the engine uses. State: $D/conntrack-table holds /proc/net/
+# nf_conntrack-shaped lines (the mock `cat` below renders it for the
+# engine's zero-dep post-assert); $D/conntrack.log records every argv so
+# tests can pin the scoped -D tuple and its ordering against the
+# `removed:` line. Markers: $D/conntrack-probe-fails makes `-C` fail
+# (unavailable ctnetlink shape); $D/conntrack-delete-fails makes `-D`
+# fail with the table untouched (a surviving-ESTABLISHED drill).
+cat > "$TESTROOT/bin/conntrack" <<'EOF'
+#!/usr/bin/env bash
+set -u
+D="${ARCMOCK_STATE:?}/nft"
+LOG="${ARCMOCK_STATE:?}/conntrack.log"
+TABLE="${ARCMOCK_STATE:?}/nft/conntrack-table"
+echo "conntrack $*" >> "$LOG"
+op="$1"; shift
+case "$op" in
+    -C)
+        [[ -f "$D/conntrack-probe-fails" ]] && { echo "mock conntrack: ctnetlink unavailable" >&2; exit 1; }
+        n=0
+        [[ -f "$TABLE" ]] && n="$(grep -c . "$TABLE" || true)"
+        echo "$n"
+        exit 0
+        ;;
+    -D)
+        if [[ -f "$D/conntrack-delete-fails" ]]; then
+            echo "conntrack: Operation failed: Connection timed out" >&2
+            exit 1
+        fi
+        # Scoped delete: drop entries whose ORIGINAL direction names
+        # BOTH the -d daddr and the --dport dport (the engine's tuple;
+        # other pins, DNS, gateway-exemption traffic stay untouched).
+        dip=""; dport=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d) dip="$2"; shift 2 ;;
+                --dport) dport="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        if [[ -f "$TABLE" && -n "$dip" && -n "$dport" ]]; then
+            awk -v a="dst=$dip " -v b="dport=$dport " \
+                'index($0, a) && index($0, b) { next } { print }' \
+                "$TABLE" > "$TABLE.t" && mv "$TABLE.t" "$TABLE"
+        fi
+        echo "0 flow entries have been deleted"
+        exit 0
+        ;;
+    --version|-V)
+        echo "conntrack v1.4.8 (conntrack-tools mock)"
+        exit 0
+        ;;
+    *)
+        echo "mock conntrack: unsupported op $op" >&2
+        exit 2
+        ;;
+esac
+EOF
+
+# EGL-139-D2 mock seam: the engine's post-assert reads the account
+# netns's conntrack table via `podman unshare --rootless-netns cat
+# /proc/net/nf_conntrack`. The host /proc is not netns-aware in the
+# harness world, so the mock `cat` serves exactly that one path from the
+# conntrack mock's state file (empty/absent = an empty table: no entries,
+# which is the pass shape) and delegates everything else to the real cat.
+cat > "$TESTROOT/bin/cat" <<'EOF'
+#!/usr/bin/env bash
+# Mock cat: intercept only /proc/net/nf_conntrack (EGL-139-D2 reader).
+for a in "$@"; do
+    if [[ "$a" == /proc/net/nf_conntrack ]]; then
+        [[ -f "${ARCMOCK_STATE:?}/nft/conntrack-table" ]] && cat "${ARCMOCK_STATE:?}/nft/conntrack-table"
+        exit 0
+    fi
+done
+exec /bin/cat "$@"
+EOF
+
 chmod +x "$TESTROOT/bin/nft" "$TESTROOT/bin/getent" "$TESTROOT/bin/podman" \
-         "$TESTROOT/bin/dpkg-query" "$EGRESSLOCK_PROFILES"
+         "$TESTROOT/bin/dpkg-query" "$TESTROOT/bin/ip" "$EGRESSLOCK_PROFILES" \
+         "$TESTROOT/bin/conntrack" "$TESTROOT/bin/cat"
 
 # Mock systemctl for kit-install tests (ARC-16): records every call.
 # EGL-51: every call is also mirrored into callorder.log so tests can

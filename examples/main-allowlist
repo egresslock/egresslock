@@ -8,4 +8,6 @@
 #
 # Note: entries are HOSTNAMES the gateway resolves (squid dstdomain).
 # Literal IPs and CIDR ranges are not accepted here — see main.conf's
-# rule shapes (allow-host takes a hostname or IPv4 literal).
+# rule shapes (allow-host takes a hostname or IPv4 literal). Bare names
+# only: no trailing dot (a `name.` line is rejected — the gateway
+# compares entries from the string ends and would never match it).

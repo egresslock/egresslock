@@ -90,17 +90,28 @@ containers are kept and no session is severed. Converged means the anchor is
 running, the gateway is running and answers its probe, and the newly
 generated gateway config and allowlist files are byte-identical to what is
 deployed — such an ensure skips the restart (the ready line says `already
-converged, not restarted`). The nftables policy refresh (atomic) and
-DNS-pin healing still run on every ensure; those never sever sessions. An
+converged, not restarted`). The nftables policy refresh (atomic;
+established/related keeps direct flows) and DNS-pin healing still run on
+every ensure; those never sever sessions. `disallow-host` is the exception:
+it severs established direct flows to the revoked pin at the mutator instant
+(a conntrack delete after the atomic ruleset swap) — revocation is the
+documented kill-switch, the opposite intent of a refresh. A manual conf edit
+that removes an allow-host followed by `ensure` is a policy refresh, not the
+kill-switch: it does not flush conntrack, so any established flow to the
+dropped pin persists until natural expiry or the next `disallow-host`. An
 unhealthy container or a genuinely changed config takes the replace/restart
 path as before — `ensure` remains the crash-recovery command.
 
 `verify <profile>` compares the live nftables chain with the rules expected
 from the profile. Structural drift or a missing healthy runtime fails
-verification. DNS drift for direct `allow-host` pins is a signal only:
-`verify` warns and does not re-pin the address; re-run `ensure` to resolve and
-install fresh pins. The systemd verify timer repeats this check for the
-account.
+verification. For direct `allow-host` pins, `ensure` also writes a pin
+record (`<profile>.pins`, beside the conf) of the addresses it installed;
+`verify` fails closed with a named error when a live pin's address diverges
+from that record (a post-ensure chain edit), when the record is missing
+(re-run `ensure`), or when it is unreadable. DNS drift for direct
+`allow-host` pins remains a signal only: `verify` warns and does not re-pin
+the address; re-run `ensure` to resolve and install fresh pins. The systemd
+verify timer repeats this check for the account.
 
 ## Account ownership
 
@@ -195,6 +206,18 @@ literal IPv4 is rejected by `allow`/`disallow` and fails `ensure` closed
 (use `allow-host` for address pins). Missing or invalid allowlists fail
 `ensure` closed.
 
+Entries are **bare names** — a trailing dot (`name.`) is rejected by
+`allow`/`disallow` and fails `ensure` closed: the gateway's `dstdomain`
+ACL compares host and entry from the string ends, so an entry carrying
+the DNS root dot can never match. Request-side trailing dots
+(`CONNECT name.:443`) are normalized by the gateway itself; the entry
+does not need to carry one.
+
+A numeric-host (IP-literal) CONNECT/GET through the proxy is denied even
+when a PTR of that IP equals an allowlisted name: the generated
+`dstdomain` ACLs carry `-n` (no reverse-DNS adoption), so the name
+contract is exactly the allowlist. Address pins stay `allow-host`.
+
 ## `allow-host` in detail
 
 `allow-host` compiles to a direct `ip daddr <ip> tcp dport <port>
@@ -208,6 +231,18 @@ accept` rule enforced independently of the HTTP gateway.
   timer only **warns** (`drift: host ... policy pins ...`), it never
   re-pins. Re-run `ensure` to refresh. Stale DNS looks like a hang to
   the new IP while the old IP still works.
+- **Tamper detection** — `ensure` records every installed pin address in
+  `<profile>.pins` beside the conf; `verify` compares the live chain's
+  pin addresses against that record and fails closed (named error, rc 1)
+  on divergence — an in-place chain edit cannot adopt its own addresses
+  as the expected values. A missing record fails closed with a re-ensure
+  hint (upgrade path: run `ensure` once after upgrading).
+- **Revocation** — `disallow-host <profile> <host:port>` is the
+  kill-switch: it removes the conf line, re-ensures (atomic ruleset
+  swap), then deletes the revoked destination's conntrack entries and
+  proves the data-path state is gone before printing `removed:`. A
+  `disallow-host` that cannot prove severance fails loudly with the
+  state disclosed; it requires the `conntrack` tool.
 - **`public-only` conflict** — a `public-only` profile cannot take
   `allow-host` (contradictory; exit 2).
 - **What "direct" changes (and what it does not)** — an allow-host rule

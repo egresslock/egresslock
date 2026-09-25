@@ -28,7 +28,7 @@ Package facts: name `egresslock`, `Architecture: all`,
 version `<VERSION_BASE>+git<YYYYMMDDHHMMSS>.<12-char-sha>` (`-dirty` on
 a dirty tree; the UTC second-resolution timestamp is the dpkg ordering
 key so rebuilds never compare as a downgrade),
-`Depends: bash, podman, netavark, nftables`, `Recommends: apparmor`.
+`Depends: bash, podman, netavark, nftables, conntrack`, `Recommends: apparmor`.
 Layout: `/usr/bin/egresslock` and `/usr/sbin/egresslock-setup` are
 wrappers around `/usr/lib/egresslock/` (engine, helpers, `gateway/`,
 `VERSION`); data under `/usr/share/egresslock/{examples,doc,apparmor}`;

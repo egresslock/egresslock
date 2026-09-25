@@ -36,10 +36,18 @@ Signal semantics (learned the hard way — check for these):
   half-installed (`iF`) state ("No file name for egresslock").
 - `drift: host <name> resolved to <new> but the policy pins <old>`:
   DNS moved; policy is unchanged; `ensure` heals on the next run.
-- SILENT exit 0 from `--ensured` means "no profiles ensured" — if you
-  expected anchors, that itself is the signal (e.g. wrong
-  XDG_RUNTIME_DIR context; the kit entry scripts resolve it from the
-  uid, so check how the unit was invoked).
+- `verify: network exists but policy does not — run: egresslock
+  ensure <profile>` / exit 1: the post-reboot stale window — the
+  profile's podman network object survived the reboot (on disk) but
+  the netns policy is gone (volatile). Heal with `ensure <profile>`
+  **as the account**; the timer never re-ensures. This is the
+  default sweep-mode timer's post-reboot drift signal.
+- SILENT exit 0 from `--ensured` means "no profiles ensured **and**
+  no stale leftovers" — if you expected anchors, that itself is the
+  signal (e.g. wrong XDG_RUNTIME_DIR context; the kit entry scripts
+  resolve it from the uid, so check how the unit was invoked). A
+  post-reboot stale profile is **not** silent: it fails named with
+  the line above.
 - `egresslock denied <profile>` lists hosts the gateway blocked
   (de-duplicated) — feed candidates to `allow <profile> <host:port>`
   (see [gateway-logs](gateway-logs.md)).
