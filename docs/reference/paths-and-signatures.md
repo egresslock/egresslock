@@ -110,5 +110,4 @@ edits as tamper and the next `ensure` rebuilds the chain; run
 - IPv4-literal pins never emit `drift:` (there is no DNS to move);
   hostname pins do (T13) — re-run `ensure` on a `drift:` warning.
 - Rule order is safe by construction: allow-host accepts compile
-  before the terminal drop, and a gateway profile has no RFC1918
-  scoped drops (those exist only for `public-only`).
+  before the terminal drop.

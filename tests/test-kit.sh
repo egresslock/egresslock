@@ -35,9 +35,9 @@ export PATH="$TESTROOT/bin:$TREE_ROOT:$PATH"
 # relied on (gateway image marker, IPAM dir).
 mkdir -p "$STATE/images" "$STATE/ips"
 : > "$STATE/images/localhost_egresslock-gateway_latest"# --- ARC-16: kit productization ---
-pass=0; fail=0
+section_begin arc16 "ARC-16 kit productization"
 
-a16() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+a16() { assert "$@"; }
 KIT="$TREE_ROOT/install-kit.sh"
 OPT="$STATE/opt-kit"          # mock --prefix
 UNITS="$STATE/units"          # mock unit dir
@@ -180,7 +180,7 @@ va_out="$(env -u EGRESSLOCK_PROFILE EGRESSLOCK_CONF="$KITCONF" \
 [[ "$va_rc" == 1 ]] && a16 pass || a16 fail "egresslock-verify fails on drift (rc=$va_rc, out: $va_out)"
 egresslock ensure local-dev >/dev/null 2>&1
 
-arc16_pass=$pass; arc16_fail=$fail
+section_end arc16
 
 # --- EGL-85: verify wrapper's bounded-probe failure modes (deployed
 # --- copy; the ARC-26 engine test covers the engine ensure path, the
@@ -190,8 +190,8 @@ arc16_pass=$pass; arc16_fail=$fail
 # (named 5s failure). Both run BEFORE the engine exec, so neither
 # touches the ensured chain state. D2: real 5s wait for the expiry
 # case (ARC-26 style), far under the 300s harness bound.
-pass=0; fail=0
-a85() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl85 "EGL-85 verify timeout paths"
+a85() { assert "$@"; }
 
 # 1. timeout(1) absent -> rc 1 + the coreutils message, before any
 #    engine run. Isolated PATH (bin-doctor-none technique): only what
@@ -224,7 +224,7 @@ v_elapsed=$(( SECONDS - v_start ))
 [[ "$v_rc" == 1 && "$v_out" == *"netns probe timed out after 5s"* && "$v_elapsed" -lt 15 ]] \
     && a85 pass || a85 fail "verify probe expiry is a named 5s failure (rc=$v_rc, elapsed=${v_elapsed}s, out: $v_out)"
 
-egl85_pass=$pass; egl85_fail=$fail
+section_end egl85
 
 # --- EGL-115: sweep-mode wrapper scoping (deployed copy) ----------------
 # The timer's sweep must exec the BARE `verify --ensured` with
@@ -233,8 +233,8 @@ egl85_pass=$pass; egl85_fail=$fail
 # An explicit --config or a leaked EGRESSLOCK_CONF would silently scope
 # the whole sweep to one file (the EGL-115 bug). Named mode stays wired
 # to EGRESSLOCK_CONF.
-pass=0; fail=0
-a115() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl115 "EGL-115 sweep-mode wrapper scoping"
+a115() { assert "$@"; }
 
 # Recording engine: EGRESSLOCK_DIR wins the kit-dir resolution, so the
 # wrapper execs this instead of the real engine and we can pin the
@@ -310,11 +310,11 @@ env -u EGRESSLOCK_CONF "$TREE_ROOT/egresslock" teardown second >/dev/null 2>&1 |
 rm -f "$HOME/.config/egresslock/main.conf" "$HOME/.config/egresslock/second.conf" \
       "$HOME/.config/egresslock/local-dev.pins" "$HOME/.config/egresslock/second.pins"
 
-egl115_pass=$pass; egl115_fail=$fail
+section_end egl115
 
 # --- ARC-17: uninstall-kit --------------------------------------------------
-pass=0; fail=0
-a17() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc17 "ARC-17 uninstall-kit"
+a17() { assert "$@"; }
 UKIT="$TREE_ROOT/uninstall-kit.sh"
 
 # Exec bit committed (R-016-2 F5 failure class: mode lost in git).
@@ -481,6 +481,23 @@ done
 e89_out="$(e89run "$u17/eg;id")"; e89_rc=$?
 [[ "$e89_rc" == 2 && "$e89_out" == *"must be an absolute kit path"* ]] \
     && a17 pass || a17 fail "charset-illegal --prefix rejected rc 2 (rc=$e89_rc, out: $e89_out)"
+# 4b. EGL-185: whitespace-class --prefix rejects (parity with e90's
+#     '/tmp/a b' pin; the newline case hits the explicit branch at
+#     uninstall-kit.sh:119-122, which had zero battery coverage).
+#     Both internal branches exit 2 with the same message, so the
+#     branch that fired is not pinned — only the rc/behavior class.
+e89_out="$(e89run '/tmp/a b')"; e89_rc=$?
+[[ "$e89_rc" == 2 && "$e89_out" == *"must be an absolute kit path"* \
+    && -f "$e89_sentinel" && -f "$TREE_ROOT/uninstall-kit.sh" ]] \
+    && a17 pass || a17 fail "space --prefix rejected rc 2 (rc=$e89_rc)"
+e89_out="$(e89run $'/tmp/a\tb')"; e89_rc=$?
+[[ "$e89_rc" == 2 && "$e89_out" == *"must be an absolute kit path"* \
+    && -f "$e89_sentinel" && -f "$TREE_ROOT/uninstall-kit.sh" ]] \
+    && a17 pass || a17 fail "tab --prefix rejected rc 2 (rc=$e89_rc)"
+e89_out="$(e89run $'/tmp/a\nb')"; e89_rc=$?
+[[ "$e89_rc" == 2 && "$e89_out" == *"must be an absolute kit path"* \
+    && -f "$e89_sentinel" && -f "$TREE_ROOT/uninstall-kit.sh" ]] \
+    && a17 pass || a17 fail "newline --prefix rejected rc 2 (rc=$e89_rc)"
 # 5. Positive path: a real kit (the quadruple) IS still removed — the
 #    full run above already asserts it; re-check the quadruple guard
 #    explicitly with a throwaway fake kit.
@@ -507,11 +524,11 @@ e89_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_LEGACY_PREFIX="$u17/ok
 [[ "$e89_rc" == 2 && "$e89_out" == *"EGRESSLOCK_LEGACY_PREFIX must be an absolute kit path"* ]] \
     && a17 pass || a17 fail "charset-illegal legacy prefix rejected rc 2 (rc=$e89_rc, out: $e89_out)"
 
-arc17_pass=$pass; arc17_fail=$fail
+section_end arc17
 
 # --- EGL-43: install-kit PATH wrappers (D1–D4) ------------------------------
-pass=0; fail=0
-a43() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl43 "EGL-43 install-kit PATH wrappers"
+a43() { assert "$@"; }
 p43="$STATE/egl43"; rm -rf "$p43"
 mkdir -p "$p43/units" "$p43/bin" "$p43/sbin" "$p43/opt"
 a43_env() {  # wrapper install with the mock PATH dirs
@@ -599,8 +616,8 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$p43/units" \
 [[ "$rc" == 0 && "$o" == *"cannot install PATH wrapper"* ]] \
     && a43 pass || a43 fail "unwritable PATH dir warns and continues (rc=$rc, out: $o)"
 
-egl43_pass=$pass; egl43_fail=$fail
-pass=0; fail=0   # EGL-43: reset before ARC-18 (that block never resets)
+section_end egl43
+section_begin egl12 "EGL-12 public snapshot staging"   # begin before the EGL-74 skip branch — one window owns both paths (EGL-184-D2)
 
 # --- EGL-12: public snapshot staging (allowlist copy, D1) -------------------
 # The snapshot script and the tests are BOTH on the allowlist, so this
@@ -628,10 +645,8 @@ PKG_SKIP_TAG="packaging-build-scripts absent"
 
 if [[ "$HAVE_SNAPSHOT" == 0 ]]; then
     skip "snapshot-public.sh absent" "EGL-12 public snapshot staging — packaging/snapshot-public.sh is not on the public tree (EGL-74-D1)"
-    egl12_pass=0; egl12_fail=0
 else
-pass=0; fail=0
-a12k() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+a12k() { assert "$@"; }
 p12="$STATE/egl12"; rm -rf "$p12"; mkdir -p "$p12/kit"
 (cd "$TREE_ROOT" && tar -cf - --exclude=./.git --exclude='./packaging/*.deb' --exclude='./packaging/*.tar.gz' .) \
     | tar -xf - -C "$p12/kit"
@@ -695,12 +710,12 @@ o="$(bash "$snap12" --dry-run "$p12/stage-d" 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$o" == *"not empty"* ]] \
     && a12k pass || a12k fail "non-empty stage refused (rc=$rc, out: $o)"
 
-egl12_pass=$pass; egl12_fail=$fail
 fi
+section_end egl12   # after the skip/else fi — both paths snapshot (EGL-184-D2)
 
 # --- EGL-47: internal_docs never reaches a distribution path (D1–D3) --------
-pass=0; fail=0
-a47() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl47 "EGL-47 internal_docs guards"
+a47() { assert "$@"; }
 p47="$STATE/egl47"; rm -rf "$p47"; mkdir -p "$p47/kit" "$p47/bin" "$p47/sbin" "$p47/units"
 # The live checkout carries internal_docs/ (maintainer material) — copy
 # the whole tree so every guard is exercised against the real hazard.
@@ -795,12 +810,11 @@ else
     skip "internal_docs absent" "EGL-47 widened-tarball tripwire — internal_docs/ is not on the public tree (EGL-74-D1)"
 fi
 
-egl47_pass=$pass; egl47_fail=$fail
-pass=0; fail=0
+section_end egl47
 
 # --- EGL-49: .deb other-readable for apt's _apt sandbox (D1) ----------------
-pass=0; fail=0
-a49() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl49 "EGL-49 deb other-readable"
+a49() { assert "$@"; }
 if command -v dpkg-deb >/dev/null 2>&1 && [[ "$HAVE_BUILD_DEB" == 1 ]]; then
     p49="$STATE/egl49"; rm -rf "$p49"; mkdir -p "$p49"
     # Build under umask 077 (the defect shape).
@@ -820,11 +834,11 @@ else
     skip "dpkg-deb absent" "EGL-49 dpkg-deb not available; skipping mode assert"
 fi
 
-egl49_pass=$pass; egl49_fail=$fail
-pass=0; fail=0   # EGL-47/EGL-49: reset before ARC-18
+section_end egl49
+section_begin arc18 "ARC-18 setup-account"
 
 # --- ARC-18: setup-account ---------------------------------------------------
-a18() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+a18() { assert "$@"; }
 SKIT="$TREE_ROOT/egresslock-setup"
 
 [[ -x "$SKIT" ]] && a18 pass || a18 fail "egresslock-setup is executable in git"
@@ -877,7 +891,7 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
 [[ "$(grep -c . "$uenv")" == 2 ]] && a18 pass || a18 fail "re-run overwrites wholesale (no dup lines)"
 
 # No gateway in conf → build skipped.
-printf 'profile p2 10.99.1.0/24\n    rule public-only\n' > "$a18d/plain.conf"
+printf 'profile p2 10.99.1.0/24\n' > "$a18d/plain.conf"
 builds_before="$(wc -l < "$STATE/buildlog")"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
     $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/plain.conf" >/dev/null 2>&1
@@ -943,16 +957,16 @@ if [[ "$f_rc" == 1 && "$f_out" == *"linger for 'cacct' did not stick"* \
 else
     a18 fail "linger Linger=no fails closed (rc=$f_rc, out: $f_out)"
 fi
-arc18_pass=$pass; arc18_fail=$fail
+section_end arc18
 
 # --- EGL-51: user manager before the account-side gateway build ------------
-pass=0; fail=0
-e51() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl51 "EGL-51 user manager before build"
+e51() { assert "$@"; }
 e51d="$STATE/e51"
 rm -rf "$e51d"; mkdir -p "$e51d/home/gacct/.config/egresslock"
 printf 'profile p1 10.99.3.0/24\n    rule gateway-only\n    gateway 10.99.3.2 3128 p1-allowlist\n' > "$e51d/site.conf"
 printf '# starter\n' > "$e51d/p1-allowlist"
-printf 'profile p2 10.99.4.0/24\n    rule public-only\n' > "$e51d/plain.conf"
+printf 'profile p2 10.99.4.0/24\n' > "$e51d/plain.conf"
 e51uid="$(id -u)"   # hook mode: the invoking process IS the account
 
 # 1. --enable + gateway conf: linger BEFORE user@ start BEFORE the build;
@@ -1031,11 +1045,11 @@ else
     e51 fail "usermgr failure + Linger=no names the linger fix (rc=$f_rc, out: $f_out)"
 fi
 rm -f "$STATE/systemctl-usermgr-fails"
-egl51_pass=$pass; egl51_fail=$fail
+section_end egl51
 
 # --- ARC-19: setup-account --init-conf (sshd-style starter conf) ----------
-pass=0; fail=0
-a19() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc19 "ARC-19 init-conf"
+a19() { assert "$@"; }
 a19p="$STATE/a19/prefix"        # fresh kit prefix with examples deployed
 a19h="$STATE/a19/home/iacct"    # virtual account home
 rm -rf "$STATE/a19"; mkdir -p "$a19p" "$a19h"
@@ -1075,7 +1089,7 @@ grep -qx "EGRESSLOCK_CONF=$a19_conf" "$a19h/.config/egresslock/unit.env" \
 #    sibling allowlist is NOT created (ARC-17-D1 / R-007-1 F5 hole) —
 #    but the torn pair is NAMED (EGL-102-D6-R3.4: declared, never
 #    silently omitted, never healed here).
-printf 'profile custom 10.198.0.0/24\n    rule public-only\n' > "$a19_conf"
+printf 'profile custom 10.198.0.0/24\n' > "$a19_conf"
 rm -f "$a19_al"
 a19_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19h" \
     $SKIT --prefix "$a19p" --account iacct --init-conf 2>&1)"
@@ -1124,11 +1138,11 @@ a19_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19h" \
 #    exercise runuser directly.)
 [[ "$(grep -c 'cd "\$home" && runuser' "$SKIT")" == 2 ]] \
     && a19 pass || a19 fail "both runuser calls are home-CWD wrapped (on-host chdir finding)"
-arc19_pass=$pass; arc19_fail=$fail
+section_end arc19
 
 # --- EGL-38: run map, --doctor, --build-gateway ------------------------------
-pass=0; fail=0
-e38() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl38 "EGL-38 run map, doctor, build-gateway"
+e38() { assert "$@"; }
 e38p="$STATE/e38/prefix"   # fresh deployed kit prefix (engine + gateway + examples)
 rm -rf "$STATE/e38"; mkdir -p "$e38p"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
@@ -1140,7 +1154,7 @@ e38h="$STATE/e38/home/uctx"
 mkdir -p "$e38h/.config/egresslock"
 printf 'profile p1 10.99.5.0/24\n    rule gateway-only\n    gateway 10.99.5.2 3128 p1-allowlist\n' > "$STATE/e38/site.conf"
 printf '# starter\n' > "$STATE/e38/p1-allowlist"
-printf 'profile p2 10.99.6.0/24\n    rule public-only\n' > "$STATE/e38/plain.conf"
+printf 'profile p2 10.99.6.0/24\n' > "$STATE/e38/plain.conf"
 # Run-map extractor: the numbered lines only (D38-6 format).
 e38_map() { grep -E '^[0-9]\) .* … (OK|SKIP|FAIL)$' <<<"$1"; }
 
@@ -1262,22 +1276,22 @@ fi
 [[ ! -s "$STATE/buildlog" ]] \
     && e38 pass || e38 fail "build-gateway: no podman build when user@ inactive"
 rm -f "$STATE/systemctl-usermgr-fails"
-egl38_pass=$pass; egl38_fail=$fail
+section_end egl38
 
 # --- ARC-60: setup confdir migration (D2) -----------------------------------
 # Old ~/.config/agent-network + absent new confdir -> mv'd as the account
 # (printed); BOTH present -> rc 1 naming both paths, nothing merged; no
 # old confdir -> unchanged behavior. (Hook mode: one uid, so ownership is
 # structural — the mv runs inside the run_as_account dispatch.)
-pass=0; fail=0
-a60() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc60 "ARC-60 setup migration"
+a60() { assert "$@"; }
 
 # 1. Old confdir only -> migrated; --init-conf starter still lands; the
 #    migrated profile parses under the engine.
 m60="$STATE/a60"; rm -rf "$m60"; mkdir -p "$m60/home/macct"
 m60_home="$m60/home/macct"
 mkdir -p "$m60_home/.config/agent-network"
-printf 'profile dev 10.199.91.0/24\n    rule public-only\n' > "$m60_home/.config/agent-network/dev.conf"
+printf 'profile dev 10.199.91.0/24\n' > "$m60_home/.config/agent-network/dev.conf"
 : > "$m60_home/.config/agent-network/dev-allowlist"
 m_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$m60_home" \
     EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:test \
@@ -1327,11 +1341,11 @@ c_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$m60c/home
     && -f "$m60c/home/cacct/.config/egresslock/main.conf" ]] \
     && a60 pass || a60 fail "D2 no old confdir -> unchanged flow (rc=$c_rc, out: $c_out)"
 
-arc60_pass=$pass; arc60_fail=$fail
+section_end arc60
 
 # --- ARC-22: packaging (.deb + tar.gz) --------------------------------------
-pass=0; fail=0
-a22() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc22 "ARC-22 packaging"
+a22() { assert "$@"; }
 
 DEBSH="$TREE_ROOT/packaging/build-deb.sh"
 TARSH="$TREE_ROOT/packaging/build-tarball.sh"
@@ -2119,6 +2133,15 @@ if command -v dpkg >/dev/null 2>&1; then
     else
         a22 fail "EGL-135 0.4.0 -> 0.5.0 base bump not an upgrade under dpkg ordering"
     fi
+    # EGL-188-D8 cross-base pin: the 0.6.0 base bump (same timestamp,
+    # same sha — worst case) must also compare as an upgrade over a
+    # 0.5.0 stamp; 0.5.0 -> 0.6.0 is never a dpkg downgrade.
+    if dpkg --compare-versions "0.5.0+git20260924192516.76f1e51d345a" \
+            lt "0.6.0+git20260924192516.76f1e51d345a"; then
+        a22 pass
+    else
+        a22 fail "EGL-188 0.5.0 -> 0.6.0 base bump not an upgrade under dpkg ordering"
+    fi
 else
     skip "dpkg absent" "EGL-27 dpkg not available; skipping compare-versions assert"
 fi
@@ -2134,6 +2157,8 @@ fi
 # and adds the 0.3.0+git lt 0.4.0+git cross-base assert above.
 # EGL-135-D8: the live-base pin moves to 0.5.0 with the VERSION_BASE bump
 # and adds the 0.4.0+git lt 0.5.0+git cross-base assert above.
+# EGL-188-D8: the live-base pin moves to 0.6.0 with the VERSION_BASE bump
+# and adds the 0.5.0+git lt 0.6.0+git cross-base assert above.
 # EGL-80-L8: the stamp embeds the git commit — in a tree WITHOUT .git
 # (the exported/staged public snapshot shape, or a plain export)
 # build-tarball legitimately falls back to 'unknown' (EGL-74
@@ -2149,9 +2174,9 @@ elif [[ ! -d "$TREE_ROOT/.git" ]]; then
 else
     t27_rc=0
     env EGRESSLOCK_TARBALL_OUT="$b27/k.tgz" "$TARSH" >"$b27/log" 2>&1 || t27_rc=$?
-    # EGL-135-D8: the live-base pin moves to 0.5.0 with the VERSION_BASE bump
-# and adds the 0.4.0+git lt 0.5.0+git cross-base assert above.
-    v27_real="$(grep -oE '0\.5\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
+    # EGL-188-D8: the live-base pin moves to 0.6.0 with the VERSION_BASE bump
+# and adds the 0.5.0+git lt 0.6.0+git cross-base assert above.
+    v27_real="$(grep -oE '0\.6\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
     [[ "$t27_rc" == 0 && -f "$b27/k.tgz" && -n "$v27_real" ]] \
         && a22 pass || a22 fail "EGL-27 tarball build stamps new scheme (rc=$t27_rc, log: $(cat "$b27/log"))"
 fi
@@ -2196,12 +2221,12 @@ else
     skip "$PKG_SKIP_TAG" "EGL-72 tarball VERSION_BASE/KIT_VERSION assert — packaging/build-tarball.sh is not on this tree (extracted kit)"
 fi
 
-arc22_pass=$pass; arc22_fail=$fail
+section_end arc22
 
 # --- EGL-39: install-kit.sh AppArmor advisory one-liner (D39-2) -----------
 # Separate prefix/unit dirs so the a16 state asserts stay untouched.
-pass=0; fail=0
-a39() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin a39 "EGL-39 install-kit advisory"
+a39() { assert "$@"; }
 ik39="$STATE/ik39"
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
     EGRESSLOCK_UNIT_DIR="$ik39/units" EGRESSLOCK_LEGACY_PREFIX="$ik39/no-legacy" \
@@ -2227,11 +2252,11 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
     "$KIT" --prefix "$ik39/opt" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"AppArmor: podman unlabeled; --apparmor-add not needed on this host"* ]] \
     && a39 pass || a39 fail "EGL-39 install-kit hats do not count as labeled (rc=$rc, out: $o)"
-a39_pass=$pass; a39_fail=$fail
+section_end a39
 
 # --- ARC-72: pasta profile resolution (distro-dependent names) -------------
-pass=0; fail=0
-a72() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc72 "ARC-72 apparmor resolution"
+a72() { assert "$@"; }
 # Fixtures: the same aa-status/apparmor_parser stubs from the ARC-22 block.
 # D1: candidates are usr.bin.pasta then pasta; a "pasta" file that does not
 # mention /usr/bin/pasta is skipped; the write target is the local include
@@ -2350,15 +2375,15 @@ o="$(run_aa72 "$aa72/aadf" --apparmor-remove 2>&1)"; rc=$?
     && "$(wc -l < "$STATE/apparmor.log")" -eq 0 ]] \
     && a72 pass || a72 fail "D4 unapply rc 0 without profile (rc=$rc, out: $o)"
 
-arc72_pass=$pass; arc72_fail=$fail
+section_end arc72
 
 # --- EGL-14: compatibility include + doctor -------------------------------
 # D1: apply on a profile with no local include installs a marked,
 # backed-up compatibility include; --remove strips exactly it. D3: the
 # --apparmor-check report reflects the amendment state and exits nonzero when a
 # required element is missing.
-pass=0; fail=0
-a14() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc14 "EGL-14 apparmor compat include + doctor"
+a14() { assert "$@"; }
 
 # 1. Re-apply after --remove: the include-less profile gets the patch,
 #    the rule loads, and a re-run is idempotent (no second patch, no
@@ -2438,7 +2463,7 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin:$PATH" \
     && "$o" == *"egresslock rule in local file: absent"* ]] \
     && a14 pass || a14 fail "EGL-14 --apparmor-check unhealthy rc!=0 (rc=$rc, out: $o)"
 
-arc14_pass=$pass; arc14_fail=$fail
+section_end arc14
 
 # --- EGL-20: parser-reality fixes (preprocess, dot backup, no-truncate) ---
 # D1: load-check uses a SINGLE -p action (mock honors it; no --print
@@ -2449,8 +2474,8 @@ arc14_pass=$pass; arc14_fail=$fail
 #     next apply. D3: strip never truncates the distro profile (refuses
 #     rc 1, file + backup untouched). D4: the patch lands after the
 #     pasta header's brace, not the first `{` in the file.
-pass=0; fail=0
-a20() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc20 "EGL-20 parser-reality fixes"
+a20() { assert "$@"; }
 
 # 0. EGL-56: the double-flag invocation must not exist in the source.
 grep -q -- '-p --preprocess' "$SKIT" \
@@ -2550,15 +2575,15 @@ else
     a20 fail "EGL-20 D3 strip refuses to destroy profile (rc=$rc, out: $o)"
 fi
 
-arc20_pass=$pass; arc20_fail=$fail
+section_end arc20
 
 # --- EGL-23: remove-path verification (parser rc surfaced, -T, negative) --
 # D1: a failing reload on remove is rc 1 (never a silent success). D2:
 # the remove reload is `apparmor_parser -r -T -- <profile>`. D3: after a
 # successful strip+reload the signal rule is ABSENT from the flattened
 # profile; a still-present rule is rc 1 loud.
-pass=0; fail=0
-a23() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc23 "EGL-23 remove verification"
+a23() { assert "$@"; }
 
 # 1. D2: remove of an applied amendment reloads with -r -T; the negative
 #    load-check (rule absent) passes and rc 0.
@@ -2600,7 +2625,7 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa72/aads/bin:$aa22/bin:$PATH" \
 [[ "$rc" == 1 && "$o" == *"apparmor_parser failed"* ]] \
     && a23 pass || a23 fail "EGL-23 D1 parser failure on remove -> rc 1 (rc=$rc, out: $o)"
 
-arc23_pass=$pass; arc23_fail=$fail
+section_end arc23
 
 
 # --- ARC-70: drift-signal visibility (setup hint) ---------------------------
@@ -2608,8 +2633,8 @@ arc23_pass=$pass; arc23_fail=$fail
 # loud stdout hint naming the re-run; with --enable there is no hint; an
 # --apparmor-alone run (no account processed) never hints. D3: the engine
 # never queries systemctl/linger (asserted in the engine harness instead).
-pass=0; fail=0
-a70() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc70 "ARC-70 drift-signal hint"
+a70() { assert "$@"; }
 
 # 1. Account setup without --enable: the hint is unmissable stdout and
 #    the re-arm line is runnable (EGL-102-F1/R4: carries --conf, and
@@ -2662,15 +2687,15 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin:$PATH" \
     && "$o" != *"no account steps requested"* ]] \
     && a70 pass || a70 fail "EGL-25 D1 remove-alone: no account closer (out: $o)"
 
-arc70_pass=$pass; arc70_fail=$fail
+section_end arc70
 
 # --- ARC-69 D5: --apparmor-add file handling (mode/inode/blank lines) ----------
 # Apply inserts the blank separator only after existing non-empty
 # content; --remove strips a blank before the marker, writes INTO the
 # file (inode + mode + owner survive; mv would clobber a conffile), and
 # truncates whitespace-only residue to 0 bytes.
-pass=0; fail=0
-a69s() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc69s "ARC-69 apparmor file handling"
+a69s() { assert "$@"; }
 
 aa69="$STATE/a22aa69"; rm -rf "$aa69"
 mkdir -p "$aa69/aad/local" "$aa69/share/apparmor"
@@ -2720,7 +2745,7 @@ else
     a69s fail "D5 remove: inode+mode kept, separator gone (rc=$rc, out: $o)"
 fi
 
-arc69s_pass=$pass; arc69s_fail=$fail
+section_end arc69s
 
 # --- EGL-50: doctor Summary + verdict reword, report-only remove, hygiene --
 # D50-2: `pasta amendment: required on this host` vocabulary. D50-3:
@@ -2729,8 +2754,8 @@ arc69s_pass=$pass; arc69s_fail=$fail
 # the apply confirm line points at --apparmor-check. D50-7: remove is
 # report-only — no ritual, no probe command. D50-4/D50-5: no `[--enable]`
 # and no internal ticket IDs in shipped output.
-pass=0; fail=0
-e50() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl50 "EGL-50 doctor summary + message hygiene"
+e50() { assert "$@"; }
 
 # 1. Unknown listing (EGL-39 4k shape): Summary CHECK UNKNOWN, rc 1
 #    (not 2), never a "not needed" claim.
@@ -2866,15 +2891,15 @@ else
     skip "$PKG_SKIP_TAG" "D50-5 tarball README hygiene greps — packaging/build-tarball.sh is not on this tree (extracted kit)"
 fi
 
-egl50_pass=$pass; egl50_fail=$fail
+section_end egl50
 
 # --- EGL-55: doctor profile-networks row (advisory) -----------------------
 # D55-1: with --account + a parsed conf, one rc-neutral row after the
 # gateway image lines: present (all), missing (names) — run: egresslock
 # ensure <name>..., or unknown when `podman network ls` fails. The row
 # never fails the doctor and never runs ensure.
-pass=0; fail=0
-e55() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl55 "EGL-55 doctor profile-networks row"
+e55() { assert "$@"; }
 mkdir -p "$STATE/e55"
 
 # 1. Healthy account slice, no networks yet: advisory missing row, rc 0.
@@ -2896,7 +2921,7 @@ e55o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
 
 # 3. Two profiles, one present one missing: missing lists only the
 #    missing names, with one ensure suggestion per profile.
-printf 'profile pa 10.99.7.0/24\n    rule public-only\nprofile pb 10.99.8.0/24\n    rule public-only\n' \
+printf 'profile pa 10.99.7.0/24\nprofile pb 10.99.8.0/24\n' \
     > "$STATE/e55/two.conf"
 printf 'driver=bridge\nsubnet=10.99.7.0/24\n' > "$STATE/networks/egresslock-pa"
 e55o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
@@ -2935,7 +2960,7 @@ e55o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     && "$e55o" == *"profile networks: skipped (conf parse failed above)"* ]] \
     && e55 pass || e55 fail "D55-1 row skipped when conf parse failed (rc=$e55rc, out: $e55o)"
 
-egl55_pass=$pass; egl55_fail=$fail
+section_end egl55
 
 # --- EGL-59: kit --help is operator UI — no ticket/process citations -----
 # Same rule as the engine (EGL-59-D1/D2/D3): the dumped headers of the
@@ -2945,8 +2970,8 @@ egl55_pass=$pass; egl55_fail=$fail
 # trailing component, so the D3 regex `docs/tickets/[A-Za-z0-9]` stays
 # green). R-EGL-69-1 finding 3: build-gateway joins the screen — its
 # header is kit-side operator UI too.
-pass=0; fail=0
-e59() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl59 "EGL-59 kit help operator-UI"
+e59() { assert "$@"; }
 k59_id_re='ARC-[0-9]|EGL-[0-9]|docs/tickets/[A-Za-z0-9]'
 entries59=("egresslock-setup:-h" "egresslock-verify:-h" \
            "install-kit.sh:-h" "uninstall-kit.sh:-h" \
@@ -2968,7 +2993,7 @@ for entry in "${entries59[@]}"; do
     fi
 done
 
-egl59_pass=$pass; egl59_fail=$fail
+section_end egl59
 
 # --- EGL-60: unlabeled-not-required matrix + out-of-scope guards ----------
 # D60-1: on a KNOWN-unlabeled host with the pasta profile found, the
@@ -2978,8 +3003,8 @@ egl59_pass=$pass; egl59_fail=$fail
 # D60-2 amends D39-4: missing extension is rc 1 only when the amendment
 # is `required` or `condition unknown` (labeled hosts keep their FAILED
 # contract — e50 #4/#5, 4t, EGL-14 #4 cover those).
-pass=0; fail=0
-e60() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl60 "EGL-60 unlabeled-not-required doctor verdict"
+e60() { assert "$@"; }
 
 # 1. The unlabeled-host reproduction (D60-1 matrix cell: MISSING + absent):
 #    unlabeled + no include + empty local file -> rc 0, OK (not needed),
@@ -3064,12 +3089,12 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin:$PATH" \
     && "$o" == *"Summary: CHECK FAILED (AppArmor patch incomplete)"* ]] \
     && e60 pass || e60 fail "D60-2 labeled MISSING+present rule stays FAILED incomplete rc 1 (rc=$rc, out: $o)"
 
-egl60_pass=$pass; egl60_fail=$fail
+section_end egl60
 
 # --- EGL-68/EGL-69: install-kit foreign-prefix guard; build-gateway
 #     context follows the script; apparmor/ ships with the prefix -----
-pass=0; fail=0
-e68() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl68 "EGL-68/69 install-kit guard + build-gateway + apparmor prefix"
+e68() { assert "$@"; }
 
 # EGL-68-D1: a non-kit prefix with a foreign gateway/ is refused rc 1,
 # and the guard runs BEFORE any write: no engine binary smeared into
@@ -3158,12 +3183,12 @@ fi
 grep -q 'build it: build-gateway' "$TREE_ROOT/egresslock" \
     && e68 pass || e68 fail "engine gateway-image hint names build-gateway"
 
-egl68_pass=$pass; egl68_fail=$fail
+section_end egl68
 
 # --- EGL-90: strict --prefix charset (audit I-02/I-03), quoted PATH
 #     wrapper exec, EGL-68 guard extended to apparmor/ -------------------
-pass=0; fail=0
-e90() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl90 "EGL-90 prefix charset + quoted wrapper + apparmor guard"
+e90() { assert "$@"; }
 e90d="$STATE/e90"; rm -rf "$e90d"; mkdir -p "$e90d/units" "$e90d/wbin" "$e90d/wsbin"
 # e90run: install-kit with the mock dirs; captures output, leaves rc.
 e90run() {
@@ -3215,12 +3240,12 @@ e90o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e90d/units" \
     && "$e90o" == *"refusing to delete $e90aa/apparmor"* && ! -e "$e90aa/egresslock" ]] \
     && e90 pass || e90 fail "foreign apparmor/ refused rc 1, untouched (rc=$e90_rc, out: $e90o)"
 
-egl90_pass=$pass; egl90_fail=$fail
+section_end egl90
 
 # --- EGL-83: co-install guard — postinst /etc shadow handling (D1) +
 #     install-kit deb-libdir refuse (D2) ---------------------------------
-pass=0; fail=0
-e83() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl83 "EGL-83 co-install guard: postinst /etc shadow + deb-libdir refuse"
+e83() { assert "$@"; }
 e83="$STATE/e83"; rm -rf "$e83"; mkdir -p "$e83"
 
 # D3: the staged (not built) postinst carries the shadow guard.
@@ -3279,7 +3304,7 @@ e83o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e83d/units" \
     && ! -e "$e83d/wbin/egresslock" && ! -e "$e83d/wsbin/egresslock-setup" ]] \
     && e83 pass || e83 fail "deb-libdir kit refuses install-kit rc 1 (rc=$e83_rc, out: $e83o)"
 
-egl83_pass=$pass; egl83_fail=$fail
+section_end egl83
 
 # --- EGL-103-D3: postinst/postrm print one line per unit mutate ---------
 # R2 disclosure bounded to unit mutates (staged-text asserts; the mock
@@ -3288,13 +3313,12 @@ egl83_pass=$pass; egl83_fail=$fail
 # operator line in the same run, except no-op disables of missing
 # units; at most one `postinst: systemd daemon-reload` per run (the
 # classified shadow-rm branch keeps its single combined line).
-pass=0; fail=0
-e103() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl103 "EGL-103 postinst/postrm unit-mutate disclosure"
+e103() { assert "$@"; }
 # EGL-107-D1: every assert here reads the EGL-83 staged postinst/postrm
 # (a build-deb.sh artifact) — skip the section with the producer.
 if [[ "$HAVE_BUILD_DEB" == 0 ]]; then
     skip "$PKG_SKIP_TAG" "EGL-103 postinst/postrm disclosure asserts — packaging/build-deb.sh is not on this tree (extracted kit)"
-    egl103_pass=0; egl103_fail=0
 else
 e103pi="$e83/stage/DEBIAN/postinst"
 e103prm="$e83/stage/DEBIAN/postrm"
@@ -3324,15 +3348,15 @@ if grep -vE '^\s*(#|$)' "$e103prm" | grep -qE 'rm -rf|rm -f|podman|config/egress
 else
     e103 pass
 fi
-egl103_pass=$pass; egl103_fail=$fail
 fi
+section_end egl103   # after the skip/else fi — both paths snapshot (EGL-184-D2)
 
 # --- EGL-102-D6-R2: install-kit source-completeness preflight -----------
 # An incomplete kit tree fails closed BEFORE any copy (nothing written,
 # named missing files + next action) instead of a mid-deploy
 # `install: cannot stat` partial prefix.
-pass=0; fail=0
-e102r2() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl102r2 "EGL-102-R2 install-kit source-completeness preflight (excluded-silent — no RESULTS line, not in TOTAL; declared gap, EGL-184-D2)" excluded-silent
+e102r2() { assert "$@"; }
 e102d="$STATE/e102r2"; rm -rf "$e102d"; mkdir -p "$e102d/sparse" "$e102d/dest"
 cp "$TREE_ROOT/install-kit.sh" "$e102d/sparse/"
 printf '0.2.0\n' > "$e102d/sparse/VERSION_BASE"
@@ -3367,11 +3391,11 @@ e102o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e102d/units" 
     && "$e102o" == *"missing: examples/recipes"* \
     && ! -e "$e102d2/egresslock" && ! -e "$e102d2/gateway" && ! -e "$e102d2/examples" ]] \
     && e102r2 pass || e102r2 fail "recipes-only gap fails closed pre-copy (rc=$e102_rc, out: $e102o)"
-egl102r2_pass=$pass; egl102r2_fail=$fail
+section_end egl102r2
 
 # --- EGL-84: --doctor verify-unit health rows (hermetic systemctl) ----
-pass=0; fail=0
-e84() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl84 "EGL-84 doctor verify-unit health"
+e84() { assert "$@"; }
 e84d="$STATE/e84"; rm -rf "$e84d"; mkdir -p "$e84d/units" "$e84d/prefix"
 : > "$e84d/prefix/egresslock"
 # Mock unit templates for the doctor rows (ExecStart present, target exec).
@@ -3629,14 +3653,14 @@ e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     && "$e84o" == *"profile networks: skipped (conf parse failed above)"* ]] \
     && e84 pass || e84 fail "profile-networks row is a named skip on parse failure (rc=$e84_rc, out: $e84o)"
 
-egl84_pass=$pass; egl84_fail=$fail
+section_end egl84
 
 # --- EGL-65: artifact hygiene — tarball excludes the internal
 #     bug-report drafts; the fleet grep catches the widened names; the
 #     private publisher never joins its own stage; the product tree is
 #     scrubbed. ----------------------------------------------------------
-pass=0; fail=0
-e65() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl65 "EGL-65 artifact hygiene"
+e65() { assert "$@"; }
 p65="$STATE/egl65"; rm -rf "$p65"; mkdir -p "$p65/kit"
 (cd "$TREE_ROOT" && tar -cf - --exclude=./.git --exclude='./packaging/*.deb' --exclude='./packaging/*.tar.gz' .) \
     | tar -xf - -C "$p65/kit"
@@ -3716,44 +3740,44 @@ else
     e65 pass
 fi
 
-egl65_pass=$pass; egl65_fail=$fail
+section_end egl65
 
 
 echo
-echo "RESULTS (ARC-16 kit productization): $arc16_pass passed, $arc16_fail failed"
-echo "RESULTS (EGL-85 verify timeout paths): $egl85_pass passed, $egl85_fail failed"
-echo "RESULTS (ARC-17 uninstall-kit): $arc17_pass passed, $arc17_fail failed"
-echo "RESULTS (EGL-43 install-kit PATH wrappers): $egl43_pass passed, $egl43_fail failed"
-echo "RESULTS (EGL-12 public snapshot staging): $egl12_pass passed, $egl12_fail failed"
-echo "RESULTS (EGL-47 internal_docs guards): $egl47_pass passed, $egl47_fail failed"
-echo "RESULTS (EGL-49 deb other-readable): $egl49_pass passed, $egl49_fail failed"
-echo "RESULTS (ARC-18 setup-account): $arc18_pass passed, $arc18_fail failed"
-echo "RESULTS (EGL-51 user manager before build): $egl51_pass passed, $egl51_fail failed"
-echo "RESULTS (ARC-19 init-conf): $arc19_pass passed, $arc19_fail failed"
-echo "RESULTS (EGL-38 run map, doctor, build-gateway): $egl38_pass passed, $egl38_fail failed"
-echo "RESULTS (ARC-60 setup migration): $arc60_pass passed, $arc60_fail failed"
-echo "RESULTS (ARC-22 packaging): $arc22_pass passed, $arc22_fail failed"
-echo "RESULTS (EGL-39 install-kit advisory): $a39_pass passed, $a39_fail failed"
-echo "RESULTS (ARC-72 apparmor resolution): $arc72_pass passed, $arc72_fail failed"
-echo "RESULTS (EGL-14 apparmor compat include + doctor): $arc14_pass passed, $arc14_fail failed"
-echo "RESULTS (EGL-20 parser-reality fixes): $arc20_pass passed, $arc20_fail failed"
-echo "RESULTS (EGL-23 remove verification): $arc23_pass passed, $arc23_fail failed"
-echo "RESULTS (ARC-70 drift-signal hint): $arc70_pass passed, $arc70_fail failed"
-echo "RESULTS (ARC-69 apparmor file handling): $arc69s_pass passed, $arc69s_fail failed"
-echo "RESULTS (EGL-50 doctor summary + message hygiene): $egl50_pass passed, $egl50_fail failed"
-echo "RESULTS (EGL-55 doctor profile-networks row): $egl55_pass passed, $egl55_fail failed"
-echo "RESULTS (EGL-59 kit help operator-UI): $egl59_pass passed, $egl59_fail failed"
-echo "RESULTS (EGL-60 unlabeled-not-required doctor verdict): $egl60_pass passed, $egl60_fail failed"
-echo "RESULTS (EGL-68/69 install-kit guard + build-gateway + apparmor prefix): $egl68_pass passed, $egl68_fail failed"
-echo "RESULTS (EGL-90 prefix charset + quoted wrapper + apparmor guard): $egl90_pass passed, $egl90_fail failed"
-echo "RESULTS (EGL-83 co-install guard: postinst /etc shadow + deb-libdir refuse): $egl83_pass passed, $egl83_fail failed"
-echo "RESULTS (EGL-115 sweep-mode wrapper scoping): $egl115_pass passed, $egl115_fail failed"
-echo "RESULTS (EGL-103 postinst/postrm unit-mutate disclosure): $egl103_pass passed, $egl103_fail failed"
-echo "RESULTS (EGL-84 doctor verify-unit health): $egl84_pass passed, $egl84_fail failed"
-echo "RESULTS (EGL-65 artifact hygiene): $egl65_pass passed, $egl65_fail failed"
-total_fail=$((arc16_fail + egl85_fail + egl115_fail + arc17_fail + egl43_fail + egl12_fail + egl47_fail + egl49_fail + arc18_fail + egl51_fail + arc19_fail + egl38_fail + arc60_fail + arc22_fail + a39_fail + arc72_fail + arc14_fail + arc20_fail + arc23_fail + arc70_fail + arc69s_fail + egl50_fail + egl55_fail + egl59_fail + egl60_fail + egl68_fail + egl90_fail + egl83_fail + egl103_fail + egl84_fail + egl65_fail))
-# EGL-99: the TOTAL line counts skips by named cause and records the
-# tree shape, so checkout vs detached-review-worktree totals compare 1:1
-# (a shape-gated assert shows up as a named skip, not a silent 1-off).
-echo "RESULTS TOTAL: $((arc16_pass + egl85_pass + egl115_pass + arc17_pass + egl43_pass + egl12_pass + egl47_pass + egl49_pass + arc18_pass + egl51_pass + arc19_pass + egl38_pass + arc60_pass + arc22_pass + a39_pass + arc72_pass + arc14_pass + arc20_pass + arc23_pass + arc70_pass + arc69s_pass + egl50_pass + egl55_pass + egl59_pass + egl60_pass + egl68_pass + egl90_pass + egl83_pass + egl103_pass + egl84_pass + egl65_pass)) passed, $total_fail failed$(skip_summary) ($(tree_shape_tag))"
+results_emit arc16
+results_emit egl85
+results_emit arc17
+results_emit egl43
+results_emit egl12
+results_emit egl47
+results_emit egl49
+results_emit arc18
+results_emit egl51
+results_emit arc19
+results_emit egl38
+results_emit arc60
+results_emit arc22
+results_emit a39
+results_emit arc72
+results_emit arc14
+results_emit arc20
+results_emit arc23
+results_emit arc70
+results_emit arc69s
+results_emit egl50
+results_emit egl55
+results_emit egl59
+results_emit egl60
+results_emit egl68
+results_emit egl90
+results_emit egl83
+results_emit egl115
+results_emit egl103
+results_emit egl84
+results_emit egl65
+# EGL-184: the hand-maintained 31-term sums are replaced by the register
+# (counted snapshots; no externals — every kit increment runs the funnels).
+# Fail-closed completeness per EGL-184-D4; the TOTAL line keeps the
+# EGL-99 skip count + tree-shape tag.
+results_total
 [[ "$total_fail" -eq 0 ]]

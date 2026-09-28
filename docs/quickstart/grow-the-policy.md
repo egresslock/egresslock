@@ -28,7 +28,7 @@ Short version: **HTTP(S) by domain → the allowlist; everything else →
 | HTTP(S) service on the SAME host | `allow` with `host.containers.internal` | [reach-a-host-service](reach-a-host-service.md) |
 
 The full decision table — non-standard ports, same-host services,
-CIDR and `public-only` status — lives in the
+CIDR — lives in the
 [policy reference](../reference/policy-reference.md). Why a request
 behaves the way it does (proxy path vs direct path, failure
 signatures): [paths-and-signatures](../reference/paths-and-signatures.md).

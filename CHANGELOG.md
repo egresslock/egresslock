@@ -4,6 +4,46 @@ All notable changes between egresslock releases. The public repository
 ships without history (each release is a fresh snapshot tree), so this
 file is the record of what changed since the previous release.
 
+## 0.6.0 - 2026-09-28
+
+> **Operator-important changes:**
+>
+> **Action required:**
+> - **`rule public-only` is removed.** Most confs need no action —
+>   the kit never created this rule; if you didn't add
+>   `rule public-only` to your conf by hand, you can stop reading
+>   here. If you did, delete the line and run
+>   `egresslock ensure <profile>` (until then, every engine
+>   command fails closed at parse: `unknown rule kind
+>   'public-only'`). There is no like-for-like replacement for
+>   "accept all public IPv4" — build a similar policy by adding
+>   each destination individually with `allow` (allowlist) /
+>   `allow-host` (direct).
+>
+> **Behavior changes:**
+> - **Clearer error messages.** Engine messages now say what went
+>   wrong in plain words, instead of citing inscrutable codes.
+> - **Better error message when `disallow-host` cannot confirm the
+>   old connection is really dead.** It now tells you the exact
+>   state and prints the command that finishes the job by hand,
+>   instead of the old dead "retry disallow-host" hint.
+> - **The threat model's T14 accepted risk (the `public-only` drop
+>   set is narrower than all special-use ranges) is retired:** the
+>   mode is gone, so the risk no longer exists to accept.
+
+### Internal
+
+- **Runtime seam.** Every Podman invocation now goes through a small
+  adapter layer in the engine instead of being scattered across
+  command paths. Podman-only today; the seam exists so a second
+  container runtime can be added later without touching policy
+  logic.
+- **In-file decomposition.** The engine, setup, and doctor paths
+  were split into smaller per-step helpers (config loading, ensure,
+  teardown, denied listing, doctor kit checks). No behavior change —
+  outputs are byte-identical, and the test battery
+  (`bash tests/run.sh`) pins the order.
+
 ## 0.5.0 - 2026-09-24
 
 > **Operator-important changes:**

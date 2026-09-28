@@ -228,8 +228,7 @@ detailed material; [troubleshooting](docs/troubleshooting.md) is the
   behavior, and the security model summary.
 - **[Policy reference](docs/reference/policy-reference.md)** — the full
   profile-conf grammar, the allowlist format, the destination →
-  mechanism decision table, `rule public-only`, and `allow-host`
-  details.
+  mechanism decision table, and `allow-host` details.
 - **[Paths and signatures](docs/reference/paths-and-signatures.md)** —
   why a request 403s, hangs, or gets refused: the two-path model, the
   failure signatures, live counters, and the same-host pasta patterns.

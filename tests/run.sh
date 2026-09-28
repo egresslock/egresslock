@@ -14,8 +14,8 @@
 # a later hang; without stdbuf the harness runs unmodified (not a failure).
 #
 # EGL-79-D2: `--help/-h` prints usage and exits 0 (no battery);
-# `--harness engine|kit|all` selects a subset (default `all` = today's
-# `test-*.sh` glob). Unknown options / bad values exit 2.
+# `--harness engine|kit|docs|all` selects a subset (default `all` =
+# today's `test-*.sh` glob). Unknown options / bad values exit 2.
 #
 # EGL-86-D1/D2: the battery is a non-root battery — refused, not
 # skipped, under uid 0 (exit 2 after flag parsing, before harness
@@ -26,7 +26,7 @@
 # summarized as one `run.sh: skips` line plus a fixed note of what the
 # public tree still covers. Skips never change the exit code.
 #
-# Run:  bash tests/run.sh [--help] [--harness engine|kit|all]
+# Run:  bash tests/run.sh [--help] [--harness engine|kit|docs|all]
 #                                      [--no-foreground]
 #
 # Exit codes: 0 all harnesses green; 1 one or more harnesses failed
@@ -42,7 +42,7 @@ usage() {
 Usage: bash tests/run.sh [options]
 
   --help, -h              Show this help and exit 0
-  --harness engine|kit|all
+  --harness engine|kit|docs|all
                           Which test-*.sh to run (default: all)
   --no-foreground         Classic timeout isolation: on expiry the whole
                           harness process group is TERMed instead of the
@@ -64,7 +64,8 @@ public tree, host-shape gaps) are summarized as a `run.sh: skips` line
 at suite end; they never change the exit code.
 
 Layers (taxonomy; not selectable flags in this ticket):
-  1 public unit/integration  — test-engine.sh + test-kit.sh
+  1 public unit/integration  — test-engine.sh + test-kit.sh +
+                               test-docs.sh (docs link resolution)
   2 public security regs.    — mixed into those harnesses
   3 private/adversarial      — not in this tree (must not ship)
 
@@ -114,7 +115,7 @@ while (( $# )); do
             ;;
         --harness)
             if (( $# < 2 )); then
-                echo "run.sh: --harness requires a value (engine|kit|all)" >&2
+                echo "run.sh: --harness requires a value (engine|kit|docs|all)" >&2
                 exit 2
             fi
             harness_sel="$2"
@@ -151,11 +152,14 @@ case "$harness_sel" in
     kit)
         harnesses=( "$tests_dir/test-kit.sh" )
         ;;
+    docs)
+        harnesses=( "$tests_dir/test-docs.sh" )
+        ;;
     all)
         harnesses=( "$tests_dir"/test-*.sh )
         ;;
     *)
-        echo "run.sh: bad --harness value: '$harness_sel' (expected engine|kit|all)" >&2
+        echo "run.sh: bad --harness value: '$harness_sel' (expected engine|kit|docs|all)" >&2
         exit 2
         ;;
 esac

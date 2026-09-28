@@ -7,7 +7,9 @@ security claims; the README's Security model section only points here.
 Every row in the [attacks table](#attacks-table) carries an honest
 status: `lab-verified` (probed on a dogfood host), `code-verified`
 (read in the shipped code, not probed live), `design-intent` (intended
-behavior, not yet probed), or `open-by-design` (a known, accepted gap).
+behavior, not yet probed), `open-by-design` (a known, accepted gap),
+or `retired` (the T-number is kept so lookups resolve; the attack no
+longer exists because its mode was removed).
 Nothing here is a pentest claim. The input paths this model assumes
 (allowlist grammar, log parsing) have had a completed hardening review
 and a completed input→sink review. Two live adversarial exercises have
@@ -21,7 +23,7 @@ one bypass — the source-address-keyed gateway exemption — closed on
 [accepted risks](#non-goals--accepted-risks). Neither exercise was a
 pentest.
 
-Last reviewed: 2026-09-24. The claims below are scoped to the dogfood
+Last reviewed: 2026-09-28. The claims below are scoped to the dogfood
 hosts in the [version matrix](#version-matrix), not to "any rootless
 Podman" install.
 
@@ -108,9 +110,8 @@ workload container (A1)      sibling container on same profile network (A2)
                 defense in depth only
 ```
 
-Picture is the **gateway-only** forward path. `public-only` terminals in
-scoped accept after the RFC1918/link-local/multicast drops (leftover
-ranges unchanged). A1↔A2 on the bridge is L2 (T7), not this hook.
+Picture is the **gateway-only** forward path. A1↔A2 on the
+bridge is L2 (T7), not this hook.
 
 Two consequences follow from where the chain sits:
 
@@ -227,12 +228,6 @@ attacks table or an explicit non-goal.
 - **`allow-host` DNS pin drift (T13):** a pin keeps the first-A IP from
   `ensure` time; if DNS moves, traffic still goes to the old address
   (and `verify` warns) until `ensure` re-pins.
-- **`public-only` is wide of some ranges (T14):** the emitted
-  drop set is exactly RFC1918 (10/8, 172.16/12, 192.168/16),
-  link-local (169.254/16), multicast (224/4), and broadcast
-  (255.255.255.255). Loopback, CGNAT (100.64/10), 0/8, benchmark
-  (198.18/15), and reserved (240/4) destinations are *not* dropped on a
-  `public-only` profile.
 - **Kit path is distribution, not isolation:** a root-owned install
   prefix protects the tool's integrity, nothing more.
 - **Kit root tools are interactive-root only:** no
@@ -323,7 +318,7 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T11 | `allow 'foo; rm -rf /'` | reject, exit 2, file unchanged | usage / invalid entry | code-verified |
 | T12 | Gateway container stopped | no useful exemption for the workload; default drop | connect fail; `denied` may be empty | design-intent |
 | T13 | `allow-host` then DNS changes | traffic still to **old** A until `ensure`; `verify` warns `drift:` | hang to new IP; `verify` rc=0 with warning | lab-verified (drift loop). E2E pin: lab-verified after leftover `agent_policy` removed |
-| T14 | `public-only` profile | public IPv4; RFC1918 + 169.254/16 + 224/4 + broadcast dropped | LAN RFC1918 blocked. Not CGNAT/loopback | lab-verified (RFC1918) |
+| T14 | `rule public-only` (drop-set narrower than all special-use ranges) | **retired** as of 0.6.0: the mode is gone, so the risk no longer exists to accept | n/a — see CHANGELOG | retired |
 | T15 | Another account's `podman network ls` | cannot see this account's nets | empty / other store | design-intent |
 | T16 | Engine run as root | refuse | error; root's store unused | design-intent |
 | T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach: cloud metadata (`169.254.169.254`) is **not delivered** on this pasta (in-lab mitigation: connection times out); hosts-file rebind is **not injectable** from the gateway (non-root gateway; Squid resolves via internal DNS, not the hosts file); LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, nft-direct, not the name-rebind path. The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
@@ -331,7 +326,9 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 
 Rows read as "what should happen", not a pentest report:
 `design-intent` rows are untested; `open-by-design` rows are gaps the
-model accepts on purpose. Nothing here is fuzz-tested. The hardening
+model accepts on purpose; `retired` rows keep the T-number so lookups
+resolve — the attack no longer exists. Nothing here is fuzz-tested.
+The hardening
 review of the input paths and the input→sink review are complete. Live
 adversarial work has run on throwaway accounts: the original
 egress-bypass exercise (no undocumented general egress found), and the

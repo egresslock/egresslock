@@ -9,7 +9,7 @@ process tickets). Review it against the primary invariant:
 > the Squid allowlist.
 
 Read the [threat model](reference/threat-model.md) first. Documented
-accepted risks (same-profile L2, `public-only` drop set, allowlisted
+accepted risks (same-profile L2, allowlisted
 name rebind through the gateway, not a sandbox) are **not** release
 blockers unless the behavior is worse than documented.
 

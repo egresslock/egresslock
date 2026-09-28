@@ -88,8 +88,8 @@ destinations not covered by an explicitly configured direct rule. The workload
 may connect to the gateway's proxy port, but the nftables chain drops direct
 connections. The gateway's own egress is separately permitted so it can
 resolve and connect to an allowlisted destination. `allow-host` is an explicit
-non-HTTP/direct-access rule; `public-only` is a separate profile mode, not a
-gateway bypass accidentally created by proxy configuration.
+non-HTTP/direct-access rule, not a gateway bypass accidentally created by
+proxy configuration.
 
 ## Where enforcement happens
 
@@ -236,8 +236,6 @@ Scoped to the dated dogfood captures in the
 - same-profile L2 stays open (peers on one profile network can reach
   each other and the gateway's proxy port directly);
 - IPv4-only — forwarded IPv6 is dropped, not proxied;
-- `public-only` drops exactly RFC1918, link-local, multicast, and
-  broadcast — not loopback, CGNAT, or other special-use ranges;
 - an allowlisted hostname that re-resolves to a private address is
   connected *through the proxy* (open by design), and
   `allow-host` pins drift with DNS until the next `ensure`.

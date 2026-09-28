@@ -788,6 +788,13 @@ cat > "$TESTROOT/bin/cat" <<'EOF'
 # Mock cat: intercept only /proc/net/nf_conntrack (EGL-139-D2 reader).
 for a in "$@"; do
     if [[ "$a" == /proc/net/nf_conntrack ]]; then
+        # EGL-168-D4: the conntrack-table-unreadable marker forces the
+        # table read to fail (rc non-zero, named stderr) — the
+        # post-swap assert's table-unreadable die path.
+        if [[ -f "${ARCMOCK_STATE:?}/nft/conntrack-table-unreadable" ]]; then
+            echo "cat: /proc/net/nf_conntrack: read failed (conntrack-table-unreadable marker)" >&2
+            exit 1
+        fi
         [[ -f "${ARCMOCK_STATE:?}/nft/conntrack-table" ]] && cat "${ARCMOCK_STATE:?}/nft/conntrack-table"
         exit 0
     fi
@@ -956,21 +963,146 @@ tree_shape_tag() {
 }
 
 pass=0; fail=0
+# EGL-184 (F-022 remainder): _sect_bump is the only sanctioned increment
+# path for pass/fail. Inside an open section it bumps the section counters
+# and the grand accumulator; outside any section the increment is booked
+# into the stray bucket and results_total refuses to print a TOTAL (a
+# silent undercount becomes a named failure, EGL-184-D4).
+_sect_open_cur=""
+_sect_open_label=""
+_sect_open_mode=""
+_sect_stray=0
+_sect_grand_pass=0; _sect_grand_fail=0    # every sanctioned increment
+_sect_booked_pass=0; _sect_booked_fail=0  # Σ all ended snapshots (counted + excluded)
+_sect_bump() { # _sect_bump pass|fail
+    if [[ -n "$_sect_open_cur" ]]; then
+        if [[ "$1" == pass ]]; then
+            pass=$((pass+1)); _sect_grand_pass=$((_sect_grand_pass+1))
+        else
+            fail=$((fail+1)); _sect_grand_fail=$((_sect_grand_fail+1))
+        fi
+    else
+        _sect_stray=$((_sect_stray+1))
+    fi
+}
 check() { # check <desc> <rc-expected> <cmd...>
     local desc="$1" want="$2"; shift 2
     local got=0
     "$@" >/dev/null 2>&1 || got=$?
     if [[ "$got" == "$want" ]]; then
-        pass=$((pass+1)); echo "PASS: $desc"
+        _sect_bump pass; echo "PASS: $desc"
     else
-        fail=$((fail+1)); echo "FAIL: $desc (want rc=$want, got rc=$got)"
+        _sect_bump fail; echo "FAIL: $desc (want rc=$want, got rc=$got)"
     fi
 }
 check_out() { # check_out <desc> <expected-substring> <cmd...>
     local desc="$1" want="$2"; shift 2
     if "$@" 2>/dev/null | grep -qF "$want"; then
-        pass=$((pass+1)); echo "PASS: $desc"
+        _sect_bump pass; echo "PASS: $desc"
     else
-        fail=$((fail+1)); echo "FAIL: $desc (output missing '$want')"
+        _sect_bump fail; echo "FAIL: $desc (output missing '$want')"
     fi
+}
+assert() { # assert pass|fail [fail-message]
+    if [[ "$1" == pass ]]; then
+        _sect_bump pass
+    else
+        _sect_bump fail
+        echo "FAIL: $2"
+    fi
+}
+
+# EGL-184 (F-022 remainder): per-section RESULTS bookkeeping. Replaces the
+# hand-maintained reset -> capture -> RESULTS-echo -> hand-sum chain in
+# test-engine.sh / test-kit.sh (86 resets, 84 captures, 84 RESULTS lines,
+# two multi-term sums where every new section edits five distant places
+# and a forgotten sum term silently undercounts). EGL-99 freeze: the
+# RESULTS/TOTAL text is byte-pinned, so section_end only snapshots —
+# emission stays at today's echo sites (the EOF dumps plus the two
+# mid-file sections) via results_emit, never inside section_end.
+#
+# Modes (section_begin <name> "<label>" [mode]):
+#   counted          — RESULTS line emitted at the migrated site, in TOTAL
+#   excluded         — RESULTS line emitted, NOT in TOTAL (declared gap;
+#                      engine e98: counted nowhere, never was)
+#   excluded-silent  — no RESULTS line, not in TOTAL (kit egl102r2)
+# Engine arc14 (own counters via the deliberately-untouched a14 delegate,
+# EGL-179-D3) and the egl140 witness alias stay manual (EGL-184-D2):
+# arc14 enters the TOTAL as a declared external via results_total's
+# extra args; its increments bypass check/check_out/assert and are
+# invisible to the grand accumulator by design.
+declare -A _sect_snap=()   # name -> "mode|label|pass|fail" (ended only)
+section_begin() { # section_begin <name> "<label>" [counted|excluded|excluded-silent]
+    local name="${1:-}" label="${2:-}" mode="${3:-counted}"
+    if [[ -z "$name" || -z "$label" ]]; then
+        echo "FAIL: section_begin: usage: section_begin <name> <label> [counted|excluded|excluded-silent] (EGL-184 fail-closed)"
+        exit 1
+    fi
+    case "$mode" in
+        counted|excluded|excluded-silent) ;;
+        *) echo "FAIL: section_begin: '$name': unknown mode '$mode' (EGL-184 fail-closed)"; exit 1 ;;
+    esac
+    if [[ -n "$_sect_open_cur" ]]; then
+        echo "FAIL: section_begin: '$_sect_open_cur' is still open (double begin / overlapping window of '$name'; EGL-184 fail-closed)"
+        exit 1
+    fi
+    if [[ -n "${_sect_snap[$name]:-}" ]]; then
+        echo "FAIL: section_begin: '$name' already ended (re-begin; EGL-184 fail-closed)"
+        exit 1
+    fi
+    _sect_open_cur="$name"; _sect_open_label="$label"; _sect_open_mode="$mode"
+    pass=0; fail=0
+}
+section_end() { # section_end <name> — snapshot only; does NOT emit (EGL-184-D1)
+    local name="${1:-}"
+    if [[ -z "$_sect_open_cur" || "$_sect_open_cur" != "$name" ]]; then
+        echo "FAIL: section_end: '$name' is not the open section (end without begin, ended twice, or out of order; EGL-184 fail-closed)"
+        exit 1
+    fi
+    _sect_snap["$name"]="$_sect_open_mode|$_sect_open_label|$pass|$fail"
+    _sect_booked_pass=$((_sect_booked_pass + pass))
+    _sect_booked_fail=$((_sect_booked_fail + fail))
+    _sect_open_cur=""; _sect_open_label=""; _sect_open_mode=""
+}
+results_emit() { # results_emit <name> — prints the pinned RESULTS line from the snapshot
+    local name="${1:-}"
+    local snap="${_sect_snap[$name]:-}"
+    if [[ -z "$snap" ]]; then
+        echo "FAIL: results_emit: '$name' has no ended snapshot (emit before end, or never begun; EGL-184 fail-closed)"
+        exit 1
+    fi
+    local rest="${snap#*|}"
+    local label="${rest%%|*}" counts="${rest#*|}"
+    echo "RESULTS ($label): ${counts%%|*} passed, ${counts#*|} failed"
+}
+results_total() { # results_total [ext_pass] [ext_fail] — declared raw-counter externals (engine arc14)
+    local ext_pass="${1:-0}" ext_fail="${2:-0}"
+    if [[ ! "$ext_pass" =~ ^[0-9]+$ || ! "$ext_fail" =~ ^[0-9]+$ ]]; then
+        echo "FAIL: results_total: external counters must be numeric (got '$ext_pass', '$ext_fail'; EGL-184 fail-closed)"
+        exit 1
+    fi
+    if [[ -n "$_sect_open_cur" ]]; then
+        echo "FAIL: results_total: section '$_sect_open_cur' still open (begun, never ended; EGL-184 fail-closed) — TOTAL refused"
+        exit 1
+    fi
+    if (( _sect_stray != 0 )); then
+        echo "FAIL: results_total: $_sect_stray check/assert increment(s) outside any section (stray; EGL-184 fail-closed) — TOTAL refused"
+        exit 1
+    fi
+    if (( _sect_grand_pass != _sect_booked_pass || _sect_grand_fail != _sect_booked_fail )); then
+        echo "FAIL: results_total: grand accumulator ($_sect_grand_pass passed, $_sect_grand_fail failed) disagrees with booked snapshots ($_sect_booked_pass passed, $_sect_booked_fail failed) — an increment ran outside every ended section (EGL-184 fail-closed) — TOTAL refused"
+        exit 1
+    fi
+    local counted_pass=0 counted_fail=0 name snap rest mode counts
+    for name in "${!_sect_snap[@]}"; do
+        snap="${_sect_snap[$name]}"
+        mode="${snap%%|*}"; rest="${snap#*|}"; counts="${rest#*|}"
+        if [[ "$mode" == counted ]]; then
+            counted_pass=$((counted_pass + ${counts%%|*}))
+            counted_fail=$((counted_fail + ${counts#*|}))
+        fi
+    done
+    total_pass=$((counted_pass + ext_pass))
+    total_fail=$((counted_fail + ext_fail))
+    echo "RESULTS TOTAL: $total_pass passed, $total_fail failed$(skip_summary) ($(tree_shape_tag))"
 }

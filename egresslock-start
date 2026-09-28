@@ -50,6 +50,13 @@ set -euo pipefail
 # gate host, and rootless Podman requires the account's own runtime dir.
 # (Assigned before export so an id -u failure cannot silently mask a void
 # XDG_RUNTIME_DIR under set -eou pipefail — SC2155.)
+#
+# EGL-176-D2: the XDG_RUNTIME_DIR resolution below and the ARC-16-D4
+# engine-dir chain are deliberately duplicated in egresslock-verify
+# (roughly its bootstrap section); the shareable surface is ~15 lines and
+# the env-guard sets differ, so a shared sourced fragment was rejected
+# (it would be a new shipped file with packaging/install/test deltas).
+# Keep the two copies in sync when editing either.
 _euid="$(id -u)"
 export XDG_RUNTIME_DIR="/run/user/$_euid"
 

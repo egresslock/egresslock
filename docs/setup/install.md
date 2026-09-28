@@ -552,7 +552,6 @@ profile main 10.199.0.0/24
 | `profile <name> <cidr>` | starts a profile block; IPv4 CIDR, prefixlen 8-29, canonical network address |
 | `rule gateway-only` | egress only through the profile's gateway (requires a `gateway` directive) |
 | `rule allow-host <host>:<port>` | direct host:port allow (repeatable; resolved at ensure time) — bypasses the gateway, pinned as an nftables rule |
-| `rule public-only` | accept all public IPv4 (still drops RFC1918 etc.; cannot combine with allow-host/gateway) |
 | `gateway <ip> <port> <file>` | static gateway IP inside the subnet + Squid port + allowlist file (conf-relative unless absolute) |
 | `no-proxy <host,...>` | extra `NO_PROXY` entries (hosts the profile may reach directly) |
 

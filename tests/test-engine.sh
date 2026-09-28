@@ -17,6 +17,41 @@ export ARCMOCK_DNS_BASE="git.example.test=192.0.2.10,gitXexample.test=192.0.2.12
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 export PATH="$TESTROOT/bin:$TREE_ROOT:$PATH"
 
+# --- EGL-184-D4: fail-closed negative controls (subshell-isolated) ---------
+# The bookkeeping library must refuse to print a TOTAL when the section
+# register is inconsistent: an open section, an op on a never-begun name,
+# a double begin, a stray increment outside any section, or grand/booked
+# drift (an increment that bypassed the sanctioned paths). Each control
+# reproduces one refusal inside a subshell (command substitution) and
+# asserts the subshell exits nonzero with a named FAIL message. On
+# success this block prints nothing, opens no section in the parent, and
+# moves no TOTAL (EGL-184-D3: no new RESULTS section).
+_ectl_bad=0
+_ectl() { # _ectl <fn> — run control <fn> in a subshell; expect a named refusal
+    local out="" rc=0
+    out="$("$1" 2>&1)" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        echo "FAIL (EGL-184 control): $1 did not fail closed"; _ectl_bad=1
+    elif [[ "$out" != *"FAIL"* ]]; then
+        echo "FAIL (EGL-184 control): $1 refused without a named message (rc=$rc, out: $out)"; _ectl_bad=1
+    fi
+}
+_ectl_dangling()     { section_begin ectl_a "control: dangling"; results_total; }
+_ectl_end_unbegun()  { section_end ectl_ghost; }
+_ectl_emit_unended() { section_begin ectl_b "control: emit-unended"; results_emit ectl_b; }
+_ectl_double()       { section_begin ectl_c "control: double"; section_begin ectl_c "control: double"; }
+_ectl_stray()        { assert pass; results_total; }
+_ectl_drift()        { section_begin ectl_d "control: drift"; pass=$((pass+1)); section_end ectl_d; results_total; }
+_ectl _ectl_dangling
+_ectl _ectl_end_unbegun
+_ectl _ectl_emit_unended
+_ectl _ectl_double
+_ectl _ectl_stray
+_ectl _ectl_drift
+unset -f _ectl _ectl_dangling _ectl_end_unbegun _ectl_emit_unended _ectl_double _ectl_stray _ectl_drift
+if [[ "$_ectl_bad" -ne 0 ]]; then exit 1; fi
+unset _ectl_bad
+
 # Run a command with stdout attached to a PTY (script(1)). The probe
 # hint used to be TTY-gated (ARC-45); EGL-117-D1 lifted that gate for
 # the resolution lines (they print every time now), so the PTY is no
@@ -29,7 +64,7 @@ export PATH="$TESTROOT/bin:$TREE_ROOT:$PATH"
 # unchanged — only script's own stdin-relay gets immediate EOF.
 pty() { script -qec "$1" /dev/null </dev/null; }
 
-pass=0; fail=0
+section_begin extra "engine config validation"
 
 # --- config validation (ARC-8 engine-specific, synthetic fixtures) -------
 # --config activates the engine; validation errors exit 2.
@@ -51,9 +86,9 @@ bad_config() { # bad_config <name> <content> <expected-message-substring>
     local out rc=0
     out="$(egresslock --config "$dir/$1.conf" list 2>&1)" || rc=$?
     if [[ "$rc" == 2 && "$out" == *"$1.conf:"* && "$out" == *"$3"* ]]; then
-        pass=$((pass+1)); echo "PASS: bad config rejected: $1"
+        _sect_bump pass; echo "PASS: bad config rejected: $1"
     else
-        fail=$((fail+1)); echo "FAIL: bad config '$1' (rc=$rc, msg: $out)"
+        _sect_bump fail; echo "FAIL: bad config '$1' (rc=$rc, msg: $out)"
     fi
 }
 
@@ -100,12 +135,9 @@ check "missing creds directive is now OK" 0 \
 bad_config gw-only-no-gw \
     $'profile a 10.50.0.0/24\n    rule gateway-only' \
     "no 'gateway' directive"
-bad_config pub-plus-allowhost \
-    $'profile a 10.50.0.0/24\n    rule public-only\n    rule allow-host git.example.test:443' \
-    "public-only combined with allow-host"
-bad_config pub-plus-gw \
-    $'profile a 10.50.0.0/24\n    rule public-only\n    gateway 10.50.0.2 3128 a' \
-    "public-only combined with gateway"
+bad_config leftover-public-only \
+    $'profile a 10.50.0.0/24\n    rule public-only' \
+    "unknown rule kind 'public-only'"
 bad_config bad-host \
     $'profile a 10.50.0.0/24\n    rule allow-host bad~host:443' \
     "invalid host name"
@@ -167,11 +199,11 @@ check_out "config-only allow-host compiled" "daddr 192.0.2.10 tcp dport 443" \
 check "config-only profile: teardown" 0 npc teardown ci
 check "config-only teardown removed gateway" 1 test -f "$STATE/running/egresslock-gateway-ci"
 
-extra_pass=$pass; extra_fail=$fail
+section_end extra
 
 
 # --- ARC-11: subnet hygiene ----------------------------------------------
-pass=0; fail=0
+section_begin arc11 "ARC-11 subnet hygiene"
 A11="$TESTROOT/arc11"
 mkdir -p "$A11"
 a11() { env EGRESSLOCK_CONF="$A11/$1" egresslock "${@:2}"; }
@@ -188,9 +220,9 @@ printf 'driver=bridge\nsubnet=10.77.0.0/24\ngateway=10.77.0.1\nipv6_enabled=fals
 ov_out="$(a11 overlap.conf ensure ov 2>&1)"; ov_rc=$?
 if [[ "$ov_rc" == 1 && "$ov_out" == *"overlaps existing Podman network 'someone-elses-net'"* \
       && "$ov_out" == *"podman network rm"* ]]; then
-    pass=$((pass+1)); echo "PASS: ensure fails closed on overlapping foreign network (with remediation)"
+    _sect_bump pass; echo "PASS: ensure fails closed on overlapping foreign network (with remediation)"
 else
-    fail=$((fail+1)); echo "FAIL: overlap pre-check (rc=$ov_rc, out: $ov_out)"
+    _sect_bump fail; echo "FAIL: overlap pre-check (rc=$ov_rc, out: $ov_out)"
 fi
 # Own network is not a collision; after removing the foreign net, ensure works.
 rm -f "$STATE/networks/someone-elses-net"
@@ -205,9 +237,9 @@ check "re-ensure own network is not a collision" 0 a11 overlap.conf ensure ov
 printf 'driver=bridge\nsubnet=10.77.0.128/30\ngateway=10.77.0.129\nipv6_enabled=false\n' > "$STATE/networks/tiny-foreign"
 ov_out="$(a11 overlap.conf ensure ov 2>&1)"; ov_rc=$?
 if [[ "$ov_rc" == 1 && "$ov_out" == *"overlaps existing Podman network 'tiny-foreign'"* ]]; then
-    pass=$((pass+1)); echo "PASS: foreign /30 nested in profile range fails ensure"
+    _sect_bump pass; echo "PASS: foreign /30 nested in profile range fails ensure"
 else
-    fail=$((fail+1)); echo "FAIL: tiny-prefix foreign subnet slipped the scan (rc=$ov_rc, out: $ov_out)"
+    _sect_bump fail; echo "FAIL: tiny-prefix foreign subnet slipped the scan (rc=$ov_rc, out: $ov_out)"
 fi
 rm -f "$STATE/networks/tiny-foreign"
 
@@ -232,8 +264,8 @@ check_out "28-prefix: gateway container at .18" "10.78.0.18" \
 check_out "28-prefix: anchor at last usable .30" "10.78.0.30" \
     cat "$STATE/containers/egresslock-anchor-sub28.ip"
 grep -q 'ip saddr 10.78.0.16/28 iifname "podman1" ip daddr 10.78.0.17' "$STATE/nft/egresslock.p_sub28" \
-    && { pass=$((pass+1)); echo "PASS: 28-prefix DNS allow targets first usable"; } \
-    || { fail=$((fail+1)); echo "FAIL: 28-prefix DNS allow gateway wrong"; }
+    && { _sect_bump pass; echo "PASS: 28-prefix DNS allow targets first usable"; } \
+    || { _sect_bump fail; echo "FAIL: 28-prefix DNS allow gateway wrong"; }
 # Anchor/gateway address exclusion: 10.78.0.17 (bridge gw) as static gw.
 bad_config sub28-gw-eq-bridge \
     $'profile a 10.78.0.16/28\n    rule gateway-only\n    gateway 10.78.0.17 3128 allow28' \
@@ -241,11 +273,11 @@ bad_config sub28-gw-eq-bridge \
 # Teardown for cleanliness.
 check "28-prefix profile: teardown" 0 a11 sub28.conf teardown sub28
 
-arc11_pass=$pass; arc11_fail=$fail
+section_end arc11
 
 
 # --- ARC-12: stale-DNS drift check ----------------------------------------
-pass=0; fail=0
+section_begin arc12 "ARC-12 DNS drift"
 A12="$TESTROOT/arc12"
 mkdir -p "$A12"
 : > "$A12/allow"
@@ -261,9 +293,9 @@ drc() { env EGRESSLOCK_CONF="$A12/drift.conf" egresslock "$@"; }
 check "drift profile: ensure" 0 drc ensure dr
 v_out="$(drc verify dr 2>&1)"; v_rc=$?
 if [[ "$v_rc" == 0 && "$v_out" != *"drift:"* ]]; then
-    pass=$((pass+1)); echo "PASS: no-drift verify is silent and passes"
+    _sect_bump pass; echo "PASS: no-drift verify is silent and passes"
 else
-    fail=$((fail+1)); echo "FAIL: no-drift verify (rc=$v_rc, out: $v_out)"
+    _sect_bump fail; echo "FAIL: no-drift verify (rc=$v_rc, out: $v_out)"
 fi
 
 # Drifted first-A: forgejo now resolves elsewhere. verify must exit 0,
@@ -272,20 +304,20 @@ export EGRESSLOCK_MOCK_DNS="git.example.test=192.0.2.99"
 v_out="$(drc verify dr 2>&1)"; v_rc=$?
 if [[ "$v_rc" == 0 && "$v_out" == *"drift: host git.example.test resolved to 192.0.2.99 but the policy pins 192.0.2.10"* ]] \
    && [[ "$(grep -c 'drift:' <<<"$v_out")" == 1 ]]; then
-    pass=$((pass+1)); echo "PASS: drifted verify warns once (per host) and exits 0"
+    _sect_bump pass; echo "PASS: drifted verify warns once (per host) and exits 0"
 else
-    fail=$((fail+1)); echo "FAIL: drifted verify (rc=$v_rc, out: $v_out)"
+    _sect_bump fail; echo "FAIL: drifted verify (rc=$v_rc, out: $v_out)"
 fi
 grep -q 'daddr 192.0.2.10 tcp dport 443' "$STATE/nft/egresslock.p_dr" \
-    && { pass=$((pass+1)); echo "PASS: drift did not mutate the policy"; } \
-    || { fail=$((fail+1)); echo "FAIL: drift check changed the pinned policy"; }
+    && { _sect_bump pass; echo "PASS: drift did not mutate the policy"; } \
+    || { _sect_bump fail; echo "FAIL: drift check changed the pinned policy"; }
 # Unresolvable host at verify: distinct warn, exit 0, pin kept.
 export EGRESSLOCK_MOCK_DNS="git.example.test="
 v_out="$(drc verify dr 2>&1)"; v_rc=$?
 if [[ "$v_rc" == 0 && "$v_out" == *"drift: host git.example.test no longer resolves; policy still pins 192.0.2.10"* ]]; then
-    pass=$((pass+1)); echo "PASS: unresolvable host warns, exits 0"
+    _sect_bump pass; echo "PASS: unresolvable host warns, exits 0"
 else
-    fail=$((fail+1)); echo "FAIL: unresolvable-at-verify (rc=$v_rc, out: $v_out)"
+    _sect_bump fail; echo "FAIL: unresolvable-at-verify (rc=$v_rc, out: $v_out)"
 fi
 unset EGRESSLOCK_MOCK_DNS
 
@@ -293,23 +325,23 @@ unset EGRESSLOCK_MOCK_DNS
 export EGRESSLOCK_MOCK_DNS="git.example.test=192.0.2.99"
 e_out="$(drc ensure dr 2>&1)"; e_rc=$?
 if [[ "$e_rc" == 0 && "$e_out" == *"refreshed: host git.example.test 192.0.2.10 -> 192.0.2.99"* ]]; then
-    pass=$((pass+1)); echo "PASS: ensure announces the refreshed host"
+    _sect_bump pass; echo "PASS: ensure announces the refreshed host"
 else
-    fail=$((fail+1)); echo "FAIL: ensure refresh announce (rc=$e_rc, out: $e_out)"
+    _sect_bump fail; echo "FAIL: ensure refresh announce (rc=$e_rc, out: $e_out)"
 fi
 # R-012-1 F1: exactly ONE announce line per drifted HOST (forgejo has
 # two allow-host ports; a naive per-port loop prints two lines).
 announced_count="$(grep -c 'refreshed: host git.example.test' <<<"$e_out")"
 if [[ "$announced_count" == 1 ]]; then
-    pass=$((pass+1)); echo "PASS: one refreshed line per drifted host (not per port)"
+    _sect_bump pass; echo "PASS: one refreshed line per drifted host (not per port)"
 else
-    fail=$((fail+1)); echo "FAIL: refreshed announce count=$announced_count (want 1)"
+    _sect_bump fail; echo "FAIL: refreshed announce count=$announced_count (want 1)"
 fi
 v_out="$(drc verify dr 2>&1)"; v_rc=$?
 if [[ "$v_rc" == 0 && "$v_out" != *"drift:"* ]]; then
-    pass=$((pass+1)); echo "PASS: verify silent after the heal"
+    _sect_bump pass; echo "PASS: verify silent after the heal"
 else
-    fail=$((fail+1)); echo "FAIL: verify after heal (rc=$v_rc, out: $v_out)"
+    _sect_bump fail; echo "FAIL: verify after heal (rc=$v_rc, out: $v_out)"
 fi
 # Unresolvable at ENSURE still fails closed.
 export EGRESSLOCK_MOCK_DNS="git.example.test="
@@ -322,15 +354,14 @@ export EGRESSLOCK_MOCK_DNS="git.example.test=192.0.2.99,cache.example.test=192.0
 # no-allow-host profile: ensure first, then verify stays silent.
 cat > "$A12/plain.conf" <<'EOF'
 profile plain 10.79.1.0/24
-    rule public-only
 EOF
 env EGRESSLOCK_CONF="$A12/plain.conf" egresslock ensure plain >/dev/null 2>&1
 export EGRESSLOCK_MOCK_DNS="git.example.test=192.0.2.99,cache.example.test=192.0.2.98"
 p_out="$(env EGRESSLOCK_CONF="$A12/plain.conf" egresslock verify plain 2>&1)"; p_rc=$?
 if [[ "$p_rc" == 0 && "$p_out" != *"drift:"* ]]; then
-    pass=$((pass+1)); echo "PASS: no-allow-host profile verify silent"
+    _sect_bump pass; echo "PASS: no-allow-host profile verify silent"
 else
-    fail=$((fail+1)); echo "FAIL: no-allow-host profile (rc=$p_rc, out: $p_out)"
+    _sect_bump fail; echo "FAIL: no-allow-host profile (rc=$p_rc, out: $p_out)"
 fi
 
 # Structural mismatch must STILL fail verify (D1 did not weaken
@@ -343,7 +374,7 @@ drc ensure dr >/dev/null 2>&1
 check "verify passes after re-ensure" 0 drc verify dr
 unset EGRESSLOCK_MOCK_DNS
 
-arc12_pass=$pass; arc12_fail=$fail
+section_end arc12
 
 
 
@@ -353,7 +384,6 @@ a14() { if [[ "$1" == pass ]]; then arc14_pass=$((arc14_pass+1)); else arc14_fai
 
 cat > "$A14/bare.conf" <<'EOF'
 profile bare 10.80.0.0/24
-    rule public-only
     rule allow-host ${FORGEJO_HOST}:443
 EOF
 
@@ -425,8 +455,8 @@ else
 fi
 
 # --- ARC-16: kit surface (engine side) -------------------------------------
-pass=0; fail=0
-a16() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc16 "ARC-16 kit surface"
+a16() { assert "$@"; }
 
 # D5: --version prints 'dev' when the binary has no VERSION file next
 # to it (repo checkout), without touching profile state.
@@ -459,11 +489,11 @@ fi
 x_out="$(env EGRESSLOCK_CONF="$TESTROOT/validconf/ok.conf" egresslock verify --ensured local-dev 2>&1)"; x_rc=$?
 [[ "$x_rc" == 2 ]] && a16 pass || a16 fail "verify --ensured rejects profile arg (rc=$x_rc)"
 
-arc16_pass=$pass; arc16_fail=$fail
+section_end arc16
 
 # --- ARC-20: config required (no compiled-in profiles) -------------------
-pass=0; fail=0
-a20() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc20 "ARC-20 config required"
+a20() { assert "$@"; }
 
 # Bare invocation (no --config, no EGRESSLOCK_CONF) fails closed for
 # every profile subcommand with the required-config message. The message
@@ -544,11 +574,11 @@ else
     a20 fail "list column headers (rc=$u4_rc, out: $u4_out)"
 fi
 
-arc20_pass=$pass; arc20_fail=$fail
+section_end arc20
 
 # --- ARC-25: fail closed when run as root -------------------------------
-pass=0; fail=0
-a25() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc25 "ARC-25 root guard"
+a25() { assert "$@"; }
 
 # Mock `id` to report uid 0 (root). The engine's only `id` use is the
 # ARC-25 guard, so a PATH shim in the test bin is a faithful root mock.
@@ -587,11 +617,11 @@ else
     a25 fail "escape hatch allows root list (rc=$e_rc, out: $e_out)"
 fi
 
-arc25_pass=$pass; arc25_fail=$fail
+section_end arc25
 
 # --- ARC-26: netns preflight probe --------------------------------------
-pass=0; fail=0
-a26() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc26 "ARC-26 netns probe"
+a26() { assert "$@"; }
 
 # Healthy probe: the mock podman's `unshare --rootless-netns <cmd>`
 # execs <cmd>, so `true` succeeds. ensure/verify still pass normally.
@@ -666,20 +696,20 @@ h_start=$SECONDS
 h_out="$(PATH="$TESTROOT/bin-hang:$PATH" npc ensure ci 2>&1)"; h_rc=$?
 h_elapsed=$(( SECONDS - h_start ))
 if [[ "$h_rc" == 1 && "$h_out" == *"netns probe timed out after 5s"* && "$h_elapsed" -lt 15 ]]; then
-    pass=$((pass+1)); echo "PASS: ARC-26 hanging probe is a named timeout failure (rc=1, ${h_elapsed}s)"
+    _sect_bump pass; echo "PASS: ARC-26 hanging probe is a named timeout failure (rc=1, ${h_elapsed}s)"
 else
-    fail=$((fail+1)); echo "FAIL: ARC-26 hanging probe not bounded (rc=$h_rc, elapsed=${h_elapsed}s, out: $h_out)"
+    _sect_bump fail; echo "FAIL: ARC-26 hanging probe not bounded (rc=$h_rc, elapsed=${h_elapsed}s, out: $h_out)"
 fi
 
-arc26_pass=$pass; arc26_fail=$fail
+section_end arc26
 
 # --- ARC-49 R-049-1 F1: no /tmp/agent-policy.* leak on a failed nft -f -
 # Regression for F1: the EXIT-trap cleanup (removed in the F1 fix) could
 # not fire on implicit set -e exits; the fix uses explicit rm + die
 # instead. Assert a mid-install_policy nft failure is fail-closed AND
 # leaves no /tmp/agent-policy.* behind.
-pass=0; fail=0
-a49() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc49 "ARC-49 nft-temp"
+a49() { assert "$@"; }
 
 mkdir -p "$TESTROOT/bin-nftfail"
 cat > "$TESTROOT/bin-nftfail/nft" <<EOF
@@ -716,11 +746,11 @@ fi
 # engine's next ensure self-heals, and later sections expect ci verified).
 restore_out="$(npc ensure ci >/dev/null 2>&1)"; restore_rc=$?
 [[ "$restore_rc" == 0 ]] && a49 pass || a49 fail "ensure ci after F1 probe self-heals (rc=$restore_rc)"
-arc49_pass=$pass; arc49_fail=$fail
+section_end arc49
 
 # --- ARC-24: per-user default config probe ------------------------------
-pass=0; fail=0
-a24() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc24 "ARC-24 default probe"
+a24() { assert "$@"; }
 
 # HOME with the well-known default present: bare `list` now AGGREGATES
 # CONFDIR/*.conf (ARC-37-D3), prints 'using configs in <dir>' on stderr,
@@ -827,11 +857,11 @@ else
     a24 fail "getent home miss stays fail-closed (rc=$g3_rc, out: $g3_out)"
 fi
 
-arc24_pass=$pass; arc24_fail=$fail
+section_end arc24
 
 # --- ARC-35: init (write a starter profile pair) ------------------------
-pass=0; fail=0
-a35() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc35 "ARC-35 init"
+a35() { assert "$@"; }
 
 # init is a writer, not a config-requiring subcommand: works with no
 # loadable conf, from $HOME/.config/egresslock.
@@ -897,11 +927,11 @@ i10_out="$(env EGRESSLOCK_CONF="$TESTROOT/i35/.config/egresslock/e2e.conf" egres
 [[ "$i10_rc" == 0 ]] \
     && a35 pass || a35 fail "init pair verifies (rc=$i10_rc, out: $i10_out)"
 
-arc35_pass=$pass; arc35_fail=$fail
+section_end arc35
 
 # --- ARC-30: disallow (remove an exact allowlist entry) -----------------
-pass=0; fail=0
-a30() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc30 "ARC-30 disallow"
+a30() { assert "$@"; }
 
 # ci.conf gateway allowlist (NPDIR/ci-allowlist). Seed two entries, one
 # to remove, one to keep, plus a comment and an order check.
@@ -956,11 +986,11 @@ else
     a30 fail "R-030-1f1: disallow preserves allowlist mode (mode=$(stat -c %a "$AD30/m-allowlist" 2>/dev/null))"
 fi
 
-arc30_pass=$pass; arc30_fail=$fail
+section_end arc30
 
 # --- ARC-46: multi-arg allow/disallow + re-ensuring status line ----------
-pass=0; fail=0
-a46() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc46 "ARC-46 allow/disallow batch"
+a46() { assert "$@"; }
 
 AD46="$TESTROOT/h46"; rm -rf "$AD46"; mkdir -p "$AD46"
 cat > "$AD46/m.conf" <<'EOF'
@@ -1057,11 +1087,11 @@ ahx_out="$(run46 allow-host mm git.example.test:2222 extra 2>&1)"; ahx_rc=$?
 [[ "$ahx_rc" == 2 && "$ahx_out" == *"exactly one"* ]] \
     && a46 pass || a46 fail "allow-host extra arg (rc=$ahx_rc, out: $ahx_out)"
 
-arc46_pass=$pass; arc46_fail=$fail
+section_end arc46
 
 # --- BUG-002: allow appends to a no-trailing-newline allowlist -----------
-pass=0; fail=0
-b2() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc_b2 "BUG-002 no-trailing-newline allow"
+b2() { assert "$@"; }
 
 # A starter-like allowlist whose last line is a comment with NO trailing
 # newline (the shipped examples/main-allowlist pre-fix shape). A plain
@@ -1126,11 +1156,11 @@ else
     b2 fail "glued entry not healed; new allow clean (rc=$b2g_rc, out: $b2g_out)"
 fi
 
-arc_b2_pass=$pass; arc_b2_fail=$fail
+section_end arc_b2
 
 # --- ARC-54: leftover inet agent_policy table dropped (rename residue) ---
-pass=0; fail=0
-a54() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc54 "ARC-54 legacy table"
+a54() { assert "$@"; }
 
 # Fixture: plain (non-gateway) profile + the stale table as observed in
 # the ARC-48 host lab — empty chains, no v6-drop rule, policy accept.
@@ -1198,11 +1228,11 @@ else
 fi
 rmleftover
 
-arc54_pass=$pass; arc54_fail=$fail
+section_end arc54
 
 # --- ARC-52: verify fail-closed on foreign early FORWARD hooks -----------
-pass=0; fail=0
-a52() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc52 "ARC-52 foreign hooks"
+a52() { assert "$@"; }
 
 A52="$TESTROOT/arc52"; rm -rf "$A52"; mkdir -p "$A52"
 cat > "$A52/a52.conf" <<'EOF'
@@ -1287,8 +1317,8 @@ else
     a52 fail "verify green again after leftovers removed (rc=$a52_rc, out: $a52_out)"
 fi
 
-echo "RESULTS (ARC-52 foreign hooks): $pass passed, $fail failed"
-arc52_pass=$pass; arc52_fail=$fail
+section_end arc52
+results_emit arc52
 
 # --- EGL-98: stale-unpolicied detection (post-reboot window) --------------
 # The podman network OBJECT survives a reboot (on-disk) while the netns
@@ -1300,8 +1330,8 @@ arc52_pass=$pass; arc52_fail=$fail
 # the unexplained `anchor ... not running` bail / the silent skip.
 # Signal-only: nothing repairs; teardown'd / never-ensured profiles
 # keep the silent skip (ARC-16-D3, narrowed).
-pass=0; fail=0
-e98() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin e98 "EGL-98 stale-unpolicied" excluded
+e98() { assert "$@"; }
 
 E98="$TESTROOT/e98"; rm -rf "$E98"; mkdir -p "$E98"
 cat > "$E98/e98.conf" <<'EOF'
@@ -1393,20 +1423,20 @@ else
 fi
 run_e98 teardown all >/dev/null 2>&1 || true
 
-echo "RESULTS (EGL-98 stale-unpolicied): $pass passed, $fail failed"
-e98_pass=$pass; e98_fail=$fail
+section_end e98
+results_emit e98
 
 # --- ARC-37: per-profile conf probe + list aggregation -------------------
-pass=0; fail=0
-a37() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc37 "ARC-37 conf discovery"
+a37() { assert "$@"; }
 
 H37="$TESTROOT/h37"
 rm -rf "$H37"; mkdir -p "$H37/.config/egresslock"
 printf 'profile main 10.199.0.0/24\n    rule gateway-only\n    gateway 10.199.0.2 3128 main-allowlist\n' \
     > "$H37/.config/egresslock/main.conf"
 : > "$H37/.config/egresslock/main-allowlist"
-printf 'profile a 10.199.1.0/24\n    rule public-only\n' > "$H37/.config/egresslock/a.conf"
-printf 'profile b 10.199.2.0/24\n    rule public-only\n' > "$H37/.config/egresslock/b.conf"
+printf 'profile a 10.199.1.0/24\n' > "$H37/.config/egresslock/a.conf"
+printf 'profile b 10.199.2.0/24\n' > "$H37/.config/egresslock/b.conf"
 
 # 1. bare list aggregates every *.conf (main + a + b).
 l_out="$(pty "env -u EGRESSLOCK_CONF HOME='$H37' egresslock list 2>$TESTROOT/a37.err")"; l_rc=$?
@@ -1431,8 +1461,8 @@ n2_out="$(env -u EGRESSLOCK_CONF HOME="$H37" egresslock network b 2>&1)"; n2_rc=
 
 # 4. duplicate profile name across two *.conf -> bare list exits 2 naming
 #    both files.
-printf 'profile b 10.199.2.0/24\n    rule public-only\n' > "$H37/.config/egresslock/b.conf"
-printf 'profile a 10.199.3.0/24\n    rule public-only\n' > "$H37/.config/egresslock/c.conf"
+printf 'profile b 10.199.2.0/24\n' > "$H37/.config/egresslock/b.conf"
+printf 'profile a 10.199.3.0/24\n' > "$H37/.config/egresslock/c.conf"
 d_out="$(env -u EGRESSLOCK_CONF HOME="$H37" egresslock list 2>&1)"; d_rc=$?
 if [[ "$d_rc" == 2 && "$d_out" == *"duplicate profile name 'a'"* \
       && "$d_out" == *"a.conf"* && "$d_out" == *"c.conf"* ]]; then
@@ -1472,18 +1502,18 @@ else
     a37 fail "explicit --config stays single-file + scoped line (rc=$x37_rc, out: $x37_out, err: $(cat $TESTROOT/a37x.err))"
 fi
 
-arc37_pass=$pass; arc37_fail=$fail
+section_end arc37
 
 # --- EGL-117: resolution disclosure — every time, TTY-independent --------
 # D1: exactly one stderr resolution line per conf-resolving invocation,
 # exact deterministic wording, never gated on stdout being a terminal.
-pass=0; fail=0
-a117() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl117 "EGL-117 resolution disclosure"
+a117() { assert "$@"; }
 
 H117="$TESTROOT/h117"
 rm -rf "$H117"; mkdir -p "$H117/.config/egresslock"
-printf 'profile main 10.199.0.0/24\n    rule public-only\n' > "$H117/.config/egresslock/main.conf"
-printf 'profile p2 10.199.1.0/24\n    rule public-only\n' > "$H117/.config/egresslock/p2.conf"
+printf 'profile main 10.199.0.0/24\n' > "$H117/.config/egresslock/main.conf"
+printf 'profile p2 10.199.1.0/24\n' > "$H117/.config/egresslock/p2.conf"
 
 # 1. Named probe hit: exact line (named command under capture).
 o="$(env -u EGRESSLOCK_CONF HOME="$H117" egresslock network p2 2>$TESTROOT/e117a.err)"; rc=$?
@@ -1527,11 +1557,11 @@ else
     a117 fail "env-scoped line under pipe (rc=$rc, err: $(cat $TESTROOT/e117d.err))"
 fi
 
-egl117_pass=$pass; egl117_fail=$fail
+section_end egl117
 
 # --- ARC-38: allow-host / disallow-host (conf mutation) ------------------
-pass=0; fail=0
-a38() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc38 "ARC-38 allow-host"
+a38() { assert "$@"; }
 
 AH="$TESTROOT/h38"; rm -rf "$AH"; mkdir -p "$AH"
 cat > "$AH/multi.conf" <<'EOF'
@@ -1591,13 +1621,14 @@ m_out="$(env EGRESSLOCK_CONF="$AH/multi.conf" egresslock allow-host two 'bad ent
 [[ "$m_rc" == 2 && "$m_out" == *"invalid allow-host entry"* ]] \
     && a38 pass || a38 fail "allow-host invalid grammar (rc=$m_rc, out: $m_out)"
 
-# 6. public-only profile -> exit 2, nothing written.
+# 6. leftover `rule public-only` (removed kind, EGL-153): allow-host
+#    fails at PARSE — exit 2, unknown-kind error, conf unchanged.
 printf 'profile pub 10.199.12.0/24\n    rule public-only\n' > "$AH/pub.conf"
 p_out="$(env EGRESSLOCK_CONF="$AH/pub.conf" egresslock allow-host pub git.example.test:2222 2>&1)"; p_rc=$?
-if [[ "$p_rc" == 2 && "$p_out" == *"public-only"* ]] && ! grep -q 'allow-host' "$AH/pub.conf"; then
+if [[ "$p_rc" == 2 && "$p_out" == *"unknown rule kind 'public-only'"* ]] && ! grep -q 'allow-host' "$AH/pub.conf"; then
     a38 pass
 else
-    a38 fail "allow-host on public-only fails closed (rc=$p_rc, out: $p_out)"
+    a38 fail "allow-host on leftover public-only fails closed at parse (rc=$p_rc, out: $p_out)"
 fi
 
 # 7. non-gateway profile can take allow-host (no gateway guard).
@@ -1689,11 +1720,11 @@ else
     a38 fail "R-038-1f2: disallow-host near-collision deletes the right line"
 fi
 
-arc38_pass=$pass; arc38_fail=$fail
+section_end arc38
 
 # --- ARC-31: denied filters allowlisted hosts ----------------------------
-pass=0; fail=0
-a31() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc31 "ARC-31 denied filter"
+a31() { assert "$@"; }
 
 AD="$TESTROOT/h31"; rm -rf "$AD"; mkdir -p "$AD"
 cat > "$AD/gw.conf" <<'EOF'
@@ -1752,11 +1783,11 @@ else
     a31 fail "R-031-1f1: leading-dot allowlist filters subdomains+bare host (rc=$ld_rc, out: $ld_out)"
 fi
 
-arc31_pass=$pass; arc31_fail=$fail
+section_end arc31
 
 # --- ARC-41: denied surfaces plain-HTTP (GET/port-80) denials -----------
-pass=0; fail=0
-a41() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc41 "ARC-41 denied HTTP-origin"
+a41() { assert "$@"; }
 
 # 1. GET-only log (empty allowlist): denied and --all both emit host:80 (D1),
 #    and a non-denied TCP_MISS row is excluded.
@@ -1867,11 +1898,11 @@ else
     a41 fail "non-HTTP/userinfo/IPv6/malformed skipped; CONNECT still listed (rc=$u_rc, out: $u_out)"
 fi
 
-arc41_pass=$pass; arc41_fail=$fail
+section_end arc41
 
 # --- ARC-42: denied time window (--days N, default 14) ------------------
-pass=0; fail=0
-a42() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc42 "ARC-42 denied window"
+a42() { assert "$@"; }
 
 AD7="$TESTROOT/h42"; rm -rf "$AD7"; mkdir -p "$AD7"
 cat > "$AD7/gw.conf" <<'EOF'
@@ -1937,11 +1968,11 @@ f2="$(env EGRESSLOCK_CONF="$AD7/gw.conf" egresslock denied gw --days 1 --all 2>&
 [[ "$f1" == "$f2" && "$f1" == *"recent.example.test"* ]] \
     && a42 pass || a42 fail "flag order equivalence (f1=[$f1] f2=[$f2])"
 
-arc42_pass=$pass; arc42_fail=$fail
+section_end arc42
 
 # --- ARC-43: allowlist — print the allowlist file raw ---------------------
-pass=0; fail=0
-a43() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc43 "ARC-43 allowlist"
+a43() { assert "$@"; }
 
 AD8="$TESTROOT/h43"; rm -rf "$AD8"; mkdir -p "$AD8"
 cat > "$AD8/gw.conf" <<'EOF'
@@ -2004,11 +2035,11 @@ am_out="$(env EGRESSLOCK_CONF="$AD8/miss.conf" egresslock allowlist gw 2>&1)"; a
 [[ "$am_rc" != 0 && "$am_out" == *"nope-allowlist"* ]] \
     && a43 pass || a43 fail "allowlist missing file names path (rc=$am_rc, out: $am_out)"
 
-arc43_pass=$pass; arc43_fail=$fail
+section_end arc43
 
 # --- ARC-44: proxy-env tokens + network single-token output -------------
-pass=0; fail=0
-a44() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc44 "ARC-44 proxy-env tokens"
+a44() { assert "$@"; }
 
 # 1. proxyip / proxyport / noproxy exact tokens; no `using config` on stdout.
 AD9="$TESTROOT/h44"; rm -rf "$AD9"; mkdir -p "$AD9"
@@ -2061,15 +2092,15 @@ netx_out="$(env EGRESSLOCK_CONF="$AD9/gw.conf" egresslock network gw extra 2>&1)
 [[ "$net_rc" == 0 && "$net_out" == "egresslock-gw" && "$netx_rc" == 2 ]] \
     && a44 pass || a44 fail "network single token + extra-arg guard (net=[$net_out] rc=$net_rc xrc=$netx_rc)"
 
-arc44_pass=$pass; arc44_fail=$fail
+section_end arc44
 
 # --- ARC-50: focused kit input→sink security review (D3 probes) ---------
 # Probes that pin the review claim for rows the code already enforces.
 # Each asserts a fail-closed/validated behavior that MUST stay green.
 # (R-050-D3: a section that cannot fail the suite is inert — arc50_fail
 # is wired into total_fail below.)
-pass=0; fail=0
-a50() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc50 "ARC-50 sinks"
+a50() { assert "$@"; }
 
 S50="$TESTROOT/s50"; rm -rf "$S50"; mkdir -p "$S50"
 cat > "$S50/gw.conf" <<'EOF'
@@ -2145,13 +2176,13 @@ else
     a50 fail "D3.6 unexpected live eval on D1 files: $eval_hits"
 fi
 
-arc50_pass=$pass; arc50_fail=$fail
+section_end arc50
 
 # --- ARC-56: GW_DNS_NAMESERVERS strict IPv4 list (ARC-50 D7) ------------
 # The override is interpolated into squid.conf dns_nameservers; it must
 # be an ASCII-space list of cfg_is_ipv4-valid addresses (D1).
-pass=0; fail=0
-a56() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc56 "ARC-56 GW_DNS"
+a56() { assert "$@"; }
 
 S56="$TESTROOT/s56"; rm -rf "$S56"; mkdir -p "$S56"
 cat > "$S56/gw.conf" <<'EOF'
@@ -2184,12 +2215,12 @@ for val in "999.999" $'8.8.8.8\n1.1.1.1' "8.8.8.8  1.1.1.1" "1.2.3"; do
         && a56 pass || a56 fail "D invalid [$(printf %q "$val")] not fail-closed (rc=$a56_rc, out: $a56_out)"
 done
 
-arc56_pass=$pass; arc56_fail=$fail
+section_end arc56
 
 # --- ARC-58: relative gateway allowlist path is a confdir basename ------
 # No '/' and no '..' segment in relative paths (D1); absolute unchanged.
-pass=0; fail=0
-a58() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc58 "ARC-58 path"
+a58() { assert "$@"; }
 
 S58="$TESTROOT/s58"; rm -rf "$S58"; mkdir -p "$S58"
 for bad in '../other/secret' 'foo/bar' '..'; do
@@ -2226,15 +2257,15 @@ EOF
 a58_out="$(egresslock --config "$S58/abs.conf" list 2>&1)"; a58_rc=$?
 [[ "$a58_rc" == 0 && "$a58_out" == *"a2"* ]] && a58 pass || a58 fail "D absolute path loads (rc=$a58_rc, out: $a58_out)"
 
-arc58_pass=$pass; arc58_fail=$fail
+section_end arc58
 
 # --- ARC-51: allowlist grammar rejects IPv4 literals (names only) ---------
 # D1: `allow` of a literal exits 2 with the allowlist untouched; a literal
 # line in the file fails `ensure` closed (not skipped). D2: `allow-host`
 # still accepts a literal (conf rule + CLI insert). Hostname cases
 # unchanged.
-pass=0; fail=0
-a51() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc51 "ARC-51 allowlist literals"
+a51() { assert "$@"; }
 
 S51="$TESTROOT/s51"; rm -rf "$S51"; mkdir -p "$S51"
 cat > "$S51/gw.conf" <<'EOF'
@@ -2302,14 +2333,14 @@ a51_out="$(egresslock --config "$S51/gw.conf" allow s51 example.com 2>&1)"; a51_
 [[ "$a51_rc" == 0 && "$a51_out" == *"added: example.com"* ]] \
     && a51 pass || a51 fail "D0 hostname allow unchanged (rc=$a51_rc, out: $a51_out)"
 
-arc51_pass=$pass; arc51_fail=$fail
+section_end arc51
 
 # --- ARC-59: leading '-' / flag-shaped tokens rejected (ARC-50 D7) -------
 # D1: profile names must start [a-z0-9]; host fields start alnum or '.';
 # env overrides (GW_IMAGE / ANCHOR_IMAGE / NFT_BIN) reject a non-empty
 # value that starts with '-'. Happy paths unchanged.
-pass=0; fail=0
-a59() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc59 "ARC-59 leading-dash"
+a59() { assert "$@"; }
 
 # D1.1 — `profile -foo` is a config error (rc 2), not a live profile.
 S59="$TESTROOT/s59"; rm -rf "$S59"; mkdir -p "$S59"
@@ -2413,7 +2444,7 @@ a59_out="$(EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:latest \
     egresslock --config "$S59/gwok.conf" ensure s59b 2>&1)"; a59_rc=$?
 [[ "$a59_rc" == 0 ]] && a59 pass || a59 fail "D1.9 GW_IMAGE happy path (rc=$a59_rc runs=$(wc -l < "$STATE/runlog") out=$a59_out)"
 
-arc59_pass=$pass; arc59_fail=$fail
+section_end arc59
 
 # --- ARC-57: denied emit filters strings the allow grammar rejects ------
 # D1: a malicious/malformed log line must not make `denied` print a
@@ -2422,8 +2453,8 @@ arc59_pass=$pass; arc59_fail=$fail
 # predicate picks them up. EGL-18-D1 AMENDED the ARC-51 IPv4 omission:
 # well-formed IPv4 host[:port] candidates are now EMITTED (not allowlist
 # entries — the allow-host pointer is the one-time stderr note).
-pass=0; fail=0
-a57() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc57 "ARC-57 denied emit filter"
+a57() { assert "$@"; }
 
 S57="$TESTROOT/s57"; rm -rf "$S57"; mkdir -p "$S57"
 cat > "$S57/gw.conf" <<'EOF'
@@ -2480,13 +2511,13 @@ a57_out="$(egresslock --config "$S57/gw.conf" allow s57 'foo;rm' 2>&1)"; a57_rc=
 [[ "$a57_rc" == 2 && "$a57_out" == *"invalid allowlist entry"* ]] \
     && a57 pass || a57 fail "D1d allow rejects the payload string (rc=$a57_rc, out: $a57_out)"
 
-arc57_pass=$pass; arc57_fail=$fail
+section_end arc57
 
 # --- EGL-18: IP destinations — denied emits IPv4 + note, allow-host ------
 # hint, NO_PROXY unions allow-host IPv4 pins (D1/D2/D3; D5: the matrix is
 # harness evidence, not a live-lab gate).
-pass=0; fail=0
-a18() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl18 "EGL-18 IP destinations"
+a18() { assert "$@"; }
 
 S18="$TESTROOT/h18"; rm -rf "$S18"; mkdir -p "$S18"
 cat > "$S18/gw.conf" <<'EOF'
@@ -2628,14 +2659,14 @@ np18c="$(env EGRESSLOCK_CONF="$S18/np3.conf" egresslock proxy-env s18n3 noproxy 
 [[ "$np18c" == "localhost,127.0.0.1" ]] \
     && a18 pass || a18 fail "D3 hostname-only stays default (got: $np18c)"
 
-egl18_pass=$pass; egl18_fail=$fail
+section_end egl18
 
 # --- ARC-60: teardown --runtime + cutover-incomplete probe ----------------
 # D1: the no-conf runtime sweep (ARC-68-D1: egresslock-only regexes; the
 # agent-* family is NOT swept). D2: the engine probe names the old confdir
 # when the new one is empty and the old one exists.
-pass=0; fail=0
-a60() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc60 "ARC-60 runtime sweep + cutover probe"
+a60() { assert "$@"; }
 
 # Fixture: the dogfood-host shape — old-generation containers/network
 # still up with NO conf anywhere, plus new-generation objects, plus
@@ -2719,7 +2750,7 @@ o="$(run_a60 list 2>&1)"; rc=$?
 [[ "$rc" == 2 && "$o" != *"cutover incomplete"* && "$o" == *"no profile config"* ]] \
     && a60 pass || a60 fail "D2 no old confdir -> generic miss only (rc=$rc, out: $o)"
 
-arc60_pass=$pass; arc60_fail=$fail
+section_end arc60
 # --- ARC-32: pre-OSS hardening -------------------------------------------
 # D1: `denied` streams and byte-caps the log read (EGRESSLOCK_DENIED_
 # MAX_BYTES, default 8 MiB) and never rotates; verify/ensure rotate
@@ -2727,8 +2758,8 @@ arc60_pass=$pass; arc60_fail=$fail
 # -> rm .1). D2: DNS length caps (host <= 253, labels 1..63) in the
 # shared predicate + conf/CLI host fields. D3: gateway base digest pin.
 # D4: NOPASSWD documented unsupported, no sudoers shipped.
-pass=0; fail=0
-a32() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc32 "ARC-32 pre-OSS hardening"
+a32() { assert "$@"; }
 
 A32="$TESTROOT/s32"; rm -rf "$A32"; mkdir -p "$A32"
 cat > "$A32/gw.conf" <<'EOF'
@@ -2960,14 +2991,14 @@ else
     a32 fail "D4.1 NOPASSWD docs / no sudoers file"
 fi
 
-arc32_pass=$pass; arc32_fail=$fail
+section_end arc32
 
 # --- ARC-66: teardown --runtime sweeps our nft tables ---------------------
 # D4: `inet egresslock` (live policy) + leftover `inet agent_policy` are
 # deleted best-effort by the no-conf sweep (missing/netns-gone = skip,
 # delete failure = note + rc 0).
-pass=0; fail=0
-a66() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc66 "ARC-66 runtime table sweep"
+a66() { assert "$@"; }
 
 # Reuse the ARC-60 fixture shape: kit runtime with NO conf anywhere.
 H66="$TESTROOT/h66"; rm -rf "$H66"; mkdir -p "$H66"
@@ -3006,18 +3037,18 @@ else
     a66 fail "D4 failing table delete notes + rc 0 (rc=$rc, out: $o)"
 fi
 
-arc66_pass=$pass; arc66_fail=$fail
+section_end arc66
 
 # --- ARC-67: network ls {{.Name}} + fail-loud list policies ----------------
 # D1/D2/D3: the helper uses {{.Name}} (the mock rejects {{.Names}} like
 # the real binary); a broken network list kills `ensure` (fail closed),
 # is "taken" for init, and only notes for --runtime.
-pass=0; fail=0
-a67() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc67 "ARC-67 network ls"
+a67() { assert "$@"; }
 
 # Failing-list podman shim: delegates to the mock except network ls.
 S67="$TESTROOT/s67"; rm -rf "$S67"; mkdir -p "$S67/bin" "$S67/conf"
-printf 'profile s67 10.199.92.0/24\n    rule public-only\n' > "$S67/conf/s67.conf"
+printf 'profile s67 10.199.92.0/24\n' > "$S67/conf/s67.conf"
 real_podman="$(command -v podman)"
 cat > "$S67/bin/podman" <<EOF
 #!/usr/bin/env bash
@@ -3058,13 +3089,13 @@ o="$(run67 init fresh67 --subnet 10.199.93.0/24 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$o" == *"overlaps an existing"* ]] \
     && a67 pass || a67 fail "D3 init list-failure = taken (rc=$rc, out: $o)"
 
-arc67_pass=$pass; arc67_fail=$fail
+section_end arc67
 
 # --- ARC-71: --runtime dispatches before the netns probe ------------------
 # D1: the recovery sweep runs with a wedged rootless netns (probe would
 # fail). D2: conf-scoped teardown still probes (and still fails loud).
-pass=0; fail=0
-a71() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc71 "ARC-71 probe dispatch"
+a71() { assert "$@"; }
 
 # Fixture: live egresslock runtime + nft table, netns WEDGED (no
 # EGRESSLOCK_SKIP_NETNS_PROBE — the probe must run and must not block).
@@ -3095,15 +3126,15 @@ o="$(env EGRESSLOCK_CONF="$H71/main.conf" HOME="$H71" egresslock teardown main 2
     && a71 pass || a71 fail "D2 conf-scoped teardown still probes (rc=$rc, out: $o)"
 
 rm -f "$STATE/netns-broken"
-arc71_pass=$pass; arc71_fail=$fail
+section_end arc71
 
 # --- ARC-69: teardown/ensure output honesty --------------------------------
 # D1: removed / not present / kept (in use) decided by existence + rm rc.
 # D2: the nft note only when it is true; nothing-left summary on a no-op.
 # D3: ensure announces the anchor only on the actual create. D4: bare
 # teardown is a usage error naming every form.
-pass=0; fail=0
-a69() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc69 "ARC-69 output honesty"
+a69() { assert "$@"; }
 
 H69="$TESTROOT/h69"; rm -rf "$H69"; mkdir -p "$H69"
 cat > "$H69/main.conf" <<'EOF'
@@ -3205,15 +3236,15 @@ o="$(run69 teardown 2>&1)"; rc=$?
     && "$o" == *"teardown --runtime"* ]] \
     && a69 pass || a69 fail "D4 bare teardown usage error (rc=$rc, out: $o)"
 
-arc69_pass=$pass; arc69_fail=$fail
+section_end arc69
 
 # --- EGL-31: engine output hygiene (bare command name; no stale doc path) -
 # D1 grep-guard: no engine output string references the hard-coded
 # /opt/egresslock/egresslock path or the never-existed how-to/ page.
 # (The launchers' `-x /opt/...` ENGINE-RESOLUTION probes are code, not
 # output, and stay — ARC-16-D4.)
-pass=0; fail=0
-a31b() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl31 "EGL-31 output hygiene"
+a31b() { assert "$@"; }
 
 hits="$(grep -n -- '/opt/egresslock/egresslock\|how-to/' "$TREE_ROOT/egresslock" | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)"
 if [[ -z "$hits" ]]; then
@@ -3229,13 +3260,13 @@ grep -q -- "sudo -iu <account> -- egresslock ..." "$TREE_ROOT/egresslock" \
     && ! grep -q -- "/opt/egresslock/egresslock" <(grep -v '^[[:space:]]*#' "$TREE_ROOT/egresslock") \
     && a31b pass || a31b fail "root guard message shape (bare command, no /opt path)"
 
-egl31_pass=$pass; egl31_fail=$fail
+section_end egl31
 
 # --- EGL-45: engine doctor (host environment probe) -------------------------
 # This container has no podman/nft/netavark, so the MISSING branch is the
 # natural state; a stub PATH supplies the all-present shape.
-pass=0; fail=0
-a45() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl45 "EGL-45 doctor"
+a45() { assert "$@"; }
 
 # 1. No conf required, podman/nft/netavark missing -> required MISSING
 #    lines, rc 1; never the "no profile config" error. The harness PATH
@@ -3440,7 +3471,7 @@ d_elapsed=$(( SECONDS - d_start ))
     && "$(grep -c 'apparmor-check' "$d_err")" == 0 && "$d_elapsed" -lt 15 ]] \
     && a45 pass || a45 fail "doctor probe expiry: 5s row + generic hint, rc 0 (rc=$d_rc, elapsed=${d_elapsed}s, out: $d_out, err: $(cat "$d_err"))"
 
-egl45_pass=$pass; egl45_fail=$fail
+section_end egl45
 
 # --- ARC-74: deep state semantics (relocated from the site harness and
 # --- neutralized to synthetic fixtures) ----------------------------------
@@ -3448,7 +3479,7 @@ egl45_pass=$pass; egl45_fail=$fail
 # rule-order battery existed only in the site harness. Neutral copier
 # fixtures (ARC-13-D5): docs-range IPs + example.test hosts, and a
 # synthetic multi-profile conf replacing the site conf.
-pass=0; fail=0
+section_begin deep "ARC-74 deep state semantics, synthetic"
 rm -rf "$STATE"
 mkdir -p "$STATE/nft" "$STATE/networks" "$STATE/running" "$STATE/containers" \
          "$STATE/images" "$STATE/ips" "$STATE/runargs"
@@ -3463,7 +3494,6 @@ profile local-dev 10.50.0.0/24
     rule allow-host ${OLLAMA_HOST:-cache.example.test}:11434
 
 profile internet-only 10.50.1.0/24
-    rule public-only
 
 profile llm-cloud 10.50.2.0/24
     rule gateway-only
@@ -3489,7 +3519,7 @@ egresslock ensure dev-llm >/dev/null 2>&1
 # add-over-existing and delete-of-populated, so a plain delete+apply
 # would fail here.
 rule_count=$(grep -c 'daddr 192.0.2.10 tcp dport 443' "$STATE/nft/egresslock.p_local_dev")
-[[ "$rule_count" == 1 ]] && { pass=$((pass+1)); echo "PASS: re-ensure does not duplicate rules"; } || { fail=$((fail+1)); echo "FAIL: re-ensure duplicated rules (count=$rule_count)"; }
+[[ "$rule_count" == 1 ]] && { _sect_bump pass; echo "PASS: re-ensure does not duplicate rules"; } || { _sect_bump fail; echo "FAIL: re-ensure duplicated rules (count=$rule_count)"; }
 # R-003-2 regression 2: the shared v6deny chain is NOT redeclared on
 # re-ensure (would fail the whole transaction).
 check "re-ensure keeps shared v6deny intact" 0 test -f "$STATE/nft/egresslock.p_v6deny"
@@ -3499,8 +3529,8 @@ check "re-ensure keeps shared v6deny intact" 0 test -f "$STATE/nft/egresslock.p_
 echo "ip saddr 10.50.0.0/24 ip daddr 203.0.113.9 tcp dport 9999 counter accept" >> "$STATE/nft/egresslock.p_local_dev"
 check "re-ensure over stale populated chain" 0 egresslock ensure local-dev
 grep -q '203.0.113.9' "$STATE/nft/egresslock.p_local_dev" \
-    && { echo "FAIL: stale rule survived re-ensure"; fail=$((fail+1)); } \
-    || { echo "PASS: stale rules replaced on re-ensure"; pass=$((pass+1)); }
+    && { echo "FAIL: stale rule survived re-ensure"; _sect_bump fail; } \
+    || { echo "PASS: stale rules replaced on re-ensure"; _sect_bump pass; }
 # Other profiles' chains must survive a local-dev re-ensure.
 check "other profile chains survive re-ensure" 0 test -f "$STATE/nft/egresslock.p_internet_only"
 
@@ -3521,12 +3551,13 @@ mocknet egresslock-local-dev 10.50.0.0/24 false
 check "ensure accepts matching network" 0 egresslock ensure local-dev
 
 # R-003-3 regression 2: deep verification.
-# a) tampered chain: strip the RFC1918 drops from internet-only; the
+# a) tampered chain: strip the DNS allow from internet-only (EGL-153
+#    reworked the subject after a rule class left the grammar); the
 #    shallow terminal-rule check would have passed this.
 cp "$STATE/nft/egresslock.p_internet_only" "$TESTROOT/backup.io"
-grep -v 'daddr 10.0.0.0/8' "$STATE/nft/egresslock.p_internet_only" > "$STATE/nft/egresslock.p_internet_only.tmp" \
+grep -v 'th dport 53' "$STATE/nft/egresslock.p_internet_only" > "$STATE/nft/egresslock.p_internet_only.tmp" \
     && mv "$STATE/nft/egresslock.p_internet_only.tmp" "$STATE/nft/egresslock.p_internet_only"
-check "verify rejects internet-only chain missing RFC1918 drops" 1 egresslock verify internet-only
+check "verify rejects internet-only chain missing DNS allow" 1 egresslock verify internet-only
 egresslock ensure internet-only >/dev/null 2>&1
 check "ensure restores tampered internet-only chain" 0 egresslock verify internet-only
 # b) tampered chain: local-dev missing the forgejo allows.
@@ -3549,8 +3580,8 @@ check "verify rejects v6deny with duplicate drops" 1 egresslock verify local-dev
 check "ensure self-heals polluted v6deny chain" 0 egresslock ensure local-dev
 check "verify passes after v6deny self-heal" 0 egresslock verify local-dev
 [[ "$(grep -c 'meta nfproto ipv6 counter drop' "$STATE/nft/egresslock.p_v6deny")" == 1 ]] \
-    && { echo "PASS: v6deny self-heal leaves exactly one drop rule"; pass=$((pass+1)); } \
-    || { echo "FAIL: v6deny self-heal left duplicates"; fail=$((fail+1)); }
+    && { echo "PASS: v6deny self-heal leaves exactly one drop rule"; _sect_bump pass; } \
+    || { echo "FAIL: v6deny self-heal left duplicates"; _sect_bump fail; }
 # d) extra foreign rule in the chain must fail verification.
 echo "ip saddr 10.50.0.0/24 ip daddr 203.0.113.9 tcp dport 9999 counter accept" >> "$STATE/nft/egresslock.p_local_dev"
 check "verify fails on unexpected extra rule" 1 egresslock verify local-dev
@@ -3565,7 +3596,7 @@ check "verify works on indented real-format nft output" 0 egresslock verify loca
 # And the raw listing really is indented (guards the mock against drift).
 grep -qE '^        ip saddr 10\.93\.0\.0/24' "$TESTROOT/unused" 2>/dev/null || true
 indented="$(PATH="$TESTROOT/bin:$PATH" bash -c "podman unshare --rootless-netns nft list chain inet egresslock p_local_dev" 2>/dev/null | grep -c '^        ip saddr')"
-[[ "${indented:-0}" -gt 0 ]] && { pass=$((pass+1)); echo "PASS: mock nft emits indented rules"; } || { fail=$((fail+1)); echo "FAIL: mock nft not emitting indented rules"; }
+[[ "${indented:-0}" -gt 0 ]] && { _sect_bump pass; echo "PASS: mock nft emits indented rules"; } || { _sect_bump fail; echo "FAIL: mock nft not emitting indented rules"; }
 
 # R-003-4 regression 2: a network with the expected subnet PLUS an extra
 # subnet must be rejected (fail closed).
@@ -3615,23 +3646,25 @@ if grep -q '^flush chain inet egresslock p_internet_only' "$STATE/nft/last-trans
    && grep -qE '^[[:space:]]*chain p_v6deny \{' "$STATE/nft/last-transaction.nft" \
    && grep -q 'ip saddr' "$STATE/nft/last-transaction.nft" \
    && grep -q 'meta nfproto ipv6 counter drop' "$STATE/nft/last-transaction.nft"; then
-    pass=$((pass+1)); echo "PASS: refresh is one combined flush+rules transaction (v6deny + profile)"
+    _sect_bump pass; echo "PASS: refresh is one combined flush+rules transaction (v6deny + profile)"
 else
-    fail=$((fail+1)); echo "FAIL: install transaction lacks the combined v6deny+profile flush+rules"
+    _sect_bump fail; echo "FAIL: install transaction lacks the combined v6deny+profile flush+rules"
 fi
-# 2. Ordered verification: an accept reordered before the RFC1918 drops
-#    must be REJECTED (the adversarial case from the review).
+# 2. Ordered verification: an accept reordered ahead of an earlier
+#    accept must be REJECTED (the adversarial case from the review;
+#    EGL-153: swap is accepts-only after the removed-mode rework —
+#    canonicalize still preserves order).
 cp "$STATE/nft/egresslock.p_internet_only" "$TESTROOT/io.bak"
 python3 - "$STATE/nft/egresslock.p_internet_only" <<'PY2'
 import sys
 p = sys.argv[1]
 lines = open(p).readlines()
-acc = next(i for i,l in enumerate(lines) if 'counter accept' in l and '10.50.1.0/24' in l and 'daddr' not in l)
-drop = next(i for i,l in enumerate(lines) if '172.16.0.0/12' in l)
-lines[acc], lines[drop] = lines[drop], lines[acc]
+est = next(i for i,l in enumerate(lines) if 'counter accept' in l and '10.50.1.0/24' in l and 'daddr' not in l)
+dns = next(i for i,l in enumerate(lines) if 'th dport 53' in l)
+lines[est], lines[dns] = lines[dns], lines[est]
 open(p,'w').writelines(lines)
 PY2
-check "verify rejects reordered internet-only accept/drop" 1 egresslock verify internet-only
+check "verify rejects reordered internet-only accepts" 1 egresslock verify internet-only
 cp "$TESTROOT/io.bak" "$STATE/nft/egresslock.p_internet_only"
 check "verify passes restored internet-only chain" 0 egresslock verify internet-only
 # 3. v6 chain tampering must be rejected (wrong priority, extra accept).
@@ -3659,21 +3692,21 @@ check_out "dev-llm network name" "egresslock-dev-llm" egresslock network dev-llm
 check "ensure dev-llm" 0 egresslock ensure dev-llm
 check "dev-llm gateway running" 0 test -f "$STATE/running/egresslock-gateway-dev-llm"
 grep -q '10.50.3.2' "$STATE/containers/egresslock-gateway-dev-llm.ip" 2>/dev/null \
-    && { pass=$((pass+1)); echo "PASS: dev-llm gateway at 10.50.3.2"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm gateway IP wrong"; }
+    && { _sect_bump pass; echo "PASS: dev-llm gateway at 10.50.3.2"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm gateway IP wrong"; }
 grep -q '10.50.3.254' "$STATE/containers/egresslock-anchor-dev-llm.ip" 2>/dev/null \
-    && { pass=$((pass+1)); echo "PASS: dev-llm anchor at 10.50.3.254"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm anchor IP not reserved"; }
+    && { _sect_bump pass; echo "PASS: dev-llm anchor at 10.50.3.254"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm anchor IP not reserved"; }
 # Combined chain: local-dev rules + gateway hop + exemption before drop.
 grep -q 'daddr 192.0.2.10 tcp dport 2222' "$STATE/nft/egresslock.p_dev_llm" \
-    && { pass=$((pass+1)); echo "PASS: dev-llm has forgejo SSH rule"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm missing forgejo SSH rule"; }
+    && { _sect_bump pass; echo "PASS: dev-llm has forgejo SSH rule"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm missing forgejo SSH rule"; }
 grep -q 'daddr 192.0.2.11 tcp dport 11434' "$STATE/nft/egresslock.p_dev_llm" \
-    && { pass=$((pass+1)); echo "PASS: dev-llm has ollama rule"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm missing ollama rule"; }
+    && { _sect_bump pass; echo "PASS: dev-llm has ollama rule"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm missing ollama rule"; }
 grep -q 'ip saddr 10.50.3.0/24 iifname "podman1" ip daddr 10.50.3.2 tcp dport 3128' "$STATE/nft/egresslock.p_dev_llm" \
-    && { pass=$((pass+1)); echo "PASS: dev-llm has gateway hop rule"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm missing gateway hop rule"; }
+    && { _sect_bump pass; echo "PASS: dev-llm has gateway hop rule"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm missing gateway hop rule"; }
 # EGL-123-D2/D3: the gateway exemption is keyed on source IP + the
 # kit-derived pinned MAC. The MAC derivation (gw_mac) is re-computed
 # here from the same conf identity so a drift in the engine's
@@ -3682,29 +3715,29 @@ d_mac_hex="$(printf '%s' 'dev-llm|10.50.3.2' | sha256sum | cut -d' ' -f1)"
 d_mac="02:${d_mac_hex:0:2}:${d_mac_hex:2:2}:${d_mac_hex:4:2}:${d_mac_hex:6:2}:${d_mac_hex:8:2}"
 # D3: the gateway run argv carries --mac-address with the derived pin.
 grep -q -- "--mac-address ${d_mac}" "$STATE/runlog" 2>/dev/null \
-    && { pass=$((pass+1)); echo "PASS: dev-llm gateway run pins derived MAC"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm gateway run missing --mac-address ${d_mac}"; }
+    && { _sect_bump pass; echo "PASS: dev-llm gateway run pins derived MAC"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm gateway run missing --mac-address ${d_mac}"; }
 grep -q "${d_mac}" "$STATE/containers/egresslock-gateway-dev-llm.mac" 2>/dev/null \
-    && { pass=$((pass+1)); echo "PASS: dev-llm gateway stored MAC equals pin"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm gateway stored MAC != pin"; }
+    && { _sect_bump pass; echo "PASS: dev-llm gateway stored MAC equals pin"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm gateway stored MAC != pin"; }
 grep -q "ip saddr 10.50.3.2 iifname \"podman1\" ether saddr ${d_mac} counter accept" "$STATE/nft/egresslock.p_dev_llm" \
-    && { pass=$((pass+1)); echo "PASS: dev-llm exemption is saddr+derived-MAC"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm exemption not saddr+derived-MAC"; }
+    && { _sect_bump pass; echo "PASS: dev-llm exemption is saddr+derived-MAC"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm exemption not saddr+derived-MAC"; }
 d_accept="$(grep -n "ip saddr 10.50.3.2 iifname \"podman1\" ether saddr ${d_mac} counter accept" "$STATE/nft/egresslock.p_dev_llm" | cut -d: -f1 | head -1)"
 d_drop="$(grep -n '^ip saddr 10.50.3.0/24 counter drop' "$STATE/nft/egresslock.p_dev_llm" | cut -d: -f1 | head -1)"
 if [[ -n "$d_accept" && -n "$d_drop" && "$d_accept" -lt "$d_drop" ]]; then
-    pass=$((pass+1)); echo "PASS: dev-llm exemption before drop"
+    _sect_bump pass; echo "PASS: dev-llm exemption before drop"
 else
-    fail=$((fail+1)); echo "FAIL: dev-llm exemption missing or after drop"
+    _sect_bump fail; echo "FAIL: dev-llm exemption missing or after drop"
 fi
 # D3: warm ensure of a matching-MAC gateway does NOT replace it (the
 # EGL-114 converged skip survives the MAC gate).
 : > "$STATE/opslog"
 check "ensure dev-llm (warm, MAC matches)" 0 egresslock ensure dev-llm
 if ! grep -qE '^podman (rm|run) .*egresslock-gateway-dev-llm' "$STATE/opslog" 2>/dev/null; then
-    pass=$((pass+1)); echo "PASS: dev-llm warm ensure keeps matching-MAC gateway (no rm/run)"
+    _sect_bump pass; echo "PASS: dev-llm warm ensure keeps matching-MAC gateway (no rm/run)"
 else
-    fail=$((fail+1)); echo "FAIL: dev-llm warm ensure replaced matching-MAC gateway (ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+    _sect_bump fail; echo "FAIL: dev-llm warm ensure replaced matching-MAC gateway (ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
 fi
 # D3: a drifted live MAC is identity drift — ensure replaces (rm + run
 # with the pin); the exemption line in the new chain carries the pin.
@@ -3713,60 +3746,60 @@ echo 'ff:ff:ff:ff:ff:ff' > "$STATE/containers/egresslock-gateway-dev-llm.mac"
 check "ensure dev-llm (drifted MAC -> replace)" 0 egresslock ensure dev-llm
 if grep -qE '^podman rm .* egresslock-gateway-dev-llm$' "$STATE/opslog" 2>/dev/null \
    && grep -qE "^podman run .*--name egresslock-gateway-dev-llm .*--mac-address ${d_mac}" "$STATE/opslog" 2>/dev/null; then
-    pass=$((pass+1)); echo "PASS: dev-llm drifted-MAC ensure replaced with pinned MAC"
+    _sect_bump pass; echo "PASS: dev-llm drifted-MAC ensure replaced with pinned MAC"
 else
-    fail=$((fail+1)); echo "FAIL: dev-llm drifted-MAC ensure did not replace with the pin (ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+    _sect_bump fail; echo "FAIL: dev-llm drifted-MAC ensure did not replace with the pin (ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
 fi
 # D3: verify on a drifted MAC fails closed with the named line.
 echo 'ff:ff:ff:ff:ff:ff' > "$STATE/containers/egresslock-gateway-dev-llm.mac"
 o="$(egresslock verify dev-llm 2>&1)"; rc=$?
 if [[ "$rc" == 1 && "$o" == *"verify: gateway MAC is 'ff:ff:ff:ff:ff:ff', expected '${d_mac}'"* ]]; then
-    pass=$((pass+1)); echo "PASS: dev-llm verify fails closed on drifted MAC"
+    _sect_bump pass; echo "PASS: dev-llm verify fails closed on drifted MAC"
 else
-    fail=$((fail+1)); echo "FAIL: dev-llm verify drifted-MAC message (rc=$rc, out: $o)"
+    _sect_bump fail; echo "FAIL: dev-llm verify drifted-MAC message (rc=$rc, out: $o)"
 fi
 # Restore: re-ensure recreates the gateway with the pinned MAC and
 # verify is green again (the MAC gate closed the loop).
 check "ensure dev-llm restores pinned MAC" 0 egresslock ensure dev-llm
 grep -q "${d_mac}" "$STATE/containers/egresslock-gateway-dev-llm.mac" 2>/dev/null \
-    && { pass=$((pass+1)); echo "PASS: dev-llm re-ensure re-pins MAC"; } \
-    || { fail=$((fail+1)); echo "FAIL: dev-llm re-ensure did not re-pin MAC"; }
+    && { _sect_bump pass; echo "PASS: dev-llm re-ensure re-pins MAC"; } \
+    || { _sect_bump fail; echo "FAIL: dev-llm re-ensure did not re-pin MAC"; }
 # Generated gateway config uses the dev-llm subnet.
 check_out "dev-llm gateway config class ACL" "acl agent_class src 10.50.3.0/24" \
     cat "$STATE/containers-egresslock-gateway-dev-llm.allowlist.last"
 
 
-deep_pass=$pass; deep_fail=$fail
+section_end deep
 
 # --- EGL-55: verify missing-network message points at ensure (D55-2) ------
 # The network-inspect guard is the first check in verify_policy: with the
 # network absent, rc 1 and the hint names `egresslock ensure <profile>`
 # (bare egresslock spelling; never suggests `verify` itself).
-pass=0; fail=0
+section_begin egl55 "EGL-55 verify missing-network hint"
 rm -f "$STATE/networks/egresslock-local-dev"
 o="$(egresslock verify local-dev 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$o" == *"verify: network egresslock-local-dev missing"* \
     && "$o" == *"missing — run: egresslock ensure local-dev"* \
     && "$o" != *"egresslock verify"* ]] \
-    && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: D55-2 verify missing-network names ensure (rc=$rc, out: $o)"; }
+    && _sect_bump pass || { _sect_bump fail; echo "FAIL: D55-2 verify missing-network names ensure (rc=$rc, out: $o)"; }
 # The chain checks still fire normally when the network exists (existing
 # pins above cover them); restore the network so nothing downstream of
 # this section sees a half-removed fixture.
 egresslock ensure local-dev >/dev/null 2>&1
 [[ -f "$STATE/networks/egresslock-local-dev" ]] \
-    && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: EGL-55 fixture restore (local-dev network recreated)"; }
-egl55_pass=$pass; egl55_fail=$fail
+    && _sect_bump pass || { _sect_bump fail; echo "FAIL: EGL-55 fixture restore (local-dev network recreated)"; }
+section_end egl55
 
 # --- EGL-59: --help is operator UI — no ticket/process citations ----------
 # The dumped header (help = the leading comment block, R-014-1 F1) must
 # not leak ticket/decision IDs or ticket paths. The EGL-57 checks: block
 # (already ID-free) must still be present in full.
-pass=0; fail=0
+section_begin egl59 "EGL-59 help operator-UI"
 h_out="$(env -u EGRESSLOCK_CONF egresslock --help 2>&1)"; h_rc=$?
 if [[ "$h_rc" == 0 ]] && ! grep -qE 'ARC-[0-9]|EGL-[0-9]|docs/tickets/[A-Za-z0-9]' <<<"$h_out"; then
-    pass=$((pass+1))
+    _sect_bump pass
 else
-    fail=$((fail+1)); echo "FAIL: EGL-59 engine --help leaks ticket/process refs (rc=$h_rc)"
+    _sect_bump fail; echo "FAIL: EGL-59 engine --help leaks ticket/process refs (rc=$h_rc)"
 fi
 h_ok=1
 for c in "egresslock doctor " "egresslock-setup --doctor [--account]" \
@@ -3774,8 +3807,8 @@ for c in "egresslock doctor " "egresslock-setup --doctor [--account]" \
     grep -qF "$c" <<<"$h_out" || h_ok=0
 done
 [[ "$h_ok" == 1 ]] \
-    && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: EGL-57 checks: block dropped from engine --help"; }
-egl59_pass=$pass; egl59_fail=$fail
+    && _sect_bump pass || { _sect_bump fail; echo "FAIL: EGL-57 checks: block dropped from engine --help"; }
+section_end egl59
 
 # --- EGL-66: the anchor is hardened like the gateway -----------------------
 # D1: the anchor `podman run` carries --cap-drop=all +
@@ -3783,13 +3816,12 @@ egl59_pass=$pass; egl59_fail=$fail
 # anchor image is digest-pinned (never a floating third-party tag);
 # the resolution order itself (env > localhost/base:latest > fallback)
 # is unchanged.
-pass=0; fail=0
-e66() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl66 "EGL-66 anchor hardening + digest pin"
+e66() { assert "$@"; }
 
 S66="$TESTROOT/s66"; rm -rf "$S66"; mkdir -p "$S66"
 cat > "$S66/anch.conf" <<'EOF'
 profile s66 10.199.74.0/24
-    rule public-only
 EOF
 # D2: with no env override and no localhost/base in the mock store, the
 # anchor run names the digest-pinned fallback.
@@ -3830,14 +3862,14 @@ e66_anchor="$(grep -m1 'egresslock-anchor-s66' "$STATE/runlog" || true)"
     && e66 pass || e66 fail "env override still wins + anchor hardened (rc=$e66_rc, run line: $e66_anchor)"
 # Restore the harness default state for anything downstream.
 egresslock --config "$S66/anch.conf" teardown s66 >/dev/null 2>&1 || true
-egl66_pass=$pass; egl66_fail=$fail
+section_end egl66
 
 echo
 # --- EGL-91: anchor is the netns holder and starts first (D4); policy
 #     lands after the holder, before the gateway; first create is ONE
 #     transaction with rules (audit G-06/I-06, EGL-93 live finding) ---
-pass=0; fail=0
-a91() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin arc91 "ARC-91 first-create atomicity (counted; no RESULTS line — pre-existing hole, EGL-184-D2)"
+a91() { assert "$@"; }
 
 S91="$TESTROOT/s91"; rm -rf "$S91"; mkdir -p "$S91"
 : > "$STATE/images/localhost_egresslock-gateway_latest"
@@ -3911,15 +3943,15 @@ else
     a91 fail "warm ensure = one combined atomic flush+re-add (rc=$a91_rc entry=[$w91_entry])"
 fi
 
-arc91_pass=$pass; arc91_fail=$fail
+section_end arc91
 
 # --- EGL-114: ensure is non-disruptive on a converged profile (D2/D5) ----
 # D5 mock matrix: converged warm ensure must not restart or rm the
 # gateway/anchor; a changed allowlist/conf applies + restarts; a dead
 # gateway still replaces + applies; the EGL-91-D4 order pins above stay
 # green. opslog (lib.sh mock) records podman rm/run/restart argv.
-pass=0; fail=0
-a114() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl114 "EGL-114 converged-ensure gate"
+a114() { assert "$@"; }
 
 S114="$TESTROOT/s114"; rm -rf "$S114"; mkdir -p "$S114"
 : > "$STATE/images/localhost_egresslock-gateway_latest"
@@ -3995,13 +4027,13 @@ else
     a114 fail "dead gateway replaced + applied (rc=$rc, out: $o, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
 fi
 
-egl114_pass=$pass; egl114_fail=$fail
+section_end egl114
 
 # --- EGL-116: per-profile read-timeout knob (D1) -------------------------
 # Grammar rejects (config_error, exit 2) + the generated conf always
 # carries the explicit `read_timeout N seconds` line (default 900).
-pass=0; fail=0
-a116() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl116 "EGL-116 read-timeout knob"
+a116() { assert "$@"; }
 
 S116="$TESTROOT/s116"; rm -rf "$S116"; mkdir -p "$S116"
 
@@ -4057,13 +4089,13 @@ bad116 rt-dup $'profile a 10.199.90.0/24\n    read-timeout 60\n    read-timeout 
 bad116 rt-trailing $'profile a 10.199.90.0/24\n    read-timeout 60 extra' "unexpected trailing text after read-timeout"
 bad116 rt-outside $'read-timeout 60\nprofile a 10.199.90.0/24' "'read-timeout' outside a profile block"
 
-egl116_pass=$pass; egl116_fail=$fail
+section_end egl116
 
 # --- EGL-120: unresolvable allow-host — clean abort, hint, no nft dump ---
 # D1: the swallowed-die footgun must abort BEFORE nft (no malformed
 # rule consumed, no stacked nft error) and print the remediation hints.
-pass=0; fail=0
-a120() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl120 "EGL-120 resolve error-path shape"
+a120() { assert "$@"; }
 
 S120="$TESTROOT/s120"; rm -rf "$S120"; mkdir -p "$S120"
 cat > "$S120/gw.conf" <<'EOF'
@@ -4106,7 +4138,7 @@ fi
 grep -q 'rule allow-host nonexistent.example.test:8080' "$S120/gw.conf" \
     && a120 pass || a120 fail "failed ensure keeps the rule in the conf"
 
-egl120_pass=$pass; egl120_fail=$fail
+section_end egl120
 
 # --- EGL-141: bridge-scoped accepts + counted anti-spoof drop (D1/D2) ----
 # The compiler resolves the profile's live bridge token (the single
@@ -4116,8 +4148,8 @@ egl120_pass=$pass; egl120_fail=$fail
 # UNscoped. Stale-token churn must fail verify closed (named iifname
 # diff) and be repaired by ensure; an unconfirmable device fails the
 # emit by rc (no partial file, no nft transaction).
-pass=0; fail=0
-a141() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl141 "EGL-141 bridge-scoped accepts"
+a141() { assert "$@"; }
 
 S141="$TESTROOT/s141"; rm -rf "$S141"; mkdir -p "$S141"
 cat > "$S141/gw.conf" <<'EOF'
@@ -4125,25 +4157,20 @@ profile s141a 10.199.81.0/24
     rule allow-host git.example.test:2222
     rule gateway-only
     gateway 10.199.81.2 3128 s141-allowlist
-profile s141p 10.199.82.0/24
-    rule public-only
+profile s141b 10.199.82.0/24
 EOF
 : > "$S141/s141-allowlist"
 egresslock --config "$S141/gw.conf" ensure s141a >/dev/null 2>&1; a141_rc=$?
-egresslock --config "$S141/gw.conf" ensure s141p >/dev/null 2>&1; p141_rc=$?
 GW_CHAIN="$STATE/nft/egresslock.p_s141a"
-PUB_CHAIN="$STATE/nft/egresslock.p_s141p"
 mac141="$(printf '%s' 's141a|10.199.81.2' | sha256sum | cut -d' ' -f1)"
 mac141="02:${mac141:0:2}:${mac141:2:2}:${mac141:4:2}:${mac141:6:2}:${mac141:8:2}"
 
 # 1. Anti-spoof drop is FIRST in the chain (D2), iifname != shape.
 [[ "$(grep -m1 'counter' "$GW_CHAIN" 2>/dev/null)" == 'iifname != "podman1" ip saddr 10.199.81.0/24 counter drop' ]] \
     && a141 pass || a141 fail "anti-spoof drop first in gateway chain (head: $(grep -m1 'counter' "$GW_CHAIN" 2>/dev/null))"
-[[ "$(grep -m1 'counter' "$PUB_CHAIN" 2>/dev/null)" == 'iifname != "podman1" ip saddr 10.199.82.0/24 counter drop' ]] \
-    && a141 pass || a141 fail "anti-spoof drop first in public-only chain (head: $(grep -m1 'counter' "$PUB_CHAIN" 2>/dev/null))"
 
 # 2. Every saddr-keyed ACCEPT is iifname-scoped (established, DNS, pin,
-#    gateway hop, public terminal, exemption); terminal drop unscoped.
+#    gateway hop, exemption); terminal drop unscoped.
 grep -q 'ip saddr 10.199.81.0/24 iifname "podman1" ct state established,related counter accept' "$GW_CHAIN" \
     && a141 pass || a141 fail "established/related is iifname-scoped"
 grep -q 'ip saddr 10.199.81.0/24 iifname "podman1" ip daddr 10.199.81.1 meta l4proto { tcp, udp } th dport 53 counter accept' "$GW_CHAIN" \
@@ -4154,8 +4181,6 @@ grep -q 'ip saddr 10.199.81.0/24 iifname "podman1" ip daddr 10.199.81.2 tcp dpor
     && a141 pass || a141 fail "gateway hop is iifname-scoped"
 grep -q 'ip saddr 10.199.81.2 iifname "podman1" ether saddr '"$mac141"' counter accept' "$GW_CHAIN" \
     && a141 pass || a141 fail "exemption is saddr+iifname+MAC (EGL-123-D2 form kept)"
-grep -q 'ip saddr 10.199.82.0/24 iifname "podman1" counter accept' "$PUB_CHAIN" \
-    && a141 pass || a141 fail "public-only terminal accept is iifname-scoped"
 [[ "$(grep -c '^ip saddr 10.199.81.0/24 counter drop' "$GW_CHAIN")" == 1 ]] \
     && a141 pass || a141 fail "terminal drop stays saddr-keyed UNscoped (exactly one unscoped drop)"
 [[ "$(grep -cE '^ip saddr 10.199.81.0/24 (ip )?d?addr? ' "$GW_CHAIN")" == 0 ]] \
@@ -4217,14 +4242,32 @@ egresslock --config "$S141/gw.conf" ensure s141a >/dev/null 2>&1 || a141 fail "e
 grep -qE '^[[:space:]]*iifname != "podman1" ip saddr 10.199.81.0/24 counter drop' "$STATE/nft/last-transaction.nft" \
     && a141 pass || a141 fail "last transaction carries the anti-spoof drop first"
 
-egl141_pass=$pass; egl141_fail=$fail
+# 6. EGL-193: bare-profile chain shape (non-gateway). The
+#    public-only half of these pins retired with EGL-153;
+#    re-anchor on a no-rules profile. Same three EGL-141-D1/D2
+#    properties. Last-transaction pin above already fired on
+#    the gateway chain — this ensure overwrites
+#    last-transaction.nft after that pin.
+egresslock --config "$S141/gw.conf" ensure s141b >/dev/null 2>&1
+BARE_CHAIN="$STATE/nft/egresslock.p_s141b"
+
+[[ "$(grep -m1 'counter' "$BARE_CHAIN" 2>/dev/null)" == 'iifname != "podman1" ip saddr 10.199.82.0/24 counter drop' ]] \
+    && a141 pass || a141 fail "anti-spoof drop first in bare chain (head: $(grep -m1 'counter' "$BARE_CHAIN" 2>/dev/null))"
+grep -q 'ip saddr 10.199.82.0/24 iifname "podman1" ct state established,related counter accept' "$BARE_CHAIN" \
+    && a141 pass || a141 fail "bare established/related is iifname-scoped"
+grep -q 'ip saddr 10.199.82.0/24 iifname "podman1" ip daddr 10.199.82.1 meta l4proto { tcp, udp } th dport 53 counter accept' "$BARE_CHAIN" \
+    && a141 pass || a141 fail "bare DNS-to-bridge is iifname-scoped"
+[[ "$(grep -c '^ip saddr 10.199.82.0/24 counter drop' "$BARE_CHAIN")" == 1 ]] \
+    && a141 pass || a141 fail "bare terminal drop stays saddr-keyed UNscoped (exactly one unscoped drop)"
+
+section_end egl141
 
 # --- EGL-146: dstdomain -n on EVERY generated ACL (D1/D3) ----------------
 # Numeric-host (IP-literal) CONNECTs must fail the name match outright
 # (X-6 E8 rDNS adoption closed): both emit sites carry `-n`, and a grep
 # belt future-proofs any new dstdomain group.
-pass=0; fail=0
-a146() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl146 "EGL-146 dstdomain -n"
+a146() { assert "$@"; }
 
 S146="$TESTROOT/s146"; rm -rf "$S146"; mkdir -p "$S146"
 cat > "$S146/gw.conf" <<'EOF'
@@ -4253,14 +4296,14 @@ else
     a146 fail "grep belt: dstdomain line without -n in $(basename "$sq146" 2>/dev/null): $(grep 'dstdomain "' "$sq146" 2>/dev/null | grep -v ' -n ' | head -2 | tr '\n' '|')"
 fi
 
-egl146_pass=$pass; egl146_fail=$fail
+section_end egl146
 
 # --- EGL-147: trailing-dot entries are rejected (D1/D2/D3) ----------------
 # Reject at allow time (CLI) and fail closed at ensure (file); never
 # normalize, never warn. Leading-dot suffixes stay valid; request-side
 # trailing dots are gateway-normalized (out of scope here).
-pass=0; fail=0
-a147() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl147 "EGL-147 trailing-dot reject"
+a147() { assert "$@"; }
 
 S147="$TESTROOT/s147"; rm -rf "$S147"; mkdir -p "$S147"
 cat > "$S147/gw.conf" <<'EOF'
@@ -4369,7 +4412,7 @@ else
     a147 fail "conf parser trailing-dot reject for no-proxy (rc=$r147 out: $(printf '%s' "$o147" | tail -1))"
 fi
 
-egl147_pass=$pass; egl147_fail=$fail
+section_end egl147
 
 # --- EGL-139/EGL-140: revocation flush + tampered-pin verify detection ----
 # EGL-139-D2: disallow-host runs a fail-closed conntrack probe BEFORE the
@@ -4382,8 +4425,8 @@ egl147_pass=$pass; egl147_fail=$fail
 # verify compares each live daddr against it — chain-vs-record
 # divergence (tamper/torn record) fails closed named, while
 # record-vs-resolver movement stays the warn-only drift channel (D2).
-pass=0; fail=0
-a139() { if [[ "$1" == pass ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
+section_begin egl139 "EGL-139 conntrack revocation flush"
+a139() { assert "$@"; }
 
 EH="$TESTROOT/h139140"; rm -rf "$EH"; mkdir -p "$EH"
 cat > "$EH/direct.conf" <<'EOF'
@@ -4391,7 +4434,6 @@ profile two 10.199.60.0/24
     rule allow-host git.example.test:2222
     rule allow-host cache.example.test:8080
 profile plain 10.199.61.0/24
-    rule public-only
 EOF
 export EGRESSLOCK_CONF="$EH/direct.conf"
 env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock ensure two >/dev/null 2>&1
@@ -4563,12 +4605,38 @@ printf 'ipv4 2 tcp 6 431998 ESTABLISHED src=10.199.60.5 dst=192.0.2.10 sport=586
 touch "$ARCMOCK_STATE/nft/conntrack-delete-fails"
 d_out="$(env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-host two git.example.test:2222 2>&1)"; d_rc=$?
 rm -f "$ARCMOCK_STATE/nft/conntrack-delete-fails"
-if [[ "$d_rc" == 1 && "$d_out" == *"still has an ESTABLISHED conntrack entry"* ]] \
+if [[ "$d_rc" == 1 && "$d_out" == *"still has an ESTABLISHED conntrack entry"* \
+      && "$d_out" == *"$TESTROOT/bin/conntrack -D -p tcp --dport 2222 -d 192.0.2.10"* \
+      && "$d_out" != *"retry disallow-host"* \
+      && "$d_out" != *"sudo apt install conntrack"* ]] \
    && ! grep -q 'removed:' <<<"$d_out" \
    && ! grep -q 'rule allow-host git.example.test:2222' "$EH/direct.conf"; then
     a139 pass
 else
     a139 fail "surviving ESTABLISHED entry dies loudly (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
+fi
+
+# 13b. unreadable ct table after the swap -> die at the READ; the
+#      remediation is the table-read command itself, NOT the scoped -D
+#      (wrong tool for this failure), NOT apt install (the probe already
+#      proved the tool present), and NOT "retry disallow-host"
+#      (unrunnable post-swap: the conf line is already gone)
+#      (EGL-168-D2/D4).
+env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock allow-host two git.example.test:2222 >/dev/null 2>&1
+printf 'ipv4 2 tcp 6 431998 ESTABLISHED src=10.199.60.5 dst=192.0.2.10 sport=58666 dport=2222 src=192.0.2.10 dst=10.0.2.15 sport=2222 dport=58670 [ASSURED] mark=0 zone=0 use=2\n' > "$CTTABLE"
+touch "$ARCMOCK_STATE/nft/conntrack-table-unreadable"
+d_out="$(env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-host two git.example.test:2222 2>&1)"; d_rc=$?
+rm -f "$ARCMOCK_STATE/nft/conntrack-table-unreadable"
+if [[ "$d_rc" == 1 && "$d_out" == *"cannot read the rootless netns conntrack table"* \
+      && "$d_out" == *"podman unshare --rootless-netns cat /proc/net/nf_conntrack"* \
+      && "$d_out" != *"retry disallow-host"* \
+      && "$d_out" != *"sudo apt install conntrack"* \
+      && "$d_out" != *'-D -p tcp --dport 2222'* ]] \
+   && ! grep -q 'removed:' <<<"$d_out" \
+   && ! grep -q 'rule allow-host git.example.test:2222' "$EH/direct.conf"; then
+    a139 pass
+else
+    a139 fail "unreadable ct table dies at the read with the table-read hint (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
 fi
 
 # 14. SYN_SENT-class transients are ignored (late in-flight packets may
@@ -4587,61 +4655,121 @@ d_out="$(CONNTRACK_BIN=-x env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-
 [[ "$d_rc" == 1 && "$d_out" == *"must not start with '-'"* ]] \
     && a139 pass || a139 fail "CONNTRACK_BIN leading-dash guard (rc=$d_rc, out: $(echo "$d_out" | head -2 | tr '\n' '|'))"
 
+section_end egl139
+# EGL-184-D2: the egl140 witness stays manual — it aliases egl139's
+# counts, so egl139's hand capture line survives next to its snapshot.
 egl139_pass=$pass; egl139_fail=$fail
 egl140_pass=$egl139_pass; egl140_fail=$egl139_fail
 
-echo "RESULTS (engine config validation): $extra_pass passed, $extra_fail failed"
-echo "RESULTS (ARC-11 subnet hygiene): $arc11_pass passed, $arc11_fail failed"
-echo "RESULTS (ARC-12 DNS drift): $arc12_pass passed, $arc12_fail failed"
+# --- EGL-175: runtime-seam grep-gate (D8/D12) ------------------------------
+# The contract's acceptance test (internal_docs/RUNTIME_BACKEND_CONTRACT.md):
+# after extracting the rt_* adapter bodies, the rest of the engine has zero
+# podman command-word invocations. Carve-outs (D8, enumerated): full-line
+# comments; operator remediation strings (podman network rm / podman
+# unshare --rootless-netns nft delete / podman run --network / podman
+# system migrate); the netns-probe diagnostic strings (… --rootless-netns
+# true', quote-anchored so a real invocation never matches); the
+# ensure_network remediation string (podman network inspect '<name>');
+# doctor stdout keys ((podman MISSING) / (podman NetworkBackend: …));
+# command -v podman; the EGL-168 post-swap remediation strings
+# (podman unshare --rootless-netns cat /proc/net/nf_conntrack and the
+# scoped $bin -D hint, quote-tailed literals, never real invocations).
+# A hit fails the battery with the offending lines.
+section_begin egl175 "EGL-175 runtime seam"
+a175() { assert "$@"; }
+
+ENG175="$TREE_ROOT/egresslock"
+
+# D3: the frozen rt_* primitive vocabulary is present (the closed adapter
+# set the gate reasons about).
+missing175=""
+for p in rt_unshare rt_image_exists rt_network_ls rt_network_inspect \
+         rt_network_create rt_network_rm rt_ps rt_run rt_rm rt_exec \
+         rt_cp rt_restart rt_inspect rt_info rt_version rt_have_runtime; do
+    grep -qE "^${p}\(\)" "$ENG175" || missing175="$missing175 $p"
+done
+[[ -z "$missing175" ]] \
+    && a175 pass || a175 fail "rt_* primitive vocabulary incomplete:$missing175"
+
+# D8/D12: zero podman invocations outside rt_* bodies (carve-outs applied).
+# The awk state machine ends an rt_* body at the first column-0 '}'; every
+# rt_* function is written multi-line so that anchor is exact.
+gate175="$(awk '
+    /^rt_[a-z0-9_]+\(\)/ { in_rt=1 }
+    in_rt && /^\}/ { in_rt=0; next }
+    in_rt { next }
+    { print }
+' "$ENG175" \
+  | grep -vE "^[[:space:]]*#" \
+  | grep -vE "command -v podman" \
+  | grep -vE "podman (network rm|unshare --rootless-netns nft delete|run --network|system migrate)" \
+  | grep -vE "podman unshare --rootless-netns true'" \
+  | grep -vE 'podman unshare --rootless-netns cat /proc/net/nf_conntrack"' \
+  | grep -vE 'podman unshare --rootless-netns \$bin -D -p tcp' \
+  | grep -vE "podman network inspect '" \
+  | grep -vE "\(podman (MISSING|NetworkBackend)" \
+  | grep -vE "\(podman cp;" \
+  | grep -nE '(^|[[:space:]`$(])podman([[:space:]|&;<>]|$)' || true)"
+[[ -z "$gate175" ]] \
+    && a175 pass || a175 fail "podman invocation outside rt_* (EGL-175 gate):
+$gate175"
+
+section_end egl175
+
+results_emit extra
+results_emit arc11
+results_emit arc12
 echo "RESULTS (ARC-14 site defaults): $arc14_pass passed, $arc14_fail failed"
-echo "RESULTS (ARC-16 kit surface): $arc16_pass passed, $arc16_fail failed"
-echo "RESULTS (ARC-20 config required): $arc20_pass passed, $arc20_fail failed"
-echo "RESULTS (ARC-25 root guard): $arc25_pass passed, $arc25_fail failed"
-echo "RESULTS (ARC-26 netns probe): $arc26_pass passed, $arc26_fail failed"
-echo "RESULTS (ARC-49 nft-temp): $arc49_pass passed, $arc49_fail failed"
-echo "RESULTS (ARC-24 default probe): $arc24_pass passed, $arc24_fail failed"
-echo "RESULTS (ARC-35 init): $arc35_pass passed, $arc35_fail failed"
-echo "RESULTS (ARC-30 disallow): $arc30_pass passed, $arc30_fail failed"
-echo "RESULTS (ARC-46 allow/disallow batch): $arc46_pass passed, $arc46_fail failed"
-echo "RESULTS (BUG-002 no-trailing-newline allow): $arc_b2_pass passed, $arc_b2_fail failed"
-echo "RESULTS (ARC-37 conf discovery): $arc37_pass passed, $arc37_fail failed"
-echo "RESULTS (ARC-38 allow-host): $arc38_pass passed, $arc38_fail failed"
-echo "RESULTS (ARC-31 denied filter): $arc31_pass passed, $arc31_fail failed"
-echo "RESULTS (ARC-41 denied HTTP-origin): $arc41_pass passed, $arc41_fail failed"
-echo "RESULTS (ARC-42 denied window): $arc42_pass passed, $arc42_fail failed"
-echo "RESULTS (ARC-43 allowlist): $arc43_pass passed, $arc43_fail failed"
-echo "RESULTS (ARC-44 proxy-env tokens): $arc44_pass passed, $arc44_fail failed"
-echo "RESULTS (ARC-50 sinks): $arc50_pass passed, $arc50_fail failed"
-echo "RESULTS (ARC-56 GW_DNS): $arc56_pass passed, $arc56_fail failed"
-echo "RESULTS (ARC-58 path): $arc58_pass passed, $arc58_fail failed"
-echo "RESULTS (ARC-51 allowlist literals): $arc51_pass passed, $arc51_fail failed"
-echo "RESULTS (ARC-59 leading-dash): $arc59_pass passed, $arc59_fail failed"
-echo "RESULTS (ARC-57 denied emit filter): $arc57_pass passed, $arc57_fail failed"
-echo "RESULTS (EGL-18 IP destinations): $egl18_pass passed, $egl18_fail failed"
-echo "RESULTS (ARC-54 legacy table): $arc54_pass passed, $arc54_fail failed"
-echo "RESULTS (ARC-60 runtime sweep + cutover probe): $arc60_pass passed, $arc60_fail failed"
-echo "RESULTS (ARC-32 pre-OSS hardening): $arc32_pass passed, $arc32_fail failed"
-echo "RESULTS (ARC-66 runtime table sweep): $arc66_pass passed, $arc66_fail failed"
-echo "RESULTS (ARC-67 network ls): $arc67_pass passed, $arc67_fail failed"
-echo "RESULTS (ARC-71 probe dispatch): $arc71_pass passed, $arc71_fail failed"
-echo "RESULTS (ARC-69 output honesty): $arc69_pass passed, $arc69_fail failed"
-echo "RESULTS (EGL-31 output hygiene): $egl31_pass passed, $egl31_fail failed"
-echo "RESULTS (EGL-45 doctor): $egl45_pass passed, $egl45_fail failed"
-echo "RESULTS (EGL-59 help operator-UI): $egl59_pass passed, $egl59_fail failed"
-echo "RESULTS (ARC-74 deep state semantics, synthetic): $deep_pass passed, $deep_fail failed"
-echo "RESULTS (EGL-55 verify missing-network hint): $egl55_pass passed, $egl55_fail failed"
-echo "RESULTS (EGL-66 anchor hardening + digest pin): $egl66_pass passed, $egl66_fail failed"
-echo "RESULTS (EGL-117 resolution disclosure): $egl117_pass passed, $egl117_fail failed"
-echo "RESULTS (EGL-114 converged-ensure gate): $egl114_pass passed, $egl114_fail failed"
-echo "RESULTS (EGL-116 read-timeout knob): $egl116_pass passed, $egl116_fail failed"
-echo "RESULTS (EGL-120 resolve error-path shape): $egl120_pass passed, $egl120_fail failed"
-echo "RESULTS (EGL-141 bridge-scoped accepts): $egl141_pass passed, $egl141_fail failed"
-echo "RESULTS (EGL-146 dstdomain -n): $egl146_pass passed, $egl146_fail failed"
-echo "RESULTS (EGL-147 trailing-dot reject): $egl147_pass passed, $egl147_fail failed"
-echo "RESULTS (EGL-139 conntrack revocation flush): $egl139_pass passed, $egl139_fail failed"
+results_emit arc16
+results_emit arc20
+results_emit arc25
+results_emit arc26
+results_emit arc49
+results_emit arc24
+results_emit arc35
+results_emit arc30
+results_emit arc46
+results_emit arc_b2
+results_emit arc37
+results_emit arc38
+results_emit arc31
+results_emit arc41
+results_emit arc42
+results_emit arc43
+results_emit arc44
+results_emit arc50
+results_emit arc56
+results_emit arc58
+results_emit arc51
+results_emit arc59
+results_emit arc57
+results_emit egl18
+results_emit arc54
+results_emit arc60
+results_emit arc32
+results_emit arc66
+results_emit arc67
+results_emit arc71
+results_emit arc69
+results_emit egl31
+results_emit egl45
+results_emit egl59
+results_emit deep
+results_emit egl55
+results_emit egl66
+results_emit egl117
+results_emit egl114
+results_emit egl116
+results_emit egl120
+results_emit egl141
+results_emit egl146
+results_emit egl147
+results_emit egl139
 echo "RESULTS (EGL-140 pin record witness): $egl140_pass passed, $egl140_fail failed"
-total_fail=$((extra_fail + arc11_fail + arc12_fail + arc14_fail + arc16_fail + arc20_fail + arc25_fail + arc26_fail + arc49_fail + arc91_fail + arc24_fail + arc35_fail + arc30_fail + arc46_fail + arc_b2_fail + arc37_fail + arc38_fail + arc31_fail + arc41_fail + arc42_fail + arc43_fail + arc44_fail + arc50_fail + arc56_fail + arc58_fail + arc51_fail + arc59_fail + arc57_fail + egl18_fail + egl45_fail + arc54_fail + arc52_fail + arc60_fail + arc32_fail + arc66_fail + arc67_fail + arc71_fail + arc69_fail + egl31_fail + deep_fail + egl55_fail + egl59_fail + egl66_fail + egl117_fail + egl114_fail + egl116_fail + egl120_fail + egl141_fail + egl146_fail + egl147_fail + egl139_fail))
-# EGL-99: TOTAL line gains the skip count (0 here — the engine harness
-# has no gated asserts) and the tree-shape tag, matching test-kit.sh.
-echo "RESULTS TOTAL: $((extra_pass + arc11_pass + arc12_pass + arc14_pass + arc16_pass + arc20_pass + arc25_pass + arc26_pass + arc49_pass + arc91_pass + arc24_pass + arc35_pass + arc30_pass + arc46_pass + arc_b2_pass + arc37_pass + arc38_pass + arc31_pass + arc41_pass + arc42_pass + arc43_pass + arc44_pass + arc50_pass + arc56_pass + arc58_pass + arc51_pass + arc59_pass + arc57_pass + egl18_pass + arc54_pass + arc52_pass + arc60_pass + arc32_pass + arc66_pass + arc67_pass + arc71_pass + arc69_pass + egl31_pass + egl45_pass + egl59_pass + deep_pass + egl55_pass + egl66_pass + egl117_pass + egl114_pass + egl116_pass + egl120_pass + egl141_pass + egl146_pass + egl147_pass + egl139_pass)) passed, $total_fail failed$(skip_summary) ($(tree_shape_tag))"
+results_emit egl175
+# EGL-184: the hand-maintained 52-term sums are replaced by the register:
+# counted snapshots plus the declared arc14 external (own counters via the
+# untouched a14 delegate, EGL-179-D3). Fail-closed completeness per
+# EGL-184-D4; the TOTAL line keeps the EGL-99 skip count + tree-shape tag.
+results_total "$arc14_pass" "$arc14_fail"
 [[ "$total_fail" -eq 0 ]]

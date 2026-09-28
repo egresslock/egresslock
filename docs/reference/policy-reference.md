@@ -7,7 +7,7 @@ and which mechanism allows which destination?"** For the practical
 [grow-the-policy](../quickstart/grow-the-policy.md).
 
 **On this page:** [Destination → mechanism decision table](#destination--mechanism-decision-table) ·
-[Profile conf](#profile-conf) · [`rule public-only` in detail](#rule-public-only-in-detail) ·
+[Profile conf](#profile-conf) ·
 [Concepts](#concepts) · [Runtime and verification](#runtime-and-verification) ·
 [Account ownership](#account-ownership) · [File names (the convention)](#file-names-the-convention) ·
 [Rules to keep straight](#rules-to-keep-straight) · [Profile lifecycle](#profile-lifecycle) ·
@@ -25,7 +25,6 @@ and which mechanism allows which destination?"** For the practical
 | non-HTTP service on the SAME host | nft allow-host, IP literal | `allow-host main 169.254.1.2:8000` | `169.254.1.2` is pasta's host address (podman map-guest-addr); the NAME cannot be pinned — [paths-and-signatures](paths-and-signatures.md); recipe: [reach-a-host-service](../quickstart/reach-a-host-service.md) |
 | domain that must NOT go through the proxy | nft allow-host + `no-proxy` | `allow-host` + `no-proxy <host>` in the conf | for gateway profiles whose clients honor proxy env |
 | IP/CIDR range | not yet supported | — | (planned: conf rule, nft-only — dstdomain cannot express CIDRs) |
-| all public IPv4 | `rule public-only` | conf | still drops RFC1918/link-local/etc.; CGNAT/bogon gap remains |
 
 ## Profile conf
 
@@ -40,30 +39,10 @@ content fails closed with exit 2. Host fields may use `${VAR}` /
 |---|---|
 | `profile <name> <cidr>` | starts a profile block; IPv4 CIDR, prefixlen 8-29, canonical network address |
 | `rule allow-host <host>:<port>` | direct host:port allow (repeatable; resolved at ensure time) |
-| `rule public-only` | accept all public IPv4 (cannot combine with allow-host/gateway) |
 | `rule gateway-only` | egress only through the profile's gateway (requires a `gateway` directive) |
 | `gateway <ip> <port> <file>` | static gateway IP inside the subnet + Squid port + allowlist file (conf-relative unless absolute) |
 | `no-proxy <host,...>` | extra NO_PROXY entries (hosts the profile may reach directly) |
 | `read-timeout <seconds>` | gateway profiles: Squid `read_timeout` override, positive integer seconds (default 900 — Squid's stock 15 minutes). Raise it for long silent non-streaming calls (LLM completions); lower it for CI-style tight failure timing. The generated gateway config always carries the explicit `read_timeout <N> seconds` line. See [troubleshooting: long request dies at exactly 15m00](../troubleshooting/long-request-15m.md) |
-
-## `rule public-only` in detail
-
-`rule public-only` accepts all public IPv4 egress while still dropping
-RFC1918 (private), link-local, multicast, and broadcast. The emitted
-drop set is exactly `10/8`, `172.16/12`, `192.168/16`, `169.254/16`,
-`224/4`, and `255.255.255.255` — other special-use ranges are **not**
-dropped: loopback (`127/8`), CGNAT (`100.64/10`), `0/8`, benchmark
-(`198.18/15`), reserved (`240/4`). It
-cannot be combined with `allow-host` or a gateway — the engine rejects
-the contradiction with exit 2.
-
-```
-# in main.conf
-profile public 10.199.5.0/24
-    rule public-only
-```
-
-To remove: delete the rule line from the conf, then `ensure <profile>`.
 
 ## Concepts
 
@@ -243,8 +222,6 @@ accept` rule enforced independently of the HTTP gateway.
   proves the data-path state is gone before printing `removed:`. A
   `disallow-host` that cannot prove severance fails loudly with the
   state disclosed; it requires the `conntrack` tool.
-- **`public-only` conflict** — a `public-only` profile cannot take
-  `allow-host` (contradictory; exit 2).
 - **What "direct" changes (and what it does not)** — an allow-host rule
   bypasses the Squid gateway but does NOT widen egress: the terminal
   scoped drop still applies and fail-closed is unchanged. What moves is
@@ -254,9 +231,8 @@ accept` rule enforced independently of the HTTP gateway.
   hang, not a 403), and DNS drift is a verify warning until you re-run
   `ensure`. It exists because it is the only way to allow non-HTTP
   egress (e.g. git-over-SSH), which the HTTP(S) gateway cannot proxy —
-  everything else should pass the gateway's allowlist or a
-  `public-only` rule. The failure signatures:
-  [paths-and-signatures](paths-and-signatures.md).
+  everything else should pass the gateway's allowlist. The failure
+  signatures: [paths-and-signatures](paths-and-signatures.md).
 
 ### HTTP vs non-HTTP: gateway vs direct
 

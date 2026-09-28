@@ -16,8 +16,7 @@ Please report privately:
   workload reading or editing its own policy);
 - behavior that is **worse than** an accepted risk the threat model
   already documents on purpose — for example beyond T7 (same-profile
-  L2 is open), T14 (the `public-only` drop set is exactly the ranges
-  listed there), or T17 (name rebind through the proxy). If you find
+  L2 is open) or T17 (name rebind through the proxy). If you find
   one of those behaving exactly as documented, it is not a novel
   vulnerability — but a report explaining why a documented acceptance
   is unsafe in a way the model missed is still welcome.

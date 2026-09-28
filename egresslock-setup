@@ -1226,18 +1226,31 @@ run_as_account() { # $@ = command words
     fi
 }
 
-# EGL-38-D2/D38-5/D38-7.2: full-state doctor — read-only; one
-# `key: value` line per check (greppable, like the engine's doctor,
-# EGL-45/D45-2), each missing required item followed by the command
-# that fixes it. Host slice (no --account): engine + unit templates.
-# Account slice adds conf parse, unit.env match, timer, linger, and
-# (for gateway confs) the user manager and the gateway image, plus one
-# advisory profile-networks row (EGL-55-D1; rc-neutral). AppArmor
-# is one pointer line — the pasta slice stays --apparmor-check's
-# (EGL-32 strings are never duplicated here). rc 1 when any required
-# item is missing.
-doctor_kit() {
-    local rc=0 list_out lg ud duid conf_ok=0
+# EGL-177-D1/D2: doctor_kit decomposed into per-check helpers — one
+# function per check-group; order = echo order = card order. Each
+# helper returns its own rc bit (0 = clean or advisory-only, 1 = a
+# required item in its group failed); doctor_kit remains the public
+# aggregator and sticky-ors the bits. Shared state (rc, list_out, lg,
+# ud, duid, conf_ok) stays aggregator-owned — helpers that set
+# ud/list_out/conf_ok/lg/duid write the enclosing locals directly (no
+# namerefs, no new bash-version floor); systemctl_bin keeps its single
+# script-scope assignment inside the health block.
+# Second-tier dynamic-scope coupling (not aggregator-owned):
+#   e84_etc — local in kit_check_verify_units, read by
+#     kit_check_verify_service and kit_check_verify_timer_shadow
+#     (shadow-path prefix);
+#   e84_reported — local assoc in kit_check_verify_units, written
+#     and read by kit_check_verify_failed (dedup failed-unit rows);
+#   systemctl_bin — assigned in kit_check_verify_units (health
+#     block); kit_check_timer and kit_check_gateway require that
+#     assignment to have run first (doctor_kit call order). Each
+#     of those readers/writers is a single call site today.
+# The R1/R3/R4/R5
+# decision comments ride the helper that carries their rows (the
+# EGL-176 comment-rides-code precedent).
+
+kit_check_engine() {
+    local rc=0
     if [[ -f "$prefix/egresslock" ]]; then
         echo "kit engine: present ($prefix)"
     else
@@ -1245,6 +1258,11 @@ doctor_kit() {
         echo "  fix: .deb hosts: reinstall the current package; prefix installs: re-run install-kit.sh (or pass --prefix)"
         rc=1
     fi
+    return $rc
+}
+
+kit_check_unit_templates() {
+    local rc=0
     ud="${EGRESSLOCK_UNIT_DIR:-${EGRESSLOCK_DEFAULT_UNIT_DIR:-/etc/systemd/system}}"
     # EGL-102-D6-R3 (sibling symmetry + partial shapes): the template
     # check decomposes per name (service/timer) and per dir (/etc probe,
@@ -1275,6 +1293,189 @@ doctor_kit() {
         echo "  fix: .deb hosts: reinstall the package; prefix installs: re-run install-kit.sh (installs the verify unit templates)"
         rc=1
     fi
+    return $rc
+}
+
+# classifier dup (EGL-183-D1 coder pick): the 203/exit-1/other case block
+# appeared twice verbatim (sweep + explicit --account probe); collapsed
+# into a tiny in-file echo helper rather than a documented copy. Emits
+# the e84_why string; emits no doctor row.
+# Not a doctor check — always rc 0; callers capture stdout
+# (`e84_why="$(kit_check_verify_fail_why …)"`) and discard rc.
+kit_check_verify_fail_why() {
+    case "$1" in
+        203) echo "start failure (203/EXEC — the ExecStart binary is missing/broken)" ;;
+        1)   echo "exit 1: verify drift, or the entry wrapper failed (missing unit.env conf, missing engine, broken netns — journal shows which)" ;;
+        *)   echo "failed (exit status ${1:-unknown})" ;;
+    esac
+}
+
+kit_check_verify_service() {
+    local rc=0
+    local e84_frag e84_deb e84_es e84_shadow_dir e84_shadow_tmr e84_shadow_rm e84_deb_libdir e84_es_path
+    # 1. Which unit file does systemd ACTUALLY load? (the account
+    #    instance when set — systemd resolves it to the template —
+    #    else the template name). An /etc fragment overriding the
+    #    deb's /usr/lib unit is the EGL-83 incident shape.
+    e84_frag=""
+    if [[ -n "$account" ]]; then
+        e84_frag="$("$systemctl_bin" show -p FragmentPath --value "egresslock-verify@$account.service" 2>/dev/null || true)"
+    fi
+    if [[ -z "$e84_frag" ]]; then
+        e84_frag="$("$systemctl_bin" show -p FragmentPath --value 'egresslock-verify@.service' 2>/dev/null || true)"
+    fi
+    if [[ -n "$e84_frag" ]]; then
+        e84_deb="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.service"
+        if [[ "$e84_frag" == "$e84_etc"/* && -f "$e84_deb" && ! "$e84_deb" -ef "$e84_frag" ]]; then
+            echo "verify unit: SHADOWED — systemd loads $e84_frag, not the deb's $e84_deb (/etc precedence; a leftover prefix-install template defeats the deb's unit)"
+            # EGL-102-D6-R5 classification (mirrors the postinst guard):
+            #   prefix-live  — ExecStart dir carries kit markers (a live
+            #                  prefix kit, wherever it is) -> remove that
+            #                  kit (it also removes these /etc templates);
+            #   product-shape — ExecStart is */egresslock/egresslock-verify
+            #                  but the kit is gone -> stale /etc templates,
+            #                  a single rm clears them;
+            #   unknown      — ExecStart outside a kit dir / missing ->
+            #                  possibly-user file: never prescribe a blind
+            #                  rm; disclose and have the operator inspect.
+            # The .deb needs no reinstall in any branch.
+            e84_es_path="$(sed -n 's/^ExecStart=//p' "$e84_frag" 2>/dev/null | head -1 | awk '{print $1}')"
+            e84_shadow_dir="${e84_es_path%/*}"
+            e84_deb_libdir="$(dirname "$(dirname "$e84_deb")")/egresslock"
+            if [[ -n "$e84_shadow_dir" && "$e84_shadow_dir" != "$e84_deb_libdir" \
+                    && ( -e "$e84_shadow_dir/egresslock" || -e "$e84_shadow_dir/VERSION" ) ]]; then
+                echo "  fix: the prefix kit at $e84_shadow_dir is still installed — remove it: uninstall-kit.sh --prefix $e84_shadow_dir (from the checkout/tarball that installed it; it also removes these stale /etc templates). The .deb needs no reinstall."
+            elif [[ -n "$e84_es_path" && "$e84_es_path" == */egresslock/egresslock-verify ]]; then
+                e84_shadow_rm="$e84_frag"
+                e84_shadow_tmr="${e84_frag%.service}.timer"
+                if [[ "$e84_frag" == *.service && "$e84_shadow_tmr" == "$e84_etc"/* && -e "$e84_shadow_tmr" ]]; then
+                    e84_shadow_rm+=" $e84_shadow_tmr"
+                fi
+                echo "  fix: stale /etc templates only (the kit that installed them is gone) — remove them: sudo rm $e84_shadow_rm && sudo systemctl daemon-reload. The .deb needs no reinstall."
+            else
+                e84_shadow_tmr="${e84_frag%.service}.timer"
+                echo "  fix: $e84_frag does not look like an egresslock product template (ExecStart outside a kit directory) — it may be yours; inspect it before removing anything. If it is a leftover, sudo rm $e84_frag && sudo systemctl daemon-reload; while it shadows the deb's unit, the package's ExecStart is not in effect."
+            fi
+            rc=1
+        else
+            e84_es="$(sed -n 's/^ExecStart=//p' "$e84_frag" 2>/dev/null | head -1 | awk '{print $1}' || true)"
+            if [[ -z "$e84_es" ]]; then
+                echo "verify unit: ExecStart missing in $e84_frag"
+                echo "  fix: the template at $e84_frag is corrupted — reinstall the channel that owns it (prefix installs: re-run install-kit.sh; .deb hosts: reinstall the package)"
+                rc=1
+            elif [[ ! -f "$e84_es" || ! -x "$e84_es" ]]; then
+                echo "verify unit: ExecStart target missing/not executable: $e84_es (loaded from $e84_frag)"
+                echo "  fix: the unit points at an uninstalled/renamed kit — reinstall that channel (uninstalled prefix: re-run install-kit.sh, or switch to the .deb)"
+                rc=1
+            fi
+        fi
+    elif [[ -f "$ud/egresslock-verify@.service" ]]; then
+        echo "verify unit fragment: not resolved by systemctl (template file present at $ud/egresslock-verify@.service); ExecStart/shadow rows skipped"
+        echo "  check: sudo systemctl daemon-reload and re-run --doctor — systemd has not loaded the template (fresh install without a reload, or systemd is not running)"
+    fi
+    return $rc
+}
+
+kit_check_verify_timer_shadow() {
+    local rc=0
+    local e84_tfrag e84_tdeb
+    # 1b. Timer-template shadow (R3 sibling symmetry: the service
+    #     fragment gets a shadow row, so the timer template must too).
+    #     An /etc timer template shadows the deb's timer (load
+    #     precedence) and can silently replace its OnCalendar. R5
+    #     classification: byte-identical to the deb's timer = stale
+    #     product copy (benign; postinst cleans it) — no row;
+    #     anything else is possibly-user: disclose, rc 1 (a shadowed
+    #     timer with foreign schedule is a dead/lying drift signal),
+    #     never prescribe a blind rm. Drop-ins (*.timer.d/) are NOT
+    #     examined here (declared unwalked on the map card).
+    e84_tfrag="$("$systemctl_bin" show -p FragmentPath --value 'egresslock-verify@.timer' 2>/dev/null || true)"
+    if [[ "$e84_tfrag" == "$e84_etc"/* && "$e84_tfrag" == *.timer ]]; then
+        e84_tdeb="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.timer"
+        if [[ -f "$e84_tdeb" && ! "$e84_tdeb" -ef "$e84_tfrag" ]] && ! cmp -s "$e84_tfrag" "$e84_tdeb"; then
+            echo "verify timer template: SHADOWED — systemd loads $e84_tfrag, not the deb's $e84_tdeb (/etc precedence)"
+            echo "  fix: $e84_tfrag does not match this package's timer template and may be yours — inspect it before removing anything; if it is a leftover from another install, sudo rm $e84_tfrag && sudo systemctl daemon-reload. While it shadows the deb's timer, the package's schedule is not in effect."
+            rc=1
+        fi
+    fi
+    return $rc
+}
+
+kit_check_verify_failed() {
+    local rc=0
+    local -a e84_failed=()
+    local e84_u e84_status e84_why
+    # 2. Failed-instance sweep: every firing of a failed verify unit
+    #    is a dead drift signal. Distinguish a start failure (203/EXEC)
+    #    from verify drift (exit 1) in the row text; both are
+    #    PROBLEMs (D3). Point at journalctl, never fix from here.
+    while IFS= read -r e84_u; do
+        [[ -z "$e84_u" ]] && continue
+        e84_u="${e84_u%%[[:space:]]*}"
+        e84_failed+=("$e84_u")
+    done < <("$systemctl_bin" list-units --failed --no-legend -- 'egresslock-verify@*' 2>/dev/null || true)
+    for e84_u in "${e84_failed[@]:-}"; do
+        [[ -z "$e84_u" ]] && continue
+        e84_status="$("$systemctl_bin" show -p ExecMainStatus --value "$e84_u" 2>/dev/null || true)"
+        e84_why="$(kit_check_verify_fail_why "$e84_status")"
+        e84_reported["$e84_u"]=1
+        # EGL-102-D6-R1 scope attribution: account-less, the sweep is
+        # the kit/host slice — every failed egresslock-verify@* instance
+        # is in scope (the 203-on-any-account class). With --account,
+        # other accounts' failures are printed, labeled out-of-account,
+        # and rc-NEUTRAL — rc is driven only by the invoked slice.
+        if [[ -n "$account" && "$e84_u" != "egresslock-verify@$account.service" \
+                && "$e84_u" != "egresslock-verify@$account.timer" ]]; then
+            echo "verify unit $e84_u: FAILED — $e84_why (out-of-account: not part of --account $account's slice; rc unaffected)"
+            echo "  inspect: journalctl -u $e84_u (or: sudo egresslock-setup --doctor --account <that account>)"
+        else
+            echo "verify unit $e84_u: FAILED — $e84_why"
+            echo "  inspect: journalctl -u $e84_u"
+            rc=1
+        fi
+    done
+    # 3. The --account instance is probed explicitly even when the
+    #    systemd listing came back empty (D2).
+    if [[ -n "$account" ]]; then
+        for e84_u in "egresslock-verify@$account.service" "egresslock-verify@$account.timer"; do
+            [[ -n "${e84_reported[$e84_u]:-}" ]] && continue
+            if "$systemctl_bin" is-failed "$e84_u" >/dev/null 2>&1; then
+                e84_status="$("$systemctl_bin" show -p ExecMainStatus --value "$e84_u" 2>/dev/null || true)"
+                e84_why="$(kit_check_verify_fail_why "$e84_status")"
+                echo "verify unit $e84_u: FAILED — $e84_why"
+                echo "  inspect: journalctl -u $e84_u"
+                rc=1
+            fi
+        done
+    fi
+    return $rc
+}
+
+kit_check_verify_dangling() {
+    local rc=0
+    local e84_want e84_wantname
+    # 4. Dangling timer enablement: a wants symlink whose template is
+    #    gone makes systemd list a not-found timer forever. Name it;
+    #    never auto-remove. Pre-rename agent-network-verify@* leftovers
+    #    are historical junk and rc-neutral (D3).
+    if [[ -d "$ud/timers.target.wants" ]]; then
+        for e84_want in "$ud/timers.target.wants"/*.timer; do
+            [[ -L "$e84_want" && ! -e "$e84_want" ]] || continue
+            e84_wantname="$(basename "$e84_want")"
+            if [[ "$e84_wantname" == agent-network-verify@* ]]; then
+                echo "leftover pre-rename timer enablement (template gone): $e84_want — historical junk, not a live signal; remove the symlink manually if desired"
+            else
+                echo "verify timer: DANGLING enablement — $e84_want points at a missing template ($e84_wantname)"
+                echo "  systemd lists a not-found timer forever; remove the symlink: sudo rm $e84_want"
+                rc=1
+            fi
+        done
+    fi
+    return $rc
+}
+
+kit_check_verify_units() {
+    local rc=0
     # EGL-84-D2/D4/D5: verify-unit health rows — the drift signal can
     # itself be dead (203/EXEC start failures, an /etc fragment shadowing
     # the deb's unit, ExecStart pointing at an uninstalled prefix,
@@ -1289,172 +1490,31 @@ doctor_kit() {
         echo "verify units: skipped (systemctl not found)"
     else
         local -A e84_reported=()
-        local -a e84_failed=()
-        local e84_frag e84_deb e84_es e84_u e84_status e84_why e84_want e84_wantname
-        local e84_shadow_dir e84_shadow_tmr e84_shadow_rm e84_deb_libdir e84_etc
-        local e84_es_path e84_tfrag e84_tdeb
         # EGRESSLOCK_ETC_UNIT_DIR: harness-only override of the /etc
         # load-precedence path in the shadow gates (mock battery; unset
         # = production /etc/systemd/system, same hook family as
         # EGRESSLOCK_DEB_UNIT_DIR).
-        e84_etc="${EGRESSLOCK_ETC_UNIT_DIR:-/etc/systemd/system}"
-        # 1. Which unit file does systemd ACTUALLY load? (the account
-        #    instance when set — systemd resolves it to the template —
-        #    else the template name). An /etc fragment overriding the
-        #    deb's /usr/lib unit is the EGL-83 incident shape.
-        e84_frag=""
-        if [[ -n "$account" ]]; then
-            e84_frag="$("$systemctl_bin" show -p FragmentPath --value "egresslock-verify@$account.service" 2>/dev/null || true)"
-        fi
-        if [[ -z "$e84_frag" ]]; then
-            e84_frag="$("$systemctl_bin" show -p FragmentPath --value 'egresslock-verify@.service' 2>/dev/null || true)"
-        fi
-        if [[ -n "$e84_frag" ]]; then
-            e84_deb="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.service"
-            if [[ "$e84_frag" == "$e84_etc"/* && -f "$e84_deb" && ! "$e84_deb" -ef "$e84_frag" ]]; then
-                echo "verify unit: SHADOWED — systemd loads $e84_frag, not the deb's $e84_deb (/etc precedence; a leftover prefix-install template defeats the deb's unit)"
-                # EGL-102-D6-R5 classification (mirrors the postinst guard):
-                #   prefix-live  — ExecStart dir carries kit markers (a live
-                #                  prefix kit, wherever it is) -> remove that
-                #                  kit (it also removes these /etc templates);
-                #   product-shape — ExecStart is */egresslock/egresslock-verify
-                #                  but the kit is gone -> stale /etc templates,
-                #                  a single rm clears them;
-                #   unknown      — ExecStart outside a kit dir / missing ->
-                #                  possibly-user file: never prescribe a blind
-                #                  rm; disclose and have the operator inspect.
-                # The .deb needs no reinstall in any branch.
-                e84_es_path="$(sed -n 's/^ExecStart=//p' "$e84_frag" 2>/dev/null | head -1 | awk '{print $1}')"
-                e84_shadow_dir="${e84_es_path%/*}"
-                e84_deb_libdir="$(dirname "$(dirname "$e84_deb")")/egresslock"
-                if [[ -n "$e84_shadow_dir" && "$e84_shadow_dir" != "$e84_deb_libdir" \
-                        && ( -e "$e84_shadow_dir/egresslock" || -e "$e84_shadow_dir/VERSION" ) ]]; then
-                    echo "  fix: the prefix kit at $e84_shadow_dir is still installed — remove it: uninstall-kit.sh --prefix $e84_shadow_dir (from the checkout/tarball that installed it; it also removes these stale /etc templates). The .deb needs no reinstall."
-                elif [[ -n "$e84_es_path" && "$e84_es_path" == */egresslock/egresslock-verify ]]; then
-                    e84_shadow_rm="$e84_frag"
-                    e84_shadow_tmr="${e84_frag%.service}.timer"
-                    if [[ "$e84_frag" == *.service && "$e84_shadow_tmr" == "$e84_etc"/* && -e "$e84_shadow_tmr" ]]; then
-                        e84_shadow_rm+=" $e84_shadow_tmr"
-                    fi
-                    echo "  fix: stale /etc templates only (the kit that installed them is gone) — remove them: sudo rm $e84_shadow_rm && sudo systemctl daemon-reload. The .deb needs no reinstall."
-                else
-                    e84_shadow_tmr="${e84_frag%.service}.timer"
-                    echo "  fix: $e84_frag does not look like an egresslock product template (ExecStart outside a kit directory) — it may be yours; inspect it before removing anything. If it is a leftover, sudo rm $e84_frag && sudo systemctl daemon-reload; while it shadows the deb's unit, the package's ExecStart is not in effect."
-                fi
-                rc=1
-            else
-                e84_es="$(sed -n 's/^ExecStart=//p' "$e84_frag" 2>/dev/null | head -1 | awk '{print $1}' || true)"
-                if [[ -z "$e84_es" ]]; then
-                    echo "verify unit: ExecStart missing in $e84_frag"
-                    echo "  fix: the template at $e84_frag is corrupted — reinstall the channel that owns it (prefix installs: re-run install-kit.sh; .deb hosts: reinstall the package)"
-                    rc=1
-                elif [[ ! -f "$e84_es" || ! -x "$e84_es" ]]; then
-                    echo "verify unit: ExecStart target missing/not executable: $e84_es (loaded from $e84_frag)"
-                    echo "  fix: the unit points at an uninstalled/renamed kit — reinstall that channel (uninstalled prefix: re-run install-kit.sh, or switch to the .deb)"
-                    rc=1
-                fi
-            fi
-        elif [[ -f "$ud/egresslock-verify@.service" ]]; then
-            echo "verify unit fragment: not resolved by systemctl (template file present at $ud/egresslock-verify@.service); ExecStart/shadow rows skipped"
-            echo "  check: sudo systemctl daemon-reload and re-run --doctor — systemd has not loaded the template (fresh install without a reload, or systemd is not running)"
-        fi
-        # 1b. Timer-template shadow (R3 sibling symmetry: the service
-        #     fragment gets a shadow row, so the timer template must too).
-        #     An /etc timer template shadows the deb's timer (load
-        #     precedence) and can silently replace its OnCalendar. R5
-        #     classification: byte-identical to the deb's timer = stale
-        #     product copy (benign; postinst cleans it) — no row;
-        #     anything else is possibly-user: disclose, rc 1 (a shadowed
-        #     timer with foreign schedule is a dead/lying drift signal),
-        #     never prescribe a blind rm. Drop-ins (*.timer.d/) are NOT
-        #     examined here (declared unwalked on the map card).
-        e84_tfrag="$("$systemctl_bin" show -p FragmentPath --value 'egresslock-verify@.timer' 2>/dev/null || true)"
-        if [[ "$e84_tfrag" == "$e84_etc"/* && "$e84_tfrag" == *.timer ]]; then
-            e84_tdeb="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.timer"
-            if [[ -f "$e84_tdeb" && ! "$e84_tdeb" -ef "$e84_tfrag" ]] && ! cmp -s "$e84_tfrag" "$e84_tdeb"; then
-                echo "verify timer template: SHADOWED — systemd loads $e84_tfrag, not the deb's $e84_tdeb (/etc precedence)"
-                echo "  fix: $e84_tfrag does not match this package's timer template and may be yours — inspect it before removing anything; if it is a leftover from another install, sudo rm $e84_tfrag && sudo systemctl daemon-reload. While it shadows the deb's timer, the package's schedule is not in effect."
-                rc=1
-            fi
-        fi
-        # 2. Failed-instance sweep: every firing of a failed verify unit
-        #    is a dead drift signal. Distinguish a start failure (203/EXEC)
-        #    from verify drift (exit 1) in the row text; both are
-        #    PROBLEMs (D3). Point at journalctl, never fix from here.
-        while IFS= read -r e84_u; do
-            [[ -z "$e84_u" ]] && continue
-            e84_u="${e84_u%%[[:space:]]*}"
-            e84_failed+=("$e84_u")
-        done < <("$systemctl_bin" list-units --failed --no-legend -- 'egresslock-verify@*' 2>/dev/null || true)
-        for e84_u in "${e84_failed[@]:-}"; do
-            [[ -z "$e84_u" ]] && continue
-            e84_status="$("$systemctl_bin" show -p ExecMainStatus --value "$e84_u" 2>/dev/null || true)"
-            case "$e84_status" in
-                203) e84_why="start failure (203/EXEC — the ExecStart binary is missing/broken)" ;;
-                1)   e84_why="exit 1: verify drift, or the entry wrapper failed (missing unit.env conf, missing engine, broken netns — journal shows which)" ;;
-                *)   e84_why="failed (exit status ${e84_status:-unknown})" ;;
-            esac
-            e84_reported["$e84_u"]=1
-            # EGL-102-D6-R1 scope attribution: account-less, the sweep is
-            # the kit/host slice — every failed egresslock-verify@* instance
-            # is in scope (the 203-on-any-account class). With --account,
-            # other accounts' failures are printed, labeled out-of-account,
-            # and rc-NEUTRAL — rc is driven only by the invoked slice.
-            if [[ -n "$account" && "$e84_u" != "egresslock-verify@$account.service" \
-                    && "$e84_u" != "egresslock-verify@$account.timer" ]]; then
-                echo "verify unit $e84_u: FAILED — $e84_why (out-of-account: not part of --account $account's slice; rc unaffected)"
-                echo "  inspect: journalctl -u $e84_u (or: sudo egresslock-setup --doctor --account <that account>)"
-            else
-                echo "verify unit $e84_u: FAILED — $e84_why"
-                echo "  inspect: journalctl -u $e84_u"
-                rc=1
-            fi
-        done
-        # 3. The --account instance is probed explicitly even when the
-        #    systemd listing came back empty (D2).
-        if [[ -n "$account" ]]; then
-            for e84_u in "egresslock-verify@$account.service" "egresslock-verify@$account.timer"; do
-                [[ -n "${e84_reported[$e84_u]:-}" ]] && continue
-                if "$systemctl_bin" is-failed "$e84_u" >/dev/null 2>&1; then
-                    e84_status="$("$systemctl_bin" show -p ExecMainStatus --value "$e84_u" 2>/dev/null || true)"
-                    case "$e84_status" in
-                        203) e84_why="start failure (203/EXEC — the ExecStart binary is missing/broken)" ;;
-                        1)   e84_why="exit 1: verify drift, or the entry wrapper failed (missing unit.env conf, missing engine, broken netns — journal shows which)" ;;
-                        *)   e84_why="failed (exit status ${e84_status:-unknown})" ;;
-                    esac
-                    echo "verify unit $e84_u: FAILED — $e84_why"
-                    echo "  inspect: journalctl -u $e84_u"
-                    rc=1
-                fi
-            done
-        fi
-        # 4. Dangling timer enablement: a wants symlink whose template is
-        #    gone makes systemd list a not-found timer forever. Name it;
-        #    never auto-remove. Pre-rename agent-network-verify@* leftovers
-        #    are historical junk and rc-neutral (D3).
-        if [[ -d "$ud/timers.target.wants" ]]; then
-            for e84_want in "$ud/timers.target.wants"/*.timer; do
-                [[ -L "$e84_want" && ! -e "$e84_want" ]] || continue
-                e84_wantname="$(basename "$e84_want")"
-                if [[ "$e84_wantname" == agent-network-verify@* ]]; then
-                    echo "leftover pre-rename timer enablement (template gone): $e84_want — historical junk, not a live signal; remove the symlink manually if desired"
-                else
-                    echo "verify timer: DANGLING enablement — $e84_want points at a missing template ($e84_wantname)"
-                    echo "  systemd lists a not-found timer forever; remove the symlink: sudo rm $e84_want"
-                    rc=1
-                fi
-            done
-        fi
+        local e84_etc="${EGRESSLOCK_ETC_UNIT_DIR:-/etc/systemd/system}"
+        kit_check_verify_service || rc=1
+        kit_check_verify_timer_shadow || rc=1
+        kit_check_verify_failed || rc=1
+        kit_check_verify_dangling || rc=1
     fi
+    return $rc
+}
+
+kit_check_host_pointers() {
     # EGL-102-D6-R1: sibling-surface pointer (AppArmor-row idiom) — the
     # host slice names what it did NOT examine and where to get it.
     if [[ -z "$account" ]]; then
         echo "account wiring (conf, unit.env, timer, linger, gateway image): not examined (no --account) — run: sudo egresslock-setup --doctor --account <acct>"
     fi
     echo "AppArmor: see egresslock-setup --apparmor-check (pasta slice)"
-    if [[ -z "$account" ]]; then
-        return $rc
-    fi
+    return 0
+}
+
+kit_check_conf_parse() {
+    local rc=0
     # EGL-117: the engine's resolution line is stderr-only now (ARC-45
     # lifted), so the PARSE reads stdout alone; the parse errors keep
     # their own capture for the FAIL display.
@@ -1472,6 +1532,11 @@ doctor_kit() {
         rm -f "$list_err"
         rc=1
     fi
+    return $rc
+}
+
+kit_check_unit_env() {
+    local rc=0
     if [[ ! -f "$home/.config/egresslock/unit.env" ]]; then
         echo "unit.env: missing ($home/.config/egresslock/unit.env)"
         echo "  fix: sudo egresslock-setup --account $account --conf $conf${profile_name:+ --profile $profile_name}"
@@ -1484,6 +1549,11 @@ doctor_kit() {
     else
         echo "unit.env: matches ($home/.config/egresslock/unit.env)"
     fi
+    return $rc
+}
+
+kit_check_timer() {
+    local rc=0
     if "$systemctl_bin" is-enabled --quiet "egresslock-verify@$account.timer" 2>/dev/null; then
         echo "timer: enabled (egresslock-verify@$account.timer)"
     else
@@ -1494,6 +1564,11 @@ doctor_kit() {
         echo "  fix: sudo egresslock-setup --account $account --conf $conf${profile_name:+ --profile $profile_name} --enable"
         rc=1
     fi
+    return $rc
+}
+
+kit_check_linger() {
+    local rc=0
     lg="$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)"
     if [[ "$lg" == "yes" ]]; then
         echo "linger: on"
@@ -1502,6 +1577,11 @@ doctor_kit() {
         echo "  fix: sudo loginctl enable-linger $account  (or re-run setup with --enable)"
         rc=1
     fi
+    return $rc
+}
+
+kit_check_gateway() {
+    local rc=0
     if grep -qE '^[[:space:]]*gateway[[:space:]]' "$conf"; then
         if [[ "$(id -u)" == 0 ]]; then
             duid="$(getent passwd "$account" 2>/dev/null | cut -d: -f3)"
@@ -1526,6 +1606,11 @@ doctor_kit() {
         echo "user manager: n/a (no gateway line in $conf)"
         echo "gateway image: n/a (no gateway line in $conf)"
     fi
+    return $rc
+}
+
+kit_check_profile_networks() {
+    local rc=0
     # EGL-55-D1: advisory runtime peek — has the account's `ensure`
     # created the conf's profile networks? Network existence is a proxy
     # for "ensure ran", not "policy is live" (that stays `egresslock
@@ -1567,6 +1652,34 @@ doctor_kit() {
         # EGL-102-D6-R1: every skipped check is a named skip + cause.
         echo "profile networks: skipped (conf parse failed above)"
     fi
+    return $rc
+}
+
+# EGL-38-D2/D38-5/D38-7.2: full-state doctor — read-only; one
+# `key: value` line per check (greppable, like the engine's doctor,
+# EGL-45/D45-2), each missing required item followed by the command
+# that fixes it. Host slice (no --account): engine + unit templates.
+# Account slice adds conf parse, unit.env match, timer, linger, and
+# (for gateway confs) the user manager and the gateway image, plus one
+# advisory profile-networks row (EGL-55-D1; rc-neutral). AppArmor
+# is one pointer line — the pasta slice stays --apparmor-check's
+# (EGL-32 strings are never duplicated here). rc 1 when any required
+# item is missing.
+doctor_kit() {
+    local rc=0 list_out lg ud duid conf_ok=0
+    kit_check_engine || rc=1
+    kit_check_unit_templates || rc=1
+    kit_check_verify_units || rc=1
+    kit_check_host_pointers   # rc-neutral pointer rows; hard-returns 0
+    if [[ -z "$account" ]]; then
+        return $rc
+    fi
+    kit_check_conf_parse || rc=1
+    kit_check_unit_env || rc=1
+    kit_check_timer || rc=1
+    kit_check_linger || rc=1
+    kit_check_gateway || rc=1
+    kit_check_profile_networks  # EGL-55-D1 rc-neutral; rc is never set
     return $rc
 }
 
