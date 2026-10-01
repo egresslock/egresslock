@@ -34,7 +34,12 @@ export PATH="$TESTROOT/bin:$TREE_ROOT:$PATH"
 # The mock state mirrors the fixture assumptions the moved kit blocks
 # relied on (gateway image marker, IPAM dir).
 mkdir -p "$STATE/images" "$STATE/ips"
-: > "$STATE/images/localhost_egresslock-gateway_latest"# --- ARC-16: kit productization ---
+: > "$STATE/images/localhost_egresslock-gateway_latest"
+# EGL-206-D2a: the alpine:latest anchor marker the kit's engine-side
+# exercises inspect is already seeded by tests/lib.sh (the mock `podman
+# run` never pulls) — do not re-seed here.
+
+# --- ARC-16: kit productization ---
 section_begin arc16 "ARC-16 kit productization"
 
 a16() { assert "$@"; }
@@ -2142,6 +2147,15 @@ if command -v dpkg >/dev/null 2>&1; then
     else
         a22 fail "EGL-188 0.5.0 -> 0.6.0 base bump not an upgrade under dpkg ordering"
     fi
+    # EGL-204-D8 cross-base pin: the 0.7.0 base bump (same timestamp,
+    # same sha — worst case) must also compare as an upgrade over a
+    # 0.6.0 stamp; 0.6.0 -> 0.7.0 is never a dpkg downgrade.
+    if dpkg --compare-versions "0.6.0+git20260924192516.76f1e51d345a" \
+            lt "0.7.0+git20260924192516.76f1e51d345a"; then
+        a22 pass
+    else
+        a22 fail "EGL-204 0.6.0 -> 0.7.0 base bump not an upgrade under dpkg ordering"
+    fi
 else
     skip "dpkg absent" "EGL-27 dpkg not available; skipping compare-versions assert"
 fi
@@ -2159,6 +2173,11 @@ fi
 # and adds the 0.4.0+git lt 0.5.0+git cross-base assert above.
 # EGL-188-D8: the live-base pin moves to 0.6.0 with the VERSION_BASE bump
 # and adds the 0.5.0+git lt 0.6.0+git cross-base assert above.
+# EGL-164: the live-base pin derives from VERSION_BASE (shape B) — no
+# further live-base pin edits at freeze; cross-base pins stay literal.
+# EGL-204-D8: the live-base pin derives from VERSION_BASE (EGL-164 shape
+# B — no live-base pin edit at the 0.7.0 bump) and adds the
+# 0.6.0+git lt 0.7.0+git cross-base assert above.
 # EGL-80-L8: the stamp embeds the git commit — in a tree WITHOUT .git
 # (the exported/staged public snapshot shape, or a plain export)
 # build-tarball legitimately falls back to 'unknown' (EGL-74
@@ -2174,9 +2193,20 @@ elif [[ ! -d "$TREE_ROOT/.git" ]]; then
 else
     t27_rc=0
     env EGRESSLOCK_TARBALL_OUT="$b27/k.tgz" "$TARSH" >"$b27/log" 2>&1 || t27_rc=$?
-    # EGL-188-D8: the live-base pin moves to 0.6.0 with the VERSION_BASE bump
-# and adds the 0.5.0+git lt 0.6.0+git cross-base assert above.
-    v27_real="$(grep -oE '0\.6\.0\+git[0-9]{14}\.[0-9a-f]{12}(-dirty)?' "$b27/log" | head -1)"
+    # EGL-164: the live-base pin derives from VERSION_BASE — a bump
+    # needs no test edit here.
+    base164="$(tr -d ' \t\n' < "$TREE_ROOT/VERSION_BASE" 2>/dev/null || true)"
+    if [[ -z "$base164" ]]; then
+        a22 fail "EGL-164 VERSION_BASE missing/empty at $TREE_ROOT/VERSION_BASE — derived live-base pin cannot run"
+        base164="IMPOSSIBLE_BASE_EGL_164"   # never matches; downstream assert stays fail-closed
+    fi
+    # EGL-164-D1: base format assumption is N.N.N — escape only '.'.
+    # Inside double quotes \\+ / \\. yield \+ / \. in the ERE —
+    # byte-identical to the old hardcoded literal (the EGL-188-D8 shape);
+    # a maintainer-written base could only widen the match (in-repo,
+    # reviewed file; accepted, EGL-164-D1).
+    re164="$(printf '%s' "$base164" | sed 's/\./\\./g')\\+git[0-9]{14}\\.[0-9a-f]{12}(-dirty)?"
+    v27_real="$(grep -oE "$re164" "$b27/log" | head -1)"
     [[ "$t27_rc" == 0 && -f "$b27/k.tgz" && -n "$v27_real" ]] \
         && a22 pass || a22 fail "EGL-27 tarball build stamps new scheme (rc=$t27_rc, log: $(cat "$b27/log"))"
 fi

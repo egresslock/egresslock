@@ -20,9 +20,10 @@
 # `.md` and non-md targets both (LICENSE and apparmor/README.md are
 # linked from README.md today). Validation is file existence with the
 # `#fragment` stripped — no heading/anchor parsing (a later widening).
-# A target whose lexically normalized path leaves the repository root
-# is a FAIL. Text inside ``` / ~~~ fences and 4-space/tab-indented
-# lines is literal, not a rendered link, and is never swept.
+# A target whose lexically normalized path is not inside `$TREE_ROOT`
+# (the scan root) is a FAIL. Text inside ``` / ~~~ fences and
+# 4-space/tab-indented lines is literal, not a rendered link, and is
+# never swept.
 #
 # The self-test below exercises the extractor on a synthetic tree,
 # including the EGL-160 defect class: the recorded ad-hoc sweep
@@ -48,11 +49,12 @@ docs_re_scheme='^[A-Za-z][A-Za-z0-9+.-]*:'
 
 # --- link validation ----------------------------------------------------
 docs_norm=""
-docs_escaped=0
-# docs_normalize <absolute-path>: lexical collapse of `.` and `seg/..`;
-# sets docs_norm and docs_escaped (1 = pops above the filesystem root,
-# i.e. the target climbs out of the repository — no realpath, no
-# symlink following; existence is the only thing checked afterwards).
+# docs_normalize <absolute-path>: pure lexical collapse of `.` and
+# `seg/..` (an above-`/` pop that cannot leave the `out=("")` root
+# sentinel is a no-op, leaving docs_norm empty). Containment is the
+# caller's prefix/strip test against the scan root (docs_root) — no
+# realpath, no symlink following; existence is the only thing checked
+# afterwards.
 docs_normalize() {
     local seg
     local -a segs=() out=("")
@@ -64,8 +66,6 @@ docs_normalize() {
             "..")
                 if (( ${#out[@]} > 1 )); then
                     out=("${out[@]:0:${#out[@]}-1}")
-                else
-                    docs_escaped=1
                 fi
                 ;;
             *) out+=("$seg") ;;
@@ -92,9 +92,12 @@ docs_check_target() {
     t2="${t%%#*}"                     # fragment stripped; file existence only
     [[ -z "$t2" ]] && return
     dir="${f%/*}"; [[ "$dir" == "$f" ]] && dir="."
-    docs_escaped=0
     docs_normalize "$docs_root/$dir/$t2"
-    if (( docs_escaped )); then
+    # Containment bar: inside-or-equal the scan root only (the
+    # "$docs_root"/* form, never a bare prefix — a sibling directory
+    # must not classify inside); empty docs_norm (an above-`/` pop)
+    # is outside. The D2 FAIL wording covers both escape shapes.
+    if [[ -z "$docs_norm" || ( "$docs_norm" != "$docs_root" && "$docs_norm" != "$docs_root"/* ) ]]; then
         docs_fail=$(( docs_fail + 1 ))
         echo "FAIL: $f: relative link '$t' resolves outside the repository root"
     elif [[ ! -e "$docs_norm" ]]; then
@@ -152,6 +155,8 @@ printf 'fenced:\n```sh\n[f](fence-only.md)\n```\n' > "$sd/fenced.md"
 printf 'skips: [a](#anchor) [s](https://example.test/x.md) [u](/etc/hosts)\n' > "$sd/skips.md"
 printf '[refdef]: missing-ref.md\nusage [refdef] only\n' > "$sd/ref.md"
 printf 'escape: [e](../../../../../outside.md)\n' > "$sd/escape.md"
+: > "$TESTROOT/outside.md"
+printf 'climb: [c](../outside.md)\n' > "$sd/climb.md"
 
 a_docs() { if [[ "$1" == pass ]]; then docs_pass=$((docs_pass+1)); else docs_fail=$((docs_fail+1)); echo "FAIL: $2"; fi; }
 
@@ -193,6 +198,12 @@ if printf '%s\n' "$st_esc" | grep -qF "FAIL: escape.md: relative link '../../../
     a_docs pass "self-test: target escaping the repository root is a FAIL"
 else
     a_docs fail "self-test: outside-root escape not flagged: $st_esc"
+fi
+st_climb="$(docs_sweep climb.md)"
+if printf '%s\n' "$st_climb" | grep -qF "FAIL: climb.md: relative link '../outside.md' resolves outside the repository root"; then
+    a_docs pass "self-test: target climbing out of TREE_ROOT to an existing file is a FAIL"
+else
+    a_docs fail "self-test: climb-out-of-TREE_ROOT escape not flagged: $st_climb"
 fi
 docs_root="$docs_root_saved"
 

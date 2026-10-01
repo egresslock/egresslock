@@ -159,7 +159,12 @@ What the kit's claims rest on:
 - nftables in the account's netns (`inet egresslock`): the enforcement
   point everything above hangs off;
 - the Squid gateway image **as built** (Debian slim + Squid), which the
-  kit always starts with `--cap-drop=all --security-opt=no-new-privileges`;
+  kit always starts with `--cap-drop=all --security-opt=no-new-privileges`,
+  refuses to start when the image carries the container-checkpoint
+  annotation (CVE-2026-94603), and asserts the pair live
+  (in-container `CapEff`/`NoNewPrivs`,
+  read from the container's PID 1) on both kit containers at start and
+  at verify;
 - the engine and the account's conf/allowlist under
   `~/.config/egresslock/`: whoever controls those controls the policy;
 - root-owned `/opt/egresslock` as **tool integrity** only — it stops a
@@ -178,7 +183,33 @@ Operator obligations the kit does not enforce:
   launcher: this is the operator's launcher's job, and examples or
   recipes showing a `podman run` line are operator-owned, not a kit
   guarantee. Plain `podman run` keeps the default capability set,
-  including `CAP_NET_RAW`;
+  including `CAP_NET_RAW`. **Flags passed are not flags honored**
+  (CVE-2026-94603 / GHSA-2cvf-wqm6-wr9g): the trigger is
+  live-observed — in the kit's VM lane (guest Podman 5.4.2, in the
+  advisory range) `podman run` on a benign image carrying the
+  annotation `io.podman.annotations.checkpoint.runtime.name`
+  interpreted the image as a container checkpoint and failed at the
+  restore import — while the advisory reports the end state: a
+  *successful* restore runs the checkpoint's embedded configuration,
+  silently discarding the requested sandbox flags, so the launcher's
+  `--cap-drop=all` never takes effect (that discard — and how far the
+  checkpoint's own configuration reaches, e.g. network mode — is
+  advisory / unresolved: not observed from this tree; the benign
+  construction fails closed at import). The affected range is per
+  the advisory (4.4.0–5.8.7, and 6.x before 6.1.3 — figures from the
+  advisory; the fixed floor is not confirmed from this tree). Prefer
+  a fixed Podman (≥ 5.8.8 / 6.1.3, or your distribution's backport)
+  and reject images carrying the checkpoint annotation — Podman
+  provides no automatic rejection, so that refusal is the upstream
+  workaround. The kit side of this — the refusal on its own
+  gateway/anchor images and the live pair assertion on both at
+  `ensure` and `verify` — is a TCB fact, not an operator obligation
+  (see the TCB list above); a workload launcher remains your
+  obligation. The residual this closes (see T9): dropping
+  capabilities is what keeps a workload
+  away from `CAP_NET_ADMIN`/`CAP_NET_RAW` and the rootless-netns
+  boundary — a silently discarded drop would make that residual
+  reachable with no operator-cap violation at all;
 - do not bind-mount the account's home (or `~/.config/egresslock/`)
   into workloads — a launcher that does changes I5. Policy files are
   not in the workload unless the operator mounts them there;
@@ -313,7 +344,7 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T6 | IPv6 destination | `p_v6deny` | fail; IPv4-only kit | lab-verified |
 | T7 | Sibling on same profile: connect to peer:22 | **allowed** (L2) | n/a — accepted risk | lab-verified (open L2; still accepted — 2026-09-21 ruling; the probe confirmed the strongest form: sibling↔sibling traffic never touches the IP-forward hook, it is pure L2 bridging, so *every* profile-internal port is open at L2) |
 | T8 | Sibling: gateway:3128; other gateway ports; cache manager | 3128 allowed + Squid ACL; other ports: nothing listens on them — **L2 does not filter them** (a service bound on one would be sibling-reachable); mgr 403 | can probe Squid; cannot widen nft | lab-verified (framing corrected by the probe: "other ports nft-dropped" was inaccurate — see T7) |
-| T9 | Co-located sibling holding `CAP_NET_ADMIN`/`CAP_NET_RAW` spoofs source IP = gateway IP (adds the gateway's address to its interface) | the kit forces cap-drop on the **gateway**; workloads are launcher policy — a default-caps or cap-holding sibling can attempt the spoof, and the profile chain still sees the packet | if a spoofed `saddr GW_IP` packet is forwarded past the terminal drop, I1 is broken | lab-verified both ways. Bypass confirmed live 2026-09-19: the spoofed SYN matched the then-address-only gateway-exemption rule, `established,related` grew a full bidirectional flow, the terminal drop never moved, and the outer endpoint answered — a complete bypass. Closed for the IP-only spoof on 2026-09-21 (exemption now also requires the gateway's pinned MAC); re-probed at the fix commit: exemption counter stays 0, no new established flow, the terminal drop counts the SYN+retries, outer endpoint unreachable. **Residual (recorded, accepted):** a sibling that clones *both* the gateway's MAC and IP still matches the exemption — same cap set, same obligation; closing it needs a non-spoofable bridge-port match (out of scope). A default-caps workload cannot attempt the spoof at all (`SOCK_RAW` → `EPERM`); cap-drop on workloads remains the operator obligation |
+| T9 | Co-located sibling holding `CAP_NET_ADMIN`/`CAP_NET_RAW` spoofs source IP = gateway IP (adds the gateway's address to its interface) | the kit forces cap-drop on the **gateway**; workloads are launcher policy — a default-caps or cap-holding sibling can attempt the spoof, and the profile chain still sees the packet | if a spoofed `saddr GW_IP` packet is forwarded past the terminal drop, I1 is broken | lab-verified both ways. Bypass confirmed live 2026-09-19: the spoofed SYN matched the then-address-only gateway-exemption rule, `established,related` grew a full bidirectional flow, the terminal drop never moved, and the outer endpoint answered — a complete bypass. Closed for the IP-only spoof on 2026-09-21 (exemption now also requires the gateway's pinned MAC); re-probed at the fix commit: exemption counter stays 0, no new established flow, the terminal drop counts the SYN+retries, outer endpoint unreachable. **Residual (recorded, accepted):** a sibling that clones *both* the gateway's MAC and IP still matches the exemption — same cap set, same obligation; closing it needs a non-spoofable bridge-port match (out of scope). A default-caps workload cannot attempt the spoof at all (`SOCK_RAW` → `EPERM`); cap-drop on workloads remains the operator obligation — the CVE-2026-94603 class (a checkpoint annotation discarding the launcher's cap-drop on a *successful* restore; not observed from this tree, the interpretation trigger is live-observed on 5.4.2) would make this residual reachable with no operator-cap violation |
 | T10 | Workload reads `~/.config/egresslock/` | not mounted by the kit; the operator's launcher is the only path in | empty of policy files unless the operator bind-mounts `$HOME` or the confdir | code-verified (kit paths) |
 | T11 | `allow 'foo; rm -rf /'` | reject, exit 2, file unchanged | usage / invalid entry | code-verified |
 | T12 | Gateway container stopped | no useful exemption for the workload; default drop | connect fail; `denied` may be empty | design-intent |

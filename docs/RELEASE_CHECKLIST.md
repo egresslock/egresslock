@@ -38,7 +38,16 @@ number alone:
 
 This tree does **not** ship a workload launcher. Missing
 `--cap-drop=all` on an operator's `podman run` is an operator
-obligation; the kit-built **gateway** must drop capabilities.
+obligation; the kit-built **gateway and anchor** must drop
+capabilities — and the kit asserts the pair is live on both
+(CVE-2026-94603: per the advisory — version floor operator-provided,
+untested from this tree — a checkpoint annotation can make
+`podman run` silently discard launch-time sandbox flags; the
+annotation-triggered checkpoint interpretation is live-observed on
+Podman 5.4.2, failing at the restore import; the
+kit refuses checkpoint-annotated images for its own containers and a
+fixed Podman + annotation rejection is the operator side of the
+workaround).
 
 ## Publish gates
 

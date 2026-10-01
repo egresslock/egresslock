@@ -199,8 +199,14 @@ are (tool integrity, not a policy boundary). Workloads must be launched
 with capabilities dropped — the kit ships no workload launcher, so this is
 the operator's launcher's job (`--cap-drop=all
 --security-opt=no-new-privileges`; plain `podman run` does not). The kit
-enforces that pair only on the gateway container it builds. Details:
-[threat model](threat-model.md).
+enforces that pair on the gateway and anchor containers it builds, and
+asserts it is live on both (CVE-2026-94603: per the advisory — version
+floor operator-provided, untested from this tree — a checkpoint
+annotation can make `podman run` silently discard launch-time sandbox
+flags; the annotation-triggered checkpoint interpretation is
+live-observed on Podman 5.4.2, failing at the restore import; the kit
+also refuses checkpoint-annotated images for its own containers).
+Details: [threat model](threat-model.md).
 
 ### Root/rootless expectations
 

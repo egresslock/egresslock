@@ -581,6 +581,30 @@ case "$cmd" in
                 exit 0
                 ;;
             cat)
+                # EGL-206-D2b: the live-hardening oracle reads PID 1's
+                # /proc/1/status inside the container. Default fixture is
+                # healthy (CapEff all-zero, NoNewPrivs 1 — exactly what
+                # --cap-drop=all --security-opt=no-new-privileges
+                # produces). Named knobs, per-container marker first then
+                # the global one: caps-bad (non-zero CapEff), caps-nnp
+                # (NoNewPrivs 0), caps-unreadable (exec fails — the
+                # fail-closed path). Per-container form: caps-<knob>-<name>.
+                if [[ "${2:-}" == /proc/1/status ]]; then
+                    knob_bad=""; knob_nnp=""; knob_unreadable=""
+                    [[ -f "$D/caps-bad-$name" || -f "$D/caps-bad" ]] && knob_bad=1
+                    [[ -f "$D/caps-nnp-$name" || -f "$D/caps-nnp" ]] && knob_nnp=1
+                    [[ -f "$D/caps-unreadable-$name" || -f "$D/caps-unreadable" ]] && knob_unreadable=1
+                    if [[ -n "$knob_unreadable" ]]; then
+                        echo "cat: /proc/1/status: No such file or directory" >&2
+                        exit 1
+                    fi
+                    capseff="0000000000000000"; nnp="1"
+                    [[ -n "$knob_bad" ]] && capseff="00000000000001f7"
+                    [[ -n "$knob_nnp" ]] && nnp="0"
+                    printf 'CapEff:\t%s\n' "$capseff"
+                    printf 'NoNewPrivs:\t%s\n' "$nnp"
+                    exit 0
+                fi
                 # ARC-7: cmd_denied reads the gateway's access log.
                 if [[ "${2:-}" == /var/log/squid/access.log ]]; then
                     cat "$D/containers-$name.access.log" 2>/dev/null || true
@@ -678,9 +702,24 @@ case "$cmd" in
         exit 0
         ;;
     image)
-        # image exists <name>: gateway image must exist once built.
-        [[ "$1" == exists ]] || exit 1
-        [[ -f "$D/images/$(echo "$2" | tr '/:' '__')" ]] && exit 0
+        case "$1" in
+            exists)
+                [[ -f "$D/images/$(echo "$2" | tr '/:' '__')" ]] && exit 0
+                exit 1
+                ;;
+            inspect)
+                # EGL-206-D2a: image inspect --format <tpl> <image> — the
+                # annotation oracle for the checkpoint-annotation refusal.
+                # Default: no annotation (empty output, rc 0). Fixture:
+                # $D/image-annotated-<name-with-/-and-:->__ marks an image
+                # as carrying io.podman.annotations.checkpoint.runtime.name.
+                img="${@: -1}"
+                [[ -f "$D/images/$(echo "$img" | tr '/:' '__')" ]] \
+                    || { echo "Error: no such image $img" >&2; exit 1; }
+                [[ -f "$D/image-annotated-$(echo "$img" | tr '/:' '__')" ]] && echo "criu"
+                exit 0
+                ;;
+        esac
         exit 1
         ;;
     build)
@@ -698,6 +737,22 @@ case "$cmd" in
             esac
         done
         [[ -n "$tag" ]] && : > "$D/images/$(echo "$tag" | tr '/:' '__')"
+        exit 0
+        ;;
+    pull)
+        # EGL-206 (R-EGL-206-2 #1): pull <image> — modeled fresh-account
+        # first-create provision (the real `podman run` pulls a missing
+        # ref; the mock run never does, so the preflight's explicit pull
+        # is the modeled provision). Mirrored into callorder.log for
+        # ordering asserts. Fixture: $D/pull-fails -> rc 1, store
+        # untouched (models a blocked/failed registry pull).
+        echo "podman pull $*" >> "$D/callorder.log"
+        echo "podman pull $*" >> "$D/opslog"
+        if [[ -f "$D/pull-fails" ]]; then
+            echo "Error: initializing source docker://$1: reading manifest (mock pull-fails fixture)" >&2
+            exit 1
+        fi
+        : > "$D/images/$(echo "$1" | tr '/:' '__')"
         exit 0
         ;;
     *) echo "mock podman: unsupported op $cmd" >&2; exit 2 ;;
@@ -913,6 +968,13 @@ export EGRESSLOCK_DEB_LIBDIR="$TESTROOT/deb-libdir"
 # name so the ensure flow exercises the image-exists check.
 mkdir -p "$STATE/images"
 : > "$STATE/images/localhost_egresslock-gateway_latest"
+# EGL-206-D2a: the checkpoint-annotation preflight inspects the RESOLVED
+# anchor image before the run. The harness anchors on alpine:latest
+# (env below); seed the marker the mock store would hold on a
+# provisioned account (the mock `podman run` never pulls).
+# localhost/base:latest stays ABSENT so the EGL-66-D2 fallback
+# resolution pin keeps its premise.
+: > "$STATE/images/docker.io_library_alpine_latest"
 
 # EGL-99 (direction 3): named-skip accounting. Every harness skip goes
 # through skip() so the RESULTS TOTAL line reports the exact skip count

@@ -215,6 +215,14 @@ rt_image_exists() { # rt_image_exists <image> — rc 0 when the image exists loc
     podman image exists "$1"
 }
 
+rt_image_inspect() { # rt_image_inspect <image> <go-template> — EGL-206-D2a image-level inspect
+    podman image inspect --format "$2" "$1"
+}
+
+rt_image_pull() { # rt_image_pull <image> — pull a ref into the local store
+    podman pull "$1"
+}
+
 rt_network_ls() { # rt_network_ls -> kit-network names ({{.Name}} singular, ARC-67-D1)
     podman network ls --format '{{.Name}}'
 }
@@ -705,10 +713,123 @@ podman_network_names() {
     rt_network_ls
 }
 
+# ---------------------------------------------------------------------------
+# EGL-206 (CVE-2026-94603 / GHSA-2cvf-wqm6-wr9g): on affected Podman
+# ranges (4.4.0–5.8.7, 6.x before 6.1.3) an ordinary OCI image carrying
+# the annotation `io.podman.annotations.checkpoint.runtime.name` is
+# interpreted as a container checkpoint and `podman run` silently
+# ignores user-requested sandbox flags (--cap-drop=all,
+# --security-opt=no-new-privileges). Podman ships no automatic
+# rejection; the upstream workaround is refusing such images. Two
+# kit-container guards, both fail-closed and named: D2a refuses a
+# checkpoint-annotated kit image before every kit-owned run; D2b
+# asserts the LIVE hardening state at start and on verify — read from
+# the container's own PID 1 (`/proc/1/status` via rt_exec), not from
+# `podman inspect` HostConfig, which this CVE invalidates as an oracle
+# (inspect may report what was requested, not what was applied).
+
+# D2a: image-level annotation oracle, run on the RESOLVED image that is
+# about to `rt_run` (covers EGRESSLOCK_*_IMAGE overrides and the
+# unpinned `localhost/base:latest` anchor path). Empty/missing key =
+# pass; any non-empty value = refuse.
+# R-EGL-206-2 #1: the original premise ("a missing image fails at
+# rt_run") is empirically false — real `podman run` pulls a missing
+# ref on demand (the live matrix's fresh-account first-create died in
+# this preflight instead). So: exist-check first; a missing ANCHOR
+# image (mode "pull-missing") is pulled here — the same pull rt_run
+# would do, moved in front of the inspect, so the refusal stays
+# preventative even on first-create — then inspected. A failed pull
+# dies named, never a silent run. The GATEWAY keeps the missing-image
+# die: its image is locally built (`build-gateway`), never pulled, and
+# ensure_gateway's exist-check already names that path.
+refuse_checkpoint_image() { # refuse_checkpoint_image <image> <label> [pull-missing]
+    local img="$1" label="$2" ann
+    if ! rt_image_exists "$img" 2>/dev/null; then
+        if [[ "${3:-}" != "pull-missing" ]]; then
+            die "$label image '$img' is missing from the local store (checkpoint-annotation preflight, CVE-2026-94603, fail closed); provide a local image that is not checkpoint-annotated"
+        fi
+        rt_image_pull "$img" >/dev/null 2>&1 \
+            || die "$label image '$img' is not in the local store and pulling it failed (checkpoint-annotation preflight, CVE-2026-94603, fail closed); pull it manually ('podman pull $img') and re-run ensure"
+    fi
+    if ! ann="$(rt_image_inspect "$img" '{{index .Annotations "io.podman.annotations.checkpoint.runtime.name"}}' 2>/dev/null)"; then
+        die "$label image '$img' could not be inspected for the checkpoint annotation (CVE-2026-94603, fail closed); provide an image that is not checkpoint-annotated"
+    fi
+    [[ -z "$ann" ]] \
+        || die "$label image '$img' carries the container-checkpoint annotation 'io.podman.annotations.checkpoint.runtime.name' — Podman can interpret it as a checkpoint and silently discard requested sandbox flags such as --cap-drop=all (CVE-2026-94603 / GHSA-2cvf-wqm6-wr9g); refusing to run it. Replace the image (upstream workaround: reject images carrying the checkpoint annotation)"
+}
+
+# D2b: live-hardening oracle. Reads PID 1's status inside the container
+# and reports one token: ok | caps:<CapEff> | nnp:<value> |
+# unreadable:<why>. Parse CapEff only — CapBnd/CapPrm/CapInh stay
+# non-zero under --cap-drop=all, so asserting them would fail every
+# healthy start. PID 1, not the exec process: the launch-time property
+# lives on the container init. Unreadable exec/parse is a named state,
+# never a skip (fail-closed map R1) — operator override images must
+# provide `cat` for the read.
+kit_caps_state() { # kit_caps_state <container>
+    local st caps nnp
+    if ! st="$(rt_exec "$1" cat /proc/1/status 2>/dev/null)" || [[ -z "$st" ]]; then
+        echo "unreadable:podman exec cat /proc/1/status failed or returned no output"
+        return 0
+    fi
+    caps="$(awk '/^CapEff:/{print $2; exit}' <<<"$st")"
+    nnp="$(awk '/^NoNewPrivs:/{print $2; exit}' <<<"$st")"
+    if [[ -z "$caps" || -z "$nnp" ]]; then
+        echo "unreadable:CapEff/NoNewPrivs lines missing from /proc/1/status"
+        return 0
+    fi
+    if [[ ! "$caps" =~ ^0+$ ]]; then
+        echo "caps:$caps"
+        return 0
+    fi
+    if [[ "$nnp" != "1" ]]; then
+        echo "nnp:$nnp"
+        return 0
+    fi
+    echo "ok"
+}
+
+# One named fail-closed message per state, shared by the ensure dies
+# and the verify echoes (same words on both paths, map R1).
+kit_caps_problem_msg() { # kit_caps_problem_msg <label> <container> <state>
+    local label="$1" ctr="$2" st="$3"
+    case "$st" in
+        caps:*)
+            echo "$label container '$ctr' CapEff is '${st#caps:}' (expected all-zero) — the launch-time --cap-drop=all did not take effect (CVE-2026-94603 flag-discard class); replace the container/image" ;;
+        nnp:*)
+            echo "$label container '$ctr' NoNewPrivs is '${st#nnp:}' (expected 1) — the launch-time --security-opt=no-new-privileges did not take effect (CVE-2026-94603 flag-discard class); replace the container/image" ;;
+        *)
+            echo "$label container '$ctr' hardening state unreadable (${st#unreadable:}) — failing closed (CVE-2026-94603); override images must provide 'cat' for the /proc/1/status read" ;;
+    esac
+}
+
+# Start-path assertion (ensure_*): die named on any non-ok state.
+assert_kit_caps() { # assert_kit_caps <container> <label>
+    local st
+    st="$(kit_caps_state "$1")"
+    [[ "$st" == "ok" ]] || die "$(kit_caps_problem_msg "$2" "$1" "$st")"
+}
+
+# Converged-predicate gate: a readable caps mismatch or an unreadable
+# state must NOT be blessed by the converged short-circuit — it falls
+# through to replacement (the EGL-123-D3 MAC-pin pattern), so a
+# once-failed launch cannot be blessed by the next ensure.
+gw_caps_ok() { # gw_caps_ok <gwname>
+    [[ "$(kit_caps_state "$1")" == "ok" ]]
+}
+
+anchor_caps_ok() { # anchor_caps_ok <anchor-name>
+    [[ "$(kit_caps_state "$1")" == "ok" ]]
+}
+
 ensure_anchor() {
     local profile="$1" anchor
     anchor="$(anchor_of "$profile")"
-    if anchor_running "$anchor"; then
+    # EGL-206-D2b: the converged short-circuit is caps-aware — a running
+    # anchor whose live hardening is wrong or unreadable falls through
+    # to replacement instead of being blessed (EGL-123-D3 MAC-pin
+    # pattern).
+    if anchor_running "$anchor" && anchor_caps_ok "$anchor"; then
         return 0
     fi
     # Stale stopped anchor from an interrupted run.
@@ -728,6 +849,12 @@ ensure_anchor() {
     # on the profile L2 — run it with the same hardening pair as the
     # kit-built gateway (ARC-32-D5): no capabilities, no privilege gain.
     animg="$(anchor_image)"
+    # EGL-206-D2a: refuse a checkpoint-annotated image before the run
+    # (CVE-2026-94603). R-EGL-206-2 #1: a fresh account's first ensure
+    # resolves the digest-pinned fallback before it is in the local
+    # store — pull it here (the pull rt_run would do), then inspect,
+    # so the refusal stays preventative on first-create.
+    refuse_checkpoint_image "$animg" "anchor image" pull-missing
     rt_run "$anchor" \
         --network "$(network_of "$profile")" \
         --ip "$anchor_ip" \
@@ -739,12 +866,17 @@ ensure_anchor() {
     # indistinguishable from reuse; already-running return stays silent.
     echo "started anchor $anchor"
     # Give Podman a moment to report it as running before we rely on it.
+    # EGL-206-D2b: wait-until-running, then assert live hardening, then
+    # return — the assert must sit on the success path, not after a
+    # loop that used to `return 0` from inside it.
     local i
     for i in $(seq 1 20); do
-        anchor_running "$anchor" && return 0
+        anchor_running "$anchor" && break
         sleep 0.5
     done
-    die "anchor container '$anchor' did not reach running state"
+    anchor_running "$anchor" \
+        || die "anchor container '$anchor' did not reach running state"
+    assert_kit_caps "$anchor" "anchor"
 }
 
 #
@@ -2422,6 +2554,10 @@ gw_start() {
     # Plain assignment so a die() inside gw_image (ARC-59 env guard)
     # propagates under set -e (command-substitution footgun).
     img="$(gw_image)"
+    # EGL-206-D2a: refuse a checkpoint-annotated image before the run
+    # (CVE-2026-94603). ensure_gateway's rt_image_exists check ran
+    # first (exist-check THEN inspect THEN rt_run).
+    refuse_checkpoint_image "$img" "gateway image"
     rt_rm "$gwname" >/dev/null 2>&1 || true
     # EGL-123-D3: the gateway carries the kit-derived pinned MAC — the
     # same identity the compiled exemption is keyed on (saddr+MAC).
@@ -2462,7 +2598,12 @@ ensure_gateway() {
     # today's replace. One-time disruption on first ensure after
     # upgrade; afterwards the pin is stable, so the EGL-114 converged
     # skip stays non-disruptive.
-    if gw_running "$gwname" && gw_probe "$gwname" "$port" && gw_mac_ok "$profile" "$gwname"; then
+    # EGL-206-D2b: the converged short-circuit is caps-aware (see
+    # ensure_anchor) — a healthy-looking gateway with wrong or
+    # unreadable live hardening falls through to replacement, never a
+    # blessing.
+    if gw_running "$gwname" && gw_probe "$gwname" "$port" && gw_mac_ok "$profile" "$gwname" \
+        && gw_caps_ok "$gwname"; then
         return 0
     fi
     # Plain assignment so a die() inside gw_image (ARC-59 env guard)
@@ -2483,12 +2624,17 @@ ensure_gateway() {
         gw_start "$profile" || die "gateway start failed (static IP ${GW_IP[$profile]} conflict?)"
     fi
     local i
-    # 60s budget: container start + squid -z + port bind.
+    # 60s budget: container start + squid -z + port bind. EGL-206-D2b:
+    # wait-until-healthy, then assert live hardening, then return —
+    # the assert must sit on the success path, not after a loop that
+    # used to `return 0` from inside it.
     for i in $(seq 1 120); do
-        gw_running "$gwname" && gw_probe "$gwname" "$port" && return 0
+        gw_running "$gwname" && gw_probe "$gwname" "$port" && break
         sleep 0.5
     done
-    die "gateway container '$gwname' did not become healthy (proxy not answering on $port)"
+    gw_running "$gwname" && gw_probe "$gwname" "$port" \
+        || die "gateway container '$gwname' did not become healthy (proxy not answering on $port)"
+    assert_kit_caps "$gwname" "gateway"
 }
 
 verify_gateway() {
@@ -2520,6 +2666,14 @@ verify_gateway() {
     # ARC-5. Liveness itself is covered by gw_probe.
     rt_exec "$gwname" squid -k parse -f /etc/squid/agent/squid.conf >/dev/null 2>&1 \
         || { echo "verify: gateway squid config invalid" >&2; return 1; }
+    # EGL-206-D2b: the launch-time hardening pair must be LIVE, read
+    # from the container's own PID 1 — not `podman inspect` HostConfig,
+    # the unverified oracle this CVE invalidates. Same named-error
+    # style as the IP/MAC checks above.
+    local caps_state
+    caps_state="$(kit_caps_state "$gwname")"
+    [[ "$caps_state" == "ok" ]] \
+        || { echo "verify: $(kit_caps_problem_msg "gateway" "$gwname" "$caps_state")" >&2; return 1; }
 }
 
 # ARC-54-D1: the ARC-47 rename (agent_policy -> egresslock) left old
@@ -2697,6 +2851,16 @@ cmd_verify() {
      require_profile "${1:-}" verify
      netns_probe || exit 1
      verify_policy "$1" || exit 1
+    # EGL-206-D2b: anchor hardening on the plain verify verb too —
+    # asserted only when the anchor is running (liveness semantics
+    # unchanged); the gateway check is inside verify_gateway below.
+    local anchor caps_state
+    anchor="$(anchor_of "$1")"
+    if anchor_running "$anchor"; then
+        caps_state="$(kit_caps_state "$anchor")"
+        [[ "$caps_state" == "ok" ]] \
+            || { echo "verify: $(kit_caps_problem_msg "anchor" "$anchor" "$caps_state")" >&2; exit 1; }
+    fi
     if is_gateway_profile "$1"; then
         verify_gateway "$1" || exit 1
         # ARC-32-D1: gateway confirmed up — rotate oversize overlay logs.
@@ -2721,7 +2885,7 @@ cmd_verify() {
 # (the oneshot unit fails -> journal signal).
 cmd_verify_ensured() {
      netns_probe || exit 1
-     local p failed=0
+     local p failed=0 anchor caps_state
     for p in "${PROFILES[@]}"; do
         if anchor_running "$(anchor_of "$p")"; then
             if ! verify_policy "$p"; then
@@ -2731,6 +2895,16 @@ cmd_verify_ensured() {
             fi
             if is_gateway_profile "$p" && ! verify_gateway "$p"; then
                 echo "verify: profile '$p' FAILED gateway verification" >&2
+                failed=1
+                continue
+            fi
+            # EGL-206-D2b: anchor hardening on the ensured sweep too —
+            # the anchor is running in this branch (checked above).
+            anchor="$(anchor_of "$p")"
+            caps_state="$(kit_caps_state "$anchor")"
+            if [[ "$caps_state" != "ok" ]]; then
+                kit_caps_problem_msg "anchor" "$anchor" "$caps_state" >&2
+                echo "verify: profile '$p' FAILED anchor hardening verification" >&2
                 failed=1
                 continue
             fi

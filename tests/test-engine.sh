@@ -3484,6 +3484,10 @@ rm -rf "$STATE"
 mkdir -p "$STATE/nft" "$STATE/networks" "$STATE/running" "$STATE/containers" \
          "$STATE/images" "$STATE/ips" "$STATE/runargs"
 : > "$STATE/images/localhost_egresslock-gateway_latest"
+# EGL-206-D2a: the anchor preflight inspects the RESOLVED anchor image
+# before the run; re-seed the harness anchor marker after the state
+# reset (the mock `podman run` never pulls).
+: > "$STATE/images/docker.io_library_alpine_latest"
 DEEP_CONF="$TESTROOT/deep/deep.conf"
 mkdir -p "$TESTROOT/deep"
 : > "$TESTROOT/deep/llm-allowlist"
@@ -3823,6 +3827,11 @@ S66="$TESTROOT/s66"; rm -rf "$S66"; mkdir -p "$S66"
 cat > "$S66/anch.conf" <<'EOF'
 profile s66 10.199.74.0/24
 EOF
+# EGL-206-D2a: the anchor preflight inspects the RESOLVED image before
+# the run — the digest-pinned fallback must exist in the mock store
+# (the mock `podman run` never pulls); localhost/base stays absent so
+# the fallback resolution below keeps its premise.
+: > "$STATE/images/docker.io_library_alpine_3.22@sha256_14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
 # D2: with no env override and no localhost/base in the mock store, the
 # anchor run names the digest-pinned fallback.
 egresslock --config "$S66/anch.conf" teardown s66 >/dev/null 2>&1 || true
@@ -3850,7 +3859,10 @@ grep -q -- '--security-opt=no-new-privileges' <<<"$e66_anchor" \
 grep -q 'docker.io/library/alpine:.*@sha256:' "$TREE_ROOT/egresslock" \
     && e66 pass || e66 fail "engine fallback anchor image carries a digest pin"
 # D1/D2: an explicit env override still wins unchanged (resolution order
-# preserved) — and still gets the hardening pair.
+# preserved) — and still gets the hardening pair. EGL-206-D2a: the mock
+# store must hold the override image for the new checkpoint-annotation
+# preflight (inspect-before-run).
+: > "$STATE/images/localhost_base_latest"
 egresslock --config "$S66/anch.conf" teardown s66 >/dev/null 2>&1 || true
 : > "$STATE/runlog"
 env EGRESSLOCK_ANCHOR_IMAGE="localhost/base:latest" \
@@ -4661,6 +4673,202 @@ section_end egl139
 egl139_pass=$pass; egl139_fail=$fail
 egl140_pass=$egl139_pass; egl140_fail=$egl139_fail
 
+# --- EGL-206: checkpoint-annotation refusal + live hardening assertions ----
+# D2a: every kit-owned run first inspects the RESOLVED image for
+# io.podman.annotations.checkpoint.runtime.name and refuses named, with
+# no `podman run` of the refused image (CVE-2026-94603). D2b: the
+# launch-time hardening pair is asserted LIVE (in-container
+# /proc/1/status: CapEff all-zero + NoNewPrivs 1) at start and on
+# verify — both containers, both verify verbs — and the converged
+# short-circuits are caps-aware (bad/unreadable caps fall through to
+# replacement, never a blessing; the EGL-123-D3 MAC pattern).
+section_begin egl206 "EGL-206 checkpoint-annotation refusal + live hardening"
+e206() { assert "$@"; }
+
+S206="$TESTROOT/s206"; rm -rf "$S206"; mkdir -p "$S206"
+cat > "$S206/gw.conf" <<'EOF'
+profile s206 10.199.98.0/24
+    rule gateway-only
+    gateway 10.199.98.2 3128 s206-allowlist
+EOF
+printf '# starter\n' > "$S206/s206-allowlist"
+cat > "$S206/bare.conf" <<'EOF'
+profile s206b 10.199.99.0/24
+EOF
+
+# D2a-1: annotated gateway image refused named, with no run of it (the
+# anchor still starts first — ensure_anchor precedes the gateway).
+: > "$STATE/image-annotated-localhost_egresslock-gateway_latest"
+e206_out="$(egresslock --config "$S206/gw.conf" ensure s206 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" != 0 && "$e206_out" == *"io.podman.annotations.checkpoint.runtime.name"* \
+      && "$e206_out" == *"CVE-2026-94603"* ]] \
+   && ! grep -q -- '--name egresslock-gateway-s206' "$STATE/runlog"; then
+    e206 pass
+else
+    e206 fail "D2a annotated gateway image refused named, no run (rc=$e206_rc, out: $e206_out, gwruns=$(grep -c -- '--name egresslock-gateway-s206' "$STATE/runlog" 2>/dev/null || echo 0))"
+fi
+rm -f "$STATE/image-annotated-localhost_egresslock-gateway_latest"
+
+# D2a-2: annotated anchor image (env override) refused named, no anchor
+# run — the anchor preflight covers EGRESSLOCK_ANCHOR_IMAGE too.
+: > "$STATE/images/localhost_base_latest"
+: > "$STATE/image-annotated-localhost_base_latest"
+e206_out="$(env EGRESSLOCK_ANCHOR_IMAGE="localhost/base:latest" \
+    egresslock --config "$S206/bare.conf" ensure s206b 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" != 0 && "$e206_out" == *"io.podman.annotations.checkpoint.runtime.name"* ]] \
+   && ! grep -q -- '--name egresslock-anchor-s206b' "$STATE/runlog"; then
+    e206 pass
+else
+    e206 fail "D2a annotated anchor image refused named, no run (rc=$e206_rc, out: $e206_out, anchruns=$(grep -c -- '--name egresslock-anchor-s206b' "$STATE/runlog" 2>/dev/null || echo 0))"
+fi
+rm -f "$STATE/image-annotated-localhost_base_latest"
+
+# D2a-3 (R-EGL-206-2 #1): fresh-account first-create — the resolved
+# anchor image is NOT in the mock store (seed marker removed). The
+# preflight must provision it (the same pull rt_run would do, in front
+# of the inspect) and the ensure must come up green — not die in the
+# preflight (the live-matrix 32/16 regression).
+rm -f "$STATE/images/docker.io_library_alpine_latest"
+: > "$STATE/callorder.log"
+e206_out="$(egresslock --config "$S206/bare.conf" ensure s206b 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" == 0 ]] \
+   && grep -q '^podman pull docker.io/library/alpine:latest$' "$STATE/callorder.log" \
+   && [[ "$(grep -n '^podman pull docker.io/library/alpine:latest$' "$STATE/callorder.log" | head -1 | cut -d: -f1)" \
+         -lt "$(grep -n -- '--name egresslock-anchor-s206b' "$STATE/callorder.log" | head -1 | cut -d: -f1)" ]]; then
+    e206 pass
+else
+    e206 fail "D2a fresh-account missing anchor image: pull-then-start green (rc=$e206_rc, out: $e206_out, order: $(tr '\n' '|' < "$STATE/callorder.log" 2>/dev/null | head -c 300))"
+fi
+
+# D2a-4 (R-EGL-206-2 #1): missing anchor image whose pull FAILS dies
+# named, with no anchor run (fail closed, never a silent run).
+egresslock --config "$S206/bare.conf" teardown s206b >/dev/null 2>&1 || true
+rm -f "$STATE/images/docker.io_library_alpine_latest"
+: > "$STATE/pull-fails"
+e206_runs_before="$(wc -l < "$STATE/runlog")"
+e206_out="$(egresslock --config "$S206/bare.conf" ensure s206b 2>&1)"; e206_rc=$?
+e206_runs_after="$(wc -l < "$STATE/runlog")"
+if [[ "$e206_rc" != 0 && "$e206_out" == *"pulling it failed"* \
+      && "$e206_out" == *"CVE-2026-94603"* ]] \
+   && [[ "$e206_runs_after" == "$e206_runs_before" ]]; then
+    e206 pass
+else
+    e206 fail "D2a failed pull on missing anchor image dies named, no run (rc=$e206_rc, out: $e206_out, runlog delta: $((e206_runs_after - e206_runs_before)))"
+fi
+rm -f "$STATE/pull-fails"
+
+# D2a-5 (R-EGL-206-2 #1): an ANNOTATED image absent from the store is
+# pulled first, then refused named — the refusal stays preventative
+# even on first-create, with no run of the pulled image.
+egresslock --config "$S206/bare.conf" teardown s206b >/dev/null 2>&1 || true
+rm -f "$STATE/images/docker.io_library_alpine_latest"
+: > "$STATE/image-annotated-docker.io_library_alpine_latest"
+: > "$STATE/callorder.log"
+e206_runs_before="$(wc -l < "$STATE/runlog")"
+e206_out="$(egresslock --config "$S206/bare.conf" ensure s206b 2>&1)"; e206_rc=$?
+e206_runs_after="$(wc -l < "$STATE/runlog")"
+if [[ "$e206_rc" != 0 && "$e206_out" == *"io.podman.annotations.checkpoint.runtime.name"* \
+      && "$e206_out" == *"CVE-2026-94603"* ]] \
+   && grep -q '^podman pull docker.io/library/alpine:latest$' "$STATE/callorder.log" \
+   && [[ "$e206_runs_after" == "$e206_runs_before" ]]; then
+    e206 pass
+else
+    e206 fail "D2a annotated missing image pulled then refused, no run (rc=$e206_rc, out: $e206_out, runlog delta: $((e206_runs_after - e206_runs_before)))"
+fi
+rm -f "$STATE/image-annotated-docker.io_library_alpine_latest"
+# restore the seeded marker the harness (and the D2b cases below) anchor on
+: > "$STATE/images/docker.io_library_alpine_latest"
+
+# Clean slate for the D2b cases: green ensure for the gateway profile.
+egresslock --config "$S206/gw.conf" teardown s206 >/dev/null 2>&1 || true
+e206_out="$(egresslock --config "$S206/gw.conf" ensure s206 2>&1)"; e206_rc=$?
+[[ "$e206_rc" == 0 ]] \
+    && e206 pass || e206 fail "D2b setup: clean ensure green (rc=$e206_rc, out: $e206_out)"
+
+# D2b-1: live gateway CapEff non-zero fails verify named (no HostConfig
+# oracle involved).
+: > "$STATE/caps-bad-egresslock-gateway-s206"
+e206_out="$(egresslock --config "$S206/gw.conf" verify s206 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" != 0 && "$e206_out" == *"gateway container 'egresslock-gateway-s206' CapEff"* ]]; then
+    e206 pass
+else
+    e206 fail "D2b gateway CapEff mismatch fails verify named (rc=$e206_rc, out: $e206_out)"
+fi
+rm -f "$STATE/caps-bad-egresslock-gateway-s206"
+
+# D2b-2: live gateway NoNewPrivs 0 fails verify named.
+: > "$STATE/caps-nnp-egresslock-gateway-s206"
+e206_out="$(egresslock --config "$S206/gw.conf" verify s206 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" != 0 && "$e206_out" == *"gateway container 'egresslock-gateway-s206' NoNewPrivs"* ]]; then
+    e206 pass
+else
+    e206 fail "D2b gateway NoNewPrivs mismatch fails verify named (rc=$e206_rc, out: $e206_out)"
+fi
+rm -f "$STATE/caps-nnp-egresslock-gateway-s206"
+
+# D2b-3: unreadable status fails closed named — on verify…
+: > "$STATE/caps-unreadable-egresslock-gateway-s206"
+e206_out="$(egresslock --config "$S206/gw.conf" verify s206 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" != 0 && "$e206_out" == *"hardening state unreadable"* ]]; then
+    e206 pass
+else
+    e206 fail "D2b unreadable status fails verify closed named (rc=$e206_rc, out: $e206_out)"
+fi
+rm -f "$STATE/caps-unreadable-egresslock-gateway-s206"
+# …and on ensure (the start assertion dies named, never a silent pass).
+: > "$STATE/caps-unreadable-egresslock-gateway-s206"
+e206_out="$(egresslock --config "$S206/gw.conf" ensure s206 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" != 0 && "$e206_out" == *"hardening state unreadable"* ]]; then
+    e206 pass
+else
+    e206 fail "D2b unreadable status fails ensure closed named (rc=$e206_rc, out: $e206_out)"
+fi
+rm -f "$STATE/caps-unreadable-egresslock-gateway-s206"
+
+# D2b-4: a mismatched anchor fails BOTH verify verbs (bare profile: the
+# anchor is the only kit container).
+egresslock --config "$S206/bare.conf" teardown s206b >/dev/null 2>&1 || true
+e206_out="$(egresslock --config "$S206/bare.conf" ensure s206b 2>&1)"; e206_rc=$?
+[[ "$e206_rc" == 0 ]] \
+    && e206 pass || e206 fail "D2b setup: bare-profile ensure green (rc=$e206_rc, out: $e206_out)"
+: > "$STATE/caps-bad-egresslock-anchor-s206b"
+e206_out="$(egresslock --config "$S206/bare.conf" verify s206b 2>&1)"; e206_rc=$?
+[[ "$e206_rc" != 0 && "$e206_out" == *"anchor container 'egresslock-anchor-s206b' CapEff"* ]] \
+    && e206 pass || e206 fail "D2b anchor mismatch fails plain verify named (rc=$e206_rc, out: $e206_out)"
+e206_out="$(env EGRESSLOCK_CONF="$S206/bare.conf" egresslock verify --ensured 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" != 0 && "$e206_out" == *"anchor container 'egresslock-anchor-s206b' CapEff"* \
+      && "$e206_out" == *"FAILED anchor hardening verification"* ]]; then
+    e206 pass
+else
+    e206 fail "D2b anchor mismatch fails verify --ensured named (rc=$e206_rc, out: $e206_out)"
+fi
+rm -f "$STATE/caps-bad-egresslock-anchor-s206b"
+
+# D2b-5: converged short-circuit is caps-aware — a converged gateway
+# whose live caps went bad is REPLACED (rm+run in the opslog), never
+# blessed; with the image fixed, the next ensure is green again.
+e206_out="$(egresslock --config "$S206/gw.conf" ensure s206 2>&1)"; e206_rc=$?
+[[ "$e206_rc" == 0 ]] \
+    && e206 pass || e206 fail "D2b setup: ensure green before converged case (rc=$e206_rc, out: $e206_out)"
+: > "$STATE/caps-bad-egresslock-gateway-s206"
+: > "$STATE/opslog"
+e206_out="$(egresslock --config "$S206/gw.conf" ensure s206 2>&1)"; e206_rc=$?
+if [[ "$e206_rc" != 0 && "$e206_out" == *"gateway container 'egresslock-gateway-s206' CapEff"* ]] \
+   && grep -q 'podman rm -f egresslock-gateway-s206' "$STATE/opslog" \
+   && grep -q -- '--name egresslock-gateway-s206' "$STATE/opslog"; then
+    e206 pass
+else
+    e206 fail "D2b converged bad-caps gateway replaced, named (rc=$e206_rc, out: $e206_out, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null | head -c 400))"
+fi
+rm -f "$STATE/caps-bad-egresslock-gateway-s206"
+e206_out="$(egresslock --config "$S206/gw.conf" ensure s206 2>&1)"; e206_rc=$?
+[[ "$e206_rc" == 0 && "$e206_out" != *"already converged, not restarted"* ]] \
+    && e206 pass || e206 fail "D2b ensure green again after the fix (rc=$e206_rc, out: $e206_out)"
+
+egresslock --config "$S206/gw.conf" teardown s206 >/dev/null 2>&1 || true
+egresslock --config "$S206/bare.conf" teardown s206b >/dev/null 2>&1 || true
+section_end egl206
+
 # --- EGL-175: runtime-seam grep-gate (D8/D12) ------------------------------
 # The contract's acceptance test (internal_docs/RUNTIME_BACKEND_CONTRACT.md):
 # after extracting the rt_* adapter bodies, the rest of the engine has zero
@@ -4683,9 +4891,11 @@ ENG175="$TREE_ROOT/egresslock"
 # D3: the frozen rt_* primitive vocabulary is present (the closed adapter
 # set the gate reasons about).
 missing175=""
-for p in rt_unshare rt_image_exists rt_network_ls rt_network_inspect \
-         rt_network_create rt_network_rm rt_ps rt_run rt_rm rt_exec \
-         rt_cp rt_restart rt_inspect rt_info rt_version rt_have_runtime; do
+for p in rt_unshare rt_image_exists rt_image_inspect rt_image_pull \
+         rt_network_ls \
+         rt_network_inspect rt_network_create rt_network_rm rt_ps rt_run \
+         rt_rm rt_exec rt_cp rt_restart rt_inspect rt_info rt_version \
+         rt_have_runtime; do
     grep -qE "^${p}\(\)" "$ENG175" || missing175="$missing175 $p"
 done
 [[ -z "$missing175" ]] \

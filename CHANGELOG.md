@@ -4,6 +4,78 @@ All notable changes between egresslock releases. The public repository
 ships without history (each release is a fresh snapshot tree), so this
 file is the record of what changed since the previous release.
 
+## 0.7.0 - 2026-10-01
+
+> **Operator-important changes:**
+>
+> **Action required:**
+> - **None for a default install** — the kit-built gateway and the
+>   digest-pinned anchor fallback do not carry a checkpoint
+>   annotation. Stop reading here unless you override the kit
+>   images (`EGRESSLOCK_GW_IMAGE`, `EGRESSLOCK_ANCHOR_IMAGE`, or
+>   an unpinned `localhost/base:latest` in the account store). A
+>   checkpoint-annotated override now fails `ensure` closed with
+>   a named error — replace the image. Optional check:
+>   `egresslock ensure <profile>`.
+
+> **Behavior changes:**
+> - **Kit containers now refuse checkpoint-annotated images and
+>   assert their live hardening** (CVE-2026-94603 /
+>   GHSA-2cvf-wqm6-wr9g). `ensure` and both `verify` verbs fail
+>   closed, named, when a kit image — gateway or anchor, including
+>   `EGRESSLOCK_GW_IMAGE` / `EGRESSLOCK_ANCHOR_IMAGE` overrides —
+>   carries the annotation
+>   `io.podman.annotations.checkpoint.runtime.name`, or when the
+>   live capability state of a kit container reads wrong or
+>   unreadable (in-container `CapEff` / `NoNewPrivs`, read from the
+>   container's PID 1). A running kit container whose live hardening
+>   is wrong is replaced by the next `ensure`, not blessed. Override
+>   images must provide `cat` for the live read — a missing `cat`
+>   is a named failure, never a skip.
+> - **Fresh-account first `ensure` now pulls the anchor's resolved
+>   image before inspecting it** (the same pull `podman run` already
+>   performed, moved ahead of the new annotation check); a failed
+>   pull fails closed with a named manual-pull instruction.
+
+### Security
+
+- **CVE-2026-94603 / GHSA-2cvf-wqm6-wr9g — checkpoint-annotation
+  images and discarded sandbox flags.** The kit now refuses to run
+  its own gateway/anchor images when they carry the
+  container-checkpoint annotation, and asserts the launch-time
+  hardening pair (`--cap-drop=all`,
+  `--security-opt=no-new-privileges`) live on both kit containers at
+  `ensure` and on both `verify` verbs — the assertion reads the
+  container's own PID 1, not `podman inspect`, which this CVE
+  invalidates as an oracle. The annotation-triggered checkpoint
+  interpretation is live-observed in the kit's VM lane (guest Podman
+  5.4.2, in the advisory range: a benign annotated image was treated
+  as a checkpoint and failed at the restore import); the silent
+  flag-discard end state and the affected range / fixed floor
+  (≥ 5.8.8 / 6.1.3) are per the advisory — not observed or confirmed
+  from this tree. Workload launchers remain the operator's
+  obligation; the kit ships no workload preflight.
+
+### Docs
+
+- Threat model: the cap-drop operator obligation now records that
+  **flags passed are not flags honored**, with the same
+  live-observed / advisory split as above; the T9 row notes that a
+  silently discarded workload cap-drop (not observed from this tree)
+  would make the recorded residual reachable with no operator-cap
+  violation. Overview and release checklist mirror the hedge; the
+  stale claim that the kit enforces the pair "only on the gateway"
+  is fixed (the anchor is covered too).
+
+### Internal
+
+- Test scripts derive the release base from `VERSION_BASE` instead
+  of hardcoding it.
+- Docs ship-gate path containment hardened: normalized link targets
+  outside the tree root are rejected.
+- Real-host smoke matrix for the runtime seam (live Podman / pasta
+  spine; operator live pass green; private tree only).
+
 ## 0.6.0 - 2026-09-28
 
 > **Operator-important changes:**
