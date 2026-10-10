@@ -55,9 +55,6 @@ All of these must hold on the snapshot tree (not the private
 development history):
 
 - [ ] `bash tests/run.sh` is green on the snapshot sources.
-- [ ] `LICENSE` is Apache-2.0; README License section points at it.
-- [ ] `SECURITY.md` exists and names a private reporting channel;
-      README links it. Public issues are not the security path.
 - [ ] Threat model matches the tree: no site launchers, accepted
       risks stated, no claim of sandbox or “any rootless Podman”.
 - [ ] README and setup docs match CLI names:
@@ -65,14 +62,6 @@ development history):
       `egresslock-setup --doctor` (kit/account state),
       `egresslock doctor` (host environment), if those commands exist
       at this tag.
-- [ ] Snapshot contains no process tickets, no internal maintainer
-      briefs, no fleet hostnames/IPs/accounts. Fleet-fact grep on the
-      staged tree is empty.
-- [ ] Examples use only publishable names (RFC 5737 / `example.test`
-      / public registries), never site destinations.
-- [ ] `.deb` / prefix / tarball do not co-install; uninstall does
-      not delete `~/.config/egresslock`; AppArmor is not applied in
-      `postinst`.
 - [ ] Full or focused review (below) ended **READY** or **READY WITH
       MINOR FIXES**, with blockers fixed or explicitly deferred in
       the threat model.

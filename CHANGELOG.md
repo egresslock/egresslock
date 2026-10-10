@@ -4,6 +4,169 @@ All notable changes between egresslock releases. The public repository
 ships without history (each release is a fresh snapshot tree), so this
 file is the record of what changed since the previous release.
 
+## 0.8.0 - 2026-10-10
+
+> **Operator-important changes:**
+>
+> **Action required:**
+> - **Rebuild the gateway image to pick up the openssl security
+>   fix (DSA-6531-1, October 2026).** A kit upgrade alone does
+>   **not** patch a running gateway. Rebuild and replace per
+>   [The gateway image](docs/reference/gateway-image.md#rebuild-and-replace-the-gateway);
+>   until then, running gateways keep the old base.
+> - **Make sure your workload launchers use the hardened flags.**
+>   Every production `podman run` should carry `--cap-drop=all` and
+>   `--security-opt=no-new-privileges` (add `--userns=keep-id` and
+>   `--read-only` where compatible). Egresslock's policy confines
+>   network egress; it does not harden the workload's capabilities or
+>   filesystem — a workload with extra capabilities can act outside the
+>   policy. The threat model's launcher obligation assumes these flags
+>   are in place; the shipped recipes now model it. Update any launcher
+>   you built from an earlier recipe, and confirm your own. See
+>   [container hardening](docs/reference/container-hardening.md). The
+>   minimal `podman run` in the quickstarts teaches the policy loop, not
+>   a production launcher.
+
+### Added
+
+- **New shared example image `egl-base` ships with the kit.** The
+  quickstarts now use one local example image, built from the same
+  pinned Debian base as the gateway, with ssh, curl, dig, ping and
+  rsync included. The README builds it as a numbered step, via a helper at
+  `examples/egl-base/build-egl-base` that reports whether
+  `localhost/egl-base:latest` is missing, current, or built from an
+  older Debian base, and rebuilds it when needed (re-run it after a kit
+  upgrade whose notes move the base pin). Build it once per account:
+  `podman build -t localhost/egl-base:latest
+  /usr/share/egresslock/examples/egl-base` (prefix installs:
+  `/opt/egresslock/examples/egl-base`). No action required unless you
+  follow the quickstarts.
+
+- **New `egresslock build-gateway` — rebuild the gateway image without
+  root.** Run it in your account's own shell (no root, no `--account`)
+  and it builds from the deployed gateway context next to the engine.
+  If the image is missing or was built from an older base pin, it
+  builds; if it already matches the deployed pin it prints an explicit
+  up-to-date line (`--force` rebuilds anyway — the squid package is
+  deliberately unpinned, so a same-pin rebuild can take squid security
+  updates). `egresslock-setup --build-gateway` keeps working and now
+  delegates to the same command. No user action needed — additive; the
+  old command now rebuilds a stale image instead of silently skipping
+  it. A running gateway is not replaced: after a rebuild, run
+  `egresslock ensure --replace-gateway <profile>` (below).
+
+- **New `egresslock ensure --replace-gateway <profile>` — easily
+  replace a running gateway.** After `egresslock build-gateway` (or
+  `build-gateway --force`), run `egresslock ensure --replace-gateway
+  <profile>` to start a new gateway container from the current image.
+  That replacement drops the profile's proxied sessions until the new
+  gateway answers; ensure prints a stderr notice. A missing or unsafe
+  target image is refused **before** removing the running gateway
+  container (earlier ensure steps — network / anchor / nft / pins —
+  are not undone). Duplicate `--replace-gateway` is a usage error.
+  Plain `egresslock ensure <profile>` is unchanged: a healthy gateway is
+  not replaced. `allow` / `disallow` / starting an agent never pass
+  this flag. Action required only when a release note tells you to
+  rebuild the gateway: after upgrading the kit, run the two commands.
+  Custom `EGRESSLOCK_GW_IMAGE` remains per-invocation — set it on the
+  `--replace-gateway` ensure if you use a non-default image.
+
+- **`egresslock doctor` now shows the gateway image's base and flags a
+  stale image.** The `gateway image:` row reports the base digest the
+  image was built from (and its build date), and prints `stale: base
+  pin moved` when the installed kit's deployed pin expects a different
+  base — the same check `sudo egresslock-setup --doctor --account
+  <acct>` already showed, now available in the account shell with no
+  root. Advisory only: exit codes are unchanged, and a missing image is
+  information, not an error. No action on install; when the release
+  notes say the base moved, rebuild with `egresslock build-gateway` and
+  replace the running gateway — see [The gateway
+  image](docs/reference/gateway-image.md#rebuild-and-replace-the-gateway).
+
+### Security
+
+- **A failed `ensure` now removes the bad kit container instead of
+  leaving it running.** When the live-hardening assertion on the
+  gateway or the anchor detects a wrong or unreadable capability state,
+  `ensure` force-removes that container (`podman rm -f`) before failing
+  closed. Previously it reported the failure but left the
+  `--restart=always` container alive — including the gateway sitting on
+  the policy's egress-exemption path. If the removal itself fails, the
+  error names the runtime error and the exact manual
+  `podman rm -f <name>` command; the exit code is unchanged (1).
+  `verify` stays read-only and only reports the bad state.
+- **Gateway base refreshed for DSA-6531-1 (openssl).** The pinned
+  `debian:13-slim` digest now carries `libssl3t64 3.5.7-1~deb13u3`.
+  A kit upgrade alone does not patch a running gateway — see the
+  action-required item above.
+
+### Docs
+
+- **Recipe launches are gated on the preflight.** Every recipe now
+  chains `egresslock ensure <profile> && egresslock verify <profile>
+  && podman run …`, so a failed check stops the launch instead of
+  continuing unprotected. Re-copy the block if you kept an earlier
+  copy. The rule is stated in [container
+  hardening](docs/reference/container-hardening.md).
+
+- **Shipped examples use consistent baseline hardening.** The recipe
+  set recommends `--cap-drop=all`,
+  `--security-opt=no-new-privileges`, and `--userns=keep-id`
+  (read-only where compatible), plus a single hardening-defaults
+  reference.
+- **Threat model: the T9-neighbor clause is hedged.** The clause now
+  carries the "flags passed are not flags honored" caveat for the
+  CVE-2026-94603 discard class.
+- **The gateway image's maintenance story is now documented in one
+  place.** When to rebuild, what the doctor's `stale:` means, and the
+  rebuild/replace steps live on
+  [The gateway image](docs/reference/gateway-image.md); install,
+  upgrade, uninstall, container hardening, and the doctor output link
+  it. No behavior change; no action needed.
+- **Threat model T9 wording is honest about capabilities.** The T9
+  row and the cap-drop guidance now name the capability each
+  technique needs: adding an interface address needs
+  `CAP_NET_ADMIN`, absent from the tested default set; creating the
+  tested `AF_PACKET`/`SOCK_RAW` socket under plain defaults returned
+  `EPERM` in the tested lane. The cap-drop guidance is precise:
+  `--cap-drop=all` drops defaults without neutralizing an explicit
+  `--cap-add`. No operator action; the cap-drop obligation is
+  unchanged.
+- **Quickstart and setup docs were revised for readers.** Several pages
+  were simplified and focused on the task at hand. No action required.
+- **Uninstall guide now leads with the `.deb` path.** For a `.deb`
+  install, disable the account's verify timer
+  (`sudo systemctl disable --now egresslock-verify@<account>.timer`)
+  then `sudo apt remove egresslock`; the checkout `uninstall-kit.sh`
+  path is the manual/prefix variant. The recipes now state the two
+  safety prerequisites: stop and remove every workload attached to a
+  kit network before runtime teardown (teardown deletes the kit's nft
+  enforcement and does not remove non-kit-named workloads), and run
+  teardown for EVERY account with kit runtime — not only the timer
+  accounts — before the host-global AppArmor unapply and package or
+  prefix removal. Account examples now create a password-disabled
+  service account (`adduser --disabled-password`). No action
+  required — existing installs are unchanged until you next
+  uninstall.
+
+### Fixed
+
+- **`disallow-host` no longer false-fails when the rootless netns
+  lacks `/proc/net/nf_conntrack`.** The severance proof now reads
+  the conntrack table over ctnetlink (`conntrack -L`) — the same
+  interface as the revocation probe and flush — so the command
+  completes with `removed:` instead of `ct unproven`. When the
+  flush deletes nothing, there is no `warn: ... failed`. No action
+  required.
+
+- **Command usage errors now surface before config errors.** An
+  invalid invocation (unknown or duplicate flag, missing/extra
+  argument, bad destination) reports its usage error and exits 2
+  even when the profile config is missing, malformed, or
+  unreadable. Valid invocations are unchanged; a missing config
+  still exits 2 with `no profile config`, and a broken config still
+  fails closed. No action required.
+
 ## 0.7.0 - 2026-10-01
 
 > **Operator-important changes:**

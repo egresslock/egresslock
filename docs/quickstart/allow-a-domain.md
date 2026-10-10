@@ -3,107 +3,190 @@
 The loop: probe the deny-all policy → see what's blocked → allow a
 domain → confirm.
 
-Run every command **as the account** (`sudo -iu <account>`), not root.
-In that shell `~` is the account's home and `podman` is the account's
-rootless Podman.
-
-Before you start, make sure the profile is up:
-`egresslock ensure main` (see
-[check-everything](../reference/check-everything.md) for the full health check).
+> **Before you start**
+>
+> 1. an account set up with a name of your choosing — the examples
+>    use `egl-runner`; enter its shell with `sudo -iu egl-runner`
+>    (see [who-runs-what](../reference/who-runs-what.md) for the
+>    three worlds)
+> 2. the profile is up — `egresslock ensure main` (the examples use
+>    profile `main`; full health check:
+>    [check-everything](../reference/check-everything.md))
+> 3. the shared example image `localhost/egl-base:latest` —
+>    built once per account
+>    ([egl-base](../../examples/egl-base/README.md#build))
 
 ## 1. Probe the deny-all policy — expect a denied CONNECT
 
-Run as the dedicated `<account>`:
+The starter allowlist is **EMPTY** (fail-closed): the gateway
+denies application connections; DNS queries to the bridge
+resolver are still allowed and can carry data out
+([threat model](../reference/threat-model.md)). Probe with
+`localhost/egl-base:latest`.
+
+From the account shell on the host — each probe is a throwaway
+container that runs one command and exits (`--rm`), so there is no
+shell to leave behind:
 
 ```sh
-sudo -iu <account>
-```
+# the host, account shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
 
-The starter allowlist is **EMPTY** (fail-closed), so the gateway denies
-everything. Probe with an image that HAS a client tool:
-`docker.io/curlimages/curl:latest` is the smallest (curl only;
-`debian:13-slim` has no curl/wget/ping). The `docker.io/` prefix is
-required on hosts with no unqualified-search registries.
-
-```sh
-# Workload with the empty starter allowlist — the gateway denies everything.
-# Proxy env comes in as one env file (the profile's six vars, no hardcoded
-# addresses). `2>&1` merges curl's stderr into stdout so the error and
-# code print in order.
+egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
 podman run --rm \
+    --cap-drop=all --security-opt=no-new-privileges \
     --network="$(egresslock network main)" \
-    --env-file=<(egresslock proxy-env main) \
-    docker.io/curlimages/curl:latest \
+    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    localhost/egl-base:latest \
     sh -c 'curl --max-time 10 -sS -o /dev/null -w "http_code=%{http_code}\n" https://example.com 2>&1'
 ```
 
-Denied, expect:
+<details>
+<summary>Expected output (denied):</summary>
+after up to 10 second delay…
 
-> curl: (7) CONNECT tunnel failed, response 403
-> http_code=000
+<pre>
+egl-runner@host:~$ egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
+podman run --rm \
+    --cap-drop=all --security-opt=no-new-privileges \
+    --network="$(egresslock network main)" \
+    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    localhost/egl-base:latest \
+    sh -c 'curl --max-time 10 -sS -o /dev/null -w "http_code=%{http_code}\n" https://example.com 2>&1'
+curl: (56) CONNECT tunnel failed, response 403
+http_code=000
+</pre>
 
-That `000` is the deny-all policy working (no HTTP response — the
-gateway rejected the CONNECT). Already seeing `http_code=200`? The
-host is already allowed — skip to
+The CONNECT `403` (`curl: (56) CONNECT tunnel failed, response 403`)
+is the gateway denial. `http_code=000` only means no origin HTTP
+response — a connection failure prints it too. See
+[paths-and-signatures](../reference/paths-and-signatures.md).
+Already `http_code=200`? The host is already allowed — skip to
 [step 4](#4-rerun-the-probe--expect-200).
 
-Proxy env: curl reads the uppercase forms, but apt, wget, git, and pip
-only honor the lowercase — the env file injects both cases; non-gateway
-profiles (direct `allow-host`
-rules) have no proxy. Tools with their own proxy configuration (Gradle,
-Maven, npm) or that ignore the env entirely:
-[proxy-clients](../reference/proxy-clients.md).
+Troubleshooting: `localhost/egl-base:latest` not found? Build it:
+[egl-base](../../examples/egl-base/README.md#build).
+</details>
 
 ## 2. See what's blocked
 
 ```sh
+# the host, account shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
+
 egresslock denied main
 ```
 
-`denied main` lists what the gateway is STILL blocking (de-duplicated,
-omitting hosts you already allowed — `denied main --all` shows the raw
-list, and `denied main --days 0` the full log beyond the default
-14-day window). It is the feed for the next `allow`.
+<details>
+<summary>Expected output:</summary>
+
+<pre>
+egl-runner@host:~$ egresslock denied main
+example.com
+</pre>
+
+One line per still-blocked destination (de-duplicated, hosts you
+already allowed omitted — `--all` shows the raw list); it is the feed
+for the next `allow`.
+
+Troubleshooting: empty when you expected a hit? Stale engine/env —
+[proxied-or-direct](../troubleshooting/proxied-or-direct.md).
+</details>
 
 ## 3. Allow the domain
 
 ```sh
+# the host, account shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
+
 egresslock allow main example.com:443
 ```
 
-`allow` appends to the allowlist and re-ensures the profile (the gateway
-now permits `example.com`).
+<details>
+<summary>Expected output:</summary>
+
+<pre>
+egl-runner@host:~$ egresslock allow main example.com:443
+using config /home/egl-runner/.config/egresslock/main.conf
+added: example.com:443 -> /home/egl-runner/.config/egresslock/main-allowlist
+re-ensuring profile 'main' ...
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
+profile 'main' ready (network egresslock-main, policy verified)
+</pre>
+
+`allow` appends to the allowlist and applies the change (the gateway
+now permits `example.com`); batch as many entries as you like —
+multiple arguments, one re-ensure.
+</details>
 
 ## 4. Re-run the probe — expect 200
 
 Same `podman run` as step 1:
 
 ```sh
+# the host, account shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
+
+egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
 podman run --rm \
+    --cap-drop=all --security-opt=no-new-privileges \
     --network="$(egresslock network main)" \
-    --env-file=<(egresslock proxy-env main) \
-    docker.io/curlimages/curl:latest \
+    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    localhost/egl-base:latest \
     sh -c 'curl --max-time 10 -sS -o /dev/null -w "http_code=%{http_code}\n" https://example.com 2>&1'
 ```
 
-Expect `http_code=200`. Still `000` with a `CONNECT tunnel failed`
-line? The allow didn't land — check `denied main` and the allowlist.
+<details>
+<summary>Expected output:</summary>
+
+<pre>
+egl-runner@host:~$ egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
+podman run --rm \
+    --cap-drop=all --security-opt=no-new-privileges \
+    --network="$(egresslock network main)" \
+    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    localhost/egl-base:latest \
+    sh -c 'curl --max-time 10 -sS -o /dev/null -w "http_code=%{http_code}\n" https://example.com 2>&1'
+http_code=200
+</pre>
+
+Troubleshooting: still `000` with a `CONNECT tunnel failed` line? The
+allow didn't land — check `denied main` and the allowlist
+(`egresslock allowlist main`).
+</details>
 
 ## Remove an allowed domain
 
 ```sh
+# the host, account shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
+
 egresslock disallow main example.com:443
 ```
 
-Removes the exact line and re-ensures; absent entry fails closed (exit
-1, nothing changed). Re-run the probe — denied again.
+<details>
+<summary>Expected output:</summary>
 
-> HTTP `allow` does not cover SSH or other non-HTTP traffic — ssh
-> ignores HTTP(S)_PROXY and never reaches the gateway. For git-over-SSH
-> use `allow-host <profile> <host:port>` (see
-> [grow-the-policy](grow-the-policy.md)). IP:port destinations (LAN
-> services, same-host services) have their own page:
-> [allow-non-http](allow-non-http.md).
+<pre>
+egl-runner@host:~$ egresslock disallow main example.com:443
+using config /home/egl-runner/.config/egresslock/main.conf
+removed: example.com:443 -> /home/egl-runner/.config/egresslock/main-allowlist
+re-ensuring profile 'main' ...
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
+profile 'main' ready (network egresslock-main, policy verified)
+</pre>
 
-Next: [Grow the policy](grow-the-policy.md) — the allow/allow-host
-flows and the destination → mechanism table.
+Removes the exact line and applies the change. Re-run the probe —
+denied again. Entry not present? It fails closed — exit 1, nothing
+changed:
+
+<pre>
+egl-runner@host:~$ egresslock disallow main example.com:443
+Error: entry not present: example.com:443
+</pre>
+</details>
+
+## Next
+
+- [Allow non-HTTP egress](allow-non-http.md) — `allow-host` for
+  git-over-SSH and raw IPs, and the fail-closed proofs.

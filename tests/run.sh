@@ -6,12 +6,21 @@
 # the standalone egresslock repo after ARC-75) cannot skip a battery by
 # accident.
 #
-# EGL-78-D2/D3/D6: every harness runs inside `timeout 300` so a single
+# EGL-78-D2/D3/D6: every harness runs inside `timeout` so a single
 # hanging check (wedged probe, stuck pty, unexpected real binary on PATH)
 # is a NAMED FAILURE, never a wedged battery. A timeout is a FAIL — never
 # a skip. When `stdbuf` is present, each harness runs as
 # `stdbuf -oL -eL bash "$h"` inside the timeout so PASS lines flush before
 # a later hang; without stdbuf the harness runs unmodified (not a failure).
+#
+# EGL-225: the bound is 600s (was 300s). The engine harness is a
+# process-spawn storm — hundreds of engine invocations, each forking
+# ~80+ mock helper processes, plus deliberate latency budgets (5s
+# named-timeout probes, EGL-217's budget-exhaustion die paths) — and
+# measured 297-345s locally vs 300s (runs 486/505/509/510 on the
+# shared CI runner: every check PASSed, then the bound fired). 600s
+# leaves headroom for the loaded 2-cpu runner and battery growth
+# while a real wedge is still named in ~10 min.
 #
 # EGL-79-D2: `--help/-h` prints usage and exits 0 (no battery);
 # `--harness engine|kit|docs|all` selects a subset (default `all` =
@@ -176,7 +185,7 @@ if [[ "$harness_sel" == "all" && ${#harnesses[@]} -eq 0 ]]; then
     exit 2
 fi
 
-HARNESS_TIMEOUT=300
+HARNESS_TIMEOUT=600
 
 # EGL-86-D3: per-harness tee logs for the end-of-suite skip summary.
 skip_logs=()

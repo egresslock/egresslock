@@ -6,8 +6,10 @@
 # Supply chain: the base is pinned by digest in gateway/Containerfile
 # (docker.io/library/debian:13-slim@sha256:...) so a rebuild cannot
 # silently float to new base content. The `squid` apt package stays
-# UNPINNED on purpose: rebuilds take distro security updates. Update
-# the pin deliberately (new digest = new recorded review).
+# UNPINNED on purpose: rebuilds take distro security updates for squid.
+# The pinned base is the opposite: its preinstalled libssl3t64/openssl
+# only move when the digest is refreshed — update the pin deliberately
+# (new digest = new recorded review).
 #
 # Options:
 #   -h, --help   print this help

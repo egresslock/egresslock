@@ -90,18 +90,31 @@ request `http://ollama.lan:11434` — does not rescue the proxied 403:
 
 ## Proving a drop with the counter
 
-The nft chains log nothing; counters are the only trace — and they
-are visible in the LIVE netns ruleset, not `rules` output:
+Run as the container-owner account on the host. Counters are in
+the live netns ruleset, not `egresslock rules` output. For `main`:
 
 ```sh
-podman unshare --rootless-netns nft list ruleset | grep 'daddr 192.0.2.24'
-#     ... counter packets N bytes M accept
+# account — enter its host shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
+
+podman unshare --rootless-netns nft list chain inet egresslock p_main
 ```
 
-Repro the hang, re-read: an incrementing counter = confirmed drop.
-Do not hand-edit the chain to add log rules — `verify` treats chain
-edits as tamper and the next `ensure` rebuilds the chain; run
-`ensure main` after any experiment to restore.
+Find the subnet-scoped rule ending in `counter packets N bytes M
+drop`. Read its packet count, run the direct probe, and read it
+again. An increase shows that packets hit that drop rule; an
+increase on an `accept` rule shows acceptance, not a drop.
+
+The drop counter covers the profile subnet, not one destination
+or container. Other traffic can increment it too: stop unrelated
+workload traffic before attributing an increase to your probe.
+A timeout or an unchanged counter alone does not prove that the
+intended traffic was blocked by this rule. A failed ruleset read
+is an inspection failure, not evidence of enforcement.
+
+Do not edit rules or reset counters for this check. For a profile
+other than `main`, use its chain name: `p_` followed by the profile
+name with hyphens replaced by underscores.
 
 ## Scope notes
 

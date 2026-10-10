@@ -679,8 +679,8 @@ fi
 # every ensure/verify/teardown. Shim podman so
 # `unshare --rootless-netns true` sleeps 60s; ensure must return
 # non-zero with the timeout-specific message, well under the harness's
-# 300s bound. SKIP is deliberately NOT set on this call (D4: the bound,
-# not the SKIP env, is the hang-prevention mechanism).
+# 600s bound (EGL-225). SKIP is deliberately NOT set on this call (D4:
+# the bound, not the SKIP env, is the hang-prevention mechanism).
 mkdir -p "$TESTROOT/bin-hang"
 cat > "$TESTROOT/bin-hang/podman" <<EOF
 #!/usr/bin/env bash
@@ -2982,6 +2982,46 @@ else
     a32 fail "D3.1 Containerfile FROM not digest-pinned ($(grep '^FROM' "$TREE_ROOT/gateway/Containerfile"))"
 fi
 
+# D3.1b (EGL-203-D2) — the OCI base labels stamp the built image with
+# the same base the FROM pins: both label keys present, and the label
+# digest equals the FROM digest (drift guard — a pin refresh must move
+# the label with it, never leave it behind).
+c32_from_dig="$(grep '^FROM ' "$TREE_ROOT/gateway/Containerfile" \
+    | grep -oE 'sha256:[0-9a-f]{64}' | head -1)"
+c32_lbl_dig="$(grep -oE '^LABEL org\.opencontainers\.image\.base\.digest="sha256:[0-9a-f]{64}"$' \
+    "$TREE_ROOT/gateway/Containerfile" | grep -oE 'sha256:[0-9a-f]{64}')"
+if [[ -n "$c32_from_dig" && -n "$c32_lbl_dig" && "$c32_lbl_dig" == "$c32_from_dig" ]] \
+      && grep -qE '^LABEL org\.opencontainers\.image\.base\.name="docker\.io/library/debian:13-slim"$' \
+           "$TREE_ROOT/gateway/Containerfile"; then
+    a32 pass
+else
+    a32 fail "D3.1b base labels missing or drifted from FROM (from=$c32_from_dig label=$c32_lbl_dig)"
+fi
+
+# D3.2 (EGL-232) — egl-base FROM is byte-equal to the gateway FROM
+# (one pin refresh updates both; the battery fails if they drift).
+c32_gw_from="$(grep '^FROM ' "$TREE_ROOT/gateway/Containerfile" | head -1)"
+c32_egl_from="$(grep '^FROM ' "$TREE_ROOT/examples/egl-base/Containerfile" | head -1)"
+if [[ -n "$c32_gw_from" && -n "$c32_egl_from" && "$c32_egl_from" == "$c32_gw_from" ]]; then
+    a32 pass
+else
+    a32 fail "D3.2 egl-base FROM drifted from gateway (gw=$c32_gw_from egl=$c32_egl_from)"
+fi
+
+# D3.2b (EGL-240) — egl-base OCI base labels stamp the built image
+# with the same base the FROM pins (same shape as D3.1b).
+c32_egl_from_dig="$(grep '^FROM ' "$TREE_ROOT/examples/egl-base/Containerfile" \
+    | grep -oE 'sha256:[0-9a-f]{64}' | head -1)"
+c32_egl_lbl_dig="$(grep -oE '^LABEL org\.opencontainers\.image\.base\.digest="sha256:[0-9a-f]{64}"$' \
+    "$TREE_ROOT/examples/egl-base/Containerfile" | grep -oE 'sha256:[0-9a-f]{64}')"
+if [[ -n "$c32_egl_from_dig" && -n "$c32_egl_lbl_dig" && "$c32_egl_lbl_dig" == "$c32_egl_from_dig" ]] \
+      && grep -qE '^LABEL org\.opencontainers\.image\.base\.name="docker\.io/library/debian:13-slim"$' \
+           "$TREE_ROOT/examples/egl-base/Containerfile"; then
+    a32 pass
+else
+    a32 fail "D3.2b egl-base base labels missing or drifted from FROM (from=$c32_egl_from_dig label=$c32_egl_lbl_dig)"
+fi
+
 # D4.1 — NOPASSWD documented as unsupported; no sudoers file shipped.
 if grep -q 'NOPASSWD' "$TREE_ROOT/docs/setup/install.md" \
    && grep -q 'NOPASSWD' "$TREE_ROOT/docs/reference/threat-model.md" \
@@ -3238,6 +3278,77 @@ o="$(run69 teardown 2>&1)"; rc=$?
 
 section_end arc69
 
+# --- EGL-202: uninstall safety-prerequisite pins (R-EGL-202-3 F1/F2) -------
+# Docs-only ticket, but the escalated review required narrow mock-backed
+# coverage pinning the shipped engine behavior the revised uninstall page's
+# safety prerequisites must spell out:
+#   F1: `teardown --runtime` is account-scoped — cleaning account A's store
+#       leaves account B's store untouched (so the page must say "every
+#       account with kit runtime", not just "the account" — the runtime
+#       set can be larger than the enabled-timer set).
+#   F2: a non-kit workload attached to a kit network SURVIVES the sweep
+#       while the netns-wide nft enforcement table is deleted, and the
+#       in-use network is kept rather than force-removed (so the page must
+#       say "stop attached workloads BEFORE teardown").
+# These pins assert the hazards exist in the engine as shipped — they are
+# an honest model for the docs, not a claim that teardown is unsafe by
+# default (the escalated reviewer's probes confirmed the same two
+# hazards independently; see ticket R-EGL-202-3).
+section_begin egl202 "EGL-202 teardown scope pins (uninstall prerequisites)"
+a202() { assert "$@"; }
+
+# Per-account stores: the mock's ARCMOCK_STATE dir IS one account's
+# rootless Podman store.
+SA202="$TESTROOT/h202-a"; SB202="$TESTROOT/h202-b"
+mk_egl202_store() { # mk_egl202_store <dir>
+    rm -rf "$1"; mkdir -p "$1/nft" "$1/networks" "$1/running" "$1/containers"
+    : > "$1/running/egresslock-anchor-main"
+    echo "egresslock-main" > "$1/containers/egresslock-anchor-main.net"
+    printf 'driver=bridge\nsubnet=10.199.0.0/24\n' > "$1/networks/egresslock-main"
+    printf 'chain filter {\n}\n' > "$1/nft/egresslock.filter"
+}
+run_egl202() { # run_egl202 <store> <engine args...>
+    local st="$1"; shift
+    env ARCMOCK_STATE="$st" HOME="$st" EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+        egresslock "$@"
+}
+
+# F1: account-A cleanup leaves account-B untouched.
+mk_egl202_store "$SA202"
+mk_egl202_store "$SB202"
+o="$(run_egl202 "$SA202" teardown --runtime 2>&1)"; rc=$?
+[[ "$rc" == 0 \
+    && "$o" == *"removed container egresslock-anchor-main"* \
+    && "$o" == *"removed network egresslock-main"* \
+    && "$o" == *"removed nft table inet egresslock"* \
+    && ! -e "$SA202/running/egresslock-anchor-main" \
+    && ! -e "$SA202/networks/egresslock-main" \
+    && ! -e "$SA202/nft/egresslock.filter" ]] \
+    && a202 pass || a202 fail "F1 account-A sweep removes A's runtime (rc=$rc, out: $o)"
+[[ -f "$SB202/running/egresslock-anchor-main" \
+    && -f "$SB202/networks/egresslock-main" \
+    && -f "$SB202/nft/egresslock.filter" ]] \
+    && a202 pass || a202 fail "F1 account-B store untouched by account-A sweep"
+
+# F2: a non-kit workload attached to the kit network survives the sweep
+# while the nft enforcement table is deleted; the in-use network is kept.
+mk_egl202_store "$SA202"
+: > "$SA202/running/agent-opencode"
+echo "egresslock-main" > "$SA202/containers/agent-opencode.net"
+touch "$SA202/network-rm-fails"
+o="$(run_egl202 "$SA202" teardown --runtime 2>&1)"; rc=$?
+[[ "$rc" == 0 \
+    && "$o" == *"removed container egresslock-anchor-main"* \
+    && "$o" == *"kept network egresslock-main (in use)"* \
+    && "$o" == *"removed nft table inet egresslock"* \
+    && -f "$SA202/running/agent-opencode" \
+    && -f "$SA202/containers/agent-opencode.net" \
+    && ! -e "$SA202/nft/egresslock.filter" ]] \
+    && a202 pass || a202 fail "F2 attached non-kit workload survives while nft enforcement is deleted (rc=$rc, out: $o)"
+rm -f "$SA202/network-rm-fails"
+
+section_end egl202
+
 # --- EGL-31: engine output hygiene (bare command name; no stale doc path) -
 # D1 grep-guard: no engine output string references the hard-coded
 # /opt/egresslock/egresslock path or the never-existed how-to/ page.
@@ -3285,6 +3396,10 @@ d_out="$(env -u EGRESSLOCK_CONF NFT_BIN=/nonexistent PATH="$none45:$TREE_ROOT" e
     && a45 pass || a45 fail "doctor without conf, missing tools (rc=$d_rc, out: $d_out)"
 [[ "$d_out" == *"rootless_netns: skipped (podman MISSING)"* ]] \
     && a45 pass || a45 fail "netns probe skipped when podman missing"
+# EGL-226-D6: the gateway-image row joins the podman-MISSING skip (additive
+# assert — the required-row asserts above are unchanged).
+[[ "$d_out" == *"gateway image: skipped (podman MISSING)"* ]] \
+    && a45 pass || a45 fail "gateway image row skipped when podman missing"
 
 # 2/3/4b. EGL-81-D1: the rc-0 asserts below are hermetic — doctor's
 # `userns:` row is pinned via the EGRESSLOCK_USERNS_SYSCTL harness
@@ -3472,6 +3587,159 @@ d_elapsed=$(( SECONDS - d_start ))
     && a45 pass || a45 fail "doctor probe expiry: 5s row + generic hint, rc 0 (rc=$d_rc, elapsed=${d_elapsed}s, out: $d_out, err: $(cat "$d_err"))"
 
 section_end egl45
+
+# --- EGL-226: doctor gateway-image staleness row (engine, account-side) ----
+# The engine doctor mirrors the kit doctor's staleness peek
+# (egresslock-setup:1658-1666) conf-less: image via gw_image(), pin from the
+# ENGINE'S NEIGHBOR gateway/Containerfile (the exact context build-gateway
+# uses), state via the rt_* seam. All rows advisory / rc-neutral. Fixture:
+# the shared bin-doctor-e226 podman wrapper handles image exists/inspect
+# against ARCMOCK_STATE markers and delegates everything else to a healthy
+# stub45/podman (so the required rows stay green and rc stays 0). Cases
+# mirror kit egl203 1-4 (tests/test-kit.sh:3022-3115), with the D10
+# empty-inspect case (no pre-label guess) added.
+section_begin egl226 "EGL-226 doctor gateway-image staleness row"
+a226() { assert "$@"; }
+
+ENG226="$TREE_ROOT/egresslock"
+E226IMG="localhost/egresslock-gateway:e226"   # isolated from the shared default fixture
+e226state="$(echo "$E226IMG" | tr '/:' '__')"
+E226IMGF="$STATE/images/$e226state"
+E226INS="$STATE/image-inspect-$e226state"
+# Pin source = the engine-under-test's neighbor; egl226 runs the TREE engine
+# (never rewriting tree files) except case 2's copied engine.
+e226dig="$(grep -oE 'sha256:[0-9a-f]{64}' "$TREE_ROOT/gateway/Containerfile" | head -1)"
+e226short="${e226dig#sha256:}"; e226short="${e226short:0:12}"
+
+# Restore the HEALTHY stub45/podman (a later egl45 case may have left a
+# failure-shaped stub behind; the case-2 body, tests/test-engine.sh:3319).
+cat > "$stub45/podman" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    --version) echo "podman version 5.4.2" ;;
+    info) echo "netavark" ;;
+    unshare) exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+chmod +x "$stub45/podman"
+
+# The e226 podman wrapper: image exists/inspect from ARCMOCK_STATE markers
+# (same tr'/:'->'__' layout as lib.sh), everything else execs stub45/podman.
+mkdir -p "$TESTROOT/bin-doctor-e226"
+cat > "$TESTROOT/bin-doctor-e226/podman" <<EOF
+#!/usr/bin/env bash
+D="\${ARCMOCK_STATE:?}"
+if [[ "\$1" == image && "\$2" == exists ]]; then
+    [[ -f "\$D/images/\$(echo "\$3" | tr '/:' '__')" ]] && exit 0
+    exit 1
+fi
+if [[ "\$1" == image && "\$2" == inspect ]]; then
+    img="\${@: -1}"
+    [[ -f "\$D/images/\$(echo "\$img" | tr '/:' '__')" ]] \
+        || { echo "Error: no such image \$img" >&2; exit 1; }
+    if [[ -f "\$D/image-inspect-\$(echo "\$img" | tr '/:' '__')" ]]; then
+        cat "\$D/image-inspect-\$(echo "\$img" | tr '/:' '__')"
+        exit 0
+    fi
+    exit 0
+fi
+exec "$stub45/podman" "\$@"
+EOF
+chmod +x "$TESTROOT/bin-doctor-e226/podman"
+
+e226run() { # e226run [engine] — env'd doctor invocation (rc-neutral expectation 0)
+    env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+        EGRESSLOCK_GW_IMAGE="$E226IMG" \
+        PATH="$TESTROOT/bin-doctor-e226:$stub45:$PATH" \
+        "${1:-$ENG226}" doctor 2>&1
+}
+
+# 1. Label == deployed pin -> present row with base (short digest) + built
+#    date, no stale line, rc 0.
+: > "$E226IMGF"
+printf '%s 2026-09-01T00:00:00.000000000Z\n' "$e226dig" > "$E226INS"
+o="$(e226run)"; rc=$?
+[[ "$rc" == 0 && "$o" == *"gateway image: present ($E226IMG) — base $e226short"* \
+    && "$o" == *", built 2026-09-01"* && "$o" != *"stale:"* ]] \
+    && a226 pass || a226 fail "match row: base + built, rc-neutral (rc=$rc, out: $o)"
+
+# 2. Pin moved in the COPIED engine's neighbor (the tree Containerfile is
+#    never touched): stale row names both sides + the account-shell rebuild
+#    pointer (byte-identical to egresslock-setup:1666), rc 0.
+rm -rf "$STATE/e226"; mkdir -p "$STATE/e226/kit/gateway"
+cp "$ENG226" "$STATE/e226/kit/egresslock"
+printf 'FROM docker.io/library/debian:13-slim@sha256:%064d\n' 0 \
+    > "$STATE/e226/kit/gateway/Containerfile"
+o="$(e226run "$STATE/e226/kit/egresslock")"; rc=$?
+[[ "$rc" == 0 && "$o" == *"gateway image: present ($E226IMG) — base $e226short"* \
+    && "$o" == *"stale: base pin moved (image base $e226short != deployed pin 000000000000) — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"* ]] \
+    && a226 pass || a226 fail "pin-moved stale row with pointer, rc-neutral (rc=$rc, out: $o)"
+
+# 3. Pre-label image (inspect answered, base empty): the pre-label row +
+#    the pre-label stale pointer, rc 0.
+printf ' 2026-08-01T00:00:00.000000000Z\n' > "$E226INS"
+o="$(e226run)"; rc=$?
+[[ "$rc" == 0 \
+    && "$o" == *"gateway image: present ($E226IMG) — base unknown (pre-label image), built 2026-08-01"* \
+    && "$o" == *"stale: base unknown (pre-label image) — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"* ]] \
+    && a226 pass || a226 fail "pre-label row with pointer, rc-neutral (rc=$rc, out: $o)"
+
+# 4. Inspect FAILS (per-case wrapper exits 1 on image inspect, otherwise
+#    execs the e226 wrapper): degrades to a bare base unknown — no
+#    pre-label guess, no stale claim, rc 0.
+mkdir -p "$STATE/e226/bin-inspectfail"
+cat > "$STATE/e226/bin-inspectfail/podman" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == image && "\$2" == inspect ]]; then echo "mock: inspect denied" >&2; exit 1; fi
+exec "$TESTROOT/bin-doctor-e226/podman" "\$@"
+EOF
+chmod +x "$STATE/e226/bin-inspectfail/podman"
+o="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+    EGRESSLOCK_GW_IMAGE="$E226IMG" \
+    PATH="$STATE/e226/bin-inspectfail:$TESTROOT/bin-doctor-e226:$stub45:$PATH" \
+    "$ENG226" doctor 2>&1)"; rc=$?
+[[ "$rc" == 0 && "$o" == *"gateway image: present ($E226IMG) — base unknown"* \
+    && "$o" != *"pre-label"* && "$o" != *"stale:"* ]] \
+    && a226 pass || a226 fail "inspect failure degrades to base unknown, rc-neutral (rc=$rc, out: $o)"
+
+# 4b. EGL-226-D10: inspect rc 0 but EMPTY output is inspect-failed too —
+#     never pre-label, never stale (the kit's exact hazard). Plain e226
+#     run (no inspectfail wrapper in front): the wrapper itself answers
+#     from the emptied fixture, rc 0 / empty, so D10's non-empty-inspect
+#     discriminator is actually exercised (R-EGL-226-2 F1).
+: > "$E226INS"
+o="$(e226run)"; rc=$?
+[[ "$rc" == 0 && "$o" == *"gateway image: present ($E226IMG) — base unknown"* \
+    && "$o" != *"pre-label"* && "$o" != *"stale:"* ]] \
+    && a226 pass || a226 fail "empty inspect output is base unknown, never pre-label (rc=$rc, out: $o)"
+
+# 5. Image missing -> informational missing row + the account-shell build
+#    pointer (NOT the kit's rc-1), rc 0.
+rm -f "$E226IMGF" "$E226INS"
+o="$(e226run)"; rc=$?
+[[ "$rc" == 0 && "$o" == *"gateway image: missing ($E226IMG)"* \
+    && "$o" == *"build it in the account shell: egresslock build-gateway (see \"The gateway image\" reference page)"* ]] \
+    && a226 pass || a226 fail "missing-image row informational, rc-neutral (rc=$rc, out: $o)"
+
+# 6. Conf-less class guard: no resolution line, no conf error on stdout.
+o="$(env -u EGRESSLOCK_CONF EGRESSLOCK_USERNS_SYSCTL="$TESTROOT/userns-on" \
+    EGRESSLOCK_GW_IMAGE="$E226IMG" \
+    PATH="$TESTROOT/bin-doctor-e226:$stub45:$PATH" "$ENG226" doctor 2>&1)"; rc=$?
+[[ "$rc" == 0 && "$o" != *"using config"* && "$o" != *"no profile config"* \
+    && "$o" != *"scoped:"* ]] \
+    && a226 pass || a226 fail "no conf resolution for doctor (rc=$rc, out: $o)"
+
+# 7. EGL-226-D9: the --help doctor bullet names the advisory image row
+#    (asserted against the TREE engine, not a copied fixture).
+"$ENG226" --help | grep -q "gateway image base" \
+    && a226 pass || a226 fail "--help doctor bullet names gateway image base"
+
+# Keep the store clean for later sections (the deep reset re-creates only
+# its own markers).
+rm -rf "$STATE/e226" "$E226IMGF" "$E226INS"
+
+section_end egl226
 
 # --- ARC-74: deep state semantics (relocated from the site harness and
 # --- neutralized to synthetic fixtures) ----------------------------------
@@ -4430,8 +4698,8 @@ section_end egl147
 # EGL-139-D2: disallow-host runs a fail-closed conntrack probe BEFORE the
 # conf mutation, captures the revoked pin's live daddr from the chain,
 # and after the atomic re-ensure swap deletes + post-asserts the
-# revoked tuple's conntrack state (zero-dep procfs reader); the
-# `removed:` success line prints only after the post-condition holds.
+# revoked tuple's conntrack state (scoped ctnetlink -L reader, EGL-231);
+# the `removed:` success line prints only after the post-condition holds.
 # EGL-140-D1: ensure writes a confdir pin record (<profile>.pins, never
 # matching the *.conf aggregate glob) from WHAT WAS JUST INSTALLED, and
 # verify compares each live daddr against it — chain-vs-record
@@ -4563,6 +4831,13 @@ grep -qxF 'conntrack -C' "$CTLOG" \
     && a139 pass || a139 fail "fail-closed probe ran in-netns (-C in conntrack log)"
 grep -qxF 'conntrack -D -p tcp --dport 2222 -d 192.0.2.10' "$CTLOG" \
     && a139 pass || a139 fail "scoped -D invoked with the captured daddr+dport (log: $(tr '\n' '|' < "$CTLOG"))"
+# EGL-231-D8: the post-assert reads ctnetlink `-L` with the same tuple,
+# after -C and -D, before `removed:` prints.
+grep -qxF 'conntrack -L -p tcp --dport 2222 -d 192.0.2.10' "$CTLOG" \
+    && a139 pass || a139 fail "post-assert reads via scoped -L (log: $(tr '\n' '|' < "$CTLOG"))"
+expected_log=$'conntrack -C\nconntrack -D -p tcp --dport 2222 -d 192.0.2.10\nconntrack -L -p tcp --dport 2222 -d 192.0.2.10'
+[[ "$(cat "$CTLOG")" == "$expected_log" ]] \
+    && a139 pass || a139 fail "conntrack argv order -C then -D then -L before removed: (log: $(tr '\n' '|' < "$CTLOG"))"
 if grep -qF 'dst=192.0.2.11 ' "$CTTABLE" && ! grep -qF 'dst=192.0.2.10 ' "$CTTABLE"; then
     a139 pass
 else
@@ -4628,19 +4903,20 @@ else
     a139 fail "surviving ESTABLISHED entry dies loudly (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
 fi
 
-# 13b. unreadable ct table after the swap -> die at the READ; the
-#      remediation is the table-read command itself, NOT the scoped -D
-#      (wrong tool for this failure), NOT apt install (the probe already
-#      proved the tool present), and NOT "retry disallow-host"
-#      (unrunnable post-swap: the conf line is already gone)
-#      (EGL-168-D2/D4).
+# e231-list-fails (reworked 13b): a failing -L read after the swap -> die
+# at the READ with the working $bin -L hint (EGL-231-D1/D3): NOT the
+# proc-read remediation (the table may not exist; EGL-231), NOT the
+# scoped -D (wrong tool for this failure), NOT apt install (the probe
+# already proved the tool present), and NOT "retry disallow-host" (the
+# conf line is already gone); `removed:` stays unprinted.
 env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock allow-host two git.example.test:2222 >/dev/null 2>&1
 printf 'ipv4 2 tcp 6 431998 ESTABLISHED src=10.199.60.5 dst=192.0.2.10 sport=58666 dport=2222 src=192.0.2.10 dst=10.0.2.15 sport=2222 dport=58670 [ASSURED] mark=0 zone=0 use=2\n' > "$CTTABLE"
-touch "$ARCMOCK_STATE/nft/conntrack-table-unreadable"
+touch "$ARCMOCK_STATE/nft/conntrack-list-fails"
 d_out="$(env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-host two git.example.test:2222 2>&1)"; d_rc=$?
-rm -f "$ARCMOCK_STATE/nft/conntrack-table-unreadable"
+rm -f "$ARCMOCK_STATE/nft/conntrack-list-fails"
 if [[ "$d_rc" == 1 && "$d_out" == *"cannot read the rootless netns conntrack table"* \
-      && "$d_out" == *"podman unshare --rootless-netns cat /proc/net/nf_conntrack"* \
+      && "$d_out" == *"$TESTROOT/bin/conntrack -L -p tcp --dport 2222 -d 192.0.2.10"* \
+      && "$d_out" != *"cat /proc/net/nf_conntrack"* \
       && "$d_out" != *"retry disallow-host"* \
       && "$d_out" != *"sudo apt install conntrack"* \
       && "$d_out" != *'-D -p tcp --dport 2222'* ]] \
@@ -4648,18 +4924,113 @@ if [[ "$d_rc" == 1 && "$d_out" == *"cannot read the rootless netns conntrack tab
    && ! grep -q 'rule allow-host git.example.test:2222' "$EH/direct.conf"; then
     a139 pass
 else
-    a139 fail "unreadable ct table dies at the read with the table-read hint (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
+    a139 fail "failed -L read dies at the read with the -L hint (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
 fi
 
-# 14. SYN_SENT-class transients are ignored (late in-flight packets may
-#     mint them; every subsequent packet drops): rc 0, success line.
+# 14. SYN_SENT-class transients are ignored even when the flush was a
+#     no-op the -L still reads (conntrack-delete-fails keeps the row in
+#     the table so the $1=="tcp" -L-shape awk is actually exercised;
+#     EGL-231-D4): rc 0, success line.
 env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock allow-host two git.example.test:2222 >/dev/null 2>&1
 printf 'ipv4 2 tcp 6 119 SYN_SENT src=10.199.60.9 dst=192.0.2.10 sport=58670 dport=2222 src=192.0.2.10 dst=10.0.2.15 sport=2222 dport=58670 mark=0 zone=0 use=1\n' > "$CTTABLE"
+touch "$ARCMOCK_STATE/nft/conntrack-delete-fails"
 d_out="$(env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-host two git.example.test:2222 2>&1)"; d_rc=$?
+rm -f "$ARCMOCK_STATE/nft/conntrack-delete-fails"
 if [[ "$d_rc" == 0 && "$(grep -c 'removed:' <<<"$d_out")" == 1 ]]; then
     a139 pass
 else
     a139 fail "SYN_SENT transient ignored, rc 0 (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
+fi
+
+# e231-absent-proc (EGL-231-D4, the reporter's host shape): the netns has
+# NO /proc/net/nf_conntrack (conntrack-table-absent marker = ENOENT for
+# any proc reader) — the disallow completes rc 0 with `removed:` because
+# the proof reads ctnetlink -L; a regressed proc reader would die ENOENT.
+env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock allow-host two git.example.test:2222 >/dev/null 2>&1
+printf 'ipv4 2 tcp 6 431998 ESTABLISHED src=10.199.60.5 dst=192.0.2.10 sport=58666 dport=2222 src=192.0.2.10 dst=10.0.2.15 sport=2222 dport=58666 [ASSURED] mark=0 zone=0 use=2\n' > "$CTTABLE"
+: > "$CTLOG"
+touch "$ARCMOCK_STATE/nft/conntrack-table-absent"
+d_out="$(env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-host two git.example.test:2222 2>&1)"; d_rc=$?
+rm -f "$ARCMOCK_STATE/nft/conntrack-table-absent"
+if [[ "$d_rc" == 0 && "$(grep -c 'removed:' <<<"$d_out")" == 1 ]] \
+   && grep -qxF 'conntrack -L -p tcp --dport 2222 -d 192.0.2.10' "$CTLOG"; then
+    a139 pass
+else
+    a139 fail "absent proc table: -L reader completes rc 0 (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
+fi
+
+# e231-flush-noop-message (EGL-231-D2/Q2): an empty table — the flush
+# deletes nothing (the reporter's no-live-flow case) — prints NO
+# `warn: conntrack delete ... failed` line, and the empty -L dump is
+# rc 0 (upstream print_stats exempts the list summary from the
+# zero-count failure — R-EGL-231-3 finding 1) and completes rc 0 with
+# `removed:`.
+env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock allow-host two git.example.test:2222 >/dev/null 2>&1
+: > "$CTTABLE"
+d_out="$(env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-host two git.example.test:2222 2>&1)"; d_rc=$?
+if [[ "$d_rc" == 0 && "$(grep -c 'removed:' <<<"$d_out")" == 1 ]] \
+   && [[ "$d_out" != *"warn: conntrack delete"* ]]; then
+    a139 pass
+else
+    a139 fail "no-op flush is silent, empty -L dump is success (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
+fi
+: > "$CTTABLE"
+
+# R-EGL-231-3 finding 1 regression battery: EVERY nonzero -L rc must
+# die at the read — `removed:` stays unprinted, the post-swap state is
+# disclosed (conf line removed, ruleset swapped, ct unproven), and no
+# summary text (a 0-shown summary, a zero-summary-plus-error
+# transcript, a positive count ending in zero, partial rows) can bless
+# a failed read into a success.
+e231_list_fail_case() { # e231_list_fail_case <marker> <label>
+    local marker="$1" label="$2"
+    env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock allow-host two git.example.test:2222 >/dev/null 2>&1
+    printf 'ipv4 2 tcp 6 431998 ESTABLISHED src=10.199.60.5 dst=192.0.2.10 sport=58666 dport=2222 src=192.0.2.10 dst=10.0.2.15 sport=2222 dport=58666 [ASSURED] mark=0 zone=0 use=2\n' > "$CTTABLE"
+    : > "$CTLOG"
+    touch "$ARCMOCK_STATE/nft/$marker"
+    d_out="$(env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-host two git.example.test:2222 2>&1)"; d_rc=$?
+    rm -f "$ARCMOCK_STATE/nft/$marker"
+    if [[ "$d_rc" == 1 && "$d_out" == *"cannot read the rootless netns conntrack table (rc=1)"* \
+          && "$d_out" == *"state: conf line removed, ruleset swapped, ct unproven"* \
+          && "$d_out" == *"$TESTROOT/bin/conntrack -L -p tcp --dport 2222 -d 192.0.2.10"* ]] \
+       && ! grep -q 'removed:' <<<"$d_out" \
+       && ! grep -q 'rule allow-host git.example.test:2222' "$EH/direct.conf"; then
+        a139 pass
+    else
+        a139 fail "failed -L shape $label dies at the read, no removed: (rc=$d_rc, out: $(echo "$d_out" | tail -1))"
+    fi
+}
+# nonzero rc + empty output (empty stdout/stderr beyond the error).
+e231_list_fail_case conntrack-list-fails 'empty-output'
+# nonzero rc + a zero-shown summary (the withdrawn D6 exception shape:
+# the substring exception would have wrongly blessed this into a green
+# `removed:`).
+e231_list_fail_case conntrack-list-nonzero-empty 'zero-summary'
+# nonzero rc + zero summary PLUS an error line in the transcript (the
+# combined shape the substring exception would have matched).
+e231_list_fail_case conntrack-list-zero-summary-error 'zero-summary-plus-error'
+# nonzero rc + a POSITIVE count ending in zero ("10 … shown") — the
+# substring match could begin at the count's final digit; the delimited
+# read gate ignores summary text entirely.
+e231_list_fail_case conntrack-list-nonzero-count 'positive-count-nonzero-rc'
+# nonzero rc + partial rows on stdout (a truncated dump followed by
+# failure) — never a success, and never the survivor die either (the
+# read itself failed).
+e231_list_fail_case conntrack-list-partial-rows-fail 'partial-rows'
+
+# e231-tuple-direction (R-EGL-231-3 non-blocking reconciliation): the
+# real -d/--dport select ORIGINAL-direction fields only, so a row
+# matching the tuple only on the REPLY side (a pinned host dialing in:
+# original src=192.0.2.10 sport=2222) is neither deleted nor listed —
+# the scoped flush leaves it alone and the disallow still completes.
+env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock allow-host two git.example.test:2222 >/dev/null 2>&1
+printf 'ipv4 2 tcp 6 431998 ESTABLISHED src=192.0.2.10 dst=10.199.60.9 sport=2222 dport=58670 src=10.199.60.9 dst=192.0.2.10 sport=58670 dport=2222 [ASSURED] mark=0 zone=0 use=2\n' > "$CTTABLE"
+d_out="$(env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-host two git.example.test:2222 2>&1)"; d_rc=$?
+if [[ "$d_rc" == 0 && "$(grep -c 'removed:' <<<"$d_out")" == 1 ]] \
+   && grep -qF 'src=192.0.2.10 ' "$CTTABLE"; then
+    a139 pass
+else
+    a139 fail "reply-only tuple match is out of the scoped flush (rc=$d_rc, table: $(tr '\n' '|' < "$CTTABLE"), out: $(echo "$d_out" | tail -1))"
 fi
 : > "$CTTABLE"
 # 15. CONNTRACK_BIN env guards mirror ARC-59 (leading-dash / non-exec).
@@ -4667,10 +5038,11 @@ d_out="$(CONNTRACK_BIN=-x env EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock disallow-
 [[ "$d_rc" == 1 && "$d_out" == *"must not start with '-'"* ]] \
     && a139 pass || a139 fail "CONNTRACK_BIN leading-dash guard (rc=$d_rc, out: $(echo "$d_out" | head -2 | tr '\n' '|'))"
 
-section_end egl139
-# EGL-184-D2: the egl140 witness stays manual — it aliases egl139's
-# counts, so egl139's hand capture line survives next to its snapshot.
 egl139_pass=$pass; egl139_fail=$fail
+section_end egl139
+# EGL-184-D2 / EGL-194-D5: egl140 stays a manual alias of egl139.
+# Capture is inside the egl139 window (before section_end) so a
+# later pass/fail reset cannot silently zero the witness.
 egl140_pass=$egl139_pass; egl140_fail=$egl139_fail
 
 # --- EGL-206: checkpoint-annotation refusal + live hardening assertions ----
@@ -4869,60 +5241,1069 @@ egresslock --config "$S206/gw.conf" teardown s206 >/dev/null 2>&1 || true
 egresslock --config "$S206/bare.conf" teardown s206b >/dev/null 2>&1 || true
 section_end egl206
 
-# --- EGL-175: runtime-seam grep-gate (D8/D12) ------------------------------
+# --- EGL-208: assert_kit_caps removes the bad container before dying -------
+# The start-path assert (ensure_anchor/ensure_gateway) runs after rt_run
+# started a --restart=always container; a bare die used to leave it alive
+# — on the gateway, under the live policy's fixed-IP+MAC egress
+# exemption. D1: the assert force-removes before dying; D3: the die
+# reports the removal outcome (success clause / loud manual-removal
+# failure, rc 1 either way); D4/Q2: verify never removes.
+section_begin egl208 "EGL-208 assert_kit_caps fail-closed removal"
+e208() { assert "$@"; }
+
+S208="$TESTROOT/s208"; rm -rf "$S208"; mkdir -p "$S208"
+cat > "$S208/gw.conf" <<'EOF'
+profile s208 10.199.100.0/24
+    rule gateway-only
+    gateway 10.199.100.2 3128 s208-allowlist
+EOF
+printf '# starter\n' > "$S208/s208-allowlist"
+cat > "$S208/bare.conf" <<'EOF'
+profile s208b 10.199.101.0/24
+EOF
+
+# EGL-208-1: fresh-start gateway bad caps — the die carries the named
+# CapEff problem AND the removal clause; the container is gone
+# ($STATE/running/...) and the opslog shows `podman rm -f <gw>` AFTER
+# the `--name <gw>` run line (rm mirror lib.sh:659, run mirror :417;
+# the pre-run stale-removal rm sits before the run line — order is the
+# pin).
+: > "$STATE/caps-bad-egresslock-gateway-s208"
+: > "$STATE/opslog"
+e208_out="$(egresslock --config "$S208/gw.conf" ensure s208 2>&1)"; e208_rc=$?
+e208_runline="$(grep -n -- '--name egresslock-gateway-s208' "$STATE/opslog" | head -1 | cut -d: -f1)"
+e208_rmafter="$(awk -v r="$e208_runline" '$0=="podman rm -f egresslock-gateway-s208"{ if (NR>r) {print NR; exit} }' "$STATE/opslog")"
+if [[ "$e208_rc" == 1 && "$e208_out" == *"gateway container 'egresslock-gateway-s208' CapEff"* \
+      && "$e208_out" == *"removed container 'egresslock-gateway-s208' (rm -f)"* ]] \
+   && [[ -n "$e208_runline" && -n "$e208_rmafter" ]] \
+   && [[ ! -f "$STATE/running/egresslock-gateway-s208" ]]; then
+    e208 pass
+else
+    e208 fail "fresh-start bad-caps gateway removed before die (rc=$e208_rc, out: $e208_out, runline=$e208_runline, rmafter=$e208_rmafter, running=$([[ -f "$STATE/running/egresslock-gateway-s208" ]] && echo yes || echo no))"
+fi
+rm -f "$STATE/caps-bad-egresslock-gateway-s208"
+
+# EGL-208-2: fresh-start anchor bad caps — same shape on the bare
+# profile (the anchor start-path case EGL-206's review recorded as
+# missing); the anchor dies pre-policy, nothing left running.
+: > "$STATE/caps-bad-egresslock-anchor-s208b"
+: > "$STATE/opslog"
+e208_out="$(egresslock --config "$S208/bare.conf" ensure s208b 2>&1)"; e208_rc=$?
+e208_runline="$(grep -n -- '--name egresslock-anchor-s208b' "$STATE/opslog" | head -1 | cut -d: -f1)"
+e208_rmafter="$(awk -v r="$e208_runline" '$0=="podman rm -f egresslock-anchor-s208b"{ if (NR>r) {print NR; exit} }' "$STATE/opslog")"
+if [[ "$e208_rc" == 1 && "$e208_out" == *"anchor container 'egresslock-anchor-s208b' CapEff"* \
+      && "$e208_out" == *"removed container 'egresslock-anchor-s208b' (rm -f)"* ]] \
+   && [[ -n "$e208_runline" && -n "$e208_rmafter" ]] \
+   && [[ ! -f "$STATE/running/egresslock-anchor-s208b" ]]; then
+    e208 pass
+else
+    e208 fail "fresh-start bad-caps anchor removed before die (rc=$e208_rc, out: $e208_out, runline=$e208_runline, rmafter=$e208_rmafter, running=$([[ -f "$STATE/running/egresslock-anchor-s208b" ]] && echo yes || echo no))"
+fi
+rm -f "$STATE/caps-bad-egresslock-anchor-s208b"
+
+# EGL-208-3: removal failure is loud, never "recovered" — rc stays 1,
+# the message keeps the named problem + the runtime error + the
+# could-not-be-removed warning + the manual `podman rm -f <n>`, and the
+# container state is still present (never silently reported removed).
+: > "$STATE/caps-bad-egresslock-gateway-s208"
+: > "$STATE/rm-container-fails"
+e208_out="$(egresslock --config "$S208/gw.conf" ensure s208 2>&1)"; e208_rc=$?
+if [[ "$e208_rc" == 1 && "$e208_out" == *"gateway container 'egresslock-gateway-s208' CapEff"* \
+      && "$e208_out" == *"removal failed:"* \
+      && "$e208_out" == *"could not be removed and may still be running"* \
+      && "$e208_out" == *"remove it manually: 'podman rm -f egresslock-gateway-s208'"* ]] \
+   && [[ -f "$STATE/running/egresslock-gateway-s208" ]]; then
+    e208 pass
+else
+    e208 fail "removal failure loud with the manual command (rc=$e208_rc, out: $e208_out, running=$([[ -f "$STATE/running/egresslock-gateway-s208" ]] && echo yes || echo no))"
+fi
+rm -f "$STATE/rm-container-fails" "$STATE/caps-bad-egresslock-gateway-s208"
+egresslock --config "$S208/gw.conf" teardown s208 >/dev/null 2>&1 || true
+
+# EGL-208-4 (Q2 pin): verify removes nothing — bad caps + a running
+# gateway → verify rc 1 naming the state, the container still running
+# after, and no rm in the opslog at all.
+e208_out="$(egresslock --config "$S208/gw.conf" ensure s208 2>&1)"; e208_rc=$?
+[[ "$e208_rc" == 0 ]] \
+    && e208 pass || e208 fail "EGL-208 setup: green ensure before the verify pin (rc=$e208_rc, out: $e208_out)"
+: > "$STATE/opslog"
+: > "$STATE/caps-bad-egresslock-gateway-s208"
+e208_out="$(egresslock --config "$S208/gw.conf" verify s208 2>&1)"; e208_rc=$?
+if [[ "$e208_rc" == 1 && "$e208_out" == *"verify: gateway container 'egresslock-gateway-s208' CapEff"* ]] \
+   && [[ -f "$STATE/running/egresslock-gateway-s208" ]] \
+   && ! grep -q '^podman rm' "$STATE/opslog"; then
+    e208 pass
+else
+    e208 fail "verify named the bad caps and removed nothing (rc=$e208_rc, out: $e208_out, running=$([[ -f "$STATE/running/egresslock-gateway-s208" ]] && echo yes || echo no))"
+fi
+rm -f "$STATE/caps-bad-egresslock-gateway-s208"
+egresslock --config "$S208/gw.conf" teardown s208 >/dev/null 2>&1 || true
+egresslock --config "$S208/bare.conf" teardown s208b >/dev/null 2>&1 || true
+section_end egl208
+
+# --- EGL-217: family-wide ensure-failure container cleanup -----------------
+# The wait-for-running/healthy dies (anchor "did not reach running state",
+# gateway "did not become healthy" / "did not come back healthy after
+# config application") and the no-die set -e exits (raw rt_run failure,
+# rule-gen rc 1) sit before/outside assert_kit_caps and used to leave this
+# run's --restart=always container behind — on the gateway,
+# running-but-unhealthy under the live policy's fixed-IP+MAC egress
+# exemption. cmd_ensure arms an EXIT-trap cleanup that removes ONLY the
+# containers this run started/replaced (R1) or restarted via the config
+# apply (R2); a converged pair on a failing refresh is never touched
+# (no-collateral pin, EGL-217-6). Self-contained section (sibling-file
+# rule: appended after egl208, no shared lines).
+# Mock knobs (tests/lib.sh): run-sick[-<name>] (the run arm registers the
+# container but skips the running/ marker), probe-fails[-<name>] (the
+# probe fails from container start or config-activation restart — the
+# run/restart arms write the live probe-fails-active-<name> marker, so a
+# pre-existing healthy gateway keeps answering until the apply restart).
+# bin-nosleep: test-local no-op `sleep` PATH shim (inverse of bin-hang)
+# so the 10s/60s wait loops do not burn wall time (sleep is external —
+# the PATH shim reaches it; the mock's restart arm does not sleep).
+section_begin egl217 "EGL-217 ensure-failure container cleanup"
+e217() { assert "$@"; }
+
+mkdir -p "$TESTROOT/bin-nosleep"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TESTROOT/bin-nosleep/sleep"
+chmod +x "$TESTROOT/bin-nosleep/sleep"
+E217PATH="$TESTROOT/bin-nosleep:$PATH"
+
+S217="$TESTROOT/s217"; rm -rf "$S217"; mkdir -p "$S217"
+cat > "$S217/gw.conf" <<'EOF'
+profile s217 10.199.102.0/24
+    rule gateway-only
+    gateway 10.199.102.2 3128 s217-allowlist
+EOF
+printf '# starter\n' > "$S217/s217-allowlist"
+cat > "$S217/bare.conf" <<'EOF'
+profile s217b 10.199.103.0/24
+EOF
+cat > "$S217/badhost.conf" <<'EOF'
+profile s217f 10.199.104.0/24
+    rule allow-host nonexistent.example.test:8080
+EOF
+
+# EGL-217-1: anchor wait die — the run registers the anchor (run-sick)
+# but it never reports running; the die used to leave the
+# --restart=always container behind. Now the EXIT trap removes it: rc 1 +
+# named die + the M3 success line, the opslog `podman rm -f` AFTER the
+# run line (run mirror lib.sh:417, rm mirror :659; order is the pin), and
+# nothing left registered/running.
+: > "$STATE/run-sick-egresslock-anchor-s217b"
+: > "$STATE/opslog"
+e217_out="$(PATH="$E217PATH" egresslock --config "$S217/bare.conf" ensure s217b 2>&1)"; e217_rc=$?
+e217_runline="$(grep -n -- '--name egresslock-anchor-s217b' "$STATE/opslog" | head -1 | cut -d: -f1)"
+e217_rmafter="$(awk -v r="$e217_runline" '$0=="podman rm -f egresslock-anchor-s217b"{ if (NR>r) {print NR; exit} }' "$STATE/opslog")"
+if [[ "$e217_rc" == 1 \
+      && "$e217_out" == *"anchor container 'egresslock-anchor-s217b' did not reach running state"* \
+      && "$e217_out" == *"removed container 'egresslock-anchor-s217b' (rm -f)"* ]] \
+   && [[ -n "$e217_runline" && -n "$e217_rmafter" ]] \
+   && [[ ! -f "$STATE/running/egresslock-anchor-s217b" \
+      && ! -f "$STATE/containers/egresslock-anchor-s217b.net" ]]; then
+    e217 pass
+else
+    e217 fail "anchor wait die removes the registered container (rc=$e217_rc, out: $e217_out, runline=$e217_runline, rmafter=$e217_rmafter, running=$([[ -f "$STATE/running/egresslock-anchor-s217b" ]] && echo yes || echo no), registered=$([[ -f "$STATE/containers/egresslock-anchor-s217b.net" ]] && echo yes || echo no))"
+fi
+rm -f "$STATE/run-sick-egresslock-anchor-s217b"
+
+# EGL-217-2: gateway wait die, first create — the gateway is running but
+# the proxy never answers (probe-fails; the sharper filed case), the
+# 60s-wait die fires, and the trap rolls back the WHOLE family: the
+# gateway AND the anchor started by the same run, each with its own M3
+# line and its own rm-after-run pin; nothing left registered/running.
+: > "$STATE/probe-fails-egresslock-gateway-s217"
+: > "$STATE/opslog"
+e217_out="$(PATH="$E217PATH" egresslock --config "$S217/gw.conf" ensure s217 2>&1)"; e217_rc=$?
+e217_gwrun="$(grep -n -- '--name egresslock-gateway-s217' "$STATE/opslog" | head -1 | cut -d: -f1)"
+e217_gwrmafter="$(awk -v r="$e217_gwrun" '$0=="podman rm -f egresslock-gateway-s217"{ if (NR>r) {print NR; exit} }' "$STATE/opslog")"
+e217_anrun="$(grep -n -- '--name egresslock-anchor-s217' "$STATE/opslog" | head -1 | cut -d: -f1)"
+e217_anrmafter="$(awk -v r="$e217_anrun" '$0=="podman rm -f egresslock-anchor-s217"{ if (NR>r) {print NR; exit} }' "$STATE/opslog")"
+if [[ "$e217_rc" == 1 \
+      && "$e217_out" == *"gateway container 'egresslock-gateway-s217' did not become healthy (proxy not answering on 3128)"* \
+      && "$e217_out" == *"removed container 'egresslock-gateway-s217' (rm -f)"* \
+      && "$e217_out" == *"removed container 'egresslock-anchor-s217' (rm -f)"* ]] \
+   && [[ -n "$e217_gwrun" && -n "$e217_gwrmafter" && -n "$e217_anrun" && -n "$e217_anrmafter" ]] \
+   && [[ ! -f "$STATE/running/egresslock-gateway-s217" \
+      && ! -f "$STATE/containers/egresslock-gateway-s217.net" \
+      && ! -f "$STATE/running/egresslock-anchor-s217" \
+      && ! -f "$STATE/containers/egresslock-anchor-s217.net" ]]; then
+    e217 pass
+else
+    e217 fail "gateway wait die rolls back the family (rc=$e217_rc, out: $e217_out, gwrun=$e217_gwrun, gwrmafter=$e217_gwrmafter, anrun=$e217_anrun, anrmafter=$e217_anrmafter, gw_running=$([[ -f "$STATE/running/egresslock-gateway-s217" ]] && echo yes || echo no), an_running=$([[ -f "$STATE/running/egresslock-anchor-s217" ]] && echo yes || echo no))"
+fi
+rm -f "$STATE/probe-fails-egresslock-gateway-s217"
+
+# EGL-217-3: apply-health die on a PRE-EXISTING converged gateway (R2).
+# Seed green, change the allowlist so gw_apply_allowlist takes the
+# restart path, arm probe-fails: the gateway keeps answering until the
+# config-activation restart (no replace — the converged short-circuit
+# holds, so there is NO `podman run` line this run), the post-restart
+# health wait dies (:2493-shaped), and the R2 marker (placed before the
+# restart) removes the now-broken gateway: rm line AFTER the `podman
+# restart` line (restart mirror lib.sh:692). The anchor was never owned
+# (converged short-circuit) and is untouched — the R2-doesn't-touch-
+# anchor boundary.
+e217_out="$(egresslock --config "$S217/gw.conf" ensure s217 2>&1)"; e217_rc=$?
+[[ "$e217_rc" == 0 ]] \
+    && e217 pass || e217 fail "EGL-217 setup: green ensure before the apply-die pin (rc=$e217_rc, out: $e217_out)"
+printf 'changed.example.test\n' >> "$S217/s217-allowlist"
+: > "$STATE/probe-fails-egresslock-gateway-s217"
+: > "$STATE/opslog"
+e217_out="$(PATH="$E217PATH" egresslock --config "$S217/gw.conf" ensure s217 2>&1)"; e217_rc=$?
+e217_restart="$(grep -n '^podman restart' "$STATE/opslog" | head -1 | cut -d: -f1)"
+e217_rmafter="$(awk -v r="$e217_restart" '$0=="podman rm -f egresslock-gateway-s217"{ if (NR>r) {print NR; exit} }' "$STATE/opslog")"
+e217_gwrun="$(grep -c -- '--name egresslock-gateway-s217' "$STATE/opslog" || true)"
+if [[ "$e217_rc" == 1 \
+      && "$e217_out" == *"gateway did not come back healthy after config application (fail closed)"* \
+      && "$e217_out" == *"removed container 'egresslock-gateway-s217' (rm -f)"* ]] \
+   && [[ -n "$e217_restart" && -n "$e217_rmafter" ]] \
+   && [[ "$e217_gwrun" == 0 ]] \
+   && [[ -f "$STATE/running/egresslock-anchor-s217" ]] \
+   && ! grep -q '^podman rm -f egresslock-anchor-s217' "$STATE/opslog"; then
+    e217 pass
+else
+    e217 fail "apply-health die removes the restarted gateway, anchor untouched (rc=$e217_rc, out: $e217_out, restart=$e217_restart, rmafter=$e217_rmafter, gwrun_lines=$e217_gwrun, an_running=$([[ -f "$STATE/running/egresslock-anchor-s217" ]] && echo yes || echo no))"
+fi
+rm -f "$STATE/probe-fails-egresslock-gateway-s217"
+
+# EGL-217-4: the no-die family case — a first-create ensure whose
+# rule-gen fails by rc (unresolvable allow-host -> resolved_dest failure
+# -> install_policy rc 1 -> set -e exit; there is NO die site to edit, so
+# the A1 per-die alternative cannot pass this). The EXIT trap removes the
+# anchor started this run with its M3 line and the rm-after-run pin. The
+# rule-gen stderr wording is EGL-120-D1's — deliberately not pinned here.
+: > "$STATE/opslog"
+e217_out="$(egresslock --config "$S217/badhost.conf" ensure s217f 2>&1)"; e217_rc=$?
+e217_runline="$(grep -n -- '--name egresslock-anchor-s217f' "$STATE/opslog" | head -1 | cut -d: -f1)"
+e217_rmafter="$(awk -v r="$e217_runline" '$0=="podman rm -f egresslock-anchor-s217f"{ if (NR>r) {print NR; exit} }' "$STATE/opslog")"
+if [[ "$e217_rc" == 1 \
+      && "$e217_out" == *"removed container 'egresslock-anchor-s217f' (rm -f)"* ]] \
+   && [[ -n "$e217_runline" && -n "$e217_rmafter" ]] \
+   && [[ ! -f "$STATE/running/egresslock-anchor-s217f" \
+      && ! -f "$STATE/containers/egresslock-anchor-s217f.net" ]]; then
+    e217 pass
+else
+    e217 fail "no-die rule-gen exit removes the started anchor (rc=$e217_rc, out: $e217_out, runline=$e217_runline, rmafter=$e217_rmafter, running=$([[ -f "$STATE/running/egresslock-anchor-s217f" ]] && echo yes || echo no))"
+fi
+
+# EGL-217-5: removal failure is loud, never "recovered" — the trap's
+# rt_rm fails (rm-container-fails, lib.sh:655-667 precedent), rc stays 1
+# (the trap never alters it), the stderr keeps the cleanup clause words
+# + the runtime error + the manual `podman rm -f <n>`, and the container
+# state is still present.
+: > "$STATE/probe-fails-egresslock-gateway-s217"
+: > "$STATE/rm-container-fails"
+e217_out="$(PATH="$E217PATH" egresslock --config "$S217/gw.conf" ensure s217 2>&1)"; e217_rc=$?
+if [[ "$e217_rc" == 1 \
+      && "$e217_out" == *"gateway container 'egresslock-gateway-s217' did not become healthy"* \
+      && "$e217_out" == *"cleanup: removal failed:"* \
+      && "$e217_out" == *"could not be removed and may still be running"* \
+      && "$e217_out" == *"remove it manually: 'podman rm -f egresslock-gateway-s217'"* ]] \
+   && [[ -f "$STATE/running/egresslock-gateway-s217" ]]; then
+    e217 pass
+else
+    e217 fail "cleanup removal failure loud with the manual command (rc=$e217_rc, out: $e217_out, running=$([[ -f "$STATE/running/egresslock-gateway-s217" ]] && echo yes || echo no))"
+fi
+rm -f "$STATE/probe-fails-egresslock-gateway-s217" "$STATE/rm-container-fails"
+
+# EGL-217-6: the no-collateral pin (Q5's R1 boundary) — a failing refresh
+# on a converged pair removes NOTHING. Green ensure on a seeded profile,
+# then add an unresolvable allow-host and re-ensure: the failure
+# (install_policy rc 1) lands after the anchor's converged short-circuit
+# and before any gateway marker, so the trap has an empty registry —
+# rc 1, no `podman rm` of the anchor/gateway at all (there is not even a
+# guarded stale-sweep: both converged), no `removed container` lines,
+# and both containers still running/registered. The A2 full-sweep
+# alternative fails this.
+rm -f "$STATE/probe-fails-egresslock-gateway-s217" "$STATE/rm-container-fails"
+egresslock --config "$S217/gw.conf" teardown s217 >/dev/null 2>&1 || true
+e217_out="$(egresslock --config "$S217/gw.conf" ensure s217 2>&1)"; e217_rc=$?
+[[ "$e217_rc" == 0 ]] \
+    && e217 pass || e217 fail "EGL-217 setup: green ensure before the no-collateral pin (rc=$e217_rc, out: $e217_out)"
+: > "$STATE/opslog"
+printf '    rule allow-host nonexistent.example.test:8080\n' >> "$S217/gw.conf"
+e217_out="$(egresslock --config "$S217/gw.conf" ensure s217 2>&1)"; e217_rc=$?
+if [[ "$e217_rc" == 1 \
+      && "$e217_out" != *"removed container"* ]] \
+   && ! grep -q '^podman rm -f egresslock-anchor-s217' "$STATE/opslog" \
+   && ! grep -q '^podman rm -f egresslock-gateway-s217' "$STATE/opslog" \
+   && [[ -f "$STATE/running/egresslock-anchor-s217" \
+      && -f "$STATE/running/egresslock-gateway-s217" ]]; then
+    e217 pass
+else
+    e217 fail "failing refresh on a converged pair removes nothing (rc=$e217_rc, out: $e217_out, an_running=$([[ -f "$STATE/running/egresslock-anchor-s217" ]] && echo yes || echo no), gw_running=$([[ -f "$STATE/running/egresslock-gateway-s217" ]] && echo yes || echo no))"
+fi
+egresslock --config "$S217/gw.conf" teardown s217 >/dev/null 2>&1 || true
+egresslock --config "$S217/bare.conf" teardown s217b >/dev/null 2>&1 || true
+egresslock --config "$S217/badhost.conf" teardown s217f >/dev/null 2>&1 || true
+section_end egl217
+
+# --- EGL-175: runtime-seam grep-gate (D8/D12, tightened EGL-194-D1) ----
 # The contract's acceptance test (internal_docs/RUNTIME_BACKEND_CONTRACT.md):
 # after extracting the rt_* adapter bodies, the rest of the engine has zero
 # podman command-word invocations. Carve-outs (D8, enumerated): full-line
-# comments; operator remediation strings (podman network rm / podman
-# unshare --rootless-netns nft delete / podman run --network / podman
-# system migrate); the netns-probe diagnostic strings (… --rootless-netns
-# true', quote-anchored so a real invocation never matches); the
-# ensure_network remediation string (podman network inspect '<name>');
-# doctor stdout keys ((podman MISSING) / (podman NetworkBackend: …));
-# command -v podman; the EGL-168 post-swap remediation strings
-# (podman unshare --rootless-netns cat /proc/net/nf_conntrack and the
-# scoped $bin -D hint, quote-tailed literals, never real invocations).
-# A hit fails the battery with the offending lines.
+# comments; operator remediation strings (podman network rm '$name'|'$net'|
+# '$1'|<name> / podman unshare --rootless-netns nft delete / podman network
+# inspect '<name>'); the netns-probe diagnostic strings (… --rootless-netns
+# true', quote-anchored so a real invocation never matches); doctor stdout
+# keys ((podman MISSING) / (podman NetworkBackend: …)); the gw_apply_allowlist
+# die strings ((podman cp; fail closed)); the EGL-231 post-swap remediation
+# strings (podman unshare --rootless-netns $bin -L -p tcp and the scoped $bin
+# -D hint, quote-tailed literals, never real invocations).
+# Dropped as dead at HEAD (EGL-194): command -v podman (only inside
+# rt_have_runtime), podman run --network (comment-only), podman system
+# migrate (no engine hit). Residual false-negative class: a genuine core
+# invocation that is byte-identical to a carved remediation string is still
+# subtracted. A hit fails the battery with the offending lines.
+# --- EGL-222: egresslock build-gateway (no-conf rebuild verb) ---------------
+# Mock podman `build` records to $STATE/buildlog (tests/lib.sh) and a -t
+# tag makes the image exist. systemctl is mocked active unless the
+# systemctl-usermgr-fails marker is present (tests/lib.sh).
+section_begin egl222 "EGL-222 build-gateway"
+a222() { assert "$@"; }
+
+ENG222="$TREE_ROOT/egresslock"
+e222d="$STATE/e222"; rm -rf "$e222d"; mkdir -p "$e222d/cwd" "$e222d/confless-cwd"
+# Deployed-copy fixture: engine + its neighbor gateway/, like the kit's
+# prefix layout (install-kit.sh deploys both side by side). The synthetic
+# pin is a fixed 64-hex digest — nothing in the harness reads the real
+# one (the mock build never inspects the Containerfile).
+E222PIN="sha256:$(printf 'a%.0s' $(seq 1 64))"
+E222IMG="localhost/egresslock-gateway:e222"
+E222INS="$STATE/image-inspect-$(echo "$E222IMG" | tr '/:' '__')"
+e222eng="$e222d/kit"; mkdir -p "$e222eng/gateway"
+cp "$ENG222" "$e222eng/egresslock"
+printf 'FROM docker.io/library/debian:13-slim@%s\n' "$E222PIN" \
+    > "$e222eng/gateway/Containerfile"
+e222run() { # e222run <cwd> [args...] — run the fixture engine from cwd
+    local cwd="$1"; shift
+    (cd "$cwd" && env -u EGRESSLOCK_CONF EGRESSLOCK_GW_IMAGE="$E222IMG" \
+        "$e222eng/egresslock" build-gateway "$@" 2>&1)
+}
+e222pinfix() { # e222pinfix <label-field> — seed the image + its inspect fixture
+    : > "$STATE/images/$(echo "$E222IMG" | tr '/:' '__')"
+    printf '%s\n' "$1" > "$E222INS"
+}
+e222clean() { # e222clean — no image, no fixture, empty buildlog
+    rm -f "$STATE/images/$(echo "$E222IMG" | tr '/:' '__')" "$E222INS"
+    : > "$STATE/buildlog"
+}
+
+# 1. Context resolves from the ENGINE's own dir, not CWD: the deployed-copy
+#    fixture run from an unrelated cwd names <dir>/gateway in the buildlog.
+e222clean
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+e222bl="$(cat "$STATE/buildlog")"
+[[ "$e222_rc" == 0 && "$e222bl" == *"build -t $E222IMG --format docker -f $e222eng/gateway/Containerfile $e222eng/gateway"* \
+    && "$e222bl" != *"$TREE_ROOT/gateway"* && "$e222o" == *">> Building $E222IMG FROM aaaaaaaaaaaa"* ]] \
+    && a222 pass || a222 fail "context is the engine's neighbor, not CWD (rc=$e222_rc, bl: $e222bl, out: $e222o)"
+
+# 2. Missing image -> build (D2 trigger, never a silent no-op).
+e222clean
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+[[ "$e222_rc" == 0 && -s "$STATE/buildlog" ]] \
+    && a222 pass || a222 fail "missing image builds (rc=$e222_rc, out: $e222o)"
+
+# 3. Label != deployed pin -> build.
+e222clean
+e222pinfix "sha256:$(printf 'b%.0s' $(seq 1 64)) 2026-09-01T00:00:00.000000000Z"
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+[[ "$e222_rc" == 0 && -s "$STATE/buildlog" ]] \
+    && a222 pass || a222 fail "pin-mismatch rebuilds (rc=$e222_rc, out: $e222o)"
+
+# 4. Empty label (the leading-space case + the inspect-answered-nothing
+#    case) -> build.
+e222clean
+e222pinfix " 2026-08-01T00:00:00.000000000Z"
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+[[ "$e222_rc" == 0 && -s "$STATE/buildlog" ]] \
+    && a222 pass || a222 fail "empty base label rebuilds (rc=$e222_rc, out: $e222o)"
+e222clean
+e222pinfix " 2026-08-01T00:00:00.000000000Z"
+: > "$E222INS"   # inspect answers nothing (rc 0, empty) — not comparable
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+[[ "$e222_rc" == 0 && -s "$STATE/buildlog" ]] \
+    && a222 pass || a222 fail "empty inspect output rebuilds (rc=$e222_rc, out: $e222o)"
+
+# 5. Label == deployed pin -> the explicit up-to-date line, rc 0, NO build.
+e222clean
+e222pinfix "$E222PIN 2026-09-01T00:00:00.000000000Z"
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+[[ "$e222_rc" == 0 && "$e222o" == "already built from deployed pin aaaaaaaaaaaa — use --force to rebuild" \
+    && ! -s "$STATE/buildlog" ]] \
+    && a222 pass || a222 fail "equal pin is an explicit up-to-date, not a silent no-op (rc=$e222_rc, out: $e222o)"
+
+# 6. --force on an equal pin -> build (same-pin squid refresh path).
+e222o="$(e222run "$e222d/cwd" --force)"; e222_rc=$?
+[[ "$e222_rc" == 0 && -s "$STATE/buildlog" ]] \
+    && a222 pass || a222 fail "--force rebuilds an equal-pin image (rc=$e222_rc, out: $e222o)"
+
+# 7. The build log pins the D5/D8 flag order: -t first, --format docker
+#    between, -f Containerfile, context last.
+e222clean
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+e222bl="$(cat "$STATE/buildlog")"
+[[ "$e222bl" == *"--format docker"* && "$e222bl" == *"-t $E222IMG --format docker -f"* ]] \
+    && a222 pass || a222 fail "buildlog carries -t first + --format docker (bl: $e222bl)"
+
+# 8. Inactive user@ -> fail closed: rc 1, stderr names user@, no build.
+e222clean
+touch "$STATE/systemctl-usermgr-fails"
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+[[ "$e222_rc" == 1 && "$e222o" == *"no systemd user manager for"* && "$e222o" == *"user@"* \
+    && ! -s "$STATE/buildlog" ]] \
+    && a222 pass || a222 fail "inactive user manager fails closed (rc=$e222_rc, out: $e222o)"
+rm -f "$STATE/systemctl-usermgr-fails"
+
+# 9. Root invocation -> rc 1 (require_nonroot; ARC-25 mock id reports 0).
+e222o="$(PATH="$TESTROOT/bin-root:$PATH" env -u EGRESSLOCK_CONF \
+    EGRESSLOCK_GW_IMAGE="$E222IMG" "$e222eng/egresslock" build-gateway 2>&1)"; e222_rc=$?
+[[ "$e222_rc" == 1 && "$e222o" == *"must run as the account, not root"* ]] \
+    && a222 pass || a222 fail "root guard (rc=$e222_rc, out: $e222o)"
+
+# 10. Missing context -> rc 1, named (D10 string).
+e222nc="$e222d/noctx"; mkdir -p "$e222nc"; cp "$ENG222" "$e222nc/egresslock"
+e222o="$(cd "$e222d/cwd" && env -u EGRESSLOCK_CONF EGRESSLOCK_GW_IMAGE="$E222IMG" \
+    "$e222nc/egresslock" build-gateway 2>&1)"; e222_rc=$?
+[[ "$e222_rc" == 1 && "$e222o" == *"no gateway build context at $e222nc/gateway/Containerfile"* ]] \
+    && a222 pass || a222 fail "missing context named rc 1 (rc=$e222_rc, out: $e222o)"
+
+# 11. Unknown/extra args -> usage rc 2.
+e222clean
+e222o="$(e222run "$e222d/cwd" extra)"; e222_rc=$?
+[[ "$e222_rc" == 2 ]] && a222 pass || a222 fail "unknown arg rc 2 (rc=$e222_rc, out: $e222o)"
+e222o="$(e222run "$e222d/cwd" --force extra)"; e222_rc=$?
+[[ "$e222_rc" == 2 ]] && a222 pass || a222 fail "extra arg after --force rc 2 (rc=$e222_rc, out: $e222o)"
+
+# 12. No conf is loaded (the doctor class): run from a conf-less cwd with
+#     EGRESSLOCK_CONF unset — no resolution line, no conf error.
+e222o="$(e222run "$e222d/confless-cwd")"; e222_rc=$?
+[[ "$e222_rc" == 0 && "$e222o" != *"using config"* && "$e222o" != *"scoped:"* \
+    && "$e222o" != *"no profile config"* ]] \
+    && a222 pass || a222 fail "no conf resolution for build-gateway (rc=$e222_rc, out: $e222o)"
+
+# 13. The verb is listed on all three usage surfaces (D7).
+"$ENG222" --help | grep -q "egresslock build-gateway \[--force\]" \
+    && a222 pass || a222 fail "--help lists build-gateway"
+"$ENG222" 2>&1 | grep -q "build-gateway" \
+    && a222 pass || a222 fail "short usage lists build-gateway"
+
+# 14. R-EGL-222-3 F1: --force must invalidate layer cache (--no-cache);
+#     the pin-mismatch/missing-image path must NOT carry it (the moved
+#     FROM digest invalidates the layer chain on its own).
+e222clean
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+e222bl="$(cat "$STATE/buildlog")"
+[[ "$e222_rc" == 0 && "$e222bl" != *"--no-cache"* ]] \
+    && a222 pass || a222 fail "unforced build carries no --no-cache (rc=$e222_rc, bl: $e222bl)"
+e222pinfix "$E222PIN 2026-09-01T00:00:00.000000000Z"
+: > "$STATE/buildlog"
+e222o="$(e222run "$e222d/cwd" --force)"; e222_rc=$?
+e222bl="$(cat "$STATE/buildlog")"
+[[ "$e222_rc" == 0 && "$e222bl" == *"-t $E222IMG --format docker -f $e222eng/gateway/Containerfile $e222eng/gateway --no-cache"* ]] \
+    && a222 pass || a222 fail "forced build carries --no-cache after the context (rc=$e222_rc, bl: $e222bl)"
+
+# 15. R-EGL-222-3 F3 + R-EGL-222-7: a failed build names a retry that can
+#     actually retry — --force preserved on the forced path, the actual
+#     engine executable (path-invoked; no PATH wrapper assumed), bare on
+#     the unforced path.
+touch "$STATE/build-fails"
+e222o="$(e222run "$e222d/cwd" --force)"; e222_rc=$?
+[[ "$e222_rc" == 1 && "$e222o" == *"fix the cause and re-run: EGRESSLOCK_GW_IMAGE=$E222IMG $e222eng/egresslock build-gateway --force"* ]] \
+    && a222 pass || a222 fail "failed forced rebuild retries with --force + engine path + override (rc=$e222_rc, out: $e222o)"
+e222clean   # missing-image path, still failing builds
+e222o="$(e222run "$e222d/cwd")"; e222_rc=$?
+[[ "$e222_rc" == 1 && "$e222o" == *"fix the cause and re-run: EGRESSLOCK_GW_IMAGE=$E222IMG $e222eng/egresslock build-gateway"* \
+    && "$e222o" != *"build-gateway --force"* ]] \
+    && a222 pass || a222 fail "failed unforced rebuild keeps the bare retry (rc=$e222_rc, out: $e222o)"
+
+# 16. R-EGL-222-7: the printed retry, EXECUTED, retries the same target —
+#     one-shot custom-tag failures (forced and unforced) must round-trip:
+#     extract the retry from stderr, remove the failure marker, run it.
+#     The minimal-PATH fixture (no engine wrapper, mock podman, no
+#     systemctl) doubles as the no-PATH-wrapper environment.
+e222retryof() { sed -n 's/.*fix the cause and re-run: //p' <<<"$1"; }
+e222bin="$e222d/bin-nosystemd"; rm -rf "$e222bin"; mkdir -p "$e222bin"
+for t in bash id dirname grep head; do ln -s "$(command -v "$t")" "$e222bin/$t"; done
+ln -s "$TESTROOT/bin/podman" "$e222bin/podman"
+# a) forced one-shot custom-tag failure; the retry runs under a minimal
+#    PATH with NO engine wrapper and no EGRESSLOCK_GW_IMAGE in the
+#    environment (the retry carries its own assignment).
+e222clean
+e222o="$(cd "$e222d/cwd" && env EGRESSLOCK_GW_IMAGE=localhost/custom-gw:v2 \
+    "$e222eng/egresslock" build-gateway --force 2>&1)"; e222_rc=$?
+[[ "$e222_rc" == 1 && -n "$(e222retryof "$e222o")" ]] \
+    && a222 pass || a222 fail "forced custom-tag failure produces a retry (rc=$e222_rc, out: $e222o)"
+e222retry="$(e222retryof "$e222o")"
+rm -f "$STATE/build-fails"; : > "$STATE/buildlog"
+e222o="$(env -u EGRESSLOCK_GW_IMAGE PATH="$e222bin" bash -c "$e222retry" 2>&1)"; e222_rc=$?
+e222bl="$(cat "$STATE/buildlog")"
+[[ "$e222_rc" == 0 && "$e222bl" == *"build -t localhost/custom-gw:v2 --format docker -f $e222eng/gateway/Containerfile"* ]] \
+    && a222 pass || a222 fail "executed forced retry rebuilds the CUSTOM tag without a PATH wrapper (rc=$e222_rc, bl: $e222bl, out: $e222o)"
+# b) unforced one-shot custom-tag failure -> same round trip, no --force.
+e222clean
+touch "$STATE/build-fails"
+e222o="$(cd "$e222d/cwd" && env EGRESSLOCK_GW_IMAGE=localhost/custom-gw:v2 \
+    "$e222eng/egresslock" build-gateway 2>&1)"; e222_rc=$?
+e222retry="$(e222retryof "$e222o")"
+[[ "$e222_rc" == 1 && "$e222retry" != *"--force" ]] \
+    && a222 pass || a222 fail "unforced custom-tag failure retry has no --force (rc=$e222_rc, retry: $e222retry)"
+e222o="$(bash -c "$e222retry" 2>&1)"; e222_rc=$?   # still failing
+rm -f "$STATE/build-fails"; : > "$STATE/buildlog"
+e222o="$(bash -c "$e222retry" 2>&1)"; e222_rc=$?
+e222bl="$(cat "$STATE/buildlog")"
+[[ "$e222_rc" == 0 && "$e222bl" == *"build -t localhost/custom-gw:v2"* ]] \
+    && a222 pass || a222 fail "executed unforced retry rebuilds the CUSTOM tag (rc=$e222_rc, bl: $e222bl, out: $e222o)"
+# c) shell-safe quoting: an override with a space survives %q and the
+#    executed retry still builds that exact (space-containing) tag.
+e222clean
+touch "$STATE/build-fails"
+e222o="$(cd "$e222d/cwd" && env EGRESSLOCK_GW_IMAGE='localhost/custom gw:v2' \
+    "$e222eng/egresslock" build-gateway --force 2>&1)"; e222_rc=$?
+e222retry="$(e222retryof "$e222o")"
+rm -f "$STATE/build-fails"; : > "$STATE/buildlog"
+e222o="$(bash -c "$e222retry" 2>&1)"; e222_rc=$?
+e222bl="$(cat "$STATE/buildlog")"
+[[ "$e222_rc" == 0 && "$e222bl" == *"build -t localhost/custom gw:v2 --format docker"* ]] \
+    && a222 pass || a222 fail "quoted override survives the printed retry (rc=$e222_rc, bl: $e222bl, out: $e222o)"
+rm -f "$STATE/build-fails"
+
+# 17. Permanent contract case (R-EGL-222-3 first-pass note): systemctl
+#     ABSENT -> the preflight proceeds to the build (the engine carries
+#     no systemd dependency). Minimal PATH with the mock podman but no
+#     systemctl (the $e222bin fixture above).
+e222clean
+e222o="$(cd "$e222d/cwd" && env -u EGRESSLOCK_CONF PATH="$e222bin" \
+    EGRESSLOCK_GW_IMAGE="$E222IMG" "$e222eng/egresslock" build-gateway 2>&1)"; e222_rc=$?
+[[ "$e222_rc" == 0 && -s "$STATE/buildlog" && "$e222o" == *">> Building"* ]] \
+    && a222 pass || a222 fail "absent systemctl proceeds to the build (rc=$e222_rc, out: $e222o)"
+
+section_end egl222
+
+# --- EGL-223: ensure --replace-gateway (explicit replace even when healthy)
+# D1: the flag forces the existing replace path; plain ensure is
+# byte-identical (the EGL-114 pins above stay green unmodified — R6
+# exact). D2: both flag positions legal; unknown flags rc 2; non-gateway
+# profile rc 2; mutators never pass the flag. D3: flag-path preflight —
+# a missing or checkpoint-annotated target image dies named BEFORE any
+# rt_rm, so the running gateway stays up and is never owned by the
+# EGL-217 EXIT trap (no "removed container" line).
+section_begin egl223 "EGL-223 ensure --replace-gateway"
+a223() { assert "$@"; }
+
+S223="$TESTROOT/s223"; rm -rf "$S223"; mkdir -p "$S223"
+: > "$STATE/images/localhost_egresslock-gateway_latest"
+cat > "$S223/gw.conf" <<'EOF'
+profile s223 10.199.97.0/24
+    rule gateway-only
+    gateway 10.199.97.2 3128 s223-allowlist
+EOF
+printf 'git.example.test\n' > "$S223/s223-allowlist"
+cat > "$S223/nongw.conf" <<'EOF'
+profile s223ng 10.199.97.16/28
+EOF
+run223() { env EGRESSLOCK_CONF="$S223/gw.conf" HOME="$S223" EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock "$@"; }
+
+# Healthy seed (unasserted setup — a broken seed surfaces in
+# e223-plain-converged's fail line). After this the gateway is running +
+# probe + MAC + caps green: exactly the state plain ensure must skip.
+o="$(run223 ensure s223 2>&1)"
+
+# e223-plain-converged: healthy gateway, no flag → the converged skip
+# line, and NO rm/run of the gateway (EGL-114 R6 unchanged by the flag).
+: > "$STATE/opslog"
+o="$(run223 ensure s223 2>&1)"; rc=$?
+if [[ "$rc" == 0 \
+      && "$o" == *"gateway 'egresslock-gateway-s223' ready (already converged, not restarted)"* \
+      && "$o" != *"replacing the running container"* ]] \
+   && ! grep -qE '^podman rm .* egresslock-gateway-s223' "$STATE/opslog" \
+   && ! grep -qE '^podman run .*--name egresslock-gateway-s223' "$STATE/opslog"; then
+    a223 pass
+else
+    a223 fail "plain converged ensure skips (rc=$rc, out: $o, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+fi
+
+# e223-flag-replaces: healthy gateway + --replace-gateway (flag before
+# profile) → rm + run of the gateway, the exact stderr disclosure, and
+# the applied/verified ready line (a replace applies — not the skip line).
+: > "$STATE/opslog"
+o="$(run223 ensure --replace-gateway s223 2>&1)"; rc=$?
+if [[ "$rc" == 0 \
+      && "$o" == *"gateway 'egresslock-gateway-s223' --replace-gateway — replacing the running container (profile sessions will drop)"* \
+      && "$o" == *"gateway 'egresslock-gateway-s223' ready (allowlist applied, health verified)"* \
+      && "$o" != *"already converged"* ]] \
+   && grep -q '^podman rm -f egresslock-gateway-s223$' "$STATE/opslog" \
+   && grep -qE '^podman run .*--name egresslock-gateway-s223' "$STATE/opslog"; then
+    a223 pass
+else
+    a223 fail "flag replaces healthy gateway (rc=$rc, out: $o, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+fi
+
+# e223-flag-after-profile: the flag AFTER the profile is the same replace
+# (D2: both positions legal). The post-replace state is converged again,
+# so this run replaces a healthy gateway too.
+: > "$STATE/opslog"
+o="$(run223 ensure s223 --replace-gateway 2>&1)"; rc=$?
+if [[ "$rc" == 0 \
+      && "$o" == *"--replace-gateway — replacing the running container"* \
+      && "$o" == *"ready (allowlist applied, health verified)"* ]] \
+   && grep -q '^podman rm -f egresslock-gateway-s223$' "$STATE/opslog" \
+   && grep -qE '^podman run .*--name egresslock-gateway-s223' "$STATE/opslog"; then
+    a223 pass
+else
+    a223 fail "flag after profile replaces too (rc=$rc, out: $o, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+fi
+
+# e223-flag-before-profile-conf: no EGRESSLOCK_CONF — the named probe
+# must load <profile>.conf (the flag must not reach resolve_conf_for as
+# the profile name; the resolution line names it) and the replace still
+# happens (EGL-223 dispatch pin).
+mkdir -p "$S223/.config/egresslock"
+cp "$S223/gw.conf" "$S223/.config/egresslock/s223.conf"
+printf 'git.example.test\n' > "$S223/.config/egresslock/s223-allowlist"
+o="$(env -u EGRESSLOCK_CONF HOME="$S223" EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+    egresslock ensure --replace-gateway s223 2>&1)"; rc=$?
+if [[ "$rc" == 0 \
+      && "$o" == *"using config $S223/.config/egresslock/s223.conf"* \
+      && "$o" == *"--replace-gateway — replacing the running container"* \
+      && "$o" == *"ready (allowlist applied, health verified)"* ]] \
+   && grep -q '^podman rm -f egresslock-gateway-s223$' "$STATE/opslog"; then
+    a223 pass
+else
+    a223 fail "flag-before-profile resolves the profile conf + replaces (rc=$rc, out: $o)"
+fi
+: > "$STATE/opslog"
+
+# e223-missing-tag-intact: flag + missing target image → the D3
+# preflight dies named BEFORE any removal; the running gateway is intact
+# and un-owned (no cleanup line, no rm of it in opslog).
+rm -f "$STATE/images/localhost_egresslock-gateway_latest"
+o="$(run223 ensure --replace-gateway s223 2>&1)"; rc=$?
+if [[ "$rc" == 1 \
+      && "$o" == *"gateway image localhost/egresslock-gateway:latest not found; build it: egresslock build-gateway"* \
+      && "$o" != *"removed container"* ]] \
+   && [[ -f "$STATE/running/egresslock-gateway-s223" ]] \
+   && ! grep -qE '^podman rm .* egresslock-gateway-s223' "$STATE/opslog"; then
+    a223 pass
+else
+    a223 fail "missing tag dies before rm, gateway intact (rc=$rc, out: $o, running=$([[ -f "$STATE/running/egresslock-gateway-s223" ]] && echo yes || echo no))"
+fi
+: > "$STATE/images/localhost_egresslock-gateway_latest"
+
+# e223-checkpoint-intact: flag + checkpoint-annotated target → the
+# EGL-206 refusal dies BEFORE any gateway rm; gateway still running.
+: > "$STATE/image-annotated-localhost_egresslock-gateway_latest"
+o="$(run223 ensure --replace-gateway s223 2>&1)"; rc=$?
+rm -f "$STATE/image-annotated-localhost_egresslock-gateway_latest"
+if [[ "$rc" == 1 \
+      && "$o" == *"io.podman.annotations.checkpoint.runtime.name"* \
+      && "$o" != *"removed container"* ]] \
+   && [[ -f "$STATE/running/egresslock-gateway-s223" ]] \
+   && ! grep -qE '^podman rm .* egresslock-gateway-s223' "$STATE/opslog"; then
+    a223 pass
+else
+    a223 fail "checkpoint-poisoned tag dies before rm, gateway intact (rc=$rc, out: $o, running=$([[ -f "$STATE/running/egresslock-gateway-s223" ]] && echo yes || echo no))"
+fi
+
+# e223-non-gateway-rc2: the flag on a profile with no gateway line →
+# named rc 2 and no container change (opslog untouched by the invocation).
+o="$(env EGRESSLOCK_CONF="$S223/nongw.conf" HOME="$S223" EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+    egresslock ensure --replace-gateway s223ng 2>&1)"; rc=$?
+if [[ "$rc" == 2 \
+      && "$o" == *"--replace-gateway requires a gateway profile (no gateway line in this conf)"* ]] \
+   && ! grep -qE '^podman rm .* s223ng' "$STATE/opslog"; then
+    a223 pass
+else
+    a223 fail "non-gateway flag rc 2 (rc=$rc, out: $o)"
+fi
+
+# e223-unknown-flag-rc2: an unknown ensure flag is a usage error —
+# named line + the flag-shaped usage line, rc 2.
+o="$(run223 ensure --bogus s223 2>&1)"; rc=$?
+if [[ "$rc" == 2 && "$o" == *"Error: ensure takes --replace-gateway only."* \
+      && "$o" == *"usage: egresslock ensure [--replace-gateway] <profile>"* ]]; then
+    a223 pass
+else
+    a223 fail "unknown flag rc 2 (rc=$rc, out: $o)"
+fi
+
+# e223-mutator-no-flag: allow on a healthy gateway (after the mock
+# rebuild above) never inherits the flag — the mutator apply may
+# restart, but there is NO gateway rm/run (no replace).
+: > "$STATE/opslog"
+o="$(run223 allow s223 cache.example.test 2>&1)"; rc=$?
+if [[ "$rc" == 0 ]] \
+   && ! grep -qE '^podman rm .* egresslock-gateway-s223' "$STATE/opslog" \
+   && ! grep -qE '^podman run .*--name egresslock-gateway-s223' "$STATE/opslog" \
+   && [[ -f "$STATE/running/egresslock-gateway-s223" ]]; then
+    a223 pass
+else
+    a223 fail "mutator never inherits the flag (rc=$rc, out: $o, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+fi
+
+# e223-dup-flag-rc2 (EGL-223-D8): a duplicate --replace-gateway is an
+# argv-contract usage error (rc 2, named "only once") — nothing
+# container-touching happens, and the resolver's one-leading-flag skip
+# stays singular (no silent main.conf fallback line in the resolution
+# output; explicit EGRESSLOCK_CONF is the only source named).
+: > "$STATE/opslog"
+o="$(run223 ensure --replace-gateway --replace-gateway s223 2>&1)"; rc=$?
+if [[ "$rc" == 2 \
+      && "$o" == *"Error: ensure takes --replace-gateway only once."* \
+      && "$o" == *"usage: egresslock ensure [--replace-gateway] <profile>"* \
+      && "$o" != *"named fallback"* ]] \
+   && ! grep -qE '^podman (rm|run) .*egresslock-gateway-s223' "$STATE/opslog"; then
+    a223 pass
+else
+    a223 fail "dup flag rc 2, no container work (rc=$rc, out: $o, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+fi
+
+# R-EGL-223-3 F2 fold pin: a leading empty-string argument is again a
+# usage rc 2 (the D2 parser may not accept "" as elidable the way the
+# first cut did).
+o="$(run223 ensure "" s223 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"Error: ensure takes one profile name."* ]] \
+    && a223 pass || a223 fail "empty-string arg rc 2 (rc=$rc, out: $o)"
+
+# e223-start-fail-keeps-anchor (EGL-223-D9): a gw_start failure dies
+# named and KEEPS the anchor holder — the ARC-5 anchor recycle block is
+# gone (it never recreated holder/policy; supplementary S2). opslog has
+# no rm of the anchor; the anchor is still running after the failure.
+# (The foreign IPAM holder makes every gateway start fail with today's
+# named IPAM-conflict line — the same fixture the ARC-5 on-host shape
+# showed.)
+: > "$STATE/opslog"
+printf 'other\n' > "$STATE/ips/10.199.97.2"
+o="$(run223 ensure --replace-gateway s223 2>&1)"; rc=$?
+if [[ "$rc" == 1 \
+      && "$o" == *"Error: gateway start failed (static IP 10.199.97.2 conflict?)"* ]] \
+   && ! grep -qE '^podman rm .* egresslock-anchor-s223' "$STATE/opslog" \
+   && [[ -f "$STATE/running/egresslock-anchor-s223" ]]; then
+    a223 pass
+else
+    a223 fail "start failure keeps the anchor (rc=$rc, out: $o, anchor=$([[ -f "$STATE/running/egresslock-anchor-s223" ]] && echo up || echo down))"
+fi
+# Leave the section converged again (same no-teardown leave-behind the
+# rest of the section has): free the foreign holder and re-converge.
+rm -f "$STATE/ips/10.199.97.2"
+o="$(run223 ensure s223 2>&1)"
+
+section_end egl223
+
+section_begin egl228 "EGL-228 argv shape before config load"
+a228() { assert "$@"; }
+E228="$TESTROOT/e228"; mkdir -p "$E228/.config/egresslock"
+printf 'profile main 10.89.0.0/24\n    frobnicate yes\n' > "$E228/malformed.conf"
+printf 'profile ng 10.89.1.0/24\n' > "$E228/nongw.conf"
+e228miss() { # e228miss <args...> — missing explicit conf
+    env EGRESSLOCK_CONF="$E228/missing.conf" HOME="$E228" EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+        egresslock "$@" 2>&1
+}
+e228mal() { # e228mal <args...> — malformed explicit conf
+    env EGRESSLOCK_CONF="$E228/malformed.conf" HOME="$E228" EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+        egresslock "$@" 2>&1
+}
+e228home() { # e228home <args...> — empty confdir (no EGRESSLOCK_CONF)
+    env -u EGRESSLOCK_CONF HOME="$E228" ARCMOCK_PASSWD_HOME="$E228" \
+        EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock "$@" 2>&1
+}
+
+# e228-dup-flag-missing-conf
+o="$(e228miss ensure --replace-gateway --replace-gateway main)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"Error: ensure takes --replace-gateway only once."* \
+   && "$o" == *"usage: egresslock ensure [--replace-gateway] <profile>"* \
+   && "$o" != *"config file not found"* ]] && a228 pass \
+   || a228 fail "dup + missing conf (rc=$rc, out: $o)"
+
+# e228-dup-flag-malformed-conf
+o="$(e228mal ensure --replace-gateway --replace-gateway main)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"Error: ensure takes --replace-gateway only once."* \
+   && "$o" != *"unknown directive"* ]] && a228 pass \
+   || a228 fail "dup + malformed conf (rc=$rc, out: $o)"
+
+# e228-dup-flag-unreadable-conf
+chmod 000 "$E228/malformed.conf"
+o="$(e228mal ensure --replace-gateway --replace-gateway main)"; rc=$?
+chmod 644 "$E228/malformed.conf"
+[[ "$rc" == 2 && "$o" == *"Error: ensure takes --replace-gateway only once."* \
+   && "$o" != *"Permission denied"* ]] && a228 pass \
+   || a228 fail "dup + unreadable conf (rc=$rc, out: $o)"
+
+# e228-unknown-flag-missing-conf
+o="$(e228miss ensure --bogus main)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"Error: ensure takes --replace-gateway only."* \
+   && "$o" != *"config file not found"* ]] && a228 pass \
+   || a228 fail "unknown flag + missing conf (rc=$rc, out: $o)"
+
+# e228-network-extra-missing-conf
+o="$(e228miss network p extra)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"Error: network takes no extra arguments."* \
+   && "$o" != *"config file not found"* && "$o" != *"no profile config"* ]] \
+   && a228 pass || a228 fail "network extra + missing conf (rc=$rc, out: $o)"
+
+# e228-allow-bad-entry-missing-conf
+o="$(e228miss allow main 1.2.3.4)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"IPv4 literal"* && "$o" != *"config file not found"* ]] \
+   && a228 pass || a228 fail "allow literal + missing conf (rc=$rc, out: $o)"
+
+# e228-verify-ensured-extra-missing-conf
+o="$(e228miss verify --ensured p)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"Error: verify --ensured takes no profile argument."* \
+   && "$o" != *"config file not found"* ]] \
+   && a228 pass || a228 fail "verify --ensured extra + missing conf (rc=$rc, out: $o)"
+
+# e228-bare-teardown-no-conf
+o="$(e228home teardown)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"Error: teardown requires an argument."* \
+   && "$o" != *"no profile config"* ]] && a228 pass \
+   || a228 fail "bare teardown + empty confdir (rc=$rc, out: $o)"
+
+# e228-nongw-shape-wins (D8)
+o="$(env EGRESSLOCK_CONF="$E228/nongw.conf" HOME="$E228" EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+    egresslock allow ng 1.2.3.4 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"IPv4 literal"* \
+   && "$o" != *"has no gateway"* ]] && a228 pass \
+   || a228 fail "nongw shape wins (rc=$rc, out: $o)"
+
+# e228-usage-no-disclosure (D4)
+o="$(e228mal ensure --bogus main)"; rc=$?
+[[ "$rc" == 2 && "$o" != *"scoped:"* && "$o" != *"using config"* ]] \
+   && a228 pass || a228 fail "usage-invalid has no disclosure (rc=$rc, out: $o)"
+
+# e228-valid-argv-config-error
+o="$(e228mal ensure main)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"unknown directive"* ]] && a228 pass \
+   || a228 fail "valid argv still config-errors (rc=$rc, out: $o)"
+
+# e228-valid-argv-no-conf
+o="$(e228home ensure main)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"no profile config"* ]] && a228 pass \
+   || a228 fail "valid argv + empty confdir (rc=$rc, out: $o)"
+
+section_end egl228
+
+# --- EGL-203 (R-EGL-203-6 F1/F2): the page recipe, composed -----------------
+# The escalated review's requested recipe-level checks, executed against
+# the page's exact recipe lines. F1: a failed build must leave the
+# replacement uninvoked (the recipe's `&&` + build-gateway's exit 1) —
+# with the old image still tagged, an un-gated replace would succeed and
+# drop the profile's sessions while re-installing the same old base.
+# F2: replacement is profile-scoped — a second gateway profile keeps its
+# container, and plain ensure of it stays converged (the doctor's
+# staleness row inspects the IMAGE, not running containers, so absence
+# of `stale:` is not rollout verification). Mock limitation (same one the
+# reviewer's probe had): the mock does not model image IDs, so
+# "old-image retention" is established by the engine's image-agnostic
+# converge predicate (no image compare), not by container image
+# identity.
+section_begin egl203r "EGL-203 F1/F2: page recipe composed"
+e203r() { assert "$@"; }
+
+# Reuses egl223's seeded fixture: s223's gateway is running healthy
+# (the section left it converged) and the default image is in the store.
+r203run() { # r203run <recipe-line> — the env'd composed-recipe invocation
+    env EGRESSLOCK_CONF="$S223/gw.conf" HOME="$S223" EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+        bash -c "$1" 2>&1
+}
+
+# F1a. Failed build: rc 1, NOTHING container-touching — opslog stays
+#      empty and the healthy gateway keeps running (no rm/run).
+touch "$STATE/build-fails"
+: > "$STATE/opslog"
+o="$(r203run 'egresslock build-gateway && egresslock ensure --replace-gateway s223')"; rc=$?
+if [[ "$rc" == 1 && "$o" == *"gateway image build failed"* ]] \
+   && ! grep -qE '^podman (rm|run) .*egresslock-gateway-s223' "$STATE/opslog" \
+   && [[ -f "$STATE/running/egresslock-gateway-s223" ]]; then
+    e203r pass
+else
+    e203r fail "F1: failed build gates the replace (rc=$rc, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+fi
+rm -f "$STATE/build-fails"
+
+# F1b. The gate passes a good build through: the same composed line
+#      replaces (rm + run) — the recipe's `&&` is a gate, not a no-op.
+: > "$STATE/opslog"
+o="$(r203run 'egresslock build-gateway && egresslock ensure --replace-gateway s223')"; rc=$?
+if [[ "$rc" == 0 && "$o" == *"--replace-gateway — replacing the running container"* ]] \
+   && grep -q '^podman rm -f egresslock-gateway-s223$' "$STATE/opslog" \
+   && grep -qE '^podman run .*--name egresslock-gateway-s223' "$STATE/opslog"; then
+    e203r pass
+else
+    e203r fail "F1: good build passes the gate and replaces (rc=$rc, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+fi
+
+# F4 (R-EGL-203-8). The page composes `--force` into the unpinned-package
+#     recipe because on an unchanged pin the plain verb is an explicit
+#     rc-0 no-op ("already built from deployed pin … use --force") — an
+#     unforced gated sequence would then replace with the UN-refreshed
+#     image. Mock shape: the equal-pin fixture sits on the shared
+#     image-inspect seam ($D/image-inspect-…), which also false-answers
+#     the separate annotation query (the R-6 probe lesson) — a replace
+#     under it would die at the preflight, so the composed replace leg is
+#     not mock-modelable here; F4 asserts the two build legs the page
+#     composes, and the `&&` gate legs are F1a/F1b (the same composed
+#     shape).
+r203pin="$(grep -oE 'sha256:[0-9a-f]{64}' "$TREE_ROOT/gateway/Containerfile" | head -1)"
+r203short="${r203pin#sha256:}"; r203short="${r203short:0:12}"
+printf '%s 2026-09-01T00:00:00.000000000Z\n' "$r203pin" \
+    > "$STATE/image-inspect-localhost_egresslock-gateway_latest"
+
+# F4a. Unchanged pin, the plain build verb (the base-moved line's leg on
+#      the WRONG trigger): explicit up-to-date line, rc 0, NO build —
+#      the no-refresh hazard the page's `--force` bullet warns about.
+: > "$STATE/buildlog"
+o="$(r203run 'egresslock build-gateway')"; rc=$?
+if [[ "$rc" == 0 \
+      && "$o" == "already built from deployed pin $r203short — use --force to rebuild" \
+      && ! -s "$STATE/buildlog" ]]; then
+    e203r pass
+else
+    e203r fail "F4: unchanged-pin plain build is an explicit rc-0 no-op (rc=$rc, out: $o)"
+fi
+
+# F4b. The page's `--force` line's build leg: an unchanged pin WITH
+#      --force actually rebuilds (and carries --no-cache, R-EGL-222-3 F1).
+: > "$STATE/buildlog"
+o="$(r203run 'egresslock build-gateway --force')"; rc=$?
+if [[ "$rc" == 0 && -s "$STATE/buildlog" \
+      && "$o" == *">> Building localhost/egresslock-gateway:latest FROM $r203short"* ]] \
+   && grep -q -- '--no-cache' "$STATE/buildlog"; then
+    e203r pass
+else
+    e203r fail "F4: --force rebuilds the unchanged-pin image (rc=$rc, out: $o, bl: $(cat "$STATE/buildlog" 2>/dev/null))"
+fi
+rm -f "$STATE/image-inspect-localhost_egresslock-gateway_latest"
+
+# F2. Two gateway profiles, both seeded healthy: replace ONE — the other
+#     profile's container is untouched (its rollout step is a separate,
+#     still-owed `--replace-gateway`), and plain ensure of it stays
+#     converged on the old image (no image compare in the converge
+#     predicate).
+cat > "$S223/two.conf" <<'EOF'
+profile s223a 10.199.98.0/24
+    rule gateway-only
+    gateway 10.199.98.2 3128 s223a-allowlist
+profile s223b 10.199.99.0/24
+    rule gateway-only
+    gateway 10.199.99.2 3128 s223b-allowlist
+EOF
+printf 'git.example.test\n' > "$S223/s223a-allowlist"
+printf 'git.example.test\n' > "$S223/s223b-allowlist"
+run2g() { env EGRESSLOCK_CONF="$S223/two.conf" HOME="$S223" EGRESSLOCK_SKIP_NETNS_PROBE=1 egresslock "$@"; }
+o="$(run2g ensure s223a 2>&1)"; rcA=$?
+o="$(run2g ensure s223b 2>&1)"; rcB=$?
+[[ "$rcA" == 0 && "$rcB" == 0 && -f "$STATE/running/egresslock-gateway-s223a" \
+    && -f "$STATE/running/egresslock-gateway-s223b" ]] \
+    && e203r pass || e203r fail "F2 seed: both profiles ensured (a rc=$rcA, b rc=$rcB)"
+: > "$STATE/opslog"
+o="$(run2g ensure --replace-gateway s223a 2>&1)"; rc=$?
+if [[ "$rc" == 0 ]] \
+   && grep -qE '^podman (rm|run) .*egresslock-gateway-s223a' "$STATE/opslog" \
+   && ! grep -qE '^podman (rm|run) .*egresslock-gateway-s223b' "$STATE/opslog" \
+   && [[ -f "$STATE/running/egresslock-gateway-s223b" ]]; then
+    e203r pass
+else
+    e203r fail "F2: replace is profile-scoped, s223b untouched (rc=$rc, ops: $(tr '\n' '|' < "$STATE/opslog" 2>/dev/null))"
+fi
+# The un-replaced profile stays converged on the old image: plain ensure
+# does not compare image identity — this is why "absence of `stale:`" and
+# "no doctor complaint" are NOT rollout verification.
+: > "$STATE/opslog"
+o="$(run2g ensure s223b 2>&1)"; rc=$?
+if [[ "$rc" == 0 && "$o" == *"already converged, not restarted"* ]] \
+   && ! grep -qE '^podman (rm|run) .*egresslock-gateway-s223b' "$STATE/opslog"; then
+    e203r pass
+else
+    e203r fail "F2: plain ensure of the un-replaced profile stays converged (rc=$rc, out: $o)"
+fi
+# Leave-behind: free the two-profile state so later sections see no
+# holder state (same no-teardown leave-behind hygiene as egl223).
+o="$(run2g teardown all 2>&1)"; rc=$?
+
+section_end egl203r
+
 section_begin egl175 "EGL-175 runtime seam"
 a175() { assert "$@"; }
 
 ENG175="$TREE_ROOT/egresslock"
 
+egl175_seam_hits() { # egl175_seam_hits <file> — remaining podman command-word hits; empty = pass
+  awk '
+      /^rt_[a-z0-9_]+\(\)/ { in_rt=1 }
+      in_rt && /^\}/ { in_rt=0; next }
+      in_rt { next }
+      { print }
+  ' "$1" \
+    | grep -vE "^[[:space:]]*#" \
+    | grep -vE "podman network rm ('[$]name'|'[$]net'|'[$]1'|<name>)" \
+    | grep -vE "podman unshare --rootless-netns nft delete" \
+    | grep -vE "podman unshare --rootless-netns true'" \
+    | grep -vE 'podman unshare --rootless-netns \$bin -L -p tcp' \
+    | grep -vE 'podman unshare --rootless-netns \$bin -D -p tcp' \
+    | grep -vE "podman network inspect '" \
+    | grep -vE "\(podman (MISSING|NetworkBackend)" \
+    | grep -vE "\(podman cp;" \
+    | grep -nE '(^|[[:space:]`$(])podman([[:space:]|&;<>]|$)' || true
+}
+egl175_cap_flags() { # egl175_cap_flags <file> — rt_capabilities heredoc body (no EOF markers)
+  awk '/^rt_capabilities\(\)/{p=1} p && /<<'\''EOF'\''/{p=2; next} p==2 && /^EOF$/{exit} p==2{print}' "$1"
+}
+
 # D3: the frozen rt_* primitive vocabulary is present (the closed adapter
 # set the gate reasons about).
 missing175=""
 for p in rt_unshare rt_image_exists rt_image_inspect rt_image_pull \
+         rt_image_build \
          rt_network_ls \
          rt_network_inspect rt_network_create rt_network_rm rt_ps rt_run \
          rt_rm rt_exec rt_cp rt_restart rt_inspect rt_info rt_version \
-         rt_have_runtime; do
+         rt_have_runtime rt_capabilities; do
     grep -qE "^${p}\(\)" "$ENG175" || missing175="$missing175 $p"
 done
 [[ -z "$missing175" ]] \
     && a175 pass || a175 fail "rt_* primitive vocabulary incomplete:$missing175"
 
+# EGL-194-D4: rt_capabilities' heredoc body is pinned to exactly the four
+# contract lines in contract order — extra, missing, renamed, or
+# reordered capability flags fail (existence alone still lets
+# rt_capabilities answer the wrong flags).
+cap_want=$'stable-shared-netns\nrootless\nns-join\ninspect'
+cap_got="$(egl175_cap_flags "$ENG175")"
+[[ "$cap_got" == "$cap_want" ]] \
+    && a175 pass || a175 fail "rt_capabilities flags drifted: $(printf %q "$cap_got")"
+
 # D8/D12: zero podman invocations outside rt_* bodies (carve-outs applied).
 # The awk state machine ends an rt_* body at the first column-0 '}'; every
 # rt_* function is written multi-line so that anchor is exact.
-gate175="$(awk '
-    /^rt_[a-z0-9_]+\(\)/ { in_rt=1 }
-    in_rt && /^\}/ { in_rt=0; next }
-    in_rt { next }
-    { print }
-' "$ENG175" \
-  | grep -vE "^[[:space:]]*#" \
-  | grep -vE "command -v podman" \
-  | grep -vE "podman (network rm|unshare --rootless-netns nft delete|run --network|system migrate)" \
-  | grep -vE "podman unshare --rootless-netns true'" \
-  | grep -vE 'podman unshare --rootless-netns cat /proc/net/nf_conntrack"' \
-  | grep -vE 'podman unshare --rootless-netns \$bin -D -p tcp' \
-  | grep -vE "podman network inspect '" \
-  | grep -vE "\(podman (MISSING|NetworkBackend)" \
-  | grep -vE "\(podman cp;" \
-  | grep -nE '(^|[[:space:]`$(])podman([[:space:]|&;<>]|$)' || true)"
+gate175="$(egl175_seam_hits "$ENG175")"
 [[ -z "$gate175" ]] \
     && a175 pass || a175 fail "podman invocation outside rt_* (EGL-175 gate):
 $gate175"
+
+# Negative control (EGL-194-D3): a bare network-rm outside rt_* is flagged.
+_plant="$STATE/e175-plant"
+cp "$ENG175" "$_plant"
+printf '\n    podman network rm foo\n' >> "$_plant"
+_hits="$(egl175_seam_hits "$_plant")"
+[[ -n "$_hits" && "$_hits" == *"podman network rm foo"* ]] \
+    && a175 pass || a175 fail "EGL-194 plant 'podman network rm foo' not flagged: $_hits"
+rm -f "$_plant"
+
+# Negative control: mutating a contract flag fails the content pin.
+_cap="$STATE/e175-cap"
+cp "$ENG175" "$_cap"
+awk '
+  /^rt_capabilities\(\)/ { p=1 }
+  p && /<<'\''EOF'\''/ { p=2; print; next }
+  p==2 && /^EOF$/ { p=0; print; next }
+  p==2 && /^inspect$/ { print "inspectX"; next }
+  { print }
+' "$_cap" > "$_cap.m" && mv "$_cap.m" "$_cap"
+_mut="$(egl175_cap_flags "$_cap")"
+[[ "$_mut" != "$cap_want" ]] \
+    && a175 pass || a175 fail "EGL-194 cap mutation not caught (got: $(printf %q "$_mut"))"
+rm -f "$_cap"
 
 section_end egl175
 
@@ -4963,6 +6344,7 @@ results_emit arc71
 results_emit arc69
 results_emit egl31
 results_emit egl45
+results_emit egl226
 results_emit egl59
 results_emit deep
 results_emit egl55
@@ -4975,8 +6357,14 @@ results_emit egl141
 results_emit egl146
 results_emit egl147
 results_emit egl139
+results_emit egl222
+results_emit egl223
+results_emit egl228
+results_emit egl203r
 echo "RESULTS (EGL-140 pin record witness): $egl140_pass passed, $egl140_fail failed"
 results_emit egl175
+results_emit egl208
+results_emit egl217
 # EGL-184: the hand-maintained 52-term sums are replaced by the register:
 # counted snapshots plus the declared arc14 external (own counters via the
 # untouched a14 delegate, EGL-179-D3). Fail-closed completeness per

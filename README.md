@@ -71,105 +71,117 @@ normative security claims and their limits).
 ### Requirements
 
 1. Linux with **systemd** and unprivileged user namespaces enabled
-2. Debian packages:
 
-   - **podman** (rootless), **netavark**
-   - **nftables** 1.0+ (`nft` at `/usr/sbin/nft` or `NFT_BIN`)
-   - **conntrack** (`conntrack` at `/usr/sbin/conntrack` or
-     `CONNTRACK_BIN` — required by `disallow-host`'s revocation flush)
+### One-step install
 
-   ```sh
-   # example — dependency install with apt:
-   sudo apt-get install -y podman netavark nftables conntrack
-   ```
+One-step install in a paste-able block (idempotent). If you prefer one step at a time:
+[Install the kit](docs/setup/install.md).
 
-3. One or more dedicated unprivileged `<account>`s to own the policies
-   (the kit never runs policy jobs as root) — **create a new account
-   specifically for this**, not your user account. Any account name
-   works; the examples use the placeholder `<account>`:
+```sh
+# your own user — sudo elevates where marked
+# prompt: $ (your own prompt)
 
-   ```sh
-   # create a dedicated account to own the containers and container networks:
-   sudo adduser <account>
-   ```
+# --- install dependencies (root) ----------------------------------------
+sudo apt-get install -y podman netavark nftables conntrack
 
-### Setup
+# --- create a dedicated account (root) — edit the name if you like -----
+# the quickstart examples use `egl-runner`; any dedicated unprivileged
+# account name works
+ACCOUNT=egl-runner
+id "$ACCOUNT" >/dev/null 2>&1 || sudo adduser --disabled-password \
+    --gecos "egresslock runner" "$ACCOUNT"
 
-From a fresh host with a dedicated unprivileged `<account>` (see
-Requirements above):
+# --- build and install the kit ------------------------------------------
+[ -d ~/egresslock ] || git clone https://github.com/egresslock/egresslock ~/egresslock
+cd ~/egresslock
+git pull
+rm -f ./packaging/egresslock_*_all.deb
+./packaging/build-deb.sh
+sudo dpkg -i ./packaging/egresslock_*_all.deb
 
-1. **Install the kit (.deb) and set up the account**:
+# --- apply the AppArmor pasta policy only if needed (root) --------------
+sudo egresslock-setup --apparmor-check | grep Summary
+sudo egresslock-setup --apparmor-check | grep -q "CHECK FAILED" && sudo egresslock-setup --apparmor-add
 
-   ```sh
-   # Build the .deb from a checkout (no root needed; there is no
-   # hosted .deb to download), then install it:
-   git clone https://github.com/egresslock/egresslock
-   cd egresslock
-   ./packaging/build-deb.sh
-   sudo dpkg -i packaging/egresslock_<VERSION>_all.deb
+# --- set up the account: starter conf + drift timer + linger (root) ------
+# quiet run: the full stream (incl. the gateway image build) goes to
+# the log; the six-step map is what matters
+sudo egresslock-setup --init-conf --enable --account "$ACCOUNT" > ~/egresslock-setup.log 2>&1
+grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
 
-   # On Ubuntu >= 25.10 (podman under an AppArmor label), add the pasta policy — to read more details about why this is needed, see apparmor/README.md
-   sudo egresslock-setup --apparmor-add
-   # egresslock-setup --apparmor-check reports whether this host needs it.
+# --- build the policy and the shared example image (as the account) -----
+sudo -iu "$ACCOUNT" -- egresslock ensure main
+sudo -iu "$ACCOUNT" -- /usr/share/egresslock/examples/egl-base/build-egl-base
+```
 
-   #set up and enable starter conf, linger, and 15-min drift check timer
-   sudo egresslock-setup --init-conf --enable --account <account>
-   ```
+<details><summary>Expected output (the lines that matter):</summary>
 
-   What this does is:
+<pre>
+$ grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
+1) validate conf … OK
+2) write unit.env … OK
+3) linger … OK
+4) user manager … OK
+5) gateway image … OK
+6) timer … OK
+$ sudo -iu egl-runner -- egresslock ensure main
+created network egresslock-main (10.199.0.0/24)
+started anchor egresslock-anchor-main
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
+profile 'main' ready (network egresslock-main, policy verified)
+$ sudo -iu egl-runner -- /usr/share/egresslock/examples/egl-base/build-egl-base
+>> Building localhost/egl-base:latest FROM a29215f6a35e
+>> Done: localhost/egl-base:latest
+</pre>
+</details>
 
-      - build the gateway image
-      - write the account's `unit.env` and ship a **deny-all** starter
-        conf (`main.conf` to `/home/<account>/.config/egresslock/`)
-      - with `--enable`: enable the 15-minute verify timer and linger
-        (linger keeps the account's session alive so the timer can run
-        outside logins; details in
-        [Install the kit](docs/setup/install.md)) — without it, drift
-        checks only run when `verify` is manually run
+What you now have:
 
-   To read more about the AppArmor pasta rule, see the
-   [pasta policy rule](apparmor/README.md).
+- on a fresh account, a starter policy (`profile main`, empty
+  allowlist) that denies application connections; DNS queries to the
+  bridge resolver are still allowed and can carry data out
+- the anchor and gateway containers running
+- the 15-minute drift check timer enabled
+- the `egl-base` example image, ready for the quickstarts
 
-   (Not installing via the .deb? See [Install the kit](docs/setup/install.md).)
+Re-running preserves existing confs and allowlists — it does not reset
+your policy to deny-all. The [threat model](docs/reference/threat-model.md)
+explains the DNS exception and other limits.
 
-2. **Build the network policy**: now that the kit is installed, as the
-   account, run `ensure` — this creates the profile network, starts the
-   anchor (and gateway) that keeps it alive, installs the fail-closed
-   nftables policy, and verifies the result. It is idempotent (safe to
-   re-run) and is required before a workload can start:
+### (Optional) Launch a container on the locked network
 
-   ```sh
-   sudo -iu <account>
-   ```
+```sh
+# your own user — sudo elevates; edit ACCOUNT if you changed it above
+# prompt: $ (your own prompt)
 
-   ```sh
-   egresslock ensure main
-   ```
+ACCOUNT=egl-runner
+# the quoted command is one single line on purpose — a multi-line
+# sh -c payload breaks if a paste collapses the newlines
+sudo -iu "$ACCOUNT" -- sh -c 'egresslock ensure main && egresslock proxy-env main > /run/user/"$(id -u)"/egresslock-proxy-main.env && podman run --rm -it --cap-drop=all --security-opt=no-new-privileges --network="$(egresslock network main)" --env-file=/run/user/"$(id -u)"/egresslock-proxy-main.env localhost/egl-base:latest sh'
+```
 
-3. **(Optional) Examine from within the container** (still in the
-   account's shell from step 2):
+A shell in an `egl-base` container on the profile network. The launch
+runs only if `ensure` succeeds; application connections follow your
+existing policy (denied by the fresh starter, apart from DNS above).
 
-   Run a container on its network with the proxy wired in
-   (IP/port pulled from the profile). On .deb hosts the engine is on
-   `PATH` as `egresslock` (prefix installs: use
-   `/opt/egresslock/egresslock`):
+<details><summary>Expected output:</summary>
+the container's shell prompt — you are inside the locked network:
 
-   ```sh
-   # Run a shell on the profile network, proxy wired in with one env file
-   # (bash process substitution; --env-file=<(...) needs bash or zsh):
-   podman run --rm -it \
-       --network="$(egresslock network main)" \
-       --env-file=<(egresslock proxy-env main) \
-       docker.io/library/debian:13-slim \
-       sh
-   ```
+<pre>
+$ sudo -iu egl-runner -- sh -c 'egresslock ensure main && egresslock proxy-env main > … && podman run … sh'
+gateway 'egresslock-gateway-main' ready (already converged, not restarted)
+profile 'main' ready (network egresslock-main, policy verified)
+root@9badc0ffee67:/#
+</pre>
 
-   This drops you into a `debian:13-slim` shell on the profile's network —
-   **no curl/wget/ping inside**, so there is no egress until you allow
-   destinations.
+`root@…` is the container's own root (rootless Podman maps it to the
+account — NOT host root); the hostname is the container's. `exit`
+returns to the account's one-off shell.
+</details>
 
-4. **Go through the quick start guides**: now that the kit is installed,
-   work through the [Quick start guides](#quick-start-guides) below.
+Next: [Allow a
+domain](docs/quickstart/allow-a-domain.md) — probe the deny-all,
+then allow one destination.
 
 ## Quick start guides
 
@@ -179,15 +191,20 @@ profile's name. The [Reference](#reference) section holds the
 detailed material; [troubleshooting](docs/troubleshooting.md) is the
 "I'm facing X" index.
 
-1. [Create a profile](docs/quickstart/create-a-profile.md) <span style="color:#6a737d">(<1 minute)</span> — the `init`/`ensure` walkthrough for a new profile.
-2. [Allow a domain (and see what's blocked)](docs/quickstart/allow-a-domain.md) <span style="color:#6a737d">(<1 minute)</span> — run a workload, 403 → `allow example.com` → re-run → `denied` → remove an entry.
-3. [Grow the policy](docs/quickstart/grow-the-policy.md) <span style="color:#6a737d">(<1 minute)</span> — the allow/allow-host flows and removing entries.
-4. [Allow non-HTTP egress](docs/quickstart/allow-non-http.md) <span style="color:#6a737d">(<1 minute)</span> — `allow-host` for git-over-SSH, raw IPs, and same-host services (recipes; the why lives in the reference).
-5. [Reach a service on the host (localhost) from a container](docs/quickstart/reach-a-host-service.md) <span style="color:#6a737d">(<1 minute)</span> — the two supported patterns (proxied name, direct literal) and the pasta-hairpin trap.
-6. [First-run checks](docs/quickstart/first-run-checks.md) <span style="color:#6a737d">(<1 minute)</span> — the things that commonly go wrong right after initial setup.
-7. [Test your container](docs/quickstart/test-your-container.md) — a five-minute pass proving the policy allows and blocks what you expect.
+Creating an additional profile (beyond the starter `main`) is
+optional — [Create a profile](docs/reference/policy-reference.md#profile-lifecycle).
+
+1. [Allow a domain (and see what's blocked)](docs/quickstart/allow-a-domain.md) <span style="color:#6a737d">(<1 minute)</span> — run a workload, 403 → `allow example.com` → re-run → `denied` → remove an entry.
+2. [Allow non-HTTP egress](docs/quickstart/allow-non-http.md) <span style="color:#6a737d">(<1 minute)</span> — `allow-host` for git-over-SSH and raw IPs, and the fail-closed proofs.
+3. [First-run checks](docs/quickstart/first-run-checks.md) <span style="color:#6a737d">(<1 minute)</span> — the things that commonly go wrong right after initial setup.
 
 ## Recipes
+
+Every recipe's `podman run` block carries the same hardening baseline
+(cap-drop + no-new-privileges always; keep-id + a read-only rootfs
+where the recipe bind-mounts a host dir and the rootfs is disposable;
+exceptions stated, never silent):
+[container hardening baseline](docs/reference/container-hardening.md).
 
 ### Archetypes
 
@@ -207,9 +224,9 @@ detailed material; [troubleshooting](docs/troubleshooting.md) is the
 ### Setup (install / upgrade / uninstall)
 
 - **[Install the kit](docs/setup/install.md)** — full install steps, every
-  setting, both channels (`.deb` and manual prefix), AppArmor
-  prerequisite, verify, files installed, host validation. The quick
-  start above is the condensed `.deb` version.
+  setting, both install methods (`.deb` and tarball prefix), AppArmor
+  prerequisite, verify, files installed. The quick start above is the
+  condensed `.deb` version.
 - **[Upgrade the kit](docs/setup/upgrade.md)** — re-running install-kit.sh
   with the same prefix, the VERSION stamp, and the post-upgrade checks.
 - **[Uninstall the kit](docs/setup/uninstall.md)** — account teardown first,
@@ -223,12 +240,21 @@ detailed material; [troubleshooting](docs/troubleshooting.md) is the
 - **[Who runs what](docs/reference/who-runs-what.md)** — root, the
   container-owner account, and the workload: who runs which command
   where.
+- **[Container hardening baseline](docs/reference/container-hardening.md)**
+  — the `podman run` flag layers for example launchers: always-on
+  cap-drop/no-new-privileges, keep-id + passwd-entry on bind-mount
+  recipes, read-only where the rootfs is disposable, and the stated
+  exceptions.
+- **[The gateway image](docs/reference/gateway-image.md)** — when to
+  rebuild the kit-built gateway, what the doctor's `stale:` means, and
+  the rebuild/replace steps.
 - **[Overview](docs/reference/overview.md)** — how it works: the
   problem it addresses, the enforcement architecture, fail-closed
   behavior, and the security model summary.
 - **[Policy reference](docs/reference/policy-reference.md)** — the full
   profile-conf grammar, the allowlist format, the destination →
-  mechanism decision table, and `allow-host` details.
+  mechanism decision table, `allow-host` details, and the profile
+  lifecycle (create / verify / teardown / delete).
 - **[Paths and signatures](docs/reference/paths-and-signatures.md)** —
   why a request 403s, hangs, or gets refused: the two-path model, the
   failure signatures, live counters, and the same-host pasta patterns.
@@ -264,7 +290,7 @@ error.
 - Docs layout: quickstart guides in `docs/quickstart/`; reference docs
   in `docs/reference/` and `docs/setup/`; troubleshooting in
   `docs/troubleshooting.md` + `docs/troubleshooting/`. See
-  [docs/README.md](docs/README.md) for the organization rules.
+  [docs/README.md](docs/README.md) for the docs map.
 
 ### License
 

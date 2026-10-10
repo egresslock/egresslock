@@ -53,15 +53,27 @@ Ports matter here:
 ## 2. Run the container (proxy env as one file)
 
 The env file carries both cases of the proxy pair (apt reads the
-**lowercase** `http_proxy`/`https_proxy`):
+**lowercase** `http_proxy`/`https_proxy`). Fail closed: converge the
+profile and assert it is live before the run:
 
 ```sh
-podman run --rm -it \
+egresslock ensure main \
+ && egresslock verify main \
+ && egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env \
+ && podman run --rm -it \
     --network="$(egresslock network main)" \
-    --env-file=<(egresslock proxy-env main) \
+    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    --cap-drop=all --security-opt=no-new-privileges \
     docker.io/library/debian:13-slim \
     sh
 ```
+
+**Stated exception** (the one rule of the
+[container hardening baseline](../../docs/reference/container-hardening.md)):
+this is an install/eval shell, so it carries **no** `--userns=keep-id`
+and **no** `--read-only` — there is no host bind mount for keep-id to
+serve, and the apt/npm install chain in the next section must write
+the container rootfs as uid 0.
 
 After a host reboot, re-run `egresslock ensure main` (or
 `egresslock-start`) before this `podman run` — the network object

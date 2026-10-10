@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# build-egl-base — build the shared example image localhost/egl-base:latest
+# from the Containerfile NEXT TO THIS SCRIPT.
+#
+# This is an example-image helper, not a workload launcher: it never
+# runs a container, never calls egresslock ensure/verify, and takes no
+# profile. Not on PATH; invoke by full path or ./ from this directory.
+#
+# Options:
+#   -h, --help   print this help
+#   --force      rebuild even when the image matches the deployed pin
+#                (uses podman --no-cache)
+#
+# Defaults that are not parameter-changeable:
+#   - image tag: localhost/egl-base:latest
+#   - build context: the directory containing this script
+#     (.deb /usr/share/egresslock/examples/egl-base, prefix
+#     /opt/egresslock/examples/egl-base, or a checkout) — never the
+#     caller's current directory
+#   - no --format docker (the example image has no HEALTHCHECK)
+
+set -euo pipefail
+
+usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+force=0
+if (( $# > 0 )); then
+    if [[ "$1" == "--force" && $# -eq 1 ]]; then
+        force=1
+    else
+        echo "Error: build-egl-base takes no arguments other than --force." >&2
+        usage >&2
+        exit 2
+    fi
+fi
+
+IMAGE="localhost/egl-base:latest"
+dir="$(cd "$(dirname "$0")" && pwd)"
+[[ -f "$dir/Containerfile" ]] || {
+    echo "Error: no Containerfile at $dir/Containerfile (the helper must sit next to the egl-base Containerfile)" >&2
+    exit 1
+}
+
+if ! command -v podman >/dev/null 2>&1; then
+    echo "Error: podman not found on PATH (required to build $IMAGE)" >&2
+    exit 1
+fi
+
+pin="$(grep -oE 'sha256:[0-9a-f]{64}' "$dir/Containerfile" | head -1 || true)"
+pin_short="${pin#sha256:}"; pin_short="${pin_short:0:12}"
+
+state=missing
+base=""
+if podman image exists "$IMAGE" 2>/dev/null; then
+    state=present
+    base="$(podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}}' "$IMAGE" 2>/dev/null || true)"
+    # Go template index of a missing key prints "<no value>".
+    [[ "$base" == "<no value>" ]] && base=""
+fi
+
+build=0
+reason=""
+if [[ "$state" != present ]]; then
+    build=1
+    reason="missing"
+elif [[ -z "$base" || -z "$pin" || "$base" != "$pin" ]]; then
+    build=1
+    if [[ -z "$base" ]]; then
+        reason="unknown"
+    else
+        reason="stale"
+    fi
+fi
+
+if (( ! build && ! force )); then
+    echo "already built from deployed pin ${pin_short} — use --force to rebuild"
+    exit 0
+fi
+
+if (( ! force )); then
+    if [[ "$reason" == "missing" ]]; then
+        echo "egl-base image: missing ($IMAGE)"
+    elif [[ "$reason" == "stale" ]]; then
+        img_short="${base#sha256:}"; img_short="${img_short:0:12}"
+        echo "egl-base image: stale: base pin moved (image $img_short != deployed pin $pin_short)"
+    else
+        echo "egl-base image: stale: base unknown (pre-label image)"
+    fi
+fi
+
+echo ">> Building $IMAGE FROM ${pin_short}"
+extra=()
+if (( force )); then
+    extra+=(--no-cache)
+fi
+if ! podman build -t "$IMAGE" "${extra[@]}" -f "$dir/Containerfile" "$dir"; then
+    retry="$(printf '%q' "$dir/build-egl-base")"
+    if (( force )); then
+        retry="$retry --force"
+    fi
+    echo "Error: egl-base image build failed for $IMAGE (build output above); fix the cause and re-run: $retry" >&2
+    exit 1
+fi
+echo ">> Done: $IMAGE"

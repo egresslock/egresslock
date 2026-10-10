@@ -70,13 +70,26 @@ containing the build version string; `install-kit.sh` uses it as the
 `version:` value when present, so a tarball install does not re-stamp
 as `+git<install-time>.unknown`. `KIT_VERSION` is never committed.
 
-Uninstall: `sudo apt remove egresslock`. Podman state, account data
-(`~/.config/egresslock`), and the pasta local snippet are never touched
-by dpkg — run `egresslock teardown --runtime` as the account
-first, while the engine still exists (and
-`egresslock-setup --apparmor-remove` if you applied the pasta
-amendment); then see the post-remove verification checklist in
-[Uninstall](../docs/setup/uninstall.md) → Verify it's fully gone.
+Uninstall: disable the per-account verify timer, then
+`sudo apt remove egresslock`:
+
+    sudo systemctl disable --now egresslock-verify@<account>.timer
+    sudo apt remove egresslock
+
+Repeat the timer line for each account you enabled. Before removal,
+per account: stop and remove every workload attached to a kit
+network, then run `egresslock teardown --runtime` as the account
+(while the engine still exists) — teardown deletes the kit's nft
+enforcement but does not remove non-kit-named workloads. Do this for
+EVERY account with kit runtime — including accounts without an
+enabled verify timer — before the host-global steps
+(`egresslock-setup --apparmor-remove` if you applied the pasta
+amendment, then package removal). Podman state,
+account data (`~/.config/egresslock`), and the pasta local snippet are
+never touched by dpkg; then see the full order, the safety
+prerequisites, and the post-remove verification checklist in
+[Uninstall](../docs/setup/uninstall.md) → Verify it's
+fully gone.
 
 ## tar.gz (manual, self-contained)
 

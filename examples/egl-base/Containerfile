@@ -1,0 +1,18 @@
+# Shared example image for the quickstarts. The FROM line must stay
+# byte-equal to gateway/Containerfile (tests/test-engine.sh D3.2).
+# No build tools.
+FROM docker.io/library/debian:13-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+# Base identity on the built artifact (the digest must equal the FROM
+# above — the kit pin test fails on drift): build-egl-base reads it to
+# flag a stale example image after this pin moves.
+LABEL org.opencontainers.image.base.name="docker.io/library/debian:13-slim"
+LABEL org.opencontainers.image.base.digest="sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f"
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        dnsutils \
+        iputils-ping \
+        openssh-client \
+        rsync \
+    && rm -rf /var/lib/apt/lists/*

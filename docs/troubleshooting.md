@@ -13,7 +13,7 @@ routine health check see
 | Squid 403 error page | proxy path — not allowlisted, or a proxied IP literal | [proxied-or-direct](troubleshooting/proxied-or-direct.md) |
 | curl hangs, nothing in access.log | direct path, nft drop | [proxied-or-direct](troubleshooting/proxied-or-direct.md) |
 | instant `Connection refused` (0 ms), counters dead | host-local service — pasta hairpin | [proxied-or-direct](troubleshooting/proxied-or-direct.md) |
-| my container can't reach a service on the host / localhost | same-host service — pasta hairpin (host-addressed traffic never leaves the netns) | [paths-and-signatures](reference/paths-and-signatures.md) |
+| my container can't reach a service on the host / localhost | same-host service — pasta hairpin (host-addressed traffic never leaves the netns) | [cannot-reach-host-service](troubleshooting/cannot-reach-host-service.md) |
 | `denied` shows nothing but clients still 403 | stale engine or stale container env | [proxied-or-direct](troubleshooting/proxied-or-direct.md) |
 | `kill network process: permission denied` | pasta/AppArmor blocker | [pasta-apparmor](troubleshooting/pasta-apparmor.md) |
 | `invalid internal status ... podman system migrate` / degraded user session | session/pause-process tangle | [session-tangles](troubleshooting/session-tangles.md) |

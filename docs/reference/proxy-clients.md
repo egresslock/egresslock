@@ -53,5 +53,8 @@ of the same pair:
   with the nftables policy.
 
 One environment-change rule to remember: proxy env is baked at
-container start — after any policy or env change, **recreate** the
+container start — after any policy or env change, **regenerate**
+the env file (`egresslock proxy-env <profile> >
+/run/user/$(id -u)/egresslock-proxy-<profile>.env` — the account's
+private runtime dir) and **recreate** the
 container (see [allow-non-http](../quickstart/allow-non-http.md)).

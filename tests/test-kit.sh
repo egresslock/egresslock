@@ -81,6 +81,10 @@ cmp -s "$TREE_ROOT/egresslock-setup" "$OPT/egresslock-setup" \
 # EGL-69-D2: the prefix ships the pasta AppArmor snippet (root-owned).
 [[ -f "$OPT/apparmor/usr.bin.pasta.local" && -f "$OPT/apparmor/README.md" ]] \
     && a16 pass || a16 fail "apparmor snippet deployed to prefix (EGL-69-D2)"
+# EGL-232: the shared example base image (egl-base) ships with the kit;
+# EGL-240: the build helper ships executable beside it.
+[[ -f "$OPT/examples/egl-base/Containerfile" && -f "$OPT/examples/egl-base/README.md" && -x "$OPT/examples/egl-base/build-egl-base" ]] \
+    && a16 pass || a16 fail "egl-base build context deployed (EGL-232)"
 [[ -f "$UNITS/egresslock-verify@.service" && -f "$UNITS/egresslock-verify@.timer" ]] \
     && a16 pass || a16 fail "instanced templates installed (D1)"
 # EGL-103-D1: shipped unit text carries the generated-file notice and
@@ -194,7 +198,7 @@ section_end arc16
 # without coverage: timeout(1) absent (fail closed) and probe expiry
 # (named 5s failure). Both run BEFORE the engine exec, so neither
 # touches the ensured chain state. D2: real 5s wait for the expiry
-# case (ARC-26 style), far under the 300s harness bound.
+# case (ARC-26 style), far under the 600s harness bound (EGL-225).
 section_begin egl85 "EGL-85 verify timeout paths"
 a85() { assert "$@"; }
 
@@ -1257,12 +1261,14 @@ e38o="$($SKIT --doctor --apparmor-add 2>&1)"; e38_rc=$?
     && e38 pass || e38 fail "doctor x apparmor-add is a usage error (rc=$e38_rc)"
 
 # 6. --build-gateway as non-root builds from the DEPLOYED prefix
-#    (not the checkout CWD rules; D38-3).
+#    (not the checkout CWD rules; D38-3). EGL-222: the standalone is now
+#    an exec alias of the engine verb, so the build carries the engine's
+#    `--format docker` between -t and -f (D5; -t stays first).
 : > "$STATE/buildlog"
 e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e38c \
     $SKIT --prefix "$e38p" --build-gateway 2>&1)"; e38_rc=$?
 [[ "$e38_rc" == 0 ]] && e38 pass || e38 fail "build-gateway run (rc=$e38_rc, out: $e38o)"
-grep -q "build -t localhost/egresslock-gateway:e38c -f $e38p/gateway/Containerfile $e38p/gateway" "$STATE/buildlog" \
+grep -q "build -t localhost/egresslock-gateway:e38c --format docker -f $e38p/gateway/Containerfile $e38p/gateway" "$STATE/buildlog" \
     && e38 pass || e38 fail "build-gateway uses the deployed prefix context ($(cat "$STATE/buildlog"))"
 grep -q "$TREE_ROOT/gateway" "$STATE/buildlog" \
     && e38 fail "build-gateway must not use checkout CWD rules" || e38 pass
@@ -1281,6 +1287,31 @@ fi
 [[ ! -s "$STATE/buildlog" ]] \
     && e38 pass || e38 fail "build-gateway: no podman build when user@ inactive"
 rm -f "$STATE/systemctl-usermgr-fails"
+
+# 8. EGL-222-D3/D9: the standalone is an exec ALIAS of the engine verb —
+#    on an equal pin the "already built from deployed pin ..." line can
+#    only come from `egresslock build-gateway`, and no second build runs.
+e38pin="$(grep -oE 'sha256:[0-9a-f]{64}' "$e38p/gateway/Containerfile" | head -1)"
+printf '%s 2026-09-01T00:00:00.000000000Z\n' "$e38pin" \
+    > "$STATE/image-inspect-localhost_egresslock-gateway_e38c"
+: > "$STATE/buildlog"
+e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e38c \
+    $SKIT --prefix "$e38p" --build-gateway 2>&1)"; e38_rc=$?
+[[ "$e38_rc" == 0 && "$e38o" == *"already built from deployed pin"* && ! -s "$STATE/buildlog" ]] \
+    && e38 pass || e38 fail "build-gateway alias delegates to the engine verb (rc=$e38_rc, out: $e38o)"
+# ... and --force forwards through the alias: an equal pin still rebuilds.
+e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e38c \
+    $SKIT --prefix "$e38p" --build-gateway --force 2>&1)"; e38_rc=$?
+[[ "$e38_rc" == 0 && -s "$STATE/buildlog" ]] \
+    && e38 pass || e38 fail "build-gateway alias forwards --force (rc=$e38_rc, out: $e38o)"
+rm -f "$STATE/image-inspect-localhost_egresslock-gateway_e38c"
+
+# 9. R-EGL-222-3 note: the alias with no engine at the prefix fails
+#    closed with the remedy named (rc 1, not a bare exec 127).
+e38neng="$STATE/e38/noeng"; mkdir -p "$e38neng"
+e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 $SKIT --prefix "$e38neng" --build-gateway 2>&1)"; e38_rc=$?
+[[ "$e38_rc" == 1 && "$e38o" == *"no engine at $e38neng/egresslock"* ]] \
+    && e38 pass || e38 fail "alias without an engine fails closed named (rc=$e38_rc, out: $e38o)"
 section_end egl38
 
 # --- ARC-60: setup confdir migration (D2) -----------------------------------
@@ -1370,6 +1401,8 @@ mkdir -p "$p22/x"; tar -xzf "$p22/k.tgz" -C "$p22/x"
 for f in README.txt egresslock/install-kit.sh egresslock/uninstall-kit.sh \
          egresslock/egresslock egresslock/egresslock-setup \
          egresslock/gateway/Containerfile egresslock/examples/main.conf \
+         egresslock/examples/egl-base/Containerfile \
+         egresslock/examples/egl-base/build-egl-base \
          egresslock/docs/setup/uninstall.md egresslock/apparmor/usr.bin.pasta.local \
          egresslock/systemd/egresslock-verify@.service \
          egresslock/systemd/egresslock-verify@.timer; do
@@ -1395,8 +1428,11 @@ i_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u22" \
 for f in egresslock egresslock-start egresslock-verify egresslock-setup VERSION; do
     [[ -f "$p22/opt/$f" ]] && a22 pass || a22 fail "tarball install deployed $f (rc=$i_rc, out: $i_out)"
 done
-[[ -d "$p22/opt/gateway" && -f "$p22/opt/examples/main.conf" && -f "$u22/egresslock-verify@.service" ]] \
-    && a22 pass || a22 fail "tarball install deployed gateway/examples/units"
+[[ -d "$p22/opt/gateway" && -f "$p22/opt/examples/main.conf" \
+    && -f "$p22/opt/examples/egl-base/Containerfile" \
+    && -x "$p22/opt/examples/egl-base/build-egl-base" \
+    && -f "$u22/egresslock-verify@.service" ]] \
+    && a22 pass || a22 fail "tarball install deployed gateway/examples/egl-base/units"
 grep -q "ExecStart=$p22/opt/egresslock-verify" "$u22/egresslock-verify@.service" \
     && a22 pass || a22 fail "tarball install rewrote ExecStart with the prefix"
 
@@ -1430,6 +1466,9 @@ for f in DEBIAN/control DEBIAN/postinst DEBIAN/postrm \
          usr/lib/egresslock/VERSION usr/lib/egresslock/gateway/Containerfile \
          usr/share/egresslock/examples/main.conf \
          usr/share/egresslock/examples/main-allowlist \
+         usr/share/egresslock/examples/egl-base/Containerfile \
+         usr/share/egresslock/examples/egl-base/README.md \
+         usr/share/egresslock/examples/egl-base/build-egl-base \
          usr/share/egresslock/doc/README.md \
          usr/share/egresslock/doc/docs/quickstart/allow-non-http.md \
          usr/share/egresslock/doc/docs/setup/install.md \
@@ -2156,6 +2195,15 @@ if command -v dpkg >/dev/null 2>&1; then
     else
         a22 fail "EGL-204 0.6.0 -> 0.7.0 base bump not an upgrade under dpkg ordering"
     fi
+    # EGL-242-D8 cross-base pin: the 0.8.0 base bump (same timestamp,
+    # same sha — worst case) must also compare as an upgrade over a
+    # 0.7.0 stamp; 0.7.0 -> 0.8.0 is never a dpkg downgrade.
+    if dpkg --compare-versions "0.7.0+git20260924192516.76f1e51d345a" \
+            lt "0.8.0+git20260924192516.76f1e51d345a"; then
+        a22 pass
+    else
+        a22 fail "EGL-242 0.7.0 -> 0.8.0 base bump not an upgrade under dpkg ordering"
+    fi
 else
     skip "dpkg absent" "EGL-27 dpkg not available; skipping compare-versions assert"
 fi
@@ -2178,6 +2226,9 @@ fi
 # EGL-204-D8: the live-base pin derives from VERSION_BASE (EGL-164 shape
 # B — no live-base pin edit at the 0.7.0 bump) and adds the
 # 0.6.0+git lt 0.7.0+git cross-base assert above.
+# EGL-242-D8: the live-base pin derives from VERSION_BASE (EGL-164 shape
+# B — no live-base pin edit at the 0.8.0 bump) and adds the
+# 0.7.0+git lt 0.8.0+git cross-base assert above.
 # EGL-80-L8: the stamp embeds the git commit — in a tree WITHOUT .git
 # (the exported/staged public snapshot shape, or a plain export)
 # build-tarball legitimately falls back to 'unknown' (EGL-74
@@ -2992,6 +3043,101 @@ e55o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
 
 section_end egl55
 
+# --- EGL-203: doctor gateway-image staleness row (advisory) --------------
+# The present branch of the gateway-image row now peeks at the image's
+# base label and compares it with the deployed Containerfile pin — read
+# from the engine's NEIGHBOR gateway/, exactly the context the
+# `egresslock build-gateway` remedy builds from (R-EGL-222-3 F2; the
+# share override never feeds the pin). Advisory and
+# rc-neutral throughout: stale-but-working is not broken wiring (the
+# EGL-55 precedent). Fixtures via the mock podman image-inspect file
+# ($D/image-inspect-<img>) — the mock's default inspect is empty, which
+# degrades to a bare "base unknown" with no staleness claim.
+section_begin egl203 "EGL-203 doctor gateway-image staleness row"
+e203() { assert "$@"; }
+e203img="localhost/egresslock-gateway:latest"
+e203fix="$STATE/image-inspect-$(echo "$e203img" | tr '/:' '__')"
+e203dig="$(grep '^FROM ' "$e38p/gateway/Containerfile" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)"
+e203short="${e203dig#sha256:}"; e203short="${e203short:0:12}"   # the row prints the short digest
+e203share="$STATE/e203/share"
+mkdir -p "$e203share/gateway"
+
+# 1. Label matches the deployed pin: the row shows the base (short
+#    digest) + built date, no staleness line, doctor rc stays 0.
+printf '%s 2026-09-01T00:00:00.000000000Z\n' "$e203dig" > "$e203fix"
+e203o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
+    EGRESSLOCK_UNIT_DIR="$UNITS" \
+    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e203rc=$?
+[[ "$e203rc" == 0 && "$e203o" == *"gateway image: present ($e203img) — base $e203short"* \
+    && "$e203o" == *", built 2026-09-01"* && "$e203o" != *"stale:"* ]] \
+    && e203 pass || e203 fail "D203-3 match row: base + built, rc-neutral (rc=$e203rc, out: $e203o)"
+rm -f "$e203fix"
+
+# 2. Divergent-pin round trip (R-EGL-222-3 F2): the share override does
+#    NOT feed the doctor's pin. Share carries pin B (all-zero digest),
+#    the engine neighbor carries pin A, the image is A-labelled: the
+#    doctor must report NO stale row (its pin source = the remedy's
+#    context), and the doctor's recommended remedy must agree — the
+#    alias execs the engine verb, which reports up-to-date and builds
+#    nothing.
+printf 'FROM docker.io/library/debian:13-slim@sha256:%064d\n' 0 > "$e203share/gateway/Containerfile"
+printf '%s 2026-09-01T00:00:00.000000000Z\n' "$e203dig" > "$e203fix"
+e203o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
+    EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_SHARE="$e203share" \
+    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e203rc=$?
+[[ "$e203rc" == 0 && "$e203o" == *"gateway image: present ($e203img) — base $e203short"* \
+    && "$e203o" != *"stale:"* ]] \
+    && e203 pass || e203 fail "D203-3 F2: share pin ignored, neighbor pin matches (rc=$e203rc, out: $e203o)"
+: > "$STATE/buildlog"
+e203o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
+    EGRESSLOCK_SHARE="$e203share" \
+    $SKIT --prefix "$e38p" --build-gateway 2>&1)"; e203rc=$?
+[[ "$e203rc" == 0 && "$e203o" == *"already built from deployed pin $e203short"* && ! -s "$STATE/buildlog" ]] \
+    && e203 pass || e203 fail "D203-3 F2: the doctor's remedy agrees with the doctor (rc=$e203rc, out: $e203o)"
+
+# 2b. Pin moved in the NEIGHBOR (the canonical pin source): the stale
+#     row still fires with both sides named and the account-shell
+#     rebuild pointer; still advisory (rc 0).
+printf 'FROM docker.io/library/debian:13-slim@sha256:%064d\n' 0 > "$e38p/gateway/Containerfile"
+e203o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
+    EGRESSLOCK_UNIT_DIR="$UNITS" \
+    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e203rc=$?
+[[ "$e203rc" == 0 && "$e203o" == *"stale: base pin moved (image base $e203short != deployed pin 000000000000)"* \
+    && "$e203o" == *"rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"* ]] \
+    && e203 pass || e203 fail "D203-3 neighbor-pin-moved stale row with pointer, rc-neutral (rc=$e203rc, out: $e203o)"
+cp -f "$TREE_ROOT/gateway/Containerfile" "$e38p/gateway/Containerfile"   # restore the fixture prefix
+rm -f "$e203fix" "$e203share/gateway/Containerfile"
+
+# 3. Pre-label image (inspect succeeds, label empty): "base unknown
+#    (pre-label image)" + the same rebuild pointer, rc-neutral.
+printf ' 2026-08-01T00:00:00.000000000Z\n' > "$e203fix"
+e203o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
+    EGRESSLOCK_UNIT_DIR="$UNITS" \
+    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e203rc=$?
+[[ "$e203rc" == 0 && "$e203o" == *"gateway image: present ($e203img) — base unknown (pre-label image), built 2026-08-01"* \
+    && "$e203o" == *"stale: base unknown (pre-label image) — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"* ]] \
+    && e203 pass || e203 fail "D203-3 pre-label row with pointer, rc-neutral (rc=$e203rc, out: $e203o)"
+rm -f "$e203fix"
+
+# 4. Inspect fails (no session/old podman): degrades to a bare "base
+#    unknown" — no staleness claim, no pre-label guess, doctor rc 0.
+mkdir -p "$STATE/e203/bin"
+cat > "$STATE/e203/bin/podman" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == image && "\$2" == inspect ]]; then echo "mock: inspect denied" >&2; exit 1; fi
+exec "$TESTROOT/bin/podman" "\$@"
+EOF
+chmod +x "$STATE/e203/bin/podman"
+e203o="$(env PATH="$STATE/e203/bin:$PATH" EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
+    EGRESSLOCK_ACCOUNT_HOME="$e38h" EGRESSLOCK_UNIT_DIR="$UNITS" \
+    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e203rc=$?
+[[ "$e203rc" == 0 && "$e203o" == *"gateway image: present ($e203img) — base unknown"* \
+    && "$e203o" != *"pre-label"* && "$e203o" != *"stale:"* ]] \
+    && e203 pass || e203 fail "D203-3 inspect failure degrades to base unknown, rc-neutral (rc=$e203rc, out: $e203o)"
+rm -f "$STATE/e203/bin/podman"
+
+section_end egl203
+
 # --- EGL-59: kit --help is operator UI — no ticket/process citations -----
 # Same rule as the engine (EGL-59-D1/D2/D3): the dumped headers of the
 # kit-side help texts must not leak ticket/decision IDs or ticket
@@ -3147,6 +3293,15 @@ e68o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
     "$KIT" --prefix "$e68r" 2>&1)"; e68_rc=$?
 [[ "$e68_rc" == 1 && -f "$e68r/examples/recipes/keep.txt" && ! -e "$e68r/egresslock" ]] \
     && e68 pass || e68 fail "foreign recipes/ refused, untouched (rc=$e68_rc, out: $e68o)"
+# EGL-232: the same guard covers examples/egl-base (foreign tree refused
+# rc 1, never deleted).
+e68b="$STATE/e68/foreign-egl-base"; mkdir -p "$e68b/examples/egl-base"
+printf 'keep\n' > "$e68b/examples/egl-base/keep.txt"
+e68o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e68b/wbin" EGRESSLOCK_PATH_SBINDIR="$e68b/wsbin" \
+    "$KIT" --prefix "$e68b" 2>&1)"; e68_rc=$?
+[[ "$e68_rc" == 1 && -f "$e68b/examples/egl-base/keep.txt" && ! -e "$e68b/egresslock" ]] \
+    && e68 pass || e68 fail "foreign egl-base/ refused, untouched (rc=$e68_rc, out: $e68o)"
 # Kit-shaped tree (gateway/Containerfile present, no other markers):
 # the rm paths are kit-shaped, the install proceeds.
 e68k="$STATE/e68/kitshaped"; mkdir -p "$e68k/gateway"
@@ -3210,7 +3365,7 @@ if grep -rn "scripts/build-gateway" "$TREE_ROOT/egresslock" "$TREE_ROOT/build-ga
 else
     e68 pass
 fi
-grep -q 'build it: build-gateway' "$TREE_ROOT/egresslock" \
+grep -q 'build it: egresslock build-gateway' "$TREE_ROOT/egresslock" \
     && e68 pass || e68 fail "engine gateway-image hint names build-gateway"
 
 section_end egl68
@@ -3421,7 +3576,219 @@ e102o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e102d/units" 
     && "$e102o" == *"missing: examples/recipes"* \
     && ! -e "$e102d2/egresslock" && ! -e "$e102d2/gateway" && ! -e "$e102d2/examples" ]] \
     && e102r2 pass || e102r2 fail "recipes-only gap fails closed pre-copy (rc=$e102_rc, out: $e102o)"
+
+# EGL-232: the enumeration covers egl-base too — everything present EXCEPT
+# examples/egl-base/Containerfile must fail closed BEFORE any copy.
+e102b="$e102d/partial-eglbase"; mkdir -p "$e102b"
+for f in install-kit.sh egresslock egresslock-start egresslock-verify egresslock-setup \
+         gateway/Containerfile gateway/entrypoint.sh gateway/squid.conf \
+         apparmor/usr.bin.pasta.local apparmor/README.md \
+         examples/main.conf examples/main-allowlist examples/recipes \
+         systemd/egresslock-verify@.service systemd/egresslock-verify@.timer; do
+    mkdir -p "$e102b/$(dirname "$f")"
+    cp -R "$TREE_ROOT/$f" "$e102b/$f"
+done
+printf '0.2.0\n' > "$e102b/VERSION_BASE"
+e102d3="$e102d/dest3"; mkdir -p "$e102d3"
+e102o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e102d/units" \
+    EGRESSLOCK_PATH_BINDIR="$e102d/wbin" EGRESSLOCK_PATH_SBINDIR="$e102d/wsbin" \
+    "$e102b/install-kit.sh" --prefix "$e102d3" 2>&1)"; e102_rc=$?
+[[ "$e102_rc" == 1 && "$e102o" == *"incomplete kit tree at $e102b"* \
+    && "$e102o" == *"missing: examples/egl-base/Containerfile"* \
+    && ! -e "$e102d3/egresslock" && ! -e "$e102d3/gateway" && ! -e "$e102d3/examples" ]] \
+    && e102r2 pass || e102r2 fail "egl-base-only gap fails closed pre-copy (rc=$e102_rc, out: $e102o)"
+
+# EGL-240: everything current (incl. examples/egl-base/Containerfile)
+# EXCEPT the build helper → rc 1, the missing list names the helper,
+# nothing copied.
+e102h="$e102d/partial-helper"; mkdir -p "$e102h"
+for f in install-kit.sh egresslock egresslock-start egresslock-verify egresslock-setup \
+         gateway/Containerfile gateway/entrypoint.sh gateway/squid.conf \
+         apparmor/usr.bin.pasta.local apparmor/README.md \
+         examples/main.conf examples/main-allowlist examples/recipes \
+         examples/egl-base/Containerfile \
+         systemd/egresslock-verify@.service systemd/egresslock-verify@.timer; do
+    mkdir -p "$e102h/$(dirname "$f")"
+    cp -R "$TREE_ROOT/$f" "$e102h/$f"
+done
+printf '0.2.0\n' > "$e102h/VERSION_BASE"
+e102d4="$e102d/dest4"; mkdir -p "$e102d4"
+e102o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e102d/units" \
+    EGRESSLOCK_PATH_BINDIR="$e102d/wbin" EGRESSLOCK_PATH_SBINDIR="$e102d/wsbin" \
+    "$e102h/install-kit.sh" --prefix "$e102d4" 2>&1)"; e102_rc=$?
+[[ "$e102_rc" == 1 && "$e102o" == *"incomplete kit tree at $e102h"* \
+    && "$e102o" == *"missing: "*examples/egl-base/build-egl-base* \
+    && ! -e "$e102d4/egresslock" && ! -e "$e102d4/gateway" && ! -e "$e102d4/examples" ]] \
+    && e102r2 pass || e102r2 fail "helper-absent gap fails closed pre-copy (rc=$e102_rc, out: $e102o)"
 section_end egl102r2
+
+# --- EGL-240: build-egl-base helper (mock podman) ------------------------
+# The example-image helper checks/builds localhost/egl-base:latest next
+# to its Containerfile. Fixture: helper + Containerfile in a temp dir;
+# the shared mock (lib.sh) answers podman image exists/inspect via
+# $STATE/image-inspect-… (catted verbatim) and records `podman build`
+# into $STATE/buildlog (build -t also makes the image exist). Never
+# runs a container; never calls egresslock.
+section_begin egl240 "EGL-240 build-egl-base"
+e240() { assert "$@"; }
+EGLIMG="localhost/egl-base:latest"
+EGLSTATE_KEY="$(echo "$EGLIMG" | tr '/:' '__')"
+EGLINS="$STATE/image-inspect-$EGLSTATE_KEY"
+EGLSRV="$STATE/egl240-srv"
+rm -rf "$EGLSRV"; mkdir -p "$EGLSRV"
+cp "$TREE_ROOT/examples/egl-base/build-egl-base" "$EGLSRV/build-egl-base"
+cp "$TREE_ROOT/examples/egl-base/Containerfile" "$EGLSRV/Containerfile"
+chmod +x "$EGLSRV/build-egl-base"
+EGLPIN="$(grep -oE 'sha256:[0-9a-f]{64}' "$EGLSRV/Containerfile" | head -1)"
+EGLPIN12="${EGLPIN#sha256:}"; EGLPIN12="${EGLPIN12:0:12}"
+egl_saved_wd="$(pwd)"
+
+# 1. Foreign cwd: invoke by path; context/flag from the helper's OWN dir.
+cd /tmp
+: > "$STATE/buildlog"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" 2>&1)"; e_rc=$?
+if [[ "$e_rc" == 0 \
+      && "$(cat "$STATE/buildlog")" == "build -t localhost/egl-base:latest -f $EGLSRV/Containerfile $EGLSRV" ]]; then
+    e240 pass
+else
+    e240 fail "case 1 foreign cwd: helper-dir context, not caller cwd (rc=$e_rc, out: $e_out, bl: $(cat "$STATE/buildlog" 2>/dev/null))"
+fi
+cd "$egl_saved_wd"
+
+# 2. Missing image → builds.
+: > "$STATE/buildlog"
+rm -f "$STATE/images/$EGLSTATE_KEY"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" 2>&1)"; e_rc=$?
+if [[ "$e_rc" == 0 \
+      && "$e_out" == *"egl-base image: missing (localhost/egl-base:latest)"* \
+      && "$e_out" == *">> Building localhost/egl-base:latest FROM $EGLPIN12"* \
+      && "$e_out" == *">> Done: localhost/egl-base:latest"* \
+      && -s "$STATE/buildlog" && "$(cat "$STATE/buildlog")" != *'--no-cache'* ]]; then
+    e240 pass
+else
+    e240 fail "case 2 missing → build (rc=$e_rc, out: $e_out, bl: $(cat "$STATE/buildlog" 2>/dev/null))"
+fi
+
+# 3. Current image (label pin == deployed pin) → exact up-to-date line.
+printf '%s\n' "$EGLPIN" > "$EGLINS"
+: > "$STATE/buildlog"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" 2>&1)"; e_rc=$?
+if [[ "$e_rc" == 0 \
+      && "$e_out" == "already built from deployed pin $EGLPIN12 — use --force to rebuild" \
+      && ! -s "$STATE/buildlog" ]]; then
+    e240 pass
+else
+    e240 fail "case 3 current → exact up-to-date line, no build (rc=$e_rc, out: $e_out)"
+fi
+
+# 4. Stale (label pin != deployed pin) → stale + rebuild.
+printf 'sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' > "$EGLINS"
+: > "$STATE/buildlog"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" 2>&1)"; e_rc=$?
+if [[ "$e_rc" == 0 \
+      && "$e_out" == *"egl-base image: stale: base pin moved (image deadbeefdead != deployed pin $EGLPIN12)"* \
+      && -s "$STATE/buildlog" ]]; then
+    e240 pass
+else
+    e240 fail "case 4 stale pin → rebuild (rc=$e_rc, out: $e_out)"
+fi
+
+# 5a. Pre-label: empty inspect fixture.
+: > "$EGLINS"
+: > "$STATE/buildlog"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" 2>&1)"; e_rc=$?
+if [[ "$e_rc" == 0 \
+      && "$e_out" == *"egl-base image: stale: base unknown (pre-label image)"* \
+      && -s "$STATE/buildlog" ]]; then
+    e240 pass
+else
+    e240 fail "case 5a pre-label empty fixture → rebuild (rc=$e_rc, out: $e_out)"
+fi
+# 5b. Pre-label: the literal <no value> (missing Go-template key).
+printf '<no value>\n' > "$EGLINS"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" 2>&1)"; e_rc=$?
+if [[ "$e_rc" == 0 \
+      && "$e_out" == *"egl-base image: stale: base unknown (pre-label image)"* \
+      && -s "$STATE/buildlog" ]]; then
+    e240 pass
+else
+    e240 fail "case 5b pre-label <no value> → rebuild (rc=$e_rc, out: $e_out)"
+fi
+
+# 6. --force on a current image → rebuild with --no-cache, no state line.
+printf '%s\n' "$EGLPIN" > "$EGLINS"
+: > "$STATE/buildlog"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" --force 2>&1)"; e_rc=$?
+if [[ "$e_rc" == 0 \
+      && "$e_out" == *">> Building"* && "$e_out" != *"egl-base image:"* \
+      && "$(cat "$STATE/buildlog")" == *'--no-cache'* ]]; then
+    e240 pass
+else
+    e240 fail "case 6 --force rebuilds (rc=$e_rc, out: $e_out, bl: $(cat "$STATE/buildlog" 2>/dev/null))"
+fi
+
+# 7. Podman absent → rc 1, exact error, no build attempted.
+egl_emptybin="$STATE/egl240-emptybin"; rm -rf "$egl_emptybin"; mkdir -p "$egl_emptybin"
+ln -s "$(command -v bash || echo /usr/bin/bash)" "$egl_emptybin/bash"
+ln -s "$(command -v dirname || echo "$(command -v dirname)")" "$egl_emptybin/dirname"
+: > "$STATE/buildlog"
+e_out="$(PATH="$egl_emptybin" "$EGLSRV/build-egl-base" 2>&1)" && e_rc=0 || e_rc=$?
+if [[ "$e_rc" == 1 \
+      && "$e_out" == *"Error: podman not found on PATH (required to build localhost/egl-base:latest)"* \
+      && ! -s "$STATE/buildlog" ]]; then
+    e240 pass
+else
+    e240 fail "case 7 podman absent (rc=$e_rc, out: $e_out)"
+fi
+
+# 8. Bad argument → rc 2 usage.
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" foo 2>&1)" && e_rc=0 || e_rc=$?
+if [[ "$e_rc" == 2 \
+      && "$e_out" == *"Error: build-egl-base takes no arguments other than --force."* ]]; then
+    e240 pass
+else
+    e240 fail "case 8 bad arg rc 2 (rc=$e_rc, out: $e_out)"
+fi
+
+# 9. --help prints the header; nothing runs.
+: > "$STATE/buildlog"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" --help 2>&1)"; e_rc=$?
+if [[ "$e_rc" == 0 \
+      && "$e_out" == *"build-egl-base — build the shared example image"* \
+      && ! -s "$STATE/buildlog" ]]; then
+    e240 pass
+else
+    e240 fail "case 9 --help (rc=$e_rc, out: $e_out)"
+fi
+
+# 10. Build failure → rc 1, exact retry line, no --force when plain.
+rm -f "$STATE/images/$EGLSTATE_KEY" "$EGLINS"
+: > "$STATE/build-fails"
+: > "$STATE/buildlog"
+egl_noP="$(PATH="$TESTROOT/bin:$PATH" "$EGLSRV/build-egl-base" 2>&1)" && e_rc=0 || e_rc=$?
+egl_q="$(printf '%q' "$EGLSRV/build-egl-base")"
+if [[ "$e_rc" == 1 \
+      && "$egl_noP" == *"Error: egl-base image build failed for localhost/egl-base:latest (build output above); fix the cause and re-run: $egl_q"* \
+      && "$egl_noP" != *"--force"* ]]; then
+    e240 pass
+else
+    e240 fail "case 10 build failure retry (rc=$e_rc, out: $egl_noP, expect retry: $egl_q)"
+fi
+rm -f "$STATE/build-fails"
+
+# 11. Missing Containerfile → rc 1 exact error.
+egl_nocf="$STATE/egl240-nocf"; rm -rf "$egl_nocf"; mkdir -p "$egl_nocf"
+cp "$TREE_ROOT/examples/egl-base/build-egl-base" "$egl_nocf/build-egl-base"
+chmod +x "$egl_nocf/build-egl-base"
+e_out="$(PATH="$TESTROOT/bin:$PATH" "$egl_nocf/build-egl-base" 2>&1)" && e_rc=0 || e_rc=$?
+if [[ "$e_rc" == 1 \
+      && "$e_out" == *"Error: no Containerfile at $egl_nocf/Containerfile"* ]]; then
+    e240 pass
+else
+    e240 fail "case 11 missing Containerfile (rc=$e_rc, out: $e_out)"
+fi
+rm -f "$EGLINS"
+section_end egl240
 
 # --- EGL-84: --doctor verify-unit health rows (hermetic systemctl) ----
 section_begin egl84 "EGL-84 doctor verify-unit health"

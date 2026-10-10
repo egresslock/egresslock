@@ -13,8 +13,8 @@
 #      (wrapper), egresslock-verify (timer entry), egresslock-setup
 #      (per-account bootstrap), gateway/ (image build
 #      context), examples/ (starter conf + empty allowlist
-#   for egresslock-setup --init-conf), apparmor/ (pasta
-#   snippet for --apparmor-add), and a VERSION
+#   for egresslock-setup --init-conf, recipes/, egl-base/),
+#   apparmor/ (pasta snippet for --apparmor-add), and a VERSION
 #   stamp (version string + deployed commit SHA + UTC date). This is
 #   the ONLY thing accounts share.
 #   2. Installs the instanced unit templates egresslock-verify@.service
@@ -63,8 +63,8 @@
 # Defaults that are not parameter-changeable:
 #   - deployed kit file set: egresslock, egresslock-start,
 #     egresslock-verify, egresslock-setup, gateway/, examples/ (starter
-#     conf + allowlist + recipes/ incl. the container example),
-#     apparmor/ (pasta snippet), VERSION (all root-owned)
+#     conf + allowlist + recipes/ incl. the container example +
+#     egl-base/), apparmor/ (pasta snippet), VERSION (all root-owned)
 #   - unit template names: egresslock-verify@.{service,timer}
 #   - legacy GLOBAL egresslock-verify.{service,timer} units are
 #     retired on upgrade
@@ -144,7 +144,8 @@ _check_kit_path_shape "$prefix"
 # Otherwise fail closed naming the path; nothing is written and nothing
 # is deleted. The check runs BEFORE any copy so a refused run leaves a
 # foreign tree untouched (no engine binary smeared into it first).
-for _dest in "$prefix/gateway" "$prefix/apparmor" "$prefix/examples/recipes"; do
+for _dest in "$prefix/gateway" "$prefix/apparmor" \
+             "$prefix/examples/recipes" "$prefix/examples/egl-base"; do
     if [[ ! -e "$_dest" ]]; then
         continue                                   # first install
     fi
@@ -190,7 +191,8 @@ _kit_missing=""
 for _src in egresslock egresslock-start egresslock-verify egresslock-setup \
             gateway/Containerfile gateway/entrypoint.sh gateway/squid.conf \
             apparmor/usr.bin.pasta.local apparmor/README.md \
-            examples/main.conf examples/main-allowlist examples/recipes; do
+            examples/main.conf examples/main-allowlist examples/recipes \
+            examples/egl-base/Containerfile examples/egl-base/build-egl-base; do
     [[ -e "$src/$_src" ]] || _kit_missing+="$_src "
 done
 if [[ -n "${EGRESSLOCK_UNIT_SRC:-}" ]]; then
@@ -264,6 +266,13 @@ cp -R "$src/examples/recipes" "$prefix/examples/recipes.tmp"
 rm -rf "$prefix/examples/recipes"
 mv "$prefix/examples/recipes.tmp" "$prefix/examples/recipes"
 chmod -R go-w "$prefix/examples/recipes"
+# EGL-232: the shared example base image (egl-base) ships too so the
+# quickstarts can build it without a checkout (same rationale as the
+# recipes and the gateway context above).
+cp -R "$src/examples/egl-base" "$prefix/examples/egl-base.tmp"
+rm -rf "$prefix/examples/egl-base"
+mv "$prefix/examples/egl-base.tmp" "$prefix/examples/egl-base"
+chmod -R go-w "$prefix/examples/egl-base"
 
 # EGL-47-D3: the deployed file set is the explicit copy list above —
 # repo-internal material (internal_docs/, maintainer notes) is NOT in

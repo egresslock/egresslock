@@ -2,8 +2,19 @@
 # digest per the registry API — multi-arch correct, and every rebuild
 # verifies the same base content. Refresh deliberately: pull the tag,
 # confirm the new digest, update here, and record it in the ticket.
-# The squid apt package stays UNPINNED (distro security updates).
-FROM docker.io/library/debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+# The squid apt package stays UNPINNED (distro security updates); the
+# digest pin is the opposite for the base: its preinstalled
+# libssl3t64/openssl are frozen at the pinned content — a rebuild alone
+# never takes an openssl security update, only a digest refresh does
+# (EGL-215: DSA-6531-1 fixed by the 2026-10-05 refresh).
+FROM docker.io/library/debian:13-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+
+# Base identity on the built artifact (the digest must equal the FROM
+# above — the kit pin test fails on drift): the doctor reads it to show
+# which base an image carries and to flag a stale image after this pin
+# moves. See the gateway image lifecycle section in docs/reference/gateway-image.md.
+LABEL org.opencontainers.image.base.name="docker.io/library/debian:13-slim"
+LABEL org.opencontainers.image.base.digest="sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f"
 
 # Minimal allowlist gateway (ARC-5).
 # Runs Squid as an HTTP CONNECT forward proxy with a hostname allowlist.

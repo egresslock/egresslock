@@ -15,7 +15,7 @@ pattern you need:
 The container cannot reach the host's own addresses directly (pasta
 hairpin). Two supported patterns — proxied by name, or direct by
 literal — are worked out in [reach a service on the host from a
-container](../../docs/quickstart/reach-a-host-service.md). Example,
+container](../../docs/troubleshooting/cannot-reach-host-service.md). Example,
 proxied HTTP server on the host:
 
 ```sh
@@ -60,15 +60,26 @@ exactly 15 minutes](../../docs/troubleshooting/long-request-15m.md).
 ## Run your program
 
 Allow changes are baked into the proxy env at container start, so
-start (or restart) the container after the `allow` above:
+start (or restart) the container after the `allow` above. Fail closed:
+converge the profile and assert it is live before the run:
 
 ```sh
-podman run --rm -it \
+egresslock ensure <profile> \
+ && egresslock verify <profile> \
+ && egresslock proxy-env <profile> > "/run/user/$(id -u)/egresslock-proxy-<profile>.env" \
+ && podman run --rm -it \
     --network="$(egresslock network <profile>)" \
-    --env-file=<(egresslock proxy-env <profile>) \
+    --env-file="/run/user/$(id -u)/egresslock-proxy-<profile>.env" \
+    --cap-drop=all --security-opt=no-new-privileges \
     docker.io/library/debian:13-slim \
     sh
 ```
+
+**Stated exception** (the one rule of the
+[container hardening baseline](../../docs/reference/container-hardening.md)):
+this is a bare eval shell, so it carries **no** `--userns=keep-id` and
+**no** `--read-only` — there is no host bind mount for keep-id to
+serve, and an interactive shell may install into the container rootfs.
 
 Then point the client at the address from the pattern you used
 (`host.containers.internal` for a host server, the server's LAN IP for

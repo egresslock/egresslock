@@ -2,9 +2,10 @@
 
 The profile-conf grammar, the allowlist format, and the fail-closed
 rules that govern them. This page answers: **"what can I configure,
-and which mechanism allows which destination?"** For the practical
-"how do I allow X" walkthroughs see
-[grow-the-policy](../quickstart/grow-the-policy.md).
+and which mechanism allows which destination?"** The practical
+"how do I allow X" walkthroughs:
+[allow-a-domain](../quickstart/allow-a-domain.md) and
+[allow-non-http](../quickstart/allow-non-http.md).
 
 **On this page:** [Destination → mechanism decision table](#destination--mechanism-decision-table) ·
 [Profile conf](#profile-conf) ·
@@ -21,8 +22,8 @@ and which mechanism allows which destination?"** For the practical
 | domain, HTTP(S), non-standard port | Squid allowlist, explicit port | `allow main example.com:8443` | becomes its own per-port dstdomain group; a plain-HTTP GET denial needs an explicit `:80` entry (a bare 443 entry does NOT cover port 80) |
 | domain, non-HTTP protocol (ssh, git-over-SSH, rsync) | nft allow-host (direct) | `allow-host main git.example.test:2222` | bypasses the gateway; ssh ignores HTTP(S)_PROXY so no no-proxy needed; DNS pin drift until next `ensure` (T13) |
 | IPv4 literal, any port/protocol | nft allow-host (direct) | `allow-host main 192.0.2.24:11434` | literals are REJECTED by `allow`; never drifts; `proxy-env` unions the pin into NO_PROXY — check `proxy-env main noproxy`, and **recreate** the workload; see [allow-non-http](../quickstart/allow-non-http.md) |
-| HTTP(S) service on the SAME host | Squid allowlist | `allow main host.containers.internal:8000` | proxied; the gateway resolves the podman-injected name; the host's LAN IP itself can never work (pasta hairpin — [paths-and-signatures](paths-and-signatures.md); recipe: [reach-a-host-service](../quickstart/reach-a-host-service.md)) |
-| non-HTTP service on the SAME host | nft allow-host, IP literal | `allow-host main 169.254.1.2:8000` | `169.254.1.2` is pasta's host address (podman map-guest-addr); the NAME cannot be pinned — [paths-and-signatures](paths-and-signatures.md); recipe: [reach-a-host-service](../quickstart/reach-a-host-service.md) |
+| HTTP(S) service on the SAME host | Squid allowlist | `allow main host.containers.internal:8000` | proxied; the gateway resolves the podman-injected name; the host's LAN IP itself can never work (pasta hairpin — [paths-and-signatures](paths-and-signatures.md); fix: [cannot-reach-host-service](../troubleshooting/cannot-reach-host-service.md)) |
+| non-HTTP service on the SAME host | nft allow-host, IP literal | `allow-host main 169.254.1.2:8000` | `169.254.1.2` is pasta's host address (podman map-guest-addr); the NAME cannot be pinned — [paths-and-signatures](paths-and-signatures.md); fix: [cannot-reach-host-service](../troubleshooting/cannot-reach-host-service.md) |
 | domain that must NOT go through the proxy | nft allow-host + `no-proxy` | `allow-host` + `no-proxy <host>` in the conf | for gateway profiles whose clients honor proxy env |
 | IP/CIDR range | not yet supported | — | (planned: conf rule, nft-only — dstdomain cannot express CIDRs) |
 
@@ -30,7 +31,7 @@ and which mechanism allows which destination?"** For the practical
 
 Each profile is a `<profile>.conf` + `<profile>-allowlist` pair under
 `~/.config/egresslock/` (see
-[Create a profile](../quickstart/create-a-profile.md)). `#`
+[Profile lifecycle](#profile-lifecycle)). `#`
 comments and blank lines are ignored; any unparseable or contradictory
 content fails closed with exit 2. Host fields may use `${VAR}` /
 `${VAR:-default}` (parsed manually, never eval'd).
@@ -150,6 +151,175 @@ are clearer (each `ensure <profile>` targets one conf).
   (`podman rm -f` / `podman network rm` — see
   `docs/setup/uninstall.md`). `all` stays main.conf /
   explicit-conf only.
+
+### Create a profile
+
+Create an additional profile and bring up its network, policy, and
+gateway live — the same three commands create the second one or the
+fifth. Normal install already created `main`.
+
+> **Before you start**
+>
+> 1. an account set up with a name of your choosing — the examples
+>    use `egl-runner`; enter its shell with `sudo -iu egl-runner`
+>    (see [who-runs-what](who-runs-what.md) for the three worlds)
+> 2. the kit installed (see [install](../setup/install.md))
+> 3. the shared example image `localhost/egl-base:latest` —
+>    built once per account
+>    ([egl-base](../../examples/egl-base/README.md#build))
+
+#### The steps
+
+1. **Write the starter pair** — `init` auto-picks a free /24 and
+   writes an empty allowlist (denies application connections; DNS
+   to the bridge resolver is still allowed):
+
+   ```sh
+   # the host, account shell: sudo -iu egl-runner
+   # prompt: egl-runner@host:~$
+
+   egresslock init dev
+   ```
+
+   <details>
+   <summary>Expected output:</summary>
+
+   <pre>
+   egl-runner@host:~$ egresslock init dev
+   init: wrote /home/egl-runner/.config/egresslock/dev.conf
+   init: wrote /home/egl-runner/.config/egresslock/dev-allowlist (empty allowlist — deny all)
+   init: next: egresslock ensure dev
+   init:       (or explicitly: egresslock --config /home/egl-runner/.config/egresslock/dev.conf ensure dev)
+   </pre>
+
+   `init` only writes files — the network, anchor, gateway, and policy
+   all come from the next step.
+   </details>
+
+   If `init` exits non-zero, stop. Nothing was overwritten; the
+   existing conf/allowlist pair is preserved. Choose another name, or
+   archive the pair first ([Delete a profile](#delete-a-profile)).
+   Never delete or reset an existing policy to continue.
+
+2. **Build it:**
+
+   ```sh
+   # the host, account shell: sudo -iu egl-runner
+   # prompt: egl-runner@host:~$
+
+   egresslock ensure dev
+   ```
+
+   <details>
+   <summary>Expected output:</summary>
+
+   <pre>
+   egl-runner@host:~$ egresslock ensure dev
+   using config /home/egl-runner/.config/egresslock/dev.conf
+   created network egresslock-dev (10.199.1.0/24)
+   started anchor egresslock-anchor-dev
+   gateway 'egresslock-gateway-dev' ready (allowlist applied, health verified)
+   profile 'dev' ready (network egresslock-dev, policy verified)
+   </pre>
+
+   The first ensure builds everything live; run it again later and the
+   same command verifies and reuses what's already there.
+   </details>
+
+   If `ensure` exits non-zero, stop — do not launch. A failed attempt
+   can leave the network up without enforcement. Re-run `ensure` to
+   recover; nothing is deleted.
+
+3. **Run a shell on it** — the empty allowlist denies application
+   connections; DNS queries to the bridge resolver are still
+   allowed and can carry data out
+   ([threat model](threat-model.md)). The proxy env comes in as
+   one env file:
+
+   ```sh
+   # the host, account shell: sudo -iu egl-runner
+   # prompt: egl-runner@host:~$
+
+   egresslock ensure dev \
+    && egresslock proxy-env dev > /run/user/$(id -u)/egresslock-proxy-dev.env \
+    && podman run --rm -it --name probe \
+        --cap-drop=all --security-opt=no-new-privileges \
+        --network="$(egresslock network dev)" \
+        --env-file=/run/user/$(id -u)/egresslock-proxy-dev.env \
+        localhost/egl-base:latest \
+        sh
+   ```
+
+   <details>
+   <summary>Expected output:</summary>
+   you land at the container's shell prompt (in-container root — not
+   the host account):
+
+   <pre>
+   egl-runner@host:~$ egresslock ensure dev \
+    && egresslock proxy-env dev > /run/user/$(id -u)/egresslock-proxy-dev.env \
+    && podman run --rm -it --name probe \
+        --cap-drop=all --security-opt=no-new-privileges \
+        --network="$(egresslock network dev)" \
+        --env-file=/run/user/$(id -u)/egresslock-proxy-dev.env \
+        localhost/egl-base:latest \
+        sh
+   gateway 'egresslock-gateway-dev' ready (already converged, not restarted)
+   profile 'dev' ready (network egresslock-dev, policy verified)
+   root@9badc0ffee67:/#
+   </pre>
+
+   `--env-file=/run/user/$(id -u)/egresslock-proxy-dev.env` injects
+   the profile's six proxy vars in one go (what they are and why
+   there are six: [proxy-clients](proxy-clients.md)).
+   </details>
+
+#### What you should have
+
+Back on the host — exit the probe container first (`exit`; it was
+`--rm`, it goes away):
+
+```sh
+# the host, account shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
+
+egresslock list
+```
+
+<details>
+<summary>Expected output:</summary>
+
+<pre>
+egl-runner@host:~$ egresslock list
+using configs in /home/egl-runner/.config/egresslock (2 profiles)
+NAME           NETWORK                SUBNET
+dev            egresslock-dev          10.199.1.0/24
+main           egresslock-main         10.199.0.0/24
+</pre>
+</details>
+
+On disk — one conf + allowlist pair per profile:
+
+```sh
+# the host, account shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
+
+ls ~/.config/egresslock/
+```
+
+<details>
+<summary>Expected output:</summary>
+
+<pre>
+egl-runner@host:~$ ls ~/.config/egresslock/
+dev-allowlist  dev.conf  main-allowlist  main.conf
+</pre>
+</details>
+
+The profile is targetable: `egresslock network dev` and
+`egresslock proxy-env dev` need no extra arguments. Grow its
+allowlist with `egresslock allow dev <host[:port]>` (see
+[allow-a-domain](../quickstart/allow-a-domain.md)).
 
 ### Delete a profile
 

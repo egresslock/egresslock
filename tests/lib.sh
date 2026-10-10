@@ -440,6 +440,29 @@ case "$cmd" in
             echo "Error: IPAM error: requested ip address $ip is already allocated to another container" >&2
             exit 1
         fi
+        # EGL-217: probe-fails arming — a container STARTED while the
+        # probe-fails knob ($D/probe-fails[-<name>]) is armed gets the
+        # live $D/probe-fails-active-<name> marker: the proxy never
+        # answers from birth. Pre-existing containers keep answering
+        # until the config-apply restart (the restart arm re-arms), which
+        # is what lets a converged gateway short-circuit and still die in
+        # gw_apply_allowlist's post-restart health wait.
+        if [[ -f "$D/probe-fails-$name" || -f "$D/probe-fails" ]]; then
+            : > "$D/probe-fails-active-$name"
+        fi
+        # EGL-217: run-registers-but-not-running knob ($D/run-sick[-<name>]):
+        # model a container the runtime registered but that never reports
+        # running (wedged start, ARC-5 partial storage) — the .net/ip/mac
+        # state files are written (so `ps -a` still lists it and cleanup's
+        # existence oracle sees it) but the `running/` marker is skipped,
+        # so the engine's wait loops never see it running.
+        if [[ -f "$D/run-sick-$name" || -f "$D/run-sick" ]]; then
+            echo "$net" > "$D/containers/$name.net"
+            [[ -n "$ip" ]] && { echo "$ip" > "$D/containers/$name.ip"; echo "$name" > "$D/ips/$ip"; }
+            [[ -n "$mac" ]] && echo "$mac" > "$D/containers/$name.mac"
+            echo "$name"
+            exit 0
+        fi
         : > "$D/running/$name"
         echo "$net" > "$D/containers/$name.net"
         [[ -n "$ip" ]] && { echo "$ip" > "$D/containers/$name.ip"; echo "$name" > "$D/ips/$ip"; }
@@ -635,7 +658,18 @@ case "$cmd" in
                 fi
                 exit 0
                 ;;
-            bash) exit 0 ;;   # gw_probe /dev/tcp check
+            bash)
+                # gw_probe /dev/tcp check. EGL-217: the probe-fails knob
+                # ($D/probe-fails[-<name>]) models a proxy that never
+                # answers — scoped to containers STARTED or RESTARTED
+                # while armed (the run/restart arms write
+                # $D/probe-fails-active-<name>): the crash begins at
+                # start or at config activation, never on a pre-existing
+                # healthy gateway mid-ensure.
+                if [[ -f "$D/probe-fails-active-$name" ]]; then
+                    exit 1
+                fi
+                exit 0 ;;
             *) exit 0 ;;
         esac
         ;;
@@ -668,7 +702,7 @@ case "$cmd" in
         fi
         rm -f "$D/running/$name" "$D/containers/$name" \
               "$D/containers/$name.net" "$D/containers/$name.ip" \
-              "$D/containers/$name.mac"
+              "$D/containers/$name.mac" "$D/probe-fails-active-$name"
         # EGL-114: a removed container's filesystem is gone — clear the
         # modeled per-container files (staged squid/allowlist payloads,
         # log fixtures) so a REPLACED gateway starts from a fresh
@@ -699,6 +733,12 @@ case "$cmd" in
             esac
         done
         [[ -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
+        # EGL-217: a RESTART while the probe-fails knob is armed puts the
+        # swapped config live — from here the proxy never answers
+        # (crash-loop), so the apply health wait fails.
+        if [[ -f "$D/probe-fails-$name" || -f "$D/probe-fails" ]]; then
+            : > "$D/probe-fails-active-$name"
+        fi
         exit 0
         ;;
     image)
@@ -713,9 +753,17 @@ case "$cmd" in
                 # Default: no annotation (empty output, rc 0). Fixture:
                 # $D/image-annotated-<name-with-/-and-:->__ marks an image
                 # as carrying io.podman.annotations.checkpoint.runtime.name.
+                # EGL-203: an image-inspect fixture
+                # ($D/image-inspect-<name-with-/-and-:->__ — e.g. the
+                # doctor's staleness peek) is catted verbatim instead, so
+                # a test controls what the inspect reads off the image.
                 img="${@: -1}"
                 [[ -f "$D/images/$(echo "$img" | tr '/:' '__')" ]] \
                     || { echo "Error: no such image $img" >&2; exit 1; }
+                if [[ -f "$D/image-inspect-$(echo "$img" | tr '/:' '__')" ]]; then
+                    cat "$D/image-inspect-$(echo "$img" | tr '/:' '__')"
+                    exit 0
+                fi
                 [[ -f "$D/image-annotated-$(echo "$img" | tr '/:' '__')" ]] && echo "criu"
                 exit 0
                 ;;
@@ -726,8 +774,14 @@ case "$cmd" in
         # build [-t tag] ... <context>: record the build; a -t tag makes
         # the image exist (ARC-16-D6 gateway self-provision). EGL-51:
         # mirrored into callorder.log for cross-tool ordering asserts.
+        # R-EGL-222-3 F3: the marker $D/build-fails models a failing
+        # build (real podman exits 125 on build errors) — recorded, then
+        # failed, so "no build" asserts (empty buildlog) stay exact.
         echo "build $*" >> "$D/buildlog"
         echo "podman build $*" >> "$D/callorder.log"
+        if [[ -f "$D/build-fails" ]]; then
+            exit 125
+        fi
         local tag=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -775,12 +829,26 @@ EOF
 
 # EGL-139-D2 mock seam: a state-file conntrack mirroring the ctnetlink
 # verbs the engine uses. State: $D/conntrack-table holds /proc/net/
-# nf_conntrack-shaped lines (the mock `cat` below renders it for the
-# engine's zero-dep post-assert); $D/conntrack.log records every argv so
-# tests can pin the scoped -D tuple and its ordering against the
-# `removed:` line. Markers: $D/conntrack-probe-fails makes `-C` fail
-# (unavailable ctnetlink shape); $D/conntrack-delete-fails makes `-D`
-# fail with the table untouched (a surviving-ESTABLISHED drill).
+# nf_conntrack-shaped lines (the render the -D/-L filters against);
+# $D/conntrack.log records every argv so tests can pin the scoped -D
+# tuple and its ordering against the `removed:` line. Markers:
+# $D/conntrack-probe-fails makes `-C` fail (unavailable ctnetlink
+# shape); $D/conntrack-delete-fails makes `-D` fail with the table
+# untouched (a surviving-ESTABLISHED drill); $D/conntrack-list-fails
+# makes `-L` fail with empty output, and $D/conntrack-list-<shape>
+# markers (R-EGL-231-3 finding 1) render the other failed-list shapes:
+# conntrack-list-nonzero-empty (rc 1 + the 0-shown summary),
+# conntrack-list-zero-summary-error (rc 1 + a zero summary AND an error
+# line — the transcript shape the withdrawn D6 exception wrongly
+# blessed), conntrack-list-nonzero-count (rc 1 + a positive summary
+# ending in zero), conntrack-list-partial-rows-fail (rc 1 + partial
+# rows on stdout). RCs match the real tool (R-EGL-231-3): -D deletes
+# nothing -> rc 1 + the banner summary on stderr; -L matches nothing ->
+# rc 0 + the banner summary on stderr (upstream print_stats exempts the
+# list summary from the zero-count failure — the empty dump is rc 0).
+# Both -D and -L filter on the ORIGINAL-direction tuple fields only
+# (what the real -d/--dport select), so a reply-side-only match never
+# counts.
 cat > "$TESTROOT/bin/conntrack" <<'EOF'
 #!/usr/bin/env bash
 set -u
@@ -802,9 +870,11 @@ case "$op" in
             echo "conntrack: Operation failed: Connection timed out" >&2
             exit 1
         fi
-        # Scoped delete: drop entries whose ORIGINAL direction names
-        # BOTH the -d daddr and the --dport dport (the engine's tuple;
-        # other pins, DNS, gateway-exemption traffic stay untouched).
+        # Scoped delete: drop entries whose ORIGINAL-direction fields
+        # (the first src/dst/sport/dport set in the row — the fields the
+        # real -d/--dport select) name BOTH the -d daddr and the --dport
+        # dport; other pins, DNS, gateway-exemption traffic, and rows
+        # matching only on the reply side stay untouched.
         dip=""; dport=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -813,12 +883,111 @@ case "$op" in
                 *) shift ;;
             esac
         done
+        n=0
         if [[ -f "$TABLE" && -n "$dip" && -n "$dport" ]]; then
-            awk -v a="dst=$dip " -v b="dport=$dport " \
-                'index($0, a) && index($0, b) { next } { print }' \
-                "$TABLE" > "$TABLE.t" && mv "$TABLE.t" "$TABLE"
+            n="$(awk -v a="$dip" -v b="$dport" '{
+                    delete seen; od = ""; dport_o = ""
+                    for (i = 1; i <= NF; i++) {
+                        split($i, kv, "=")
+                        if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
+                            if (seen[kv[1]]++ == 0) {
+                                if (kv[1] == "dst") od = kv[2]
+                                if (kv[1] == "dport") dport_o = kv[2]
+                            }
+                        }
+                    }
+                    if (od == a && dport_o == b) { c++ }
+                } END { print c+0 }' "$TABLE")"
+            awk -v a="$dip" -v b="$dport" '{
+                    delete seen; od = ""; dport_o = ""
+                    for (i = 1; i <= NF; i++) {
+                        split($i, kv, "=")
+                        if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
+                            if (seen[kv[1]]++ == 0) {
+                                if (kv[1] == "dst") od = kv[2]
+                                if (kv[1] == "dport") dport_o = kv[2]
+                            }
+                        }
+                    }
+                    if (od == a && dport_o == b) { next }
+                    { print }
+                }' "$TABLE" > "$TABLE.t" && mv "$TABLE.t" "$TABLE"
         fi
-        echo "0 flow entries have been deleted"
+        # EGL-231-R2: honest rc + the banner summary on stderr like the
+        # real tool — a no-op delete is nonzero with the delimited
+        # "…: 0 flow entries have been deleted." summary; a real delete
+        # is rc 0. (The engine keys the no-warn on the ": 0 …." shape.)
+        echo "conntrack v1.4.8 (conntrack-tools): $n flow entries have been deleted." >&2
+        [[ "$n" -gt 0 ]] && exit 0
+        exit 1
+        ;;
+    -L)
+        if [[ -f "$D/conntrack-list-fails" ]]; then
+            # EGL-231: empty-output failure shape (no summary at all) —
+            # a failing read must not classify as success.
+            echo "mock conntrack: list failed" >&2
+            exit 1
+        fi
+        # R-EGL-231-3 failed-list shapes: rc != 0 in every one; the
+        # engine must die at the read (suppress `removed:`) on all.
+        if [[ -f "$D/conntrack-list-nonzero-empty" ]]; then
+            echo "conntrack v1.4.8 (conntrack-tools): 0 flow entries have been shown." >&2
+            exit 1
+        fi
+        if [[ -f "$D/conntrack-list-zero-summary-error" ]]; then
+            echo "conntrack: netlink error: Operation failed" >&2
+            echo "conntrack v1.4.8 (conntrack-tools): 0 flow entries have been shown." >&2
+            exit 1
+        fi
+        if [[ -f "$D/conntrack-list-nonzero-count" ]]; then
+            echo "conntrack v1.4.8 (conntrack-tools): 10 flow entries have been shown." >&2
+            exit 1
+        fi
+        if [[ -f "$D/conntrack-list-partial-rows-fail" ]]; then
+            # Partial dump: rows on stdout, then the failure.
+            echo "tcp 6 431998 ESTABLISHED src=10.199.60.5 dst=192.0.2.10 sport=58666 dport=2222 src=192.0.2.10 dst=10.0.2.15 sport=2222 dport=58666 [ASSURED] mark=0 zone=0 use=2"
+            echo "conntrack: netlink error: Operation failed" >&2
+            echo "conntrack v1.4.8 (conntrack-tools): 1 flow entry has been shown." >&2
+            exit 1
+        fi
+        # Scoped list of the remaining entries for the tuple; rows are
+        # rendered in the ctnetlink -L shape (no leading `ipv4 2 `, the
+        # procfs dump prefix — EGL-231-D1) on stdout, the banner summary
+        # on stderr; an empty dump is rc 0 (upstream print_stats
+        # exempts the list summary from the zero-count failure —
+        # R-EGL-231-3, the D6 correction).
+        dip=""; dport=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d) dip="$2"; shift 2 ;;
+                --dport) dport="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        n=0
+        if [[ -f "$TABLE" && -n "$dip" && -n "$dport" ]]; then
+            while IFS= read -r row; do
+                [[ -z "$row" ]] && continue
+                orig="$(awk -v a="$dip" -v b="$dport" '{
+                        delete seen; od = ""; dport_o = ""
+                        for (i = 1; i <= NF; i++) {
+                            split($i, kv, "=")
+                            if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
+                                if (seen[kv[1]]++ == 0) {
+                                    if (kv[1] == "dst") od = kv[2]
+                                    if (kv[1] == "dport") dport_o = kv[2]
+                                }
+                            }
+                        }
+                        if (od == a && dport_o == b) { print "y"; exit }
+                    }' <<<"$row")"
+                if [[ "$orig" == "y" ]]; then
+                    (( n += 1 ))
+                    echo "${row#ipv4 2 }"
+                fi
+            done < "$TABLE"
+        fi
+        echo "conntrack v1.4.8 (conntrack-tools): $n flow entries have been shown." >&2
         exit 0
         ;;
     --version|-V)
@@ -832,17 +1001,25 @@ case "$op" in
 esac
 EOF
 
-# EGL-139-D2 mock seam: the engine's post-assert reads the account
-# netns's conntrack table via `podman unshare --rootless-netns cat
-# /proc/net/nf_conntrack`. The host /proc is not netns-aware in the
-# harness world, so the mock `cat` serves exactly that one path from the
-# conntrack mock's state file (empty/absent = an empty table: no entries,
-# which is the pass shape) and delegates everything else to the real cat.
+# EGL-139-D2 mock seam: the epilogue reader for /proc/net/nf_conntrack
+# reads. Since EGL-231 the engine's disallow-host post-assert no longer
+# cats the proc table (it reads ctnetlink via the conntrack mock), but
+# the mock `cat` stays so a regressed proc reader still has a named
+# fail: conntrack-table-unreadable forces a read failure, and
+# conntrack-table-absent (EGL-231-D4, the reporter's host shape) is the
+# ENOENT the real rootless netns shows. Everything else delegates to
+# the real cat.
 cat > "$TESTROOT/bin/cat" <<'EOF'
 #!/usr/bin/env bash
 # Mock cat: intercept only /proc/net/nf_conntrack (EGL-139-D2 reader).
 for a in "$@"; do
     if [[ "$a" == /proc/net/nf_conntrack ]]; then
+        # EGL-231-D4: the conntrack-table-absent marker is the reporter's
+        # host shape — the proc file simply does not exist in that netns.
+        if [[ -f "${ARCMOCK_STATE:?}/nft/conntrack-table-absent" ]]; then
+            echo "cat: /proc/net/nf_conntrack: No such file or directory" >&2
+            exit 1
+        fi
         # EGL-168-D4: the conntrack-table-unreadable marker forces the
         # table read to fail (rc non-zero, named stderr) — the
         # post-swap assert's table-unreadable die path.
@@ -1089,10 +1266,11 @@ assert() { # assert pass|fail [fail-message]
 #                      engine e98: counted nowhere, never was)
 #   excluded-silent  — no RESULTS line, not in TOTAL (kit egl102r2)
 # Engine arc14 (own counters via the deliberately-untouched a14 delegate,
-# EGL-179-D3) and the egl140 witness alias stay manual (EGL-184-D2):
-# arc14 enters the TOTAL as a declared external via results_total's
-# extra args; its increments bypass check/check_out/assert and are
-# invisible to the grand accumulator by design.
+# EGL-179-D3) and the egl140 witness alias stay manual (EGL-184-D2 /
+# EGL-194-D5): egl140 aliases egl139's in-window capture (before
+# section_end). arc14 enters the TOTAL as a declared external via
+# results_total's extra args; its increments bypass check/check_out/assert
+# and are invisible to the grand accumulator by design.
 declare -A _sect_snap=()   # name -> "mode|label|pass|fail" (ended only)
 section_begin() { # section_begin <name> "<label>" [counted|excluded|excluded-silent]
     local name="${1:-}" label="${2:-}" mode="${3:-counted}"

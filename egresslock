@@ -21,6 +21,19 @@
 #                                      # an already-converged profile is
 #                                      # non-disruptive: healthy containers
 #                                      # are kept, no session is severed
+#   egresslock ensure --replace-gateway <profile>
+#                                      # same as ensure, but replace the
+#                                      # running gateway even when it is
+#                                      # healthy (sessions drop until the
+#                                      # new container answers). Both
+#                                      # flag positions are legal; a
+#                                      # duplicate flag is a usage error.
+#                                      # A missing or checkpoint-annotated
+#                                      # target image is refused before
+#                                      # the old gateway container is
+#                                      # removed — earlier ensure steps
+#                                      # (network / anchor / nft / pins)
+#                                      # are NOT undone; no rollback.
 #   egresslock verify <profile>     # verify only (exit 1 = fail closed)
 #   egresslock network <profile>    # print the Podman network name
 #   egresslock proxy-env <profile> [token]  # proxy env assignments
@@ -46,10 +59,17 @@
 #   egresslock list                 # list profiles
 #   egresslock doctor               # host environment probe: podman,
 #                                      # netavark, nft, unprivileged
-#                                      # userns (+ advisory backend/netns
-#                                      # lines). Kit/apparmor
+#                                      # userns (+ advisory lines: backend,
+#                                      # rootless netns, gateway image base).
+#                                      # Kit/apparmor
 #                                      # checks live in egresslock-setup
 #                                      # (see `egresslock-setup --help`).
+#   egresslock build-gateway [--force]  # rebuild the gateway image
+#                                      # into this account's store from
+#                                      # the engine's neighbor gateway/
+#                                      # (no conf; --force rebuilds even
+#                                      # when the image matches the
+#                                      # deployed pin)
 #
 # Which check answers which question — four commands, four layers:
 #   checks:
@@ -106,12 +126,13 @@
 #                          skip the podman rootless-netns preflight probe
 #                          (test harness only)
 #
-# Subcommands: ensure, verify (also: verify --ensured),
+# Subcommands: ensure, ensure --replace-gateway, verify (also: verify --ensured),
 # network, proxy-env (tokens: proxyip|proxyport|noproxy), rules,
 # allowlist, denied (--all, --days),
 # allow, disallow, allow-host, disallow-host,
 # init, list, doctor (host environment probe; kit-state
 # checks are `egresslock-setup`'s job — see `egresslock-setup --help`),
+# build-gateway [--force] (no conf; rebuild the gateway image),
 # teardown, --version (kit stamp or 'dev').
 
 set -euo pipefail
@@ -126,7 +147,7 @@ usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "$0" | head -1 | cut -d: 
 # typed the wrong thing sees what is available.
 short_usage() {
     echo "usage: egresslock [--config <file>] <command> [args...]"
-    echo "commands: ensure, verify, network, proxy-env, rules, allowlist, denied, allow, disallow, allow-host, disallow-host, init, list, doctor, teardown"
+    echo "commands: ensure, verify, network, proxy-env, rules, allowlist, denied, allow, disallow, allow-host, disallow-host, init, list, doctor, build-gateway, teardown"
     echo "run 'egresslock --help' for the full help"
 }
 
@@ -221,6 +242,19 @@ rt_image_inspect() { # rt_image_inspect <image> <go-template> — EGL-206-D2a im
 
 rt_image_pull() { # rt_image_pull <image> — pull a ref into the local store
     podman pull "$1"
+}
+
+rt_image_build() { # rt_image_build <image> <containerfile> <context> [extra podman-build flags...]
+    # -t immediately after build: the EGL-38 flag-order assert
+    # (tests/test-kit.sh) pins `build -t <tag> ... -f <Containerfile>`
+    # through the `egresslock-setup --build-gateway` exec alias; docker
+    # format keeps one artifact shape across entries (HEALTHCHECK
+    # survives for interactive inspect users). Optional extra flags are
+    # appended verbatim (R-EGL-222-3 F1: `--no-cache` on the forced
+    # rebuild path).
+    local img="$1" cf="$2" ctx="$3"
+    shift 3
+    podman build -t "$img" --format docker -f "$cf" "$ctx" "$@"
 }
 
 rt_network_ls() { # rt_network_ls -> kit-network names ({{.Name}} singular, ARC-67-D1)
@@ -804,10 +838,65 @@ kit_caps_problem_msg() { # kit_caps_problem_msg <label> <container> <state>
 }
 
 # Start-path assertion (ensure_*): die named on any non-ok state.
+# EGL-208: the assert runs after rt_run has started a --restart=always
+# container, so a bare die would leave a possibly-wrong hardening state
+# alive — on the gateway, under the live policy's fixed-IP+MAC egress
+# exemption (EGL-123-D3). Force-remove the container (rm -f defeats the
+# restart policy and frees the name/IPAM) BEFORE dying; only ensure's
+# start path routes here — the verify verbs call kit_caps_problem_msg
+# directly and stay read-only (map R1: problem wording shared, removal
+# outcome is the ensure die's addition).
 assert_kit_caps() { # assert_kit_caps <container> <label>
-    local st
+    local st problem rmerr
     st="$(kit_caps_state "$1")"
-    [[ "$st" == "ok" ]] || die "$(kit_caps_problem_msg "$2" "$1" "$st")"
+    [[ "$st" == "ok" ]] && return 0
+    problem="$(kit_caps_problem_msg "$2" "$1" "$st")"
+    # `if !` keeps set -e from exiting before the failure is named; the
+    # capture keeps the runtime's removed-name echo out of the output.
+    if ! rmerr="$(rt_rm "$1" 2>&1)"; then
+        die "$problem; removal failed: $rmerr — container '$1' could not be removed and may still be running; remove it manually: 'podman rm -f $1'"
+    fi
+    die "$problem; removed container '$1' (rm -f)"
+}
+
+# EGL-217: family-wide ensure-failure cleanup — the EXIT-trap body armed
+# by cmd_ensure (M1/M3). The wait-for-running/healthy dies (anchor "did
+# not reach running state", gateway "did not become healthy"/"did not
+# come back healthy") and the no-die set -e exits (raw rt_run failure,
+# rule-gen rc 1) sit before or outside assert_kit_caps and used to leave
+# this run's --restart=always container behind — on the gateway,
+# running-but-unhealthy under the live policy's fixed-IP+MAC egress
+# exemption. Ownership (Q5): remove ONLY the containers this run
+# started/replaced (R1) or restarted via the config apply (R2) — never a
+# pre-existing healthy pair on an unrelated failure (a full sweep would
+# turn a failed refresh into an outage). A name no longer registered
+# with the runtime (already removed by assert_kit_caps, never created, or
+# reaped by ensure_gateway's anchor-recycle) is skipped — that also
+# suppresses the double-removal report when EGL-208's inline assert
+# removal saw the same container. set -e-safe (`if !` captures,
+# `|| continue`), never calls die/exit, never alters the failing rc: the
+# shell still exits with the original status after the trap completes.
+ensure_cleanup() { # ensure_cleanup <rc> — EXIT-trap body; armed by cmd_ensure
+    local rc="$1" names n rmerr
+    # Belt behind the disarm: a success exit never cleans up.
+    [[ "$rc" == 0 ]] && return 0
+    [[ -n "$ENSURE_OWNED" ]] || return 0
+    # Registered-container oracle: rt_ps all (podman ps -a) lists
+    # registered-but-not-running containers too. A failed probe (wedged
+    # runtime) attempts removal anyway — fail closed on an exempt
+    # container; a "could not be removed" line for an absent name is the
+    # honest side of that trade.
+    if ! names="$(rt_ps all 2>/dev/null)"; then
+        names="$ENSURE_OWNED"
+    fi
+    for n in $ENSURE_OWNED; do
+        grep -qx "$n" <<<"$names" || continue
+        if ! rmerr="$(rt_rm "$n" 2>&1)"; then
+            echo "cleanup: removal failed: $rmerr — container '$n' could not be removed and may still be running; remove it manually: 'podman rm -f $n'" >&2
+        else
+            echo "removed container '$n' (rm -f)" >&2
+        fi
+    done
 }
 
 # Converged-predicate gate: a readable caps mismatch or an unreadable
@@ -855,6 +944,12 @@ ensure_anchor() {
     # store — pull it here (the pull rt_run would do), then inspect,
     # so the refusal stays preventative on first-create.
     refuse_checkpoint_image "$animg" "anchor image" pull-missing
+    # EGL-217 (M2, R1): this run owns the anchor it is about to start —
+    # marked BEFORE the run so a failed rt_run that still registered the
+    # name (ARC-5 partial storage) is cleaned up by the EXIT trap. The
+    # converged short-circuit above returns before this marker: a reused
+    # anchor is never owned.
+    ensure_own "$anchor"
     rt_run "$anchor" \
         --network "$(network_of "$profile")" \
         --ip "$anchor_ip" \
@@ -1151,7 +1246,7 @@ live_pin_daddr() { # live_pin_daddr <profile> <host> <port> -> ip (empty = none)
 # EGL-139-D2 steps 5-6: scoped conntrack delete of the revoked pin's
 # entries AFTER the atomic nft swap (never before/inside it — a pre-swap
 # flush lets in-flight packets re-mint the entry under the still-matching
-# pin rule, R-003-7), then the zero-dep post-assert that no data-path
+# pin rule, R-003-7), then the post-assert that no data-path
 # (ESTABLISHED) entry remains for the tuple. The -D rc is advisory (an
 # already-dead tuple may match nothing); the post-assert is the
 # completion gate. A surviving ESTABLISHED entry after a successful
@@ -1159,6 +1254,10 @@ live_pin_daddr() { # live_pin_daddr <profile> <host> <port> -> ip (empty = none)
 # with a live revoked flow (error-loudly-lie shape, R2/R9). SYN_SENT-
 # class transients are ignored: late in-flight packets can mint them
 # even though every subsequent packet drops.
+# EGL-231-D1: the completion reader is a scoped ctnetlink `$bin -L` —
+# the same surface as the probe and the -D — not /proc/net/nf_conntrack,
+# which is routinely absent in a rootless netns (a false fail on every
+# disallow-host there).
 conntrack_flush_and_assert() { # conntrack_flush_and_assert <daddr> <dport>
     local dip="$1" dport="$2" out bin
     # EGL-168-D2: resolve the bin once so the post-swap failure dies can
@@ -1172,20 +1271,37 @@ conntrack_flush_and_assert() { # conntrack_flush_and_assert <daddr> <dport>
     # DNS, gateway-exemption traffic untouched. Side effect of also
     # killing a gateway->internet leg to the same IP:port is accepted
     # (EGL-139-D2; squid reopens if the allowlist still allows it).
+    # EGL-231-D2: "…: 0 flow entries have been deleted." is the normal
+    # no-live-flow case (conntrack-tools exits nonzero on it) — not a
+    # failure; no warn. The match is delimited on the banner's ": "
+    # prefix and the summary's trailing "." so counts ending in zero
+    # (10/20/100) never satisfy it (R-EGL-231-3 finding 1). Any other
+    # nonzero -D stays a named warn.
     if ! out="$(netns_conntrack -D -p tcp --dport "$dport" -d "$dip" 2>&1)"; then
-        echo "warn: conntrack delete for $dip:$dport failed: $(tail -1 <<<"$out")" >&2
+        [[ "$out" == *": 0 flow entries have been deleted." ]] || \
+            echo "warn: conntrack delete for $dip:$dport failed: $(tail -1 <<<"$out")" >&2
     fi
-    # (c) zero-dep post-assert: /proc/net/nf_conntrack (the group-B
-    # harness reader, live-proved). Unreadable table = cannot prove
-    # severance = fail closed named.
+    # (c) EGL-231: scoped ctnetlink read — same surface as the probe and
+    # the -D (the probe already proved tool + ctnetlink live here; a
+    # missing /proc/net/nf_conntrack is routine, not a failure).
+    # EGL-231-R2 (finding 1): EVERY nonzero -L rc is unreadable = cannot
+    # prove severance = fail closed named. No text exception: upstream
+    # conntrack-tools (1.4.7-1.4.9, print_stats) exempts the list
+    # summary from the zero-count failure, so an empty dump is rc 0 —
+    # a nonzero rc that happens to carry a zero/any summary is a failed
+    # read, not an empty table.
     local rc=0
-    out="$(rt_unshare cat /proc/net/nf_conntrack 2>&1)" || rc=$?
+    out="$(netns_conntrack -L -p tcp --dport "$dport" -d "$dip" 2>&1)" || rc=$?
     if (( rc != 0 )); then
-        die "cannot read the rootless netns conntrack table (rc=$rc): ${out:-<no output>}; state: conf line removed, ruleset swapped, ct unproven — do not re-run disallow-host (the rule is already gone); next action: podman unshare --rootless-netns cat /proc/net/nf_conntrack"
+        die "cannot read the rootless netns conntrack table (rc=$rc): ${out:-<no output>}; state: conf line removed, ruleset swapped, ct unproven; next action: podman unshare --rootless-netns $bin -L -p tcp --dport $dport -d $dip"
     fi
+    # EGL-231-D1: -L dump lines carry no procfs `ipv4 2` prefix (they
+    # start directly with the protocol), so the survivor match keys on
+    # $1 == "tcp" (index-based, not field position — both directions on
+    # one line stay safe).
     local survivor
     survivor="$(awk -v want_dst="dst=$dip " -v want_dport="dport=$dport " \
-        'index($0, want_dst) && index($0, want_dport) && $3 == "tcp" && /ESTABLISHED/ { print; exit }' <<<"$out")"
+        'index($0, want_dst) && index($0, want_dport) && $1 == "tcp" && /ESTABLISHED/ { print; exit }' <<<"$out")"
     if [[ -n "$survivor" ]]; then
         die "revoked pin $dip:$dport still has an ESTABLISHED conntrack entry after the flush: $survivor; state: conf line removed, ruleset swapped, ct entry persists (fresh packets now drop and the entry drains) — finish the kill by hand: podman unshare --rootless-netns $bin -D -p tcp --dport $dport -d $dip"
     fi
@@ -2187,6 +2303,32 @@ gw_image() {
     fi
 }
 
+# EGL-226: image-state probe shared by cmd_doctor and cmd_build_gateway.
+# Reads the first sha256 digest of <containerfile> as the deployed pin and
+# the image's base-digest label + created stamp through the rt_* seam.
+# Globals, never stdout. Never call this (or gw_image) in a command
+# substitution — a die() inside gw_image at the call site must
+# propagate under set -e.
+gw_probe_state() { # gw_probe_state <image> <containerfile>
+    GW_PROBE_STATE=missing
+    GW_PROBE_BASE=""; GW_PROBE_CREATED=""; GW_PROBE_PIN=""; GW_PROBE_INS=""
+    if [[ -f "$2" ]]; then
+        # `|| true`: a digest-less Containerfile is pin="" (EGL-222 :4666)
+        GW_PROBE_PIN="$(grep -oE 'sha256:[0-9a-f]{64}' "$2" | head -1 || true)"
+    fi
+    rt_image_exists "$1" 2>/dev/null || return 0
+    GW_PROBE_STATE=present
+    local ins=""
+    if ins="$(rt_image_inspect "$1" '{{index .Config.Labels "org.opencontainers.image.base.digest"}} {{.Created}}' 2>/dev/null)"; then
+        GW_PROBE_INS="$ins"
+        if [[ "$ins" == *\ * ]]; then
+            GW_PROBE_BASE="${ins%% *}"; GW_PROBE_CREATED="${ins#* }"
+        else
+            GW_PROBE_BASE="$ins"
+        fi
+    fi
+}
+
 #
 # Squid dstdomain allowlist content generated from the repo source file.
 # Lines: comment (#) and blank lines stripped; entries are host[:port] or
@@ -2414,6 +2556,19 @@ gw_converged() { # gw_converged <gwname> <stage-dir> <candidate-squid.conf>
 # caller and is not affected by the skip.
 #
 GW_APPLY_SKIPPED=0
+# EGL-217 (M2): ownership registry for the cmd_ensure EXIT-trap cleanup
+# (ensure_cleanup). File-scope plain string — names never contain spaces
+# and it is set-`u`-safe; cmd_ensure resets it and arms the trap. Marked
+# by ensure_own at exactly three sites: ensure_anchor (before its run),
+# ensure_gateway (after its replace rt_rm) and gw_apply_allowlist (before
+# the config-apply restart, R2).
+ENSURE_OWNED=""
+ensure_own() { # ensure_own <name> — unique-by-name ownership marker (EGL-217 M2)
+    case " $ENSURE_OWNED " in
+        *" $1 "*) ;;
+        *) ENSURE_OWNED="$ENSURE_OWNED${ENSURE_OWNED:+ }$1" ;;
+    esac
+}
 gw_apply_allowlist() {
     local profile="$1" gwname
     gwname="$(gw_name "$profile")"
@@ -2469,6 +2624,14 @@ gw_apply_allowlist() {
     # Activate: restart so the entrypoint picks the generated config via
     # its -f path; a `squid -k reconfigure` would re-read whatever config
     # the process was originally started with.
+    # EGL-217 (M2, R2): the swap has committed the container to the new
+    # config, so from here the gateway is this run's broken state even
+    # when it pre-existed — mark it before the restart so a failed
+    # restart/health-wait die removes it. The earlier apply dies (gen,
+    # staging, parse, swap) predate this marker on purpose: there the
+    # container is still healthy on its old config and must NOT be
+    # removed.
+    ensure_own "$gwname"
     rt_restart "$gwname" 5 >/dev/null
     local i port="${GW_PORT[$profile]}"
     for i in $(seq 1 120); do
@@ -2589,7 +2752,11 @@ gw_mac_ok() { # gw_mac_ok <profile> <gwname>
 }
 
 ensure_gateway() {
-    local profile="$1" gwname port img
+    # EGL-223: arg2 = replace_gw (default 0). 1 forces the replace path
+    # even when the converged predicate below is true (the operator asked
+    # for it: `build-gateway` then `ensure --replace-gateway`). Plain
+    # ensure (0) is byte-identical to before.
+    local profile="$1" replace_gw="${2:-0}" gwname port img
     gwname="$(gw_name "$profile")"
     port="${GW_PORT[$profile]}"
     # EGL-123-D3: running + probe is no longer sufficient — the live MAC
@@ -2602,27 +2769,49 @@ ensure_gateway() {
     # ensure_anchor) — a healthy-looking gateway with wrong or
     # unreadable live hardening falls through to replacement, never a
     # blessing.
-    if gw_running "$gwname" && gw_probe "$gwname" "$port" && gw_mac_ok "$profile" "$gwname" \
-        && gw_caps_ok "$gwname"; then
+    if (( replace_gw == 0 )) \
+        && gw_running "$gwname" && gw_probe "$gwname" "$port" \
+        && gw_mac_ok "$profile" "$gwname" && gw_caps_ok "$gwname"; then
         return 0
     fi
     # Plain assignment so a die() inside gw_image (ARC-59 env guard)
     # propagates under set -e (command-substitution footgun).
     img="$(gw_image)"
+    # EGL-223-D3: on the flag path the target image is preflighted
+    # BEFORE any removal — a missing or checkpoint-annotated tag dies
+    # named with the running gateway intact (today's recovery path keeps
+    # its rm-then-exists order: those containers were already wrong).
+    if (( replace_gw )); then
+        rt_image_exists "$img" 2>/dev/null \
+            || die "gateway image $img not found; build it: egresslock build-gateway"
+        refuse_checkpoint_image "$img" "gateway image"
+        echo "gateway '$gwname' --replace-gateway — replacing the running container (profile sessions will drop)" >&2
+    fi
     rt_rm "$gwname" >/dev/null 2>&1 || true
-    rt_image_exists "$img" 2>/dev/null \
-        || die "gateway image $img not found; build it: build-gateway (kit tree / installed prefix copy)"
+    # EGL-217 (M2, R1): the old gateway is gone and any new one (both
+    # gw_start attempts) is this run's — mark it for the EXIT-trap
+    # cleanup. A die at the image-exists check below therefore finds
+    # nothing registered with the runtime to remove (no-op, correctly).
+    ensure_own "$gwname"
+    if (( replace_gw == 0 )); then
+        rt_image_exists "$img" 2>/dev/null \
+            || die "gateway image $img not found; build it: egresslock build-gateway"
+    fi
     # The gateway joins the same class network with a FIXED ip so the
     # nftables rule and the proxy env vars stay stable.
-    if ! gw_start "$profile"; then
-        # On-host finding (maintainer, ARC-5): a legacy anchor created
-        # before the gateway existed may hold the gateway's static IP.
-        # The anchor is our own disposable netns holder with no services;
-        # recycle it (it is recreated below with its own reserved IP)
-        # and retry once.
-        rt_rm "$(anchor_of "$profile")" >/dev/null 2>&1 || true
-        gw_start "$profile" || die "gateway start failed (static IP ${GW_IP[$profile]} conflict?)"
-    fi
+    # EGL-223-D9 (supplementary S2): on gw_start failure, KEEP the anchor
+    # holder and die named. The old ARC-5 recycle (rt_rm the anchor +
+    # one blind retry) never recreated what it removed: EGL-91 runs
+    # ensure_anchor/install_policy BEFORE the gateway is started, so
+    # removing the anchor here leaves no holder for the netns — if it
+    # was the last one, the policy can disappear before the retry
+    # (EGL-91/ARC-1 evidence). A start failure is a consequence of the
+    # started state, nil: the fix is a full re-run of cmd_ensure
+    # (holder -> policy -> gateway again), never an in-function retry.
+    # Applies to the flag path and the recovery path alike (one
+    # function).
+    gw_start "$profile" \
+        || die "gateway start failed (static IP ${GW_IP[$profile]} conflict?)"
     local i
     # 60s budget: container start + squid -z + port bind. EGL-206-D2b:
     # wait-until-healthy, then assert live hardening, then return —
@@ -2717,8 +2906,10 @@ ensure_converge_gateway() { # EGL-178-D1: gateway start + allowlist + log rotati
     # The policy is live (D4); now start the gateway — gateway profiles
     # only. The static IP was never at risk: the anchor pinned the LAST
     # usable address, not a dynamic one (ARC-5/ARC-11-D3).
+    # EGL-223: arg2 is the --replace-gateway flag (0/1), threaded to
+    # ensure_gateway. Sole caller: cmd_ensure (grep-pinned).
     if is_gateway_profile "$1"; then
-        ensure_gateway "$1"
+        ensure_gateway "$1" "${2:-0}"
         gw_apply_allowlist "$1"
         # ARC-32-D1: the gateway is confirmed healthy here — rotate any
         # oversize overlay logs before the policy work continues.
@@ -2761,14 +2952,70 @@ ensure_finalize() { # EGL-178-D1: gateway verification + ready lines (closing li
 }
 
 cmd_ensure() {
+    # EGL-217 (M1): arm the family-wide failure cleanup for this run —
+    # on any nonzero exit (a wait/health die or a no-die set -e exit) the
+    # EXIT trap removes only the containers this run started/replaced (or
+    # restarted via the config apply), so no --restart=always container
+    # is left behind (on the gateway: running-but-unhealthy under the
+    # live policy's egress exemption). The disarm after ensure_finalize
+    # is what protects the re-ensure callers' post-ensure steps
+    # (cmd_allow/cmd_disallow/cmd_allow_host/cmd_disallow_host): a
+    # failure there must not touch a converged kit. A die INSIDE
+    # ensure_finalize still fires the trap (family semantics).
+    ENSURE_OWNED=""
+    trap 'ensure_cleanup "$?"' EXIT
+    # EGL-223-D2: optional --replace-gateway, both positions legal
+    # (`ensure --replace-gateway <p>` and `ensure <p> --replace-gateway`).
+    # One profile name; unknown flags are usage errors (rc 2). Plain
+    # ensure parses identically to before: profile only.
+    local replace_gw=0 profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --replace-gateway)
+                # EGL-223-D8 / EGL-228-D1: a duplicate flag is an
+                # argv-contract error (rc 2). argv_shape_check rejects
+                # it before resolve/load, so a missing/malformed/
+                # unreadable conf cannot mask this diagnostic. The
+                # handler parser stays as the second filter.
+                if (( replace_gw )); then
+                    echo "Error: ensure takes --replace-gateway only once." >&2
+                    echo "usage: egresslock ensure [--replace-gateway] <profile>" >&2
+                    exit 2
+                fi
+                replace_gw=1; shift ;;
+            "")  # R-EGL-223-3 F2 fold: an empty-string argument is never a
+                 # profile name — usage rc 2, same bar as pre-flag grammar
+                 # (require_profile "${1:-}" rc 2).
+                echo "Error: ensure takes one profile name." >&2
+                echo "usage: egresslock ensure [--replace-gateway] <profile>" >&2
+                exit 2 ;;
+            -*) echo "Error: ensure takes --replace-gateway only." >&2
+                echo "usage: egresslock ensure [--replace-gateway] <profile>" >&2
+                exit 2 ;;
+            *)  [[ -z "$profile" ]] || {
+                    echo "Error: ensure takes one profile name." >&2
+                    echo "usage: egresslock ensure [--replace-gateway] <profile>" >&2
+                    exit 2
+                }
+                profile="$1"; shift ;;
+        esac
+    done
+    require_profile "${profile:-}" ensure
+    # EGL-223-D2: the flag is gateway-only — a non-gateway profile has no
+    # gateway container to replace, so the flag is a usage error (rc 2,
+    # named) with no container touched.
+    if (( replace_gw )) && ! is_gateway_profile "$profile"; then
+        echo "Error: --replace-gateway requires a gateway profile (no gateway line in this conf)" >&2
+        exit 2
+    fi
     # EGL-178-D1: aggregator. The policy-verify die stays at aggregator
     # scope: a helper that returned rc instead of dying would invite a
     # swallowed verify failure (never claim success on an unverified
-    # policy).
-    require_profile "${1:-}" ensure
+    # policy). (One require_profile here — the R-EGL-223-2 F1 duplicate
+    # was folded when the parser was next touched.)
     netns_probe || exit 1
     drop_legacy_table
-    ensure_network "$1"
+    ensure_network "$profile"
     # EGL-91-D4 (EGL-93 live finding, amends D1): the anchor is the
     # rootless-netns HOLDER — start it before any nft write. A
     # pre-container `podman unshare --rootless-netns nft` lands in a
@@ -2782,8 +3029,8 @@ cmd_ensure() {
     # (EGL-98: the post-reboot shape of this window — network object
     # persisted, netns+policy gone — is a named verify failure via
     # profile_stale_unpolicied until this ensure closes it.)
-    ensure_anchor "$1"
-    ensure_snapshot_pins "$1"
+    ensure_anchor "$profile"
+    ensure_snapshot_pins "$profile"
     # EGL-91-D1/D2 (audit G-06/I-06): install the nft policy BEFORE the
     # gateway start. The long window is the gateway health loop (up to
     # 60s); until the profile chain exists, the bridge (and any
@@ -2795,7 +3042,7 @@ cmd_ensure() {
     # fine. First create is ONE
     # create-with-rules transaction (D2); refreshes flush+re-add
     # atomically.
-    install_policy "$1"
+    install_policy "$profile"
     # EGL-140-D1: the pin record is the second witness for the
     # allow-host daddr axis — written here, from WHAT WAS JUST INSTALLED
     # (the live chain's pin accepts), atomically, beside the conf. A
@@ -2803,11 +3050,12 @@ cmd_ensure() {
     # success with a missing record. Zero-allow-host profiles remove any
     # stale record instead. The pre-refresh snapshot above may read the
     # PREVIOUS record (ARC-12-D2 refreshed: semantics unchanged).
-    write_pin_record "$1"
-    ensure_converge_gateway "$1"
-    verify_policy "$1" || die "policy verification failed for profile '$1' (fail closed)"
-    ensure_announce_refreshed "$1"
-    ensure_finalize "$1"
+    write_pin_record "$profile"
+    ensure_converge_gateway "$profile" "$replace_gw"
+    verify_policy "$profile" || die "policy verification failed for profile '$profile' (fail closed)"
+    ensure_announce_refreshed "$profile"
+    ensure_finalize "$profile"
+    trap - EXIT # EGL-217 (M1): disarm — a later failure owns no cleanup
 }
 
 #
@@ -3862,7 +4110,7 @@ cmd_init() {
     local conf_path="$dest/$name.conf" al_path="$dest/$name-allowlist"
     if [[ -e "$conf_path" || -e "$al_path" ]]; then
         echo "Error: '$name' already exists ($conf_path or $al_path); init never overwrites." >&2
-        echo "  to replace it, teardown + archive the pair first (see docs/quickstart/create-a-profile.md and the policy reference's profile lifecycle)." >&2
+        echo "  to replace it, teardown + archive the pair first (see the policy reference's profile lifecycle)." >&2
         exit 1
     fi
 
@@ -4268,6 +4516,187 @@ aggregate_configs() { # aggregate_configs <confdir>
     done
 }
 
+# EGL-228-D2: conf-independent argv-shape check. Called after
+# require_nonroot and before resolve/load so a usage rc 2 is stable
+# whether the conf is missing, malformed, or unreadable. Handlers
+# keep their parsers (this is an early filter). Conf-dependent
+# checks (unknown profile, gateway-only, engine-required) stay in
+# the handler after the load.
+argv_shape_check() { # argv_shape_check <command> <args-after-command...>
+    local cmd="${1:-}"; shift
+    case "$cmd" in
+        ensure)
+            local replace_gw=0 profile=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --replace-gateway)
+                        if (( replace_gw )); then
+                            echo "Error: ensure takes --replace-gateway only once." >&2
+                            echo "usage: egresslock ensure [--replace-gateway] <profile>" >&2
+                            exit 2
+                        fi
+                        replace_gw=1; shift ;;
+                    "")
+                        echo "Error: ensure takes one profile name." >&2
+                        echo "usage: egresslock ensure [--replace-gateway] <profile>" >&2
+                        exit 2 ;;
+                    -*) echo "Error: ensure takes --replace-gateway only." >&2
+                        echo "usage: egresslock ensure [--replace-gateway] <profile>" >&2
+                        exit 2 ;;
+                    *)  [[ -z "$profile" ]] || {
+                            echo "Error: ensure takes one profile name." >&2
+                            echo "usage: egresslock ensure [--replace-gateway] <profile>" >&2
+                            exit 2
+                        }
+                        profile="$1"; shift ;;
+                esac
+            done
+            if [[ -z "$profile" ]]; then
+                echo "Error: ensure requires a profile name." >&2
+                echo "usage: egresslock ensure <profile>" >&2
+                exit 2
+            fi
+            ;;
+        verify)
+            if [[ "${1:-}" == "--ensured" ]]; then
+                [[ $# -eq 1 ]] || {
+                    echo "Error: verify --ensured takes no profile argument." >&2
+                    usage >&2
+                    exit 2
+                }
+            else
+                if [[ $# -lt 1 || -z "$1" ]]; then
+                    echo "Error: verify requires a profile name." >&2
+                    echo "usage: egresslock verify <profile>" >&2
+                    exit 2
+                fi
+            fi
+            ;;
+        network)
+            if [[ $# -lt 1 || -z "$1" ]]; then
+                echo "Error: network requires a profile name." >&2
+                echo "usage: egresslock network <profile>" >&2
+                exit 2
+            fi
+            [[ -z "${2:-}" ]] || {
+                echo "Error: network takes no extra arguments." >&2
+                echo "usage: egresslock network <profile>" >&2
+                exit 2
+            }
+            ;;
+        proxy-env)
+            if [[ $# -lt 1 || -z "$1" ]]; then
+                echo "Error: proxy-env requires a profile name." >&2
+                echo "usage: egresslock proxy-env <profile>" >&2
+                exit 2
+            fi
+            if [[ -n "${2:-}" ]]; then
+                [[ -z "${3:-}" ]] || {
+                    echo "Error: proxy-env takes at most one token." >&2
+                    echo "usage: egresslock proxy-env <profile> [proxyip|proxyport|noproxy]" >&2
+                    exit 2
+                }
+                case "$2" in
+                    proxyip|proxyport|noproxy) ;;
+                    *) echo "Error: unknown proxy-env token '$2' (expected: proxyip, proxyport, noproxy)." >&2; exit 2 ;;
+                esac
+            fi
+            ;;
+        rules)
+            if [[ $# -lt 1 || -z "$1" ]]; then
+                echo "Error: rules requires a profile name." >&2
+                echo "usage: egresslock rules <profile>" >&2
+                exit 2
+            fi
+            ;;
+        allowlist)
+            if [[ $# -lt 1 || -z "$1" ]]; then
+                echo "Error: allowlist requires a profile name." >&2
+                echo "usage: egresslock allowlist <profile>" >&2
+                exit 2
+            fi
+            [[ -z "${2:-}" ]] || {
+                echo "Error: allowlist takes no extra arguments." >&2
+                echo "usage: egresslock allowlist <profile>" >&2
+                exit 2
+            }
+            ;;
+        denied)
+            if [[ $# -lt 1 || -z "$1" ]]; then
+                echo "Error: denied requires a profile name." >&2
+                echo "usage: egresslock denied <profile>" >&2
+                exit 2
+            fi
+            shift
+            local days=14
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --all)  shift ;;
+                    --days) [[ $# -ge 2 ]] || { echo "Error: --days requires a value." >&2; exit 2; }
+                            days="$2"; shift 2 ;;
+                    *)      echo "Error: denied takes --all and/or --days N." >&2
+                            echo "usage: egresslock denied <profile> [--all] [--days N]" >&2
+                            exit 2 ;;
+                esac
+            done
+            [[ "$days" =~ ^(0|[1-9][0-9]*)$ ]] || {
+                echo "Error: --days must be a non-negative integer (0 = no time limit)." >&2
+                exit 2
+            }
+            ;;
+        allow|disallow)
+            if [[ $# -lt 1 || -z "$1" ]]; then
+                echo "Error: $cmd requires a profile name." >&2
+                echo "usage: egresslock $cmd <profile>" >&2
+                exit 2
+            fi
+            shift
+            [[ $# -ge 1 ]] || {
+                echo "Error: $cmd requires a destination." >&2
+                echo "usage: egresslock $cmd <profile> <host[:port]> [host[:port] ...]" >&2
+                exit 2
+            }
+            local e
+            for e in "$@"; do
+                validate_allow_entry "$e" || exit 2
+            done
+            ;;
+        allow-host|disallow-host)
+            if [[ $# -lt 1 || -z "$1" ]]; then
+                echo "Error: $cmd requires a profile name." >&2
+                echo "usage: egresslock $cmd <profile>" >&2
+                exit 2
+            fi
+            local entry="${2:-}"
+            [[ -n "$entry" ]] || {
+                echo "Error: $cmd requires a destination." >&2
+                echo "usage: egresslock $cmd <profile> <host:port>" >&2
+                exit 2
+            }
+            if [[ $# -gt 2 ]]; then
+                echo "Error: $cmd takes exactly one host:port." >&2
+                echo "usage: egresslock $cmd <profile> <host:port>" >&2
+                exit 2
+            fi
+            validate_host_port "$entry"
+            ;;
+        teardown)
+            if [[ -z "${1:-}" ]]; then
+                echo "Error: teardown requires an argument." >&2
+                echo "usage: egresslock teardown <profile> | egresslock teardown all | egresslock teardown --runtime" >&2
+                exit 2
+            fi
+            if [[ "$1" == "--runtime" && $# -gt 1 ]]; then
+                echo "Error: teardown --runtime takes no other arguments." >&2
+                echo "usage: egresslock teardown --runtime" >&2
+                exit 2
+            fi
+            ;;
+        list) ;;
+        *) ;;
+    esac
+}
+
 resolve_conf_for() { # resolve_conf_for <command> <arg2>
     local cmd="${1:-}" arg2="${2:-}"
     local confdir
@@ -4440,7 +4869,139 @@ cmd_doctor() {
         echo "bridge_driver: unknown"
     fi
 
+    # EGL-226: account-side gateway-image advisory — the same base /
+    # label / staleness peek the kit doctor prints
+    # (egresslock-setup:1658-1666), conf-less and read-only. rc-neutral
+    # like every line above.
+    if (( ! podman_ok )); then
+        echo "gateway image: skipped (podman MISSING)"
+    else
+        local dimg gw_base_short gw_pin_short gw_built
+        dimg="$(gw_image)"
+        gw_probe_state "$dimg" "$(dirname "${BASH_SOURCE[0]}")/gateway/Containerfile"
+        gw_base_short="${GW_PROBE_BASE#sha256:}"; gw_base_short="${gw_base_short:0:12}"
+        gw_pin_short="${GW_PROBE_PIN#sha256:}"; gw_pin_short="${gw_pin_short:0:12}"
+        gw_built=""
+        if [[ -n "$GW_PROBE_CREATED" ]]; then
+            gw_built=", built ${GW_PROBE_CREATED:0:10}"
+        fi
+        if [[ "$GW_PROBE_STATE" == missing ]]; then
+            echo "gateway image: missing ($dimg)"
+            echo "  build it in the account shell: egresslock build-gateway (see \"The gateway image\" reference page)"
+        elif [[ -n "$GW_PROBE_BASE" ]]; then
+            echo "gateway image: present ($dimg) — base $gw_base_short${gw_built}"
+            if [[ -n "$GW_PROBE_PIN" && "$GW_PROBE_BASE" != "$GW_PROBE_PIN" ]]; then
+                echo "  stale: base pin moved (image base $gw_base_short != deployed pin $gw_pin_short) — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"
+            fi
+        elif [[ -n "$GW_PROBE_INS" ]]; then
+            echo "gateway image: present ($dimg) — base unknown (pre-label image)${gw_built}"
+            echo "  stale: base unknown (pre-label image) — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"
+        else
+            echo "gateway image: present ($dimg) — base unknown"
+        fi
+    fi
+
     exit "$rc"
+}
+
+# EGL-222: build-gateway — rebuild the gateway image into the invoking
+# account's rootless store from the gateway/ context NEXT TO THE ENGINE
+# (the dirname BASH_SOURCE[0] precedent of --version; on a .deb host
+# the /usr/bin wrapper execs the libdir copy, so the neighbor is still
+# the real engine's). Loads NO conf (doctor class). Never a silent
+# no-op (D2): a missing image, an empty base-digest label, or a label
+# != the deployed Containerfile pin all build; an equal pin prints one
+# explicit up-to-date line (rc 0); --force always builds (the squid
+# package is deliberately unpinned, so a same-pin rebuild can take
+# squid security updates).
+cmd_build_gateway() {
+    local force=0
+    if (( $# > 0 )); then
+        if [[ "$1" == "--force" && $# -eq 1 ]]; then
+            force=1
+        else
+            echo "Error: build-gateway takes no arguments other than --force." >&2
+            short_usage >&2
+            exit 2
+        fi
+    fi
+
+    # User-manager preflight (EGL-51-D1, D6): rootless podman needs the
+    # account's systemd user manager (session or linger). Fail closed
+    # when systemctl ANSWERS inactive; proceed when systemctl is ABSENT
+    # (the engine carries no systemd dependency — cmd_doctor degrades
+    # without it too; setup's un-guarded check would wrongly take the
+    # inactive branch there).
+    local uid lg
+    uid="$(id -u)"
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet "user@${uid}.service" 2>/dev/null; then
+            echo "egresslock: no systemd user manager for '$(id -un)' (user@${uid}.service inactive). As root: systemctl start user@${uid}.service" >&2
+            lg="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+            [[ "$lg" == "yes" ]] || \
+                echo "egresslock: ... and: loginctl enable-linger $(id -un)  (or re-run the account bundle setup with --enable)" >&2
+            exit 1
+        fi
+    fi
+
+    # Context: the engine's own neighbor gateway/.
+    local gdir
+    gdir="$(dirname "${BASH_SOURCE[0]}")/gateway"
+    if [[ ! -f "$gdir/Containerfile" ]]; then
+        echo "Error: no gateway build context at $gdir/Containerfile (the gateway/ directory must sit next to the engine)" >&2
+        exit 1
+    fi
+    # Image + deployed pin via the shared probe (EGL-226): plain
+    # assignment so the ARC-59 die() in gw_image propagates under set -e.
+    local img pin_short
+    img="$(gw_image)"
+    gw_probe_state "$img" "$gdir/Containerfile"
+    pin_short="${GW_PROBE_PIN#sha256:}"; pin_short="${pin_short:0:12}"
+    local build=0
+    if [[ "$GW_PROBE_STATE" != present || -z "$GW_PROBE_BASE" \
+          || -z "$GW_PROBE_PIN" || "$GW_PROBE_BASE" != "$GW_PROBE_PIN" ]]; then
+        build=1
+    fi
+
+    if (( ! build && ! force )); then
+        # D2: never a silent no-op — one explicit up-to-date line.
+        echo "already built from deployed pin ${pin_short} — use --force to rebuild"
+        return 0
+    fi
+
+    # Build (D10 leading line; D8 primitive; D5 docker format, -t first).
+    echo ">> Building $img FROM ${pin_short}"
+    local -a extra_flags=()
+    if (( force )); then
+        # R-EGL-222-3 F1: a forced rebuild must not reuse cached layers —
+        # the unchanged `RUN apt-get ... squid` instruction would
+        # otherwise reuse its old layer, and the same-pin squid security
+        # refresh that is --force's named purpose (D2) would never
+        # happen. The pin-mismatch path needs no flag: the FROM digest
+        # moved, which invalidates every layer after it on its own.
+        extra_flags+=(--no-cache)
+    fi
+    if ! rt_image_build "$img" "$gdir/Containerfile" "$gdir" "${extra_flags[@]}"; then
+        # R-EGL-222-7 (S-EGL-222-20261008-1): the printed retry must
+        # reproduce THIS invocation, not a generic one — the actual
+        # engine executable (a path-invoked engine need not have a PATH
+        # wrapper; install-kit keeps the prefix install usable when
+        # wrapper installation fails) and any explicit
+        # EGRESSLOCK_GW_IMAGE override (a one-shot assignment does not
+        # persist in the caller's shell, so a bare retry would build the
+        # default tag instead). %q keeps every token shell-safe.
+        local retry_cmd retry_engine
+        retry_engine="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+        retry_cmd="$(printf '%q build-gateway' "$retry_engine")"
+        if (( force )); then
+            retry_cmd="$retry_cmd --force"
+        fi
+        if [[ -n "${EGRESSLOCK_GW_IMAGE:-}" ]]; then
+            retry_cmd="$(printf 'EGRESSLOCK_GW_IMAGE=%q %s' "$EGRESSLOCK_GW_IMAGE" "$retry_cmd")"
+        fi
+        echo "Error: gateway image build failed for $img (build output above); fix the cause and re-run: $retry_cmd" >&2
+        exit 1
+    fi
 }
 
 # ARC-8: --config <file> (or EGRESSLOCK_CONF) activates the
@@ -4472,6 +5033,7 @@ case "${1:-}" in
         # execute the engine; root only distributes the kit (ARC-7-D5).
         # Escape hatch for intentional root use (not recommended).
         require_nonroot
+        argv_shape_check "${1:-}" "${@:2}"
         if [[ "${1:-}" == "teardown" && "${2:-}" == "--runtime" ]]; then
             # ARC-60-D1: --runtime loads NO conf — it sweeps by name so it
             # works when the conf is already gone. An explicit --config /
@@ -4488,7 +5050,18 @@ case "${1:-}" in
             # commands probe <profile>.conf then main.conf; bare list and
             # bare verify --ensured aggregate CONFDIR/*.conf; bare teardown
             # all stays main.conf-only. Explicit beats implicit (D1).
-            resolve_conf_for "${1:-}" "${2:-}"
+            # EGL-223-D2 / EGL-228-D1: `ensure --replace-gateway
+            # <profile>` — the flag precedes the profile, so arg2 is
+            # the flag, not the profile name; feed the resolver the
+            # PROFILE (arg3). argv_shape_check has already rejected
+            # a duplicate/unknown flag, so this skip stays singular.
+            # Explicit --config / EGRESSLOCK_CONF never reach
+            # resolve_conf_for (no change there).
+            _e223_arg2="${2:-}"
+            if [[ "${1:-}" == "ensure" && "$_e223_arg2" == "--replace-gateway" ]]; then
+                _e223_arg2="${3:-}"
+            fi
+            resolve_conf_for "${1:-}" "$_e223_arg2"
         fi
         ;;
     init)
@@ -4501,6 +5074,12 @@ case "${1:-}" in
         # EGL-45-D1: the host environment probe loads NO conf (same
         # class as --help/--version). ARC-25 root guard applies: probe
         # the ACCOUNT's store/netns, never root's.
+        require_nonroot
+        ;;
+    build-gateway)
+        # EGL-222: the gateway rebuild verb loads NO conf (same class
+        # as doctor/--help/--version). ARC-25 root guard applies: build
+        # into the ACCOUNT's rootless store, never root's.
         require_nonroot
         ;;
 esac
@@ -4530,6 +5109,7 @@ case "${1:-}" in
                  # EGL-45-D1: no profile argument, no extra args.
                  [[ $# -eq 0 ]] || { echo "Error: doctor takes no arguments." >&2; short_usage >&2; exit 2; }
                  cmd_doctor ;;
+    build-gateway) shift; cmd_build_gateway "$@" ;;
     teardown)    shift; cmd_teardown "$@" ;;
     -h|--help) usage ;;
     "")        short_usage ;;

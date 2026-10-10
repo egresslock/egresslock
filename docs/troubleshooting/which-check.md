@@ -34,6 +34,10 @@ Pick the row that matches the question you actually have:
 | Pasta AppArmor | Need/have the pasta signal patch? | `egresslock-setup --apparmor-check` | rc 1 |
 | Profile runtime | Is this account's policy live? | `egresslock ensure` / `verify` | rc 1 (fail-closed) |
 
+`egresslock doctor` also carries labeled account-side advisory
+lines (network backend, rootless netns, gateway image base);
+advisories never change its exit code.
+
 All four exit nonzero when something is missing, so "rc 0" is the
 shared green signal. For the runtime layer, `verify <profile>` is the
 read-only check — if it reports a missing network, that profile was

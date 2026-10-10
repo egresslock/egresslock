@@ -165,11 +165,14 @@
 #                     doctor` (host environment probe).
 #   --build-gateway   account-shell gateway build: builds
 #                     the gateway image from the deployed/share prefix
-#                     into the invoking user's Podman store. Requires
-#                     an already-active user manager (session or
-#                     linger) and fails closed otherwise; never starts
-#                     user@, never enables linger. Cannot be combined
-#                     with --account (the bundle builds via runuser).
+#                     into the invoking user's Podman store (an exec
+#                     alias of `egresslock build-gateway`). --force
+#                     rebuilds even when the image matches the deployed
+#                     pin. Requires an already-active user manager
+#                     (session or linger) and fails closed otherwise;
+#                     never starts user@, never enables linger. Cannot
+#                     be combined with --account (the bundle builds via
+#                     runuser).
 #   -h, --help        print this help
 #
 # Which check answers which question — four commands, four layers:
@@ -227,6 +230,7 @@ aa_remove=0
 aa_check=0
 doctor=0
 buildgw=0
+gw_force=0
 prefix_explicit=0
 gw_img="${EGRESSLOCK_GW_IMAGE:-localhost/egresslock-gateway:latest}"
 # ARC-59-D1: a non-empty override that starts with '-' is a flag-shaped
@@ -252,6 +256,7 @@ while [[ $# -gt 0 ]]; do
         --apparmor-check) aa_check=1; shift ;;
         --doctor)   doctor=1; shift ;;
         --build-gateway) buildgw=1; shift ;;
+        --force)    gw_force=1; shift ;;
         --apparmor-remove) apparmor=1; aa_remove=1; shift ;;
         -h|--help)  usage; exit 0 ;;
         *)          echo "egresslock-setup: unknown argument: $1" >&2; exit 2 ;;
@@ -326,6 +331,14 @@ if [[ "$buildgw" == 1 ]]; then
             exit 2
         fi
     done
+fi
+if [[ "$gw_force" == 1 && "$buildgw" == 0 ]]; then
+    # EGL-222-D9: --force exists only to forward to the engine's
+    # build-gateway; without --build-gateway it stays the
+    # unknown-argument usage error it always was (rc 2).
+    echo "egresslock-setup: --force is only valid together with --build-gateway" >&2
+    usage >&2
+    exit 2
 fi
 if [[ -z "$account" && "$apparmor" == 0 && "$doctor" == 0 && "$aa_check" == 0 && "$buildgw" == 0 ]]; then
     echo "egresslock-setup: --account is required (or --apparmor-add, --apparmor-remove, --apparmor-check, --doctor, or --build-gateway alone)" >&2
@@ -1596,10 +1609,65 @@ kit_check_gateway() {
             rc=1
         fi
         if run_as_account podman image exists "$gw_img" 2>/dev/null; then
-            echo "gateway image: present ($gw_img)"
+            # EGL-203-D3: staleness peek — which base does the built image
+            # carry, and does it still match the deployed Containerfile pin
+            # (the engine's neighbor gateway/ — exactly the context the
+            # `egresslock build-gateway` remedy builds from, so the advice
+            # and the remedy can never disagree; R-EGL-222-3 F2 dropped the
+            # old share-first preference, which no deploy layout uses for
+            # gateway/ and which the new verb deliberately does not honor)?
+            # Advisory and rc-neutral: stale-but-working is not broken
+            # wiring (the EGL-55 profile-networks precedent); any inspect
+            # failure degrades to "base unknown", never a die, and never
+            # claims "pre-label" when it could not look.
+            local gw_pin_file gw_pin gw_ins gw_base gw_created
+            local gw_short pin_short gw_built gw_stale
+            gw_pin_file=""
+            if [[ -f "$prefix/gateway/Containerfile" ]]; then
+                gw_pin_file="$prefix/gateway/Containerfile"
+            fi
+            gw_pin=""
+            if [[ -n "$gw_pin_file" ]]; then
+                gw_pin="$(grep -oE 'sha256:[0-9a-f]{64}' "$gw_pin_file" | head -1)"
+            fi
+            gw_base=""; gw_created=""
+            if gw_ins="$(run_as_account podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}} {{.Created}}' "$gw_img" 2>/dev/null)"; then
+                # One space separates label and .Created; an empty label
+                # leaves the leading space (read would skip it and eat
+                # the date as the base).
+                if [[ "$gw_ins" == *\ * ]]; then
+                    gw_base="${gw_ins%% *}"
+                    gw_created="${gw_ins#* }"
+                else
+                    gw_base="$gw_ins"
+                    gw_created=""
+                fi
+            fi
+            gw_short="${gw_base#sha256:}"; gw_short="${gw_short:0:12}"
+            pin_short="${gw_pin#sha256:}"; pin_short="${pin_short:0:12}"
+            gw_built=""
+            [[ -n "$gw_created" ]] && gw_built=", built ${gw_created:0:10}"
+            gw_stale=""
+            if [[ -n "$gw_base" ]]; then
+                if [[ -n "$gw_pin" && "$gw_base" != "$gw_pin" ]]; then
+                    gw_stale="stale: base pin moved (image base $gw_short != deployed pin $pin_short)"
+                fi
+            elif [[ -n "$gw_ins" ]]; then
+                gw_stale="stale: base unknown (pre-label image)"
+            fi
+            if [[ -n "$gw_base" ]]; then
+                echo "gateway image: present ($gw_img) — base $gw_short${gw_built}"
+            elif [[ -n "$gw_ins" ]]; then
+                echo "gateway image: present ($gw_img) — base unknown (pre-label image)${gw_built}"
+            else
+                echo "gateway image: present ($gw_img) — base unknown"
+            fi
+            if [[ -n "$gw_stale" ]]; then
+                echo "  $gw_stale — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"
+            fi
         else
             echo "gateway image: missing ($gw_img)"
-            echo "  fix: sudo egresslock-setup --account $account --conf $conf (the bundle builds it), or in the account shell: egresslock-setup --build-gateway"
+            echo "  fix: sudo egresslock-setup --account $account --conf $conf (the bundle builds it), or in the account shell: egresslock build-gateway"
             rc=1
         fi
     else
@@ -1683,35 +1751,29 @@ doctor_kit() {
     return $rc
 }
 
-# EGL-38-D3/D38-7.3: --build-gateway — the account-shell build form.
-# Runs as the INVOKING user (no --account, no runuser), builds from the
-# deployed/share prefix (never the checkout CWD rules of build-gateway),
-# never starts user@ and never enables linger: the user manager must
-# already be active (session or linger), else fail closed with the
-# EGL-51-D1 stderr and no build. Root --account bundles keep the
-# D1 start-then-build helper.
+# EGL-38-D3/D38-7.3, EGL-222-D3: --build-gateway — the account-shell
+# build form. Since EGL-222 the ENGINE owns the build: this is a thin
+# exec alias for `egresslock build-gateway` (same invocation, same
+# exit, one implementation). The engine sits next to setup in both
+# layouts (the prefix: install-kit.sh; the .deb libdir), and exec
+# replaces this process, so setup's `exit $?` after the call is
+# unreachable (kept, harmless). The EGL-51 user-manager diagnostic and
+# the trigger semantics (missing/stale image build; equal pin = an
+# explicit up-to-date line; --force always builds) come from the
+# engine.
 build_gw_standalone() {
-    local uid lg gdir
-    uid="$(id -u)"
-    if ! systemctl is-active --quiet "user@${uid}.service" 2>/dev/null; then
-        echo "egresslock-setup: no systemd user manager for '$(id -un)' (user@${uid}.service inactive). As root: systemctl start user@${uid}.service" >&2
-        lg="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
-        [[ "$lg" == "yes" ]] || \
-            echo "egresslock-setup: ... and: loginctl enable-linger $(id -un)  (or re-run the account bundle setup with --enable)" >&2
+    # R-EGL-222-3 note: exec without an engine returns a bare 127 with no
+    # repair instructions — name the problem and the remedy instead.
+    if [[ ! -x "$prefix/egresslock" ]]; then
+        echo "egresslock-setup: --build-gateway: no engine at $prefix/egresslock (install the kit first: install-kit.sh, or the egresslock package)" >&2
         exit 1
     fi
-    if [[ -n "${EGRESSLOCK_SHARE:-}" && -f "$EGRESSLOCK_SHARE/gateway/Containerfile" ]]; then
-        gdir="$EGRESSLOCK_SHARE/gateway"
-    elif [[ -f "$prefix/gateway/Containerfile" ]]; then
-        gdir="$prefix/gateway"
+    # EGL-222-D9: forward the remaining argv (--force) so the alias
+    # rebuilds even on an equal pin.
+    if [[ "$gw_force" == 1 ]]; then
+        exec "$prefix/egresslock" build-gateway --force
     else
-        echo "egresslock-setup: --build-gateway: no gateway build context (tried ${EGRESSLOCK_SHARE:-$prefix}/gateway and $prefix/gateway); install-kit.sh deploys it to the prefix" >&2
-        exit 1
-    fi
-    if podman image exists "$gw_img" 2>/dev/null; then
-        echo "egresslock-setup: gateway image present"
-    else
-        podman build -t "$gw_img" -f "$gdir/Containerfile" "$gdir"
+        exec "$prefix/egresslock" build-gateway
     fi
 }
 

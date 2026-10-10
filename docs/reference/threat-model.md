@@ -183,7 +183,13 @@ Operator obligations the kit does not enforce:
   launcher: this is the operator's launcher's job, and examples or
   recipes showing a `podman run` line are operator-owned, not a kit
   guarantee. Plain `podman run` keeps the default capability set,
-  including `CAP_NET_RAW`. **Flags passed are not flags honored**
+  which in the tested rootless lane (Podman 5.4.2 configured
+  defaults) included neither `CAP_NET_ADMIN` nor `CAP_NET_RAW`. The
+  T9 add-address technique needs `CAP_NET_ADMIN`; creating the
+  tested `AF_PACKET`/`SOCK_RAW` socket under those defaults returned
+  `EPERM` — version-scoped observations, not a claim about every
+  Podman configuration (see the version matrix). **Flags passed are
+  not flags honored**
   (CVE-2026-94603 / GHSA-2cvf-wqm6-wr9g): the trigger is
   live-observed — in the kit's VM lane (guest Podman 5.4.2, in the
   advisory range) `podman run` on a benign image carrying the
@@ -267,6 +273,14 @@ attacks table or an explicit non-goal.
   arguments are free-form (`--prefix`, `--account` + `runuser`,
   `--conf`), so passwordless sudo on them without exact argv is
   equivalent to root. The engine itself refuses root (T16).
+- **Gateway base is frozen by digest:** the kit-built gateway image
+  pins its base and never updates in place — base-package fixes reach
+  a running gateway only through a deliberate rebuild with a refreshed
+  pin, and a stale image keeps the old base's vulnerabilities until
+  that rebuild and replace. The gateway-image row in both doctors (`egresslock
+  doctor`, `egresslock-setup --doctor`) and kit release notes
+  surface staleness; the rebuild-and-replace steps are in
+  [When to rebuild the gateway image](gateway-image.md#when-to-rebuild-the-gateway-image).
 - **Name rebind through the proxy (T17) is open by design:**
   the allowlist is name-based (dstdomain), names resolve at request
   time, and the gateway's own egress is exempt from the profile chain —
@@ -288,9 +302,10 @@ attacks table or an explicit non-goal.
   alone no longer opens anything (the exemption also requires the
   gateway's pinned MAC). What still rides the base accept is an
   **out-of-subnet source** — next bullet. Dropping capabilities on
-  workloads remains the operator obligation — when the operator's
-  launcher drops caps, the spoof attempts above are not reachable at
-  all.
+  workloads remains the operator obligation — when the launcher's
+  flags are honored, the spoof attempts above are not reachable at
+  all. **Flags passed are not flags honored** (CVE-2026-94603 class;
+  see the launcher obligation above and the T9 row).
 - **Out-of-profile sources ride the chain's base accept (C-5/E-01
   neighbor; ruled an accepted boundary 2026-09-21):** profile chains
   are `policy accept` with `ip saddr <subnet>`-scoped rules — required
@@ -344,7 +359,7 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T6 | IPv6 destination | `p_v6deny` | fail; IPv4-only kit | lab-verified |
 | T7 | Sibling on same profile: connect to peer:22 | **allowed** (L2) | n/a — accepted risk | lab-verified (open L2; still accepted — 2026-09-21 ruling; the probe confirmed the strongest form: sibling↔sibling traffic never touches the IP-forward hook, it is pure L2 bridging, so *every* profile-internal port is open at L2) |
 | T8 | Sibling: gateway:3128; other gateway ports; cache manager | 3128 allowed + Squid ACL; other ports: nothing listens on them — **L2 does not filter them** (a service bound on one would be sibling-reachable); mgr 403 | can probe Squid; cannot widen nft | lab-verified (framing corrected by the probe: "other ports nft-dropped" was inaccurate — see T7) |
-| T9 | Co-located sibling holding `CAP_NET_ADMIN`/`CAP_NET_RAW` spoofs source IP = gateway IP (adds the gateway's address to its interface) | the kit forces cap-drop on the **gateway**; workloads are launcher policy — a default-caps or cap-holding sibling can attempt the spoof, and the profile chain still sees the packet | if a spoofed `saddr GW_IP` packet is forwarded past the terminal drop, I1 is broken | lab-verified both ways. Bypass confirmed live 2026-09-19: the spoofed SYN matched the then-address-only gateway-exemption rule, `established,related` grew a full bidirectional flow, the terminal drop never moved, and the outer endpoint answered — a complete bypass. Closed for the IP-only spoof on 2026-09-21 (exemption now also requires the gateway's pinned MAC); re-probed at the fix commit: exemption counter stays 0, no new established flow, the terminal drop counts the SYN+retries, outer endpoint unreachable. **Residual (recorded, accepted):** a sibling that clones *both* the gateway's MAC and IP still matches the exemption — same cap set, same obligation; closing it needs a non-spoofable bridge-port match (out of scope). A default-caps workload cannot attempt the spoof at all (`SOCK_RAW` → `EPERM`); cap-drop on workloads remains the operator obligation — the CVE-2026-94603 class (a checkpoint annotation discarding the launcher's cap-drop on a *successful* restore; not observed from this tree, the interpretation trigger is live-observed on 5.4.2) would make this residual reachable with no operator-cap violation |
+| T9 | Co-located sibling holding `CAP_NET_ADMIN` (the live bypass also added `CAP_NET_RAW`) spoofs source IP = gateway IP (adds the gateway's address to its interface) | the kit forces cap-drop on the **gateway**; workloads are launcher policy — a sibling that holds `CAP_NET_ADMIN` can add the gateway's address and attempt the spoof, and the profile chain still sees the packet | if a spoofed `saddr GW_IP` packet is forwarded past the terminal drop, I1 is broken | lab-verified both ways. Bypass confirmed live 2026-09-19: the spoofed SYN matched the then-address-only gateway-exemption rule, `established,related` grew a full bidirectional flow, the terminal drop never moved, and the outer endpoint answered — a complete bypass. Closed for the IP-only spoof on 2026-09-21 (exemption now also requires the gateway's pinned MAC); re-probed at the fix commit: exemption counter stays 0, no new established flow, the terminal drop counts the SYN+retries, outer endpoint unreachable. **Residual (recorded, accepted):** a sibling that clones *both* the gateway's MAC and IP still matches the exemption — same cap set, same obligation; closing it needs a non-spoofable bridge-port match (out of scope). A default-caps workload cannot add the gateway's address (the tested default set includes neither `CAP_NET_ADMIN` nor `CAP_NET_RAW`; see the launcher obligation). Raw packet crafting is a different technique; creating the tested `AF_PACKET`/`SOCK_RAW` socket under plain defaults returned `EPERM` in the tested lane (see the launcher obligation and the version matrix); cap-drop on workloads remains the operator obligation — the CVE-2026-94603 class (a checkpoint annotation discarding the launcher's cap-drop on a *successful* restore; not observed from this tree, the interpretation trigger is live-observed on 5.4.2) would make this residual reachable with no operator-cap violation |
 | T10 | Workload reads `~/.config/egresslock/` | not mounted by the kit; the operator's launcher is the only path in | empty of policy files unless the operator bind-mounts `$HOME` or the confdir | code-verified (kit paths) |
 | T11 | `allow 'foo; rm -rf /'` | reject, exit 2, file unchanged | usage / invalid entry | code-verified |
 | T12 | Gateway container stopped | no useful exemption for the workload; default drop | connect fail; `denied` may be empty | design-intent |
@@ -406,8 +421,10 @@ it is not a license to generalize the matrix to "any rootless Podman".
 
 ## Related
 
-- [Grow the policy](../quickstart/grow-the-policy.md) — the two allow
-  mechanisms (allowlist file vs `allow-host`) this model talks about.
+- [Allow a domain](../quickstart/allow-a-domain.md) and
+  [allow non-HTTP egress](../quickstart/allow-non-http.md) — the two
+  allow mechanisms (allowlist file vs `allow-host`) this model talks
+  about.
 - [Troubleshooting](../troubleshooting.md) — what a miss looks like in
   practice (hang vs 403 vs 503); not duplicated here.
 - Hardening — **completed**: the adversarial review of the

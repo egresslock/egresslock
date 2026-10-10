@@ -57,7 +57,21 @@ sudo -iu <account> -- egresslock --config '$HOME/.config/egresslock/main.conf' e
 #                                             ^ quoted: expanded by the account's shell
 ```
 
+## Root, sudo, and NOPASSWD (no passwordless root)
+
+The three root-running kit entry points — `install-kit.sh`,
+`uninstall-kit.sh`, and `egresslock-setup` — are **interactive root**
+tools. Do **not** grant them passwordless sudo (`NOPASSWD` in
+sudoers): their arguments are deliberately free-form (`--prefix`,
+`--account`, `--conf`), and `egresslock-setup` runs as the target
+account via `runuser` — so a `NOPASSWD` rule on any of these binaries
+without an exact-argv restriction is **equivalent to full root**.
+
+The engine itself never runs as root (the root guard) and does not
+need sudo at all; only distribution of the shared kit (install/
+uninstall) and the per-account bootstrap touch root.
+
 ## Next
 
-- [Create a profile](../quickstart/create-a-profile.md) — the first
+- [Allow a domain](../quickstart/allow-a-domain.md) — the first
   real task at level 2.

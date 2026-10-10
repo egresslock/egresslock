@@ -65,19 +65,31 @@ mkdir -p "$HOME/work/build"
 ## 3. Run the build container
 
 ```sh
-# do the build
-podman run --rm -it --name safe-build \
+# fail-closed preflight (the assert after the step-1 ensure):
+# hardening baseline: layer 1 + layer 2 (bind mount) + layer 3
+# (disposable rootfs) — see the container hardening baseline
+egresslock ensure build \
+ && egresslock verify build \
+ && egresslock proxy-env build > /run/user/$(id -u)/egresslock-proxy-build.env \
+ && podman run --rm -it --name safe-build \
     --network="$(egresslock network build)" \
-    --env-file=<(egresslock proxy-env build) \
+    --env-file=/run/user/$(id -u)/egresslock-proxy-build.env \
+    --cap-drop=all --security-opt=no-new-privileges \
+    --userns=keep-id \
+    --passwd-entry="$USER:x:$(id -u):$(id -g)::/tmp/home:/bin/sh" \
+    --env HOME=/tmp/home \
+    --read-only --tmpfs /tmp --tmpfs /run \
     -v "$HOME/work/build:/workspace:rw" \
     <build image> \
     sh -c 'cd /workspace && make'
 ```
 
 Replace `<build image>` / `make` with your toolchain (e.g.
-`debian:13-slim` + `npm ci && npm run build`). The profile's policy
-applies at runtime — the build can reach only the allowlisted
-registries, nothing else. After a host reboot, re-run
+`debian:13-slim` + `npm ci && npm run build`); scratch writes land on
+the `/tmp` tmpfs. The hardening flags are the
+[container hardening baseline](../../docs/reference/container-hardening.md).
+The profile's policy applies at runtime — the build can reach only the
+allowlisted registries, nothing else. After a host reboot, re-run
 `egresslock ensure build` (or `egresslock-start`) before this
 `podman run` — the network object survives reboot without its policy
 ([after-a-reboot](../../docs/troubleshooting/after-a-reboot.md)).

@@ -59,18 +59,33 @@ podman build -t localhost/agent-image-example \
 ```sh
 mkdir -p "$HOME/work/agent"
 
-podman run --rm -it --name agent-opencode \
+# fail-closed preflight (the assert after the step-1 ensure):
+# hardening baseline: layer 1 (always on) + layer 2 (bind mount)
+# + layer 3 (disposable rootfs) — see the container hardening baseline
+egresslock ensure main \
+ && egresslock verify main \
+ && egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env \
+ && podman run --rm -it --name agent-opencode \
     --network="$(egresslock network main)" \
-    --env-file=<(egresslock proxy-env main) \
+    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    --cap-drop=all --security-opt=no-new-privileges \
+    --userns=keep-id \
+    --passwd-entry="$USER:x:$(id -u):$(id -g)::/tmp/home:/bin/sh" \
+    --env HOME=/tmp/home \
+    --read-only --tmpfs /tmp --tmpfs /run \
     -v "$HOME/work/agent:/workspace:rw" \
     localhost/agent-image-example \
     sh -c 'cd /workspace && opencode'
 ```
 
 The tool reaches exactly `openrouter.ai` (LLM API) + `github.com` (SSH).
-Your work persists in `~/work/agent`; the container itself is disposable
-(`--rm`). opencode starts with a blank config — log in / configure the
-LLM API inside the container. After a host reboot, re-run
+The hardening flags are the
+[container hardening baseline](../../docs/reference/container-hardening.md)
+(why each layer, and the one exception rule). Your work persists in
+`~/work/agent`; the container rootfs, `/tmp` and the agent's
+`/tmp/home` are all disposable (`--rm`). opencode starts with a blank
+config — log in / configure the LLM API inside the container; that
+config is gone when the container exits. After a host reboot, re-run
 `egresslock ensure main` (or `egresslock-start`) before this
 `podman run` — the network object survives reboot without its policy
 ([after-a-reboot](../../docs/troubleshooting/after-a-reboot.md)).
@@ -81,8 +96,12 @@ LLM API inside the container. After a host reboot, re-run
   the profile's fail-closed policy applies only to `podman run`. That
   keeps the build simple and the runtime allowlist minimal.
 - **The API key is never baked into the image** — configure it inside
-  the container, or mount `~/.config/opencode` (create it first) to
-  persist config/auth across runs.
+  the container. Config/auth does **not** persist across runs
+  (`--rm` + the ephemeral `/tmp` tmpfs); a persistent-state variant of
+  this recipe is planned follow-up work. Mounting the host home (or a
+  `~/.config` subtree) to get persistence is never the answer — see
+  the never-mount rule in the
+  [container hardening baseline](../../docs/reference/container-hardening.md).
 - The redirect rule: a host that 403s may not be the host you asked for
   (e.g. `raw.githubusercontent.com` behind a github.com redirect) — add
   the redirect target to the allowlist.

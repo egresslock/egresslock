@@ -142,6 +142,19 @@ docs_sweep() {
     done
 }
 
+# docs_require_nonempty — fail closed when the shipped-file list is empty
+# (EGL-194 item 3): a failed `find` / missing staged roots used to yield a
+# vacuously green `0 passed, 0 failed` sweep. The increment + FAIL line is
+# the signal; the harness's final `[[ "$docs_fail" -eq 0 ]]` yields rc 1.
+docs_require_nonempty() {
+    if (( ${#docs_files[@]} == 0 )); then
+        docs_fail=$(( docs_fail + 1 ))
+        echo "FAIL: docs ship-gate file list is empty (docs_root=$docs_root)"
+        return 1
+    fi
+    return 0
+}
+
 # --- self-test (EGL-163-D2): synthetic tree; proves the extractor on
 # the EGL-160 defect class and the out-of-cut skips before the real
 # sweep runs. Asserts read the captured output (the sweep runs in a
@@ -205,6 +218,22 @@ if printf '%s\n' "$st_climb" | grep -qF "FAIL: climb.md: relative link '../outsi
 else
     a_docs fail "self-test: climb-out-of-TREE_ROOT escape not flagged: $st_climb"
 fi
+
+# EGL-194 item 3 self-test: an empty shipped-file list fails closed (the
+# guard increments docs_fail and names the empty list). Do not wrap the
+# helper in $() — that is a subshell and would drop the docs_fail
+# increment; the counters are restored after the observation either way.
+docs_fail_saved=$docs_fail
+docs_files=()
+docs_require_nonempty >"$sd/empty.out" || true
+if [[ "$docs_fail" -eq $((docs_fail_saved + 1)) ]] \
+   && grep -qF "FAIL: docs ship-gate file list is empty" "$sd/empty.out"; then
+    docs_fail=$docs_fail_saved
+    a_docs pass "self-test: empty shipped-file list is fail-closed"
+else
+    docs_fail=$docs_fail_saved
+    a_docs fail "self-test: empty shipped-file list did not fail-closed: $(cat "$sd/empty.out")"
+fi
 docs_root="$docs_root_saved"
 
 # --- the shipped set (EGL-163-D2 roots; sorted for stable FAIL order) ---
@@ -212,7 +241,7 @@ docs_files=()
 while IFS= read -r f; do
     docs_files+=( "$f" )
 done < <(
-    cd "$docs_root" || exit 0
+    cd "$docs_root" || exit 1
     find docs examples -name '*.md' \
         -not -path 'docs/tickets/*' -not -path 'docs/BOARD.md' 2>/dev/null | sort
     for f in README.md SECURITY.md CHANGELOG.md packaging/README.md apparmor/README.md; do
@@ -220,6 +249,7 @@ done < <(
     done
 )
 docs_sweep ${docs_files[@]+"${docs_files[@]}"}
+docs_require_nonempty || true
 
 echo "RESULTS (docs link resolution): $docs_pass passed, $docs_fail failed"
 echo "RESULTS TOTAL: $docs_pass passed, $docs_fail failed$(skip_summary) ($(tree_shape_tag))"

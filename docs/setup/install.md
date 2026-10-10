@@ -1,23 +1,20 @@
 # How to: install the kit
 
-Full reference for installing (and verifying) the kit on a host. This
-page answers: **"how do I install, set up an account, and verify the
-install?"** The README's [Install and first
-run](../../README.md#install-and-first-run) is the condensed version;
-this page has the details, explains every setting, and covers both
-install channels (`.deb` and manual).
+Install the kit on a host, set up a runner account, and verify the
+install. One flow below — the `.deb` install is recommended; the
+tarball alternative appears inline where it differs.
 
-**On this page:** [Requirements](#requirements) · [Deb install](#deb-install) ·
-[Manual install](#manual-install) · [Account setup (`egresslock-setup`)](#account-setup-egresslock-setup) ·
-[Settings reference](#settings-reference) · [AppArmor prerequisite](#apparmor-prerequisite) ·
-[Root & sudo](#root-sudo-interactive-only-no-nopasswd) · [Files installed](#files-installed) ·
-[Validating a host](#validating-a-host-install-verification)
+**On this page:** [Requirements](#requirements) · [Install the kit](#install-the-kit) ·
+[Files installed](#files-installed)
 
-There are **two install channels** — same commands, different entry
-points. Pick ONE per host, never both at once: the `.deb` postinst
-warns if `/opt/egresslock/egresslock` exists. To switch from the
-prefix deploy to the `.deb`: `uninstall-kit.sh` first, then `dpkg -i`.
-See [Packaging](../../packaging/README.md) for the build/install/uninstall process.
+Commands run as **root via `sudo` from your own shell** (no separate
+admin account — root's prompt looks like your own) unless a block is
+tagged otherwise (`account`, `your own user`); every block carries
+its world tag and prompt on separate comment lines. Root for the kit
+is **interactive only** — do **not** grant `install-kit.sh`,
+`uninstall-kit.sh`, or `egresslock-setup` passwordless sudo
+(`NOPASSWD`); why:
+[who runs what](../reference/who-runs-what.md#root-sudo-and-nopasswd-no-passwordless-root).
 
 ## Requirements
 
@@ -27,8 +24,30 @@ See [Packaging](../../packaging/README.md) for the build/install/uninstall proce
 2. **Debian packages** (install as root):
 
    ```sh
+   # root — via sudo from your own shell
+   # prompt: $ (your own prompt)
+
    sudo apt-get install -y podman netavark nftables conntrack
    ```
+
+   <details><summary>Expected output:</summary>
+   standard apt resolution; package versions vary by distro — the four
+   names are what matters.
+
+   <pre>
+   $ sudo apt-get install -y podman netavark nftables conntrack
+   Reading package lists... Done
+   Building dependency tree... Done
+   Reading state information... Done
+   The following NEW packages will be installed:
+     conntrack netavark nftables podman
+   0 upgraded, 4 newly installed, 0 to remove and 0 not upgraded.
+   ...
+   Setting up podman (5.4.2) ...
+   </pre>
+   </details>
+
+   <details><summary>Why each dependency</summary>
 
    | Package | What it is / why |
    |---|---|
@@ -37,690 +56,471 @@ See [Packaging](../../packaging/README.md) for the build/install/uninstall proce
    | **nftables** | the enforcement engine — the kit installs a fail-closed policy in the account's rootless netns (1.0+; `nft` at `/usr/sbin/nft` or set `NFT_BIN`) |
    | **conntrack** | required by `disallow-host`'s revocation flush (the kit's `Depends:`) |
 
+   </details>
+
 3. **One or more dedicated unprivileged `<account>`s** to own the
    policies — the kit never runs policy jobs as root. **Create a new
    account specifically for this**, not your user account:
 
    ```sh
-   sudo adduser <account>
-   sudo loginctl enable-linger <account>
+   # root — via sudo from your own shell
+   # prompt: $ (your own prompt)
+
+   sudo adduser --disabled-password --gecos "egresslock runner" <account>
    ```
 
-   `enable-linger` keeps `/run/user/<uid>` alive outside login sessions
-   (required for the verify timer; `egresslock-setup --enable` does both
-   steps automatically — see [Account setup](#account-setup-egresslock-setup)).
+   <details><summary>Expected output:</summary>
+   no password prompt — `--disabled-password` leaves login locked;
+   uid/gid numbers vary.
 
-4. **AppArmor (pasta profile)** — on affected hosts only (pasta
-   enforced **and** podman running under an AppArmor label, any
-   profile mode — Ubuntu >= 25.10 by default; see the
-   [AppArmor prerequisite](#apparmor-prerequisite)), the enforce-mode
-   pasta profile denies the SIGTERM podman sends to its shared-netns
-   holder, so the first `ensure` fails with `rootless netns: kill
-   network process: permission denied`. If the host is affected,
-   apply the shipped one-rule amendment before the first `ensure` —
-   the full apply/verify/unapply steps are in the
-   [AppArmor pasta rule](../../apparmor/README.md). The kit ships the
-   snippet but does **not** auto-apply it; `egresslock-setup
-   --apparmor-check` reports whether this host needs it.
+   <pre>
+   $ sudo adduser --disabled-password --gecos "egresslock runner" <account>
+   Adding user `<account>' ...
+   Adding new group `<account>' (1001) ...
+   Adding new user `<account>' (1001) with group `<account>' ...
+   Creating home directory `/home/<account>' ...
+   Copying files from `/etc/skel' ...
+   </pre>
+   </details>
 
-## Deb install
+   - `--disabled-password` gives the account no password login —
+     it is a service account, reached with `sudo -iu <account>` or
+     SSH keys.
+   - Linger (required by the verify timer) is armed by
+     `egresslock-setup --enable` in install step 4 — no manual
+     `loginctl` needed.
+   - `egresslock-setup` does **not** create the account — this step
+     is the only account-creation step.
 
-The `.deb` is the FHS-layout channel: the engine lands on `PATH` as
-`egresslock`, and uninstall is `apt remove egresslock`.
+## Install the kit
+
+The `.deb` install is recommended. Alternative methods (the tarball
+prefix deploy) appear inline in collapsed blocks where they differ.
+To switch install methods later, uninstall the current one first
+([Uninstall](uninstall.md)) — never install both: the `.deb` postinst
+warns if `/opt/egresslock/egresslock` exists.
 
 ### 1. Get the kit
 
-The kit ships as source: there is **no hosted `.deb` or tarball** to
-download. Clone the checkout and build the channel you want
-(both build scripts ship in the tree):
+The kit ships as source — there is **no hosted `.deb` or tarball** to
+download. In your own shell (building needs no root), get the
+checkout (cloned only if missing; `git pull` updates a re-run) and
+build the `.deb` ([Packaging](../../packaging/README.md) has the
+build details):
 
 ```sh
-git clone https://github.com/egresslock/egresslock && cd egresslock
+# your own user — no sudo needed to build
+# prompt: $ (your own prompt)
 
-# .deb (FHS layout, engine on PATH):
+[ -d ~/egresslock ] || git clone https://github.com/egresslock/egresslock ~/egresslock
+cd ~/egresslock
+git pull
+rm -f ./packaging/egresslock_*_all.deb
 ./packaging/build-deb.sh        # → packaging/egresslock_<VERSION>_all.deb
-
-# or tarball (self-contained, manual install):
-./packaging/build-tarball.sh    # → packaging/egresslock_<VERSION>.tar.gz
 ```
+
+<details><summary>Expected output:</summary>
+first run: clone noise, then the build's last line names the built
+`.deb`; re-runs skip the clone and show a `git pull` summary instead.
+
+<pre>
+$ [ -d ~/egresslock ] || git clone https://github.com/egresslock/egresslock ~/egresslock
+Cloning into 'egresslock'...
+remote: Enumerating objects: 9124, done.
+Receiving objects: 100% (9124/9124), 2.10 MiB | 8.20 MiB/s, done.
+Resolving deltas: 100% (6410/6410), done.
+$ cd ~/egresslock
+$ git pull
+Already up to date.
+$ ./packaging/build-deb.sh
+build-deb: built packaging/egresslock_<VERSION>_all.deb (version <VERSION>)
+</pre>
+</details>
+
+<details><summary>Alternative: build the tarball instead</summary>
+Same clone; or, from the checkout, build the self-contained tarball
+and unpack it (no repo needed afterwards); expectations as above.
+
+<pre>
+$ ./packaging/build-tarball.sh
+build-tarball: built packaging/egresslock_<VERSION>.tar.gz
+$ tar -xzf packaging/egresslock_<VERSION>.tar.gz && cd egresslock
+</pre>
+</details>
 
 ### 2. Install the package
 
-Build from a checkout (no root needed), then:
-
 ```sh
-sudo dpkg -i ./egresslock_<VERSION>_all.deb
+# root — via sudo from your own shell
+# prompt: $ (your own prompt)
+
+sudo dpkg -i ./packaging/egresslock_<VERSION>_all.deb
 ```
 
-### 3. Add the pasta policy (affected hosts only)
+<details><summary>Expected output:</summary>
 
-On an **affected** host — pasta enforced **and** podman running under
-an AppArmor label (any profile mode; Ubuntu >= 25.10 by default) — add
-the pasta policy; on other hosts the step is a harmless no-op (a label
-can return; `--apparmor-check` tells you which case you are in). For
-more details about why this is needed, see the
-[AppArmor prerequisite](#apparmor-prerequisite) below and the
-[AppArmor pasta rule](../../apparmor/README.md):
+<pre>
+$ sudo dpkg -i ./packaging/egresslock_<VERSION>_all.deb
+Selecting previously unselected package egresslock.
+(Reading database ... 118294 files and directories currently installed.)
+Preparing to unpack .../packaging/egresslock_<VERSION>_all.deb ...
+Unpacking egresslock (<VERSION>) ...
+Setting up egresslock (<VERSION>) ...
+</pre>
+
+Troubleshooting:
+- a warning about an existing `/opt/egresslock/egresslock` means the
+  tarball install is present — uninstall it first (one install
+  method per host).
+</details>
+
+<details><summary>Alternative: tarball (manual prefix) install</summary>
+Deploys the kit to a shared, root-owned prefix and the unit templates
+to `/etc/systemd/system/` (changing the prefix later means re-running
+`install-kit.sh`; re-running is a safe idempotent upgrade). PATH
+wrappers are installed so the bare commands in the rest of this page
+work identically; if `/usr/local/…` is unwritable the install warns
+and skips them — call the full path (`$PREFIX/egresslock`) instead.
+
+<pre>
+$ PREFIX=/opt/egresslock
+$ sudo ./install-kit.sh --prefix "$PREFIX"
+install-kit: deployed kit to /opt/egresslock
+install-kit: unit templates -> /etc/systemd/system
+install-kit: PATH wrappers -> /usr/local/bin/egresslock, /usr/local/sbin/egresslock-setup
+
+next step — per-account setup (from the installed kit):
+  sudo /opt/egresslock/egresslock-setup --account <acct> --init-conf --enable
+</pre>
+
+Set `PREFIX` to the chosen absolute path; `/opt/egresslock` above is
+the default. Keep that same path for upgrades and uninstall.
+</details>
+
+### 3. Check the pasta policy (only some hosts need it)
+
+A few hosts (pasta enforced **and** podman under an AppArmor label —
+Ubuntu >= 25.10 by default) need a one-rule AppArmor amendment before
+the first `ensure`. Check; act only if the verdict says so
+(why: the
+[pasta/AppArmor blocker](../troubleshooting/pasta-apparmor.md) —
+decision tree and affected-OS matrix;
+[apparmor/README.md](../../apparmor/README.md) has the
+apply/verify/unapply steps):
 
 ```sh
-sudo egresslock-setup --apparmor-add
+# root — via sudo from your own shell
+# prompt: $ (your own prompt)
+
+sudo egresslock-setup --apparmor-check | grep Summary
 ```
+
+<details><summary>Expected output (not needed):</summary>
+most hosts; nothing to do — continue with step 4.
+
+<pre>
+$ sudo egresslock-setup --apparmor-check | grep Summary
+Summary: CHECK OK (AppArmor patch not needed)
+</pre>
+</details>
+
+<details><summary>Expected output (needed):</summary>
+affected host — apply the amendment before step 4 (the first
+`ensure` fails without it):
+
+<pre>
+$ sudo egresslock-setup --apparmor-check | grep Summary
+Summary: CHECK FAILED (AppArmor patch needed)
+</pre>
+</details>
+
+<details><summary>If affected: apply the amendment</summary>
+One command, idempotent; the full apply/verify/unapply steps live in
+[apparmor/README.md](../../apparmor/README.md).
+
+<pre>
+$ sudo egresslock-setup --apparmor-add
+AppArmor: pasta profile reloaded (/etc/apparmor.d/usr.bin.pasta). Confirm with: sudo egresslock-setup --apparmor-check
+</pre>
+</details>
 
 ### 4. Set up and enable the account
 
-```sh
-sudo egresslock-setup --init-conf --enable --account <account>
-```
+`egresslock-setup` (root) is the one-command per-account bootstrap. It:
 
-This ships a **deny-all** starter conf (`profile main` + empty
-allowlist — the gateway denies everything), writes the account's
-`unit.env`, builds the gateway image, and (with `--enable`) arms the
-15-minute drift-check timer and enables linger. See
-[Account setup](#account-setup-egresslock-setup) for what each flag
-does.
+- ships the starter conf (`profile main` + empty allowlist) when
+  missing; on a fresh account it denies application connections,
+- writes the account's `unit.env`,
+- builds the gateway image,
+- arms the 15-minute verify timer and enables linger (`--enable`).
 
-**Required parameters:**
+Existing confs and allowlists are preserved, not reset. DNS queries
+to the bridge resolver remain allowed even with an empty allowlist
+and can carry data out — see the [threat model](../reference/threat-model.md).
 
-- `--account <name>` — the target account (required unless
-  `--apparmor-add` is used alone).
-- exactly one of `--init-conf` or `--conf <path>`:
-  - `--init-conf` ships the deny-all starter (`profile main` + empty
-    allowlist) from `examples/`, **only if no conf exists yet** (never
-    overwrites). Without `--conf`, the dest is
-    `~/.config/egresslock/main.conf`.
-  - `--conf <path>` is the alternative — bring your own conf file
-    (e.g. from a copy step). It validates + wires that conf into
-    `unit.env` and skips the starter.
-
-**Pinned conf / restricted accounts (runner-style):** the full bundle
-also covers accounts that get a **pre-made conf** (deploy tooling
-distributes a pinned conf + allowlist; the account must not edit it):
+Every flag and the step-by-step run map: the
+[scripts and environment reference](../reference/scripts-and-environment.md#egresslock-setup--per-account-bootstrap).
 
 ```sh
-sudo egresslock-setup --account <acct> --conf <pinned-conf> --profile <profile> --enable
+# root — via sudo from your own shell
+# prompt: $ (your own prompt)
+
+sudo egresslock-setup --init-conf --enable --account <account> > ~/egresslock-setup.log 2>&1
+grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
 ```
 
-That is conf validation (as the account) + `unit.env` + gateway image
-build + timer + linger in one command — the same bundle
-`--init-conf` gives generic accounts, without shipping a starter.
-Before building the gateway image, setup starts the account's systemd
-user manager (`user@<uid>.service`), so a never-logged-in
-account works on the first run. `--enable` still owns linger and the
-verify timer.
-`--prefix` is usually unnecessary: the prefix derives from the
-installed unit templates, including the .deb layout
-(`/usr/lib/egresslock`) — and when a stale prefix unit points at a
-missing engine, setup retries the deb unit dir. This is
-the form to use for service accounts (CI runners, per-service
-daemons); see [the CI runner recipe](../../examples/recipes/ci-runner.md).
+<details><summary>Expected output:</summary>
+the six-step run map — each step `OK` (the full stream goes to
+~/egresslock-setup.log; details below):
 
-**Optional parameters you may also use:**
-
-- `--profile <name>` — write `EGRESSLOCK_PROFILE=<name>` (named verify
-  mode); omit for `--ensured` mode.
-- `--prefix <path>` — deployed kit prefix (default: derived from the
-  installed unit template, else `/opt/egresslock`).
-- `--enable` — enable+start `egresslock-verify@<account>.timer` AND
-  enable linger for the account (fails closed if linger does not
-  stick).
-- `--apparmor-add` / `--apparmor-remove` — apply/unapply the pasta rule (see step 3).
-
-**The run map (numbered progress):**
-
-Every account-bundle run prints one line per step, in execution order,
-so you can see what a run changed and where it stopped:
-
-```
+<pre>
+$ sudo egresslock-setup --init-conf --enable --account <account> > ~/egresslock-setup.log 2>&1
+$ grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
 1) validate conf … OK
 2) write unit.env … OK
-3) linger … OK          # SKIP without --enable
-4) user manager … OK    # SKIP without a `gateway` line in the conf
-5) gateway image … OK   # SKIP without a `gateway` line
-6) timer … OK           # SKIP without --enable
-```
+3) linger … OK
+4) user manager … OK
+5) gateway image … OK
+6) timer … OK
+</pre>
 
-`FAIL` is always the last printed step (the run stops there, nothing
-after it executed).
+- `FAIL` is always the last printed step (the run stops there,
+  nothing after it executed).
+- re-runs are quieter still: steps not needed print `SKIP`.
 
-**Root vs account steps (D38-4):**
+Troubleshooting:
+- `hint: pasta is AppArmor-enforced` on a host whose check said
+  "not needed": the label can return; re-run
+  [step 3](#3-check-the-pasta-policy-only-some-hosts-need-it).
+</details>
 
-| Step | Runs as | Why |
-|---|---|---|
-| validate conf | account (`runuser`) | the conf must parse under the account's engine/store |
-| write unit.env | account (`runuser`) | kit-generated state lives in the account's confdir |
-| linger | **root** | `loginctl enable-linger` is a system logind change (`--enable` only) |
-| user manager | **root** | `systemctl start user@<uid>.service` (gateway confs; start, never restart) |
-| gateway image | account (`runuser`) | must land in the account's rootless Podman store |
-| timer | **root** | `systemctl enable --now egresslock-verify@<account>.timer` (`--enable` only) |
+<details><summary>Prefer to watch the run instead?</summary>
+Drop the redirect — but expect the raw stream to be **~300 lines of
+build noise**: the AppArmor hint (affected hosts), the image pull,
+`debconf` frontend-fallback lines, and `HEALTHCHECK` warnings. It
+looks like it is installing things; it is building the gateway image,
+and every line shown is normal. The excerpts:
 
-**Modular sub-actions:**
+<pre>
+$ sudo egresslock-setup --init-conf --enable --account <account>
+egresslock-setup: hint: pasta is AppArmor-enforced; if the netns probe fails, apply the shipped rule with --apparmor-add (snippet: /usr/share/egresslock/apparmor/usr.bin.pasta.local)
+1) validate conf … OK
+2) write unit.env … OK
+3) linger … OK
+4) user manager … OK
+5) gateway image … OK
+Trying to pull docker.io/library/debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f...
+Getting image source signatures
+Copying blob ecc510c1e359 done   |
+Copying config 567e3c17b1 done   |
+Writing manifest to image destination
+debconf: falling back to frontend: Noninteractive
+WARN[0011] HEALTHCHECK is not supported for OCI image format and will be ignored. Must use `docker` format
+6) timer … OK
+Created symlink '/etc/systemd/system/timers.target.wants/egresslock-verify@<account>.timer' → '/usr/lib/systemd/system/egresslock-verify@.timer'.
+</pre>
+</details>
 
-- `sudo egresslock-setup --doctor` — read-only kit/account state check
-  with the fix command for each missing item. Without `--account` it
-  checks the host slice (engine at the derived prefix, unit templates
-  installed); with `--account` it adds conf parse, `unit.env` match,
-  timer, linger, and (for gateway confs) the user manager and gateway
-  image. AppArmor is pointed at `--apparmor-check`, not duplicated.
-  This is distinct from the engine's `egresslock doctor` (the host
-  environment probe: podman, netavark, nft, unprivileged userns).
-- `egresslock-setup --build-gateway` — build the gateway image in the
-  **invoking user's own shell** from the deployed/share prefix
-  (`$prefix/gateway` or `$EGRESSLOCK_SHARE/gateway`), no root and no
-  `--account`. It never starts `user@` and never enables linger: the
-  user manager must already be active (an active session or linger),
-  otherwise it fails closed and tells you the fix.
-
-**About linger and the drift timer:**
-
-`--enable` enables **linger** for the account, which keeps
-`/run/user/<uid>` alive outside login sessions (required for the
-verify timer). If you do **not** pass `--enable`, you must enable
-linger yourself:
-
-```sh
-sudo loginctl enable-linger <account>
-```
-
-Without `--enable`, the **15-minute drift timer will not run**. The kit
-works fine without it — but you lose automatic drift detection. Drift
-is when a domain's IP changes (DNS re-resolution): the pinned
-`allow-host` rules point at stale addresses, and `verify` reports a
-`drift:` line. Re-run `ensure` to re-resolve and re-pin. The timer
-catches this for you every 15 minutes; without it, you only see drift
-when you run `verify` by hand.
-
-### 5. Verify the install
-
-First, confirm what was installed (as root):
+<details><summary>Restricted accounts (runner-style): bring your own conf</summary>
+Accounts that must not edit their conf get a pre-made conf
+distributed by deploy tooling — same bundle, no starter shipped:
 
 ```sh
-dpkg -L egresslock                    # .deb layout: /usr/bin/egresslock, /usr/sbin/egresslock-setup, /usr/lib/egresslock/, /usr/share/egresslock/, /usr/lib/systemd/system/
-systemctl list-timers 'egresslock-verify@*'   # templates + timers present
-egresslock --version                          # the deployed commit stamp
+# root — via sudo from your own shell
+# prompt: $ (your own prompt)
+
+sudo egresslock-setup --account <account> --conf <pinned-conf> --profile <profile> --enable
 ```
 
-Note: the verify timer is a **system** unit (installed by
-`install-kit.sh`, enabled per-account by `egresslock-setup --enable`),
-so it appears under `systemctl list-timers` — NOT
-`systemctl --user list-timers`. Before `--enable`, the template shows
-here with 0 loaded instances, which is expected.
+The same six-step map (the conf is validated as the account instead
+of shipped). The form to use for service accounts (CI runners,
+per-service daemons) — see
+[the CI runner recipe](../../examples/recipes/ci-runner.md).
+</details>
 
-Then, as the account, check the conf files that were shipped:
+### 5. Confirm what was installed (root)
 
 ```sh
+# root — via sudo from your own shell
+# prompt: $ (your own prompt)
+
+dpkg -L egresslock                          # the .deb layout
+systemctl list-timers 'egresslock-verify@*' # templates + timers present
+egresslock --version                        # the deployed commit stamp
+```
+
+<details><summary>Expected output:</summary>
+three checks; the timer line appears per account once `--enable` ran
+(system scope — before that, only the unloaded templates show).
+
+<pre>
+$ dpkg -L egresslock
+/usr
+/usr/bin
+/usr/bin/egresslock
+/usr/sbin
+/usr/sbin/egresslock-setup
+/usr/lib/systemd/system/egresslock-verify@.service
+/usr/lib/systemd/system/egresslock-verify@.timer
+/usr/share/egresslock
+/usr/share/egresslock/doc/README.md
+...
+$ systemctl list-timers 'egresslock-verify@*'
+NEXT                       LEFT     LAST PASSED UNIT                                  ACTIVATES
+Tue 2026-10-09 14:00:00 UTC  14min  -    -      egresslock-verify@<account>.timer      egresslock-verify@<account>.service
+
+1 timers listed.
+$ egresslock --version
+version: <VERSION>
+commit: <commit>
+deployed: 2026-10-09T12:00:00Z
+</pre>
+
+Troubleshooting:
+- `--version` prints `dev` when run from a checkout instead of an
+  installed kit — that is the checkout's stamp, not a failure.
+</details>
+
+<details><summary>Alternative: tarball install — confirm what was installed</summary>
+Same checks, different listing: `ls "$PREFIX"` (`egresslock`,
+`gateway/`, `examples/`, `VERSION`) instead of `dpkg -L`. The bare
+`egresslock`/`egresslock-setup` commands work via the PATH wrappers
+(`/usr/local/...`) — full path (`$PREFIX/egresslock`) if the
+wrappers were skipped.
+</details>
+
+> [!NOTE]
+> **The verify timer is a system unit**
+>
+> Installed by the kit and enabled per-account by `egresslock-setup
+> --enable` — it appears under `systemctl list-timers`, NOT
+> `systemctl --user list-timers`.
+
+### 6. Become the account
+
+The kit never runs policy jobs as root — everything from here runs
+in the account's own shell (`sudo -iu` = "substitute user, login
+shell": a complete login as that account, home directory and all;
+you stay in it until you type `exit`):
+
+```sh
+# root — via sudo from your own shell
+# prompt: $ (your own prompt)
+
 sudo -iu <account>
-ls -la ~/.config/egresslock/          # main.conf, main-allowlist, unit.env
-cat ~/.config/egresslock/unit.env     # EGRESSLOCK_CONF=...
 ```
 
-Then **build the policy** — this is a required step. `ensure` creates
-the profile network, starts the anchor (and gateway), installs the
-nftables policy, and verifies the result:
+<details><summary>Expected output:</summary>
+the prompt changes — you are now the account, in its home directory:
+
+<pre>
+$ sudo -iu <account>
+<account>@host:~$
+</pre>
+
+You are in a different world here: everything until you type `exit`
+runs as `<account>`, and its prompt (`<account>@host:~$`) is how you
+tell.
+</details>
+
+### 7. Build the policy
+
+`ensure` creates the profile network, starts the anchor (and
+gateway), installs the nftables policy, and verifies the result:
 
 ```sh
+# account — you are now in the account shell
+# prompt: <account>@host:~$
+
 egresslock ensure main                # or your profile name
 ```
 
-Now confirm the podman networks are up:
+<details><summary>Expected output:</summary>
+the first `ensure` creates the network, starts the anchor and
+gateway, and installs the policy; re-runs are idempotent and report
+`already converged`.
+
+<pre>
+<account>@host:~$ egresslock ensure main
+created network egresslock-main (10.199.0.0/24)
+started anchor egresslock-anchor-main
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
+profile 'main' ready (network egresslock-main, policy verified)
+</pre>
+
+Troubleshooting:
+- `rootless netns: kill network process: permission denied` — the
+  AppArmor step 3 was skipped on an affected host; apply the
+  amendment (see
+  [pasta/AppArmor blocker](../troubleshooting/pasta-apparmor.md)).
+</details>
+
+### 8. Confirm the policy is up
 
 ```sh
+# account — you are still in the account shell
+# prompt: <account>@host:~$
+
 podman network ls                     # egresslock-main
 podman ps -a                          # egresslock-anchor-main, egresslock-gateway-main
 egresslock list                       # profiles: name, network, subnet
 egresslock verify main                # read-only drift check
 ```
 
-### 6. (Optional) Examine from within the container
+<details><summary>Expected output:</summary>
 
-All management and container starts run as the dedicated `<account>`
-(never root), so switch to it first:
+<pre>
+<account>@host:~$ podman network ls
+NETWORK ID    NAME              DRIVER
+<id>          egresslock-main   bridge
+<account>@host:~$ podman ps -a
+CONTAINER ID  IMAGE                                STATUS        NAMES
+<id>          localhost/egresslock-anchor:latest   Up 2 minutes  egresslock-anchor-main
+<id>          localhost/egresslock-gateway:latest  Up 2 minutes  egresslock-gateway-main
+<account>@host:~$ egresslock list
+NAME           NETWORK                SUBNET
+main           egresslock-main        10.199.0.0/24
+<account>@host:~$ egresslock verify main
+profile 'main' policy and gateway verified
+</pre>
+</details>
 
-```sh
-sudo -iu <account>
-```
-
-Then the bare skeleton — ensure the profile, then run a container on
-its network with the proxy env wired in with one env file (never
-hardcoded IPs):
-
-```sh
-# Build/verify the network policy (idempotent — safe to re-run):
-egresslock ensure main
-# Then run a shell on the profile network, proxy wired in:
-podman run --rm -it \
-    --network="$(egresslock network main)" \
-    --env-file=<(egresslock proxy-env main) \
-    docker.io/library/debian:13-slim \
-    sh
-```
-
-This drops you into a `debian:13-slim` shell on the profile's network —
-**no curl/wget/ping inside**, so there is no egress until you allow
-destinations.
-
-### 7. Next steps
-
-Now that the kit is installed, work through the
-[Quick start guides](../../README.md#quick-start-guides) in the README.
-
-## Manual install
-
-The manual channel deploys the kit to a shared, root-owned prefix
-(default `/opt/egresslock`) from a checkout or the self-contained
-`tar.gz`. `install-kit.sh` also installs PATH wrappers
-(`/usr/local/bin/egresslock`, `/usr/local/sbin/egresslock-setup`), so
-the bare `egresslock` command works after install (like the `.deb`'s
-`/usr/bin` wrapper; if `/usr/local/…` is unwritable the install
-warns and skips — call the full path instead).
-
-### 1. Get the kit
+### 9. (Optional) Look at the conf files
 
 ```sh
-# Option A — clone the repo (primary, what the harness tests):
-git clone https://github.com/egresslock/egresslock && cd egresslock
+# account — you are still in the account shell
+# prompt: <account>@host:~$
 
-# Option B — build the tarball, then unpack it (self-contained, no
-# repo needed afterwards):
-./packaging/build-tarball.sh
-tar -xzf packaging/egresslock_<VERSION>.tar.gz && cd egresslock
-```
-
-### 2. Install the kit (root)
-
-```sh
-# --- edit this line ---------------------------------------------------
-PREFIX=/opt/egresslock          # where the shared kit is deployed
-# ----------------------------------------------------------------------
-sudo ./install-kit.sh --prefix "$PREFIX"
-```
-
-`install-kit.sh` deploys the kit to `--prefix` (one shared, root-owned
-copy) and installs the `egresslock-verify@.service`/`@.timer`
-templates. The installed unit's `ExecStart` is rewritten with the
-deployed prefix at install time, so changing the prefix later means
-re-running `install-kit.sh`. It does **not** touch accounts (no timers
-enabled here — that is `egresslock-setup --enable`, after the account's
-`unit.env` exists). Re-running is safe (idempotent upgrade).
-
-### 3. Apply the AppArmor pasta policy (only if using AppArmor)
-
-```sh
-sudo /opt/egresslock/egresslock-setup --apparmor-add
-```
-
-### 4. Set up and enable the account
-
-```sh
-sudo /opt/egresslock/egresslock-setup --init-conf --enable --account <account>
-```
-
-**Required parameters:**
-
-- `--account <name>` — the target account (required unless
-  `--apparmor-add` is used alone).
-- exactly one of `--init-conf` or `--conf <path>`:
-  - `--init-conf` ships the deny-all starter (`profile main` + empty
-    allowlist) from `examples/`, **only if no conf exists yet** (never
-    overwrites). Without `--conf`, the dest is
-    `~/.config/egresslock/main.conf`.
-  - `--conf <path>` is the alternative — bring your own conf file
-    (e.g. from a copy step). It validates + wires that conf into
-    `unit.env` and skips the starter.
-
-**Pinned conf / restricted accounts (runner-style):** the full bundle
-also covers accounts that get a **pre-made conf** (deploy tooling
-distributes a pinned conf + allowlist; the account must not edit it):
-
-```sh
-sudo egresslock-setup --account <acct> --conf <pinned-conf> --profile <profile> --enable
-```
-
-That is conf validation (as the account) + `unit.env` + gateway image
-build + timer + linger in one command — the same bundle
-`--init-conf` gives generic accounts, without shipping a starter.
-`--prefix` is usually unnecessary: the prefix derives from the
-installed unit templates, including the .deb layout
-(`/usr/lib/egresslock`) — and when a stale prefix unit points at a
-missing engine, setup retries the deb unit dir. This is
-the form to use for service accounts (CI runners, per-service
-daemons); see [the CI runner recipe](../../examples/recipes/ci-runner.md).
-
-**Optional parameters you may also use:**
-
-- `--profile <name>` — write `EGRESSLOCK_PROFILE=<name>` (named verify
-  mode); omit for `--ensured` mode.
-- `--prefix <path>` — deployed kit prefix (default: derived from the
-  installed unit template, else `/opt/egresslock`).
-- `--enable` — enable+start `egresslock-verify@<account>.timer` AND
-  enable linger for the account (fails closed if linger does not
-  stick).
-- `--apparmor-add` / `--apparmor-remove` — apply/unapply the pasta rule (see step 3).
-
-**About linger and the drift timer:**
-
-`--enable` enables **linger** for the account, which keeps
-`/run/user/<uid>` alive outside login sessions (required for the
-verify timer). If you do **not** pass `--enable`, you must enable
-linger yourself:
-
-```sh
-sudo loginctl enable-linger <account>
-```
-
-Without `--enable`, the **15-minute drift timer will not run**. The kit
-works fine without it — but you lose automatic drift detection. Drift
-is when a domain's IP changes (DNS re-resolution): the pinned
-`allow-host` rules point at stale addresses, and `verify` reports a
-`drift:` line. Re-run `ensure` to re-resolve and re-pin. The timer
-catches this for you every 15 minutes; without it, you only see drift
-when you run `verify` by hand.
-
-### 5. Verify the install
-
-First, confirm what was installed (as root):
-
-```sh
-ls "$PREFIX"                                     # egresslock, gateway/, examples/, VERSION
-systemctl list-timers 'egresslock-verify@*'   # templates + timers present
-"$PREFIX/egresslock" --version               # the deployed commit stamp
-```
-
-Then, as the account, check the conf files that were shipped:
-
-```sh
-sudo -iu <account>
 ls -la ~/.config/egresslock/          # main.conf, main-allowlist, unit.env
 cat ~/.config/egresslock/unit.env     # EGRESSLOCK_CONF=...
 ```
 
-Then **build the policy** — this is a required step. `ensure` creates
-the profile network, starts the anchor (and gateway), installs the
-nftables policy, and verifies the result:
+<details><summary>Expected output:</summary>
 
-```sh
-/opt/egresslock/egresslock ensure main          # or your profile name
-```
+<pre>
+<account>@host:~$ ls -la ~/.config/egresslock/
+total 16
+drwx------ 2 <account> <account> 4096 Oct  9 12:00 .
+drwx------ 4 <account> <account> 4096 Oct  9 12:00 ..
+-rw------- 1 <account> <account>  137 Oct  9 12:00 main.conf
+-rw-r--r-- 1 <account> <account>    0 Oct  9 12:00 main-allowlist
+-rw------- 1 <account> <account>   62 Oct  9 12:00 unit.env
+<account>@host:~$ cat ~/.config/egresslock/unit.env
+EGRESSLOCK_CONF=/home/<account>/.config/egresslock/main.conf
+</pre>
+</details>
 
-Now confirm the podman networks are up:
-
-```sh
-podman network ls                     # egresslock-main
-podman ps -a                          # egresslock-anchor-main, egresslock-gateway-main
-/opt/egresslock/egresslock list       # profiles: name, network, subnet
-/opt/egresslock/egresslock verify main  # read-only drift check
-```
-
-### 6. (Optional) Examine from within the container
-
-Same as the [.deb step 6](#6-optional-examine-from-within-the-container),
-but call the engine by full path (`/opt/egresslock/egresslock`); the
-bare `egresslock` command also works via the installed PATH wrapper
-(`/usr/local/bin/egresslock`).
-
-### 7. Next steps
-
-Now that the kit is installed, work through the
-[Quick start guides](../../README.md#quick-start-guides) in the README.
-
-## Account setup (`egresslock-setup`)
-
-`egresslock-setup` is the one-command per-account bootstrap. Run as
-**root**, from the installed kit or a checkout. It: ships the starter
-conf with `--init-conf`, validates the conf, writes the account's
-`unit.env`, builds the gateway image (if the conf has one), and
-optionally enables the verify timer.
-
-**Affected hosts only** (AppArmor-enforced pasta **and** podman under
-an AppArmor label, any profile mode — Ubuntu >= 25.10 by default; see
-the [pasta/AppArmor blocker](../troubleshooting/pasta-apparmor.md)
-matrix): apply the amendment with
-`sudo egresslock-setup --apparmor-add` BEFORE the account's first `ensure`
-— the rule is not needed for setup itself (the `unit.env` write and
-the gateway image build never touch the rootless netns), but the first
-netns probe/creation fails without it, and a failed probe can leave
-the pasta holder wedged. If setup runs without it on
-such a host, it prints one stderr hint; nothing is auto-applied (see
-[apparmor/README.md](../../apparmor/README.md)). On unaffected hosts
-the rule is a harmless future-proofing no-op.
-
-### Flags
-
-| Flag | What it does |
-|---|---|
-| `--account <name>` | target account (required unless `--apparmor-add` is used alone) |
-| `--conf <path>` | profile conf to validate + wire into `unit.env` (required unless `--init-conf`) |
-| `--init-conf` | ship the starter conf pair from the deployed prefix when the dest conf is missing (never overwrites); without `--conf` the dest is `~/.config/egresslock/main.conf` |
-| `--profile <name>` | write `EGRESSLOCK_PROFILE=<name>` (named verify mode); omit for `--ensured` mode |
-| `--prefix <path>` | deployed kit prefix (default: derived from the installed unit template, else `/opt/egresslock`) |
-| `--enable` | enable+start `egresslock-verify@<account>.timer` AND enable linger for the account (fails closed if linger does not stick) |
-| `--apparmor-add` | apply the shipped pasta rule (root; may be combined with `--account` or used alone) — resolves the pasta profile file and writes the rule into the **local include it references** (`local/usr.bin.pasta` or `local/pasta`; idempotent) and reloads the resolved profile |
-| `--apparmor-remove` | unapply the pasta rule (strips only the marker-scoped block; never removes operator lines) |
-| `--apparmor-check` | report AppArmor/pasta amendment health (read-only, no root) |
-| `-h`, `--help` | print the full help (the script is the source of truth) |
-
-### What setup does
-
-- **`--init-conf`** ships the deny-all starter (`profile main` + empty
-  allowlist) from `examples/`, only if no conf exists yet (never
-  overwrites; never heals an existing conf's missing allowlist).
-- **Validates** the conf: exists AND readable by the account, parses
-  cleanly under the deployed engine, and (with `--profile`) that the
-  named profile exists in it.
-- **Writes `~/.config/egresslock/unit.env`** (0600): exactly one
-  `EGRESSLOCK_CONF=<conf>` line, plus `EGRESSLOCK_PROFILE=<name>` only
-  when `--profile` is given. Re-runs overwrite the file wholesale.
-- **Builds the gateway image** into the account's Podman store from the
-  deployed prefix (for gateway profiles) if the image is missing.
-- **`--enable`** enables+starts `egresslock-verify@<account>.timer`
-  and enables linger for the account, so `/run/user/<uid>` persists
-  outside login sessions for the timer's `egresslock-verify`.
-
-### The two files that matter
-
-- **The profile conf** (engine input): profiles, subnets, rules,
-  allowlist references. Account-owned site data. Gateway profiles need
-  an allowlist file **next to the conf** (conf-relative path in the
-  `gateway` directive); missing/invalid allowlists fail `ensure`
-  closed.
-- **`~/.config/egresslock/unit.env`** (0600) — *pure systemd wiring*:
-  tells the verify timer where the account's conf is. Exactly one
-  required line + one optional:
-  - `EGRESSLOCK_CONF=<conf path>` — required
-  - `EGRESSLOCK_PROFILE=<name>` — optional; omit for `verify --ensured`
-
-### Full reference
-
-`egresslock-setup --help` (`-h`) documents every option, default, and
-the manual fallback. This section is the quick orientation; the script
-is the source of truth.
-
-## Settings reference
-
-### Profile conf (`<profile>.conf`)
-
-Each profile is a `<profile>.conf` + `<profile>-allowlist` pair under
-`~/.config/egresslock/`. The starter (`examples/main.conf`) is:
-
-```conf
-profile main 10.199.0.0/24
-    rule gateway-only
-    gateway 10.199.0.2 3128 main-allowlist
-```
-
-| Setting | What it does |
-|---|---|
-| `profile <name> <cidr>` | starts a profile block; IPv4 CIDR, prefixlen 8-29, canonical network address |
-| `rule gateway-only` | egress only through the profile's gateway (requires a `gateway` directive) |
-| `rule allow-host <host>:<port>` | direct host:port allow (repeatable; resolved at ensure time) — bypasses the gateway, pinned as an nftables rule |
-| `gateway <ip> <port> <file>` | static gateway IP inside the subnet + Squid port + allowlist file (conf-relative unless absolute) |
-| `no-proxy <host,...>` | extra `NO_PROXY` entries (hosts the profile may reach directly) |
-
-The full grammar, the allowlist format, and the rules to keep straight
-are in the [Policy reference](../reference/policy-reference.md).
-
-### `unit.env` (`~/.config/egresslock/unit.env`, 0600)
-
-Pure systemd wiring — tells the verify timer where the account's conf
-is. Written by `egresslock-setup`.
-
-| Line | Meaning |
-|---|---|
-| `EGRESSLOCK_CONF=<conf path>` | required — where the account's profile conf is |
-| `EGRESSLOCK_PROFILE=<name>` | optional — named verify mode; omit for `--ensured` |
-
-### Engine environment overrides
-
-See `egresslock --help` for the full list:
-
-| Variable | What it does |
-|---|---|
-| `EGRESSLOCK_CONF` | required for every profile subcommand — the engine has no compiled-in profiles; unset or empty fails closed with `no profile config` |
-| `NFT_BIN` | path to the `nft` binary (default `/usr/sbin/nft`, else `$PATH`) |
-| `EGRESSLOCK_ANCHOR_IMAGE` | anchor image (default: base image or alpine) |
-| `EGRESSLOCK_GW_IMAGE` | gateway image (default `localhost/egresslock-gateway:latest`) |
-| `EGRESSLOCK_ALLOW_ROOT=1` | allow running as root (NOT recommended — root's Podman store/netns is not an account) |
-| `EGRESSLOCK_SKIP_NETNS_PROBE=1` | skip the podman rootless-netns preflight probe (test harness only) |
-| `EGRESSLOCK_GW_LOG_MAX_BYTES` | gateway log rotation cap in bytes (default 32 MiB; `0` = no cap) |
-| `EGRESSLOCK_DENIED_MAX_BYTES` | `denied` log-read cap in bytes (default 8 MiB; `0` = uncapped) |
-
-Config resolution: when neither `--config` nor
-`EGRESSLOCK_CONF` is given, the engine probes the running user's default
-folder `~/.config/egresslock/`. Named commands use `<profile>.conf` if
-present, else `main.conf`; bare `list` and bare `verify --ensured`
-aggregate every `*.conf` in that folder. Explicit always beats the
-probe. Details in the README's
-[Configuration options](../../README.md#configuration-options).
-
-> **TBD:** any setting not listed above that you expect to see here is
-> still being documented — check `egresslock --help` /
-> `egresslock-setup --help` (the source of truth) and open an issue if
-> something is missing.
-
-## AppArmor prerequisite
-
-On affected hosts, an **enforce-mode** AppArmor profile for `pasta`
-denies the SIGTERM podman sends to its shared-netns holder, so the
-first `ensure` fails with `rootless netns: kill network process:
-permission denied`. **Affected** means pasta enforced **and**
-podman running under an AppArmor label (any profile mode): Ubuntu
->= 25.10 by default (the label profile ships in the `apparmor`
-package); stock Debian ships no podman label profile, noble ships no
-pasta profile at all, Fedora/RHEL use SELinux — there the denial
-cannot fire and the amendment is a harmless future-proofing no-op.
-See the [affected-OS matrix](../../docs/troubleshooting/pasta-apparmor.md#affected-os--stack-matrix-snapshot-verified-2026-09-10)
-for the full table. The kit does not touch AppArmor (distro-owned
-policy, applied by you).
-
-Check the actual state on your host, and apply if needed — the full
-apply/verify/unapply steps are in the dedicated
-[AppArmor pasta rule](../../apparmor/README.md):
-
-```sh
-sudo egresslock-setup --apparmor-check
-sudo egresslock-setup --apparmor-add
-```
-
-## Root & sudo: interactive only, no NOPASSWD
-
-The three root-running kit entry points — `install-kit.sh`,
-`uninstall-kit.sh`, and `egresslock-setup` — are **interactive root**
-tools. Do **not** grant them passwordless sudo (`NOPASSWD` in
-sudoers): their arguments are deliberately free-form (`--prefix`,
-`--account`, `--conf`), and `egresslock-setup` runs as the target
-account via `runuser` — so a `NOPASSWD` rule on any of these binaries
-without an exact-argv restriction is **equivalent to full root**.
-
-The engine itself never runs as root (the root guard) and does
-not need sudo at all; only distribution of the shared kit (install/
-uninstall) and the per-account bootstrap touch root.
-
-For the full picture — who runs which command where (root / the
-container-owner account / the workload) and the `sudo -iu` tilde trap
-— see [who-runs-what](../reference/who-runs-what.md).
+What these files mean and the profile conf grammar: the
+[scripts and environment reference](../reference/scripts-and-environment.md)
+and the [Policy reference](../reference/policy-reference.md).
 
 ## Files installed
 
-### Deployed kit (manual prefix install)
+What the kit puts on the host (`.deb` layout, prefix layout, unit
+templates) and what a checkout contains: the
+[files-installed reference](../reference/files-installed.md).
 
-The kit is deployed ROOT-owned to `--prefix` (default
-`/opt/egresslock`):
+## Next
 
-| File / dir | What it is |
-|---|---|
-| `egresslock` | the engine CLI (`ensure`, `verify`, `list`, `network`, `rules`, `allowlist`, `denied`, `allow`/`disallow`, `allow-host`/`disallow-host`, `init`, `doctor`, `teardown`, ...) |
-| `egresslock-start` | daemon-start wrapper: `ensure` the profile, then exec the daemon |
-| `egresslock-verify` | entry point for the verify timer (named or `--ensured`) |
-| `egresslock-setup` | per-account bootstrap: ship starter conf, validate, write `unit.env`, build gateway, enable timer |
-| `gateway/` | build context for the Squid gateway image (`Containerfile`, `squid.conf`, entrypoint) |
-| `apparmor/` | pasta AppArmor snippet + profiles shipped root-owned with the prefix (distribution only — applying stays the explicit `egresslock-setup --apparmor-add`; see `apparmor/README.md`) |
-| `examples/` | starter conf + empty allowlist for `egresslock-setup --init-conf`; `recipes/` deployed so accounts build from the prefix |
-| `VERSION` | `commit:` SHA + `deployed:` UTC date (+ `-dirty` marker) of what is installed |
-
-Unit templates installed to `/etc/systemd/system/` (overridable via
-`EGRESSLOCK_UNIT_DIR`):
-
-| Unit | What it is |
-|---|---|
-| `egresslock-verify@.service` | runs `egresslock-verify` as the account (instance = account) |
-| `egresslock-verify@.timer` | 15-min drift signal, `Persistent=true` |
-
-### Source tree (what a checkout contains)
-
-The **deployed** kit is a subset of this. Paths are relative to the
-repository root:
-
-| Path | What it is |
-|---|---|
-| `egresslock` | The engine CLI: `ensure`, `verify` (incl. `--ensured`), `list`, `network`, `proxy-env` (tokens: `proxyip`/`proxyport`/`noproxy`), `rules`, `allowlist`, `denied` (`--all`, `--days N`), `allow`/`disallow`, `allow-host`/`disallow-host`, `init`, `doctor`, `teardown` (incl. `--runtime`), `--version` |
-| `install-kit.sh` | (root) Deploy the kit to a prefix and install the instanced verify unit templates (no account changes) |
-| `egresslock-setup` | (root) One-command per-account setup: ship the starter conf with `--init-conf`, validate conf, write `unit.env`, build the gateway image, optionally enable the timer |
-| `uninstall-kit.sh` | (root) Remove the kit; account data is preserved unless `--purge-account-data` |
-| `egresslock-start` | Wrapper for daemon services: `ensure $EGRESSLOCK_PROFILE` (fail closed), then exec the daemon |
-| `egresslock-verify` | Entry point for the verify timer: named profile or `--ensured` mode |
-| `gateway/` | Build context for the Squid gateway image (`Containerfile`, `squid.conf`, entrypoint) |
-| `examples/` | Starter conf + empty allowlist shipped by `install-kit.sh` for `egresslock-setup --init-conf`; recipes under `recipes/` |
-| `build-gateway` | Build the gateway image into the current user's store (checkout use) |
-| `tests/` | Mock battery: `bash tests/run.sh` runs `lib.sh` + `test-engine.sh` + `test-kit.sh` (engine and kit harnesses; no root/Podman needed) |
-| `packaging/` | `build-deb.sh` (FHS `.deb`, thin `dpkg-deb` build) and `build-tarball.sh` (self-contained manual-install tar.gz incl. `uninstall-kit.sh`); `README.md` (the packaging guide) |
-| `docs/quickstart/` | Post-install quickstart guides (allow a domain, allow non-HTTP, grow the policy, first-run checks, test your container) |
-| `docs/setup/` | install / upgrade / uninstall references |
-| `docs/reference/` | overview, who runs what, policy reference, paths-and-signatures, proxy clients, check-everything catalog, scripts-and-environment, threat model |
-| `docs/troubleshooting.md` + `docs/troubleshooting/` | symptom index + one page per issue |
-| `docs/README.md` | docs organization map |
-
-### .deb doc location
-
-The `.deb` ships the docs tree under
-`/usr/share/egresslock/doc/` — structure-preserving (the same
-`docs/quickstart|setup|reference|troubleshooting` layout as the repo)
-plus `doc/README.md` (the repo front page). Process files
-(`docs/tickets/`, `BOARD.md`) are never shipped.
-
-## Validating a host (install verification)
-
-After a fresh install, before relying on the host:
-
-1. `install-kit.sh`; then `egresslock-setup --enable`; confirm
-   `systemctl list-timers 'egresslock-verify@*'` (SYSTEM scope —
-   NOT `--user`).
-2. As the account: `ensure <profile>` then `verify <profile>` — both
-   must pass with the gateway healthy.
-3. Start the timer oneshot manually and expect the `verified
-   (ensured)` lines in the journal.
-4. Negative check: stop the gateway container, re-run the oneshot —
-   it must FAIL (that is the drift signal working).
-
-The shorter everyday version (and the commonly-wrong items) is
-[first-run-checks](../quickstart/first-run-checks.md).
-
-## Next steps
-
-- [Check everything is working](../reference/check-everything.md) — the
-  health check for a fresh setup.
-- [Upgrade the kit](upgrade.md) — re-running install-kit.sh with the
-  same prefix, the VERSION stamp, and the post-upgrade checks.
-- [Uninstall the kit](uninstall.md) — account teardown first, kit
-  removal, and the AppArmor revert.
-- [Troubleshooting](../troubleshooting.md) — diagnosis checklist, service
-  units & signal semantics, the pasta/AppArmor netns blocker, gateway
-  (Squid) log reading, and host validation steps.
+- [Quick start guides](../../README.md#quick-start-guides) — the
+  first tasks on the installed kit.

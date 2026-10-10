@@ -10,7 +10,7 @@
 #   /usr/sbin/egresslock-setup       wrapper -> /usr/lib/egresslock/egresslock-setup
 #   /usr/lib/egresslock/             engine, egresslock-start, egresslock-verify,
 #                                    egresslock-setup, gateway/, VERSION
-#   /usr/share/egresslock/examples/  starter conf + allowlist + recipes
+#   /usr/share/egresslock/examples/  starter conf + allowlist + recipes + egl-base
 #   /usr/share/egresslock/doc/       docs/ tree (EGL-28 structure,
 #                                    structure-preserving) + README.md
 #   /usr/share/egresslock/apparmor/  ARC-27 pasta snippet + README (shipped,
@@ -125,6 +125,12 @@ done
     exit 2
 }
 [[ -f "$kit/apparmor/usr.bin.pasta.local" ]] || { echo "build-deb: apparmor snippet missing" >&2; exit 2; }
+# EGL-232: the shared example base image ships in the deb (D4);
+# EGL-240: the build helper ships executable beside it.
+[[ -f "$kit/examples/egl-base/Containerfile" && -f "$kit/examples/egl-base/README.md" && -x "$kit/examples/egl-base/build-egl-base" ]] || {
+    echo "build-deb: egl-base context missing: $kit/examples/egl-base" >&2
+    exit 2
+}
 
 stage="$(mktemp -d /tmp/egresslock-deb.XXXXXX)"
 trap 'rm -rf "$stage"' EXIT
@@ -184,6 +190,13 @@ for f in "$kit"/examples/recipes/*; do
     install -m 0644 "$f" "$share/examples/recipes/$(basename "$f")"
 done
 chmod -R go-w "$share/examples/recipes"
+# EGL-232: the shared example base image (egl-base) — staged as its own
+# directory (the recipes loop above is file-only and would skip it).
+install -d -m 0755 "$share/examples/egl-base"
+install -m 0644 "$kit/examples/egl-base/Containerfile" "$share/examples/egl-base/Containerfile"
+install -m 0644 "$kit/examples/egl-base/README.md"     "$share/examples/egl-base/README.md"
+install -m 0755 "$kit/examples/egl-base/build-egl-base" "$share/examples/egl-base/build-egl-base"
+chmod -R go-w "$share/examples/egl-base"
 # EGL-28: the docs/ tree ships structure-preserving (quickstart/setup/
 # reference/troubleshooting tiers + the index); process files (tickets/,
 # BOARD.md) and site-named docs never ship. README.md sits beside the

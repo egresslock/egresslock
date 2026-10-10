@@ -55,7 +55,12 @@ per-account.)
 ## 2. Point the runner's containers at the profile
 
 Two settings in the runner software's own container configuration —
-not egresslock flags — make job containers run under the profile:
+not egresslock flags — make job containers run under the profile. And
+one obligation before any setting: the network policy is the egress
+boundary, but container-level hardening (cap-drop,
+no-new-privileges, read-only rootfs where the runner image allows it)
+is the launcher's — the same baseline as every other recipe: the
+[container hardening baseline](../../docs/reference/container-hardening.md).
 
 1. **Attach job containers to the profile's network.** Set the
    container network to the profile's network name (e.g. on a
