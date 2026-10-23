@@ -19,13 +19,12 @@
 #   /usr/lib/systemd/system/         egresslock-verify@.{service,timer}
 #                                    (ExecStart rewritten to libdir)
 #
-# Maintainer scripts (ARC-22-D2): postinst retires the pre-ARC-16 global
-# unit names, fails the install while a live prefix kit still shadows
-# the deb's units via /etc, removes the STALE /etc prefix-install
-# templates (EGL-83-D1), daemon-reloads and prints the next step — no
-# timer enable, no AppArmor apply, no account touch. EGL-103-D3: every
-# unit/systemctl mutate prints one matching operator line (no-op
-# disables stay quiet; one daemon-reload line per run). postrm
+# Maintainer scripts (ARC-22-D2): postinst fails the install while a
+# live prefix kit still shadows the deb's units via /etc, removes the
+# STALE /etc prefix-install templates (EGL-83-D1), daemon-reloads and
+# prints the next step — no timer enable, no AppArmor apply, no account
+# touch. EGL-103-D3: every unit/systemctl mutate prints one matching
+# operator line (one daemon-reload line per run). postrm
 # daemon-reloads only; it never tears down Podman state, never deletes
 # ~/.config/egresslock (not even on purge — ARC-7-D5), never removes
 # the pasta local snippet.
@@ -355,26 +354,11 @@ fi
 # Already-printed (keep): classified /etc shadow-rm ("removed stale
 # prefix-install unit…"), unknown-kept disclosures, the closing
 # next-step lines.
-systemctl disable --now egresslock-verify.timer >/dev/null 2>&1 || true
-legacy_unit_rm() {
-    for f in "$@"; do
-        [ -f "$f" ] || continue
-        rm -f "$f"
-        echo "postinst: removed legacy unit $f"
-    done
-}
-legacy_unit_rm /etc/systemd/system/egresslock-verify.service \
-               /etc/systemd/system/egresslock-verify.timer
-systemctl disable --now 'agent-network-verify@*.timer' >/dev/null 2>&1 || true
-legacy_unit_rm /etc/systemd/system/agent-network-verify@.service \
-               /etc/systemd/system/agent-network-verify@.timer \
-               /etc/systemd/system/agent-network-verify.service \
-               /etc/systemd/system/agent-network-verify.timer
 systemctl daemon-reload || true
 echo "postinst: systemd daemon-reload"
 echo "egresslock installed. next step:"
-echo "  sudo egresslock-setup --account <acct> --init-conf --enable"
-echo "  sudo egresslock-setup --apparmor-check  # confirm pasta AppArmor compatibility on this host"
+echo "  sudo egresslock-setup init --account <acct> --init-conf --enable"
+echo "  sudo egresslock-setup apparmor check  # confirm pasta AppArmor compatibility on this host"
 exit 0
 EOF
 

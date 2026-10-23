@@ -11,31 +11,25 @@
 #   1. Deploys the shared, ROOT-OWNED kit to --prefix (default
 #      /opt/egresslock): egresslock (engine), egresslock-start
 #      (wrapper), egresslock-verify (timer entry), egresslock-setup
-#      (per-account bootstrap), gateway/ (image build
-#      context), examples/ (starter conf + empty allowlist
-#   for egresslock-setup --init-conf, recipes/, egl-base/),
-#   apparmor/ (pasta snippet for --apparmor-add), and a VERSION
-#   stamp (version string + deployed commit SHA + UTC date). This is
-#   the ONLY thing accounts share.
-#   2. Installs the instanced unit templates egresslock-verify@.service
-#      and egresslock-verify@.timer into /etc/systemd/system/.
+#      (per-account bootstrap), gateway/ (image build context),
+#      examples/ (starter conf + empty allowlist for egresslock-setup
+#      --init-conf, recipes/, egl-base/), apparmor/ (pasta snippet for
+#      --apparmor-add), and a VERSION stamp (version string + deployed
+#      commit SHA + UTC date). This is the ONLY thing accounts share.
 #   1b. Installs PATH wrappers: /usr/local/bin/egresslock and
 #      /usr/local/sbin/egresslock-setup exec the deployed prefix copies,
 #      so the bare command works on prefix installs the way the .deb
 #      does. Marker-guarded; refused (rc 1) when the .deb is installed
 #      or the dest is a foreign file. An unwritable PATH dir warns and
 #      skips.
-#   3. Removes the legacy GLOBAL egresslock-verify.{service,timer}
-#      AND the pre-rename GLOBAL + instanced agent-network-verify@.*
-#      templates so neither an upgrade nor a
-#      cutover can leave both generations active (the old timers would
-#      keep invoking the old engine).
+#   2. Installs the instanced unit templates egresslock-verify@.service
+#      and egresslock-verify@.timer into /etc/systemd/system/.
 #
-# It does NOT touch accounts: per-account timers are enabled
-# by egresslock/egresslock-setup --enable, at account setup, AFTER the
-# account's unit.env exists — never as a vacuous enable at install
-# time. Account-owned data (conf, allowlist, unit.env, gateway image)
-# is NOT installed here either: accounts execute, root distributes.
+# It does NOT touch accounts: per-account timers are enabled by
+# `egresslock-setup init --enable` at account setup, AFTER the account's
+# unit.env exists — never as a vacuous enable at install time.
+# Account-owned data (conf, allowlist, unit.env, gateway image) is NOT
+# installed here either: accounts execute, root distributes.
 #
 # Options:
 #   --prefix <path>   deploy the kit here (default: /opt/egresslock)
@@ -55,10 +49,6 @@
 #   EGRESSLOCK_PATH_SBINDIR=<dir>    PATH wrapper dir for
 #                                egresslock-setup (default:
 #                                /usr/local/sbin)
-#   EGRESSLOCK_LEGACY_PREFIX=<path>   path to probe for a leftover
-#                                pre-rename kit (default: /opt/agent-network;
-#                                overridable so the mock harness can
-#                                exercise the warning without touching /opt)
 #
 # Defaults that are not parameter-changeable:
 #   - deployed kit file set: egresslock, egresslock-start,
@@ -66,8 +56,6 @@
 #     conf + allowlist + recipes/ incl. the container example +
 #     egl-base/), apparmor/ (pasta snippet), VERSION (all root-owned)
 #   - unit template names: egresslock-verify@.{service,timer}
-#   - legacy GLOBAL egresslock-verify.{service,timer} units are
-#     retired on upgrade
 #   - the installed unit template's ExecStart is rewritten with the
 #     deployed prefix at install time
 #
@@ -78,9 +66,8 @@ set -euo pipefail
 prefix="/opt/egresslock"
 src="$(cd "$(dirname "$0")" && pwd)"
 # Kit root = the script's own directory: the kit files always live
-# beside it (at the repo root since the EGL-1 flatten, or inside an
-# extracted tarball tree). Git facts (the VERSION stamp) resolve from
-# the checkout toplevel when the kit is a git checkout.
+# beside it (repo root or extracted tarball). Git facts (the VERSION
+# stamp) resolve from the checkout toplevel when the kit is a git checkout.
 repo="$(git -C "$src" rev-parse --show-toplevel 2>/dev/null || echo "$src")"
 
 while [[ $# -gt 0 ]]; do
@@ -92,16 +79,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# EGL-90-D1 (audit I-02/I-03): the --prefix path shape is validated at
-# parse. It must be an absolute, charset-clean kit path: ^/[A-Za-z0-9._/-]+$
-# under LC_ALL=C, no //, no /./ or /../ segment (incl. a trailing /. or
-# /..), never /, ., or .. — and (the old ARC-49-D3 rule, subsumed here)
-# no whitespace: the unit template's ExecStart is substituted with sed
-# and systemd splits ExecStart on whitespace, while the PATH wrapper
-# embeds the prefix into an sh file — metacharacters in a prefix are
-# either a broken install or code-exec in the wrapper. Fail closed rc 2
-# rather than half-install. Same rule as uninstall-kit.sh (EGL-89-D1);
-# duplicated by design, not a shared library.
+# EGL-90-D1 (audit I-02/I-03): validate the --prefix path shape at parse.
+# It must be absolute and charset-clean (^/[A-Za-z0-9._/-]+$ under
+# LC_ALL=C, no //, /./ or /../ segment, never /, ., or ..), with no
+# whitespace: systemd splits the substituted ExecStart on whitespace, and
+# the PATH wrapper embeds the prefix into an sh file, so metacharacters
+# are either a broken install or code-exec in the wrapper. Fail closed
+# rc 2 rather than half-install. Same rule as uninstall-kit.sh
+# (EGL-89-D1); duplicated by design, not a shared library.
 _check_kit_path_shape() {
     local p="$1" bad=0
     if [[ "$p" == "/" || "$p" == "." || "$p" == ".." ]]; then
@@ -134,16 +119,12 @@ _check_kit_path_shape "$prefix"
 }
 
 # EGL-68-D1 / EGL-90-D3: never rm -rf through a mistyped --prefix. The
-# install replaces "$prefix/gateway", "$prefix/apparmor" and
-# "$prefix/examples/recipes" wholesale; that must only ever delete
-# kit-shaped content. For EACH such path, deleting is allowed only when:
-#   - the path does not exist (first install), or
-#   - $prefix carries a kit marker (VERSION or the egresslock
-#     executable) — a reinstall over this kit's own deploy, or
-#   - the path itself is kit-shaped (gateway/Containerfile present).
-# Otherwise fail closed naming the path; nothing is written and nothing
-# is deleted. The check runs BEFORE any copy so a refused run leaves a
-# foreign tree untouched (no engine binary smeared into it first).
+# install replaces gateway/, apparmor/, examples/recipes/ and
+# examples/egl-base/. Deleting one is allowed only when it is absent
+# (first install), $prefix carries a kit marker (VERSION or the
+# egresslock executable), or the path is kit-shaped
+# (gateway/Containerfile). Otherwise fail closed before any copy, naming
+# the path. EGL-265 item 4: keep this list in lockstep with the loop.
 for _dest in "$prefix/gateway" "$prefix/apparmor" \
              "$prefix/examples/recipes" "$prefix/examples/egl-base"; do
     if [[ ! -e "$_dest" ]]; then
@@ -174,20 +155,15 @@ base="$(tr -d ' \t\n' < "$src/VERSION_BASE")"
     exit 1
 }
 
-# EGL-102-D6-R2 (partial-completion disclosure, fail-closed form): the
-# whole source set must exist BEFORE any copy — a mid-deploy
-# `install: cannot stat` used to leave a partial prefix (binaries or
-# templates missing, no next action). This gate fails closed naming the
-# missing files; nothing has been written yet.
+# EGL-102-D6-R2: the whole source set must exist BEFORE any copy. A
+# mid-deploy `install: cannot stat` used to leave a partial prefix
+# (binaries or templates missing, no next action); this gate fails
+# closed naming the missing files, before anything is written.
 _kit_missing=""
-# EGL-102-D6-F3: the enumeration must cover the WHOLE unconditional copy
-# list (binaries, gateway/, apparmor/, examples incl. recipes/, unit
-# templates) — `examples/recipes` and the gateway/apparmor side files
-# are copied unconditionally below, so a tree missing only one of them
-# would still die mid-deploy on a bare `cp: cannot stat` (partial
-# prefix, no next action). Keep this list in lockstep with the copy
-# list; the EGL-47-D3 tripwire below guards the shipped set, this
-# guards the copied set.
+# EGL-102-D6-F3: cover the WHOLE unconditional copy list (binaries,
+# gateway/, apparmor/, examples incl. recipes/, unit templates). Keep
+# this list in lockstep with the copy list: the EGL-47-D3 tripwire
+# below guards the shipped set, this guards the copied set.
 for _src in egresslock egresslock-start egresslock-verify egresslock-setup \
             gateway/Containerfile gateway/entrypoint.sh gateway/squid.conf \
             apparmor/usr.bin.pasta.local apparmor/README.md \
@@ -210,11 +186,10 @@ if [[ -n "$_kit_missing" ]]; then
 fi
 unset _kit_missing _src _unit_src_chk _ut
 
-# EGL-72-D3: the version: line. A tarball install carries KIT_VERSION
-# (the build-time version string written by build-tarball.sh) — use it
-# so the deployed stamp is the BUILD version, not
-# <base>+git<install-ts>.unknown. Otherwise (checkout install)
-# synthesize from VERSION_BASE + git; the install-time timestamp is OK.
+# EGL-72-D3: the version line. A tarball install carries KIT_VERSION
+# (written by build-tarball.sh) so the deployed stamp is the BUILD
+# version; a checkout install synthesizes it from VERSION_BASE + git.
+# The install-time timestamp is expected there.
 kit_version=""
 if [[ -f "$src/KIT_VERSION" ]]; then
     kit_version="$(tr -d ' \t\n' < "$src/KIT_VERSION")"
@@ -244,21 +219,18 @@ cp -R "$src/gateway" "$prefix/gateway.tmp"
 rm -rf "$prefix/gateway"
 mv "$prefix/gateway.tmp" "$prefix/gateway"
 chmod -R go-w "$prefix/gateway"
-# EGL-69-D2: the pasta AppArmor snippet ships with the prefix (root-owned,
-# same as gateway/) so the documented
-# `sudo $prefix/egresslock-setup --apparmor-add` works on prefix installs.
-# ARC-22-D3 holds: shipping the snippet is distribution; applying it is
-# still explicit --apparmor-add only.
+# EGL-69-D2: the pasta AppArmor snippet ships with the prefix
+# (root-owned, like gateway/) so `sudo $prefix/egresslock-setup
+# --apparmor-add` works on prefix installs. Shipping is distribution;
+# applying stays explicit --apparmor-add only (ARC-22-D3).
 cp -R "$src/apparmor" "$prefix/apparmor.tmp"
 rm -rf "$prefix/apparmor"
 mv "$prefix/apparmor.tmp" "$prefix/apparmor"
 chmod -R go-w "$prefix/apparmor"
 # ARC-19-D3: starter conf + empty allowlist for egresslock-setup
-# --init-conf. Root-owned, like gateway/. Never installed into account
-# homes. uninstall-kit removes the whole prefix, so no extra purge here.
-# Recipes (incl. the agent-container-example build context) ship too so
-# accounts can build from the PREFIX — they have no checkout of this
-# repo (same rationale as ARC-16-D6 shipping the gateway context).
+# --init-conf. Root-owned, never installed into account homes.
+# Recipes and egl-base ship too so accounts can build from the PREFIX
+# without a checkout (same rationale as the gateway context, ARC-16-D6).
 install -d -m 0755 "$prefix/examples"
 install -m 0644 "$src/examples/main.conf"       "$prefix/examples/main.conf"
 install -m 0644 "$src/examples/main-allowlist" "$prefix/examples/main-allowlist"
@@ -301,21 +273,16 @@ fi
 } > "$prefix/VERSION"
 chmod 0644 "$prefix/VERSION"
 
-# 1b. PATH wrappers (EGL-43): the .deb ships /usr/bin wrappers, but the
-#     prefix deploy historically installed none, so the bare `egresslock`
-#     command (the engine's own root-guard guidance, EGL-31) failed
-#     command-not-found on prefix hosts. D1: a small sh wrapper with an
-#     absolute exec (never a symlink), and the FIRST line after the
-#     shebang is the marker comment so upgrades (D3) and uninstall
-#     (D4) only ever touch this prefix's wrappers. D2: two names only —
-#     the engine and egresslock-setup; start/verify are invoked by the
-#     installed units' rewritten ExecStart and stay unwrapped.
-#     D3: refuse to co-install with the .deb (ARC-22-D1) and refuse to
-#     clobber a dest file that is not this prefix's own wrapper.
-#     EGL-80-L2: the deb-shape guard's /usr/bin path is hookable
-#     (EGRESSLOCK_UB_BIN, default /usr/bin/egresslock) — same pattern as
-#     the other destination hooks — so the guard is testable on hosts
-#     where the .deb is actually installed.
+# 1b. PATH wrappers (EGL-43): the .deb ships /usr/bin wrappers, but a
+#     prefix deploy had none, so bare `egresslock` (the root-guard
+#     guidance, EGL-31) failed command-not-found. D1: an sh wrapper with
+#     an absolute exec (never a symlink); line 2 is the marker comment so
+#     upgrade (D3) and uninstall (D4) touch only this prefix's wrappers.
+#     Two names only: engine + egresslock-setup; start/verify are invoked
+#     by the installed units' rewritten ExecStart. D3: refuse co-install
+#     with the .deb (ARC-22-D1) and never clobber a foreign dest.
+#     EGL-80-L2: the deb-shape guard honours EGRESSLOCK_UB_BIN (default
+#     /usr/bin/egresslock), so it is testable on hosts with the .deb.
 path_bindir="${EGRESSLOCK_PATH_BINDIR:-/usr/local/bin}"
 path_sbindir="${EGRESSLOCK_PATH_SBINDIR:-/usr/local/sbin}"
 ub_bin="${EGRESSLOCK_UB_BIN:-/usr/bin/egresslock}"
@@ -326,9 +293,8 @@ if [[ "$deb_status" == *'installed'* ]]; then
     exit 1
 fi
 # EGL-83-D2: dpkg-query can be missing or wrong (non-dpkg cleanup,
-# foreign host) while the deb's libdir kit is still present — the
-# PATH-wrapper check above misses a libdir-only leftover. Refuse on the
-# deb libdir's VERSION marker too (hookable for tests). Refuse, never
+# foreign host) while the deb's libdir kit is still present. Refuse on
+# the deb libdir's VERSION marker too (hookable for tests); never
 # auto-remove the deb (same never-co-install policy as above).
 deb_libdir="${EGRESSLOCK_DEB_LIBDIR:-/usr/lib/egresslock}"
 if [[ -e "$deb_libdir/VERSION" ]]; then
@@ -368,10 +334,9 @@ for _wl in "$path_bindir/egresslock:$prefix/egresslock" \
     fi
     # EGL-90-D1.2 (audit I-03): the exec target is double-quoted so a
     # prefix can never become wrapper code even if a future regression
-    # reintroduces a permissive charset (the charset check above is the
-    # primary lock; this is the second). The marker comment on line 2
-    # stays unquoted (`prefix=$prefix`) — EGL-43 uninstall matching and
-    # EGL-90's charset make that safe.
+    # reintroduces a permissive charset. The line-2 marker stays unquoted
+    # (`prefix=$prefix`) — EGL-43 uninstall matching and EGL-90's charset
+    # make that safe.
     if printf '#!/bin/sh\n# egresslock-path-wrapper prefix=%s\nexec "%s" "$@"\n' \
             "$prefix" "$_wtarget" > "$_wdest" 2>/dev/null \
             && chmod 0755 "$_wdest" 2>/dev/null; then
@@ -391,11 +356,10 @@ done
 #    a non-default --prefix yields a working timer; the repo template
 #    keeps the __EGRESSLOCK_PREFIX__ placeholder.
 unit_dest="${EGRESSLOCK_UNIT_DIR:-/etc/systemd/system}"
-# ARC-22 but tightened for the repo split (ARC-74-D5): the unit templates
-# are kit assets that live inside the egresslock tree, so a self-contained
-# kit tree deploys with no shared-repo layout at all. Only
-# EGRESSLOCK_UNIT_SRC (override) or $src/systemd are consulted — there
-# is no legacy fallback outside the tree.
+# ARC-22, tightened for the repo split (ARC-74-D5): the unit templates
+# are kit assets inside the egresslock tree, so a self-contained kit tree
+# deploys with no shared-repo layout. Only EGRESSLOCK_UNIT_SRC (override)
+# or $src/systemd are consulted; there is no fallback outside the tree.
 if [[ -n "${EGRESSLOCK_UNIT_SRC:-}" ]]; then
     unit_src="${EGRESSLOCK_UNIT_SRC}"
 else
@@ -411,26 +375,7 @@ sed "s|__EGRESSLOCK_PREFIX__|$prefix|g" "$unit_src/egresslock-verify@.service" \
 chmod 0644 "$unit_dest/egresslock-verify@.service"
 install -m 0644 "$unit_src/egresslock-verify@.timer" "$unit_dest/"
 
-# 3. Upgrade: retire the pre-ARC-16 global units (ARC-16-D9.3) AND the
-#    pre-rename agent-network-verify@.* templates + enabled instances
-#    (ARC-47-D3) so an old timer can never keep invoking the old
-#    engine. Never fatal if they were never installed.
-systemctl disable --now egresslock-verify.timer >/dev/null 2>&1 || true
-rm -f "$unit_dest/egresslock-verify.service" \
-      "$unit_dest/egresslock-verify.timer"
-systemctl disable --now 'agent-network-verify@*.timer' >/dev/null 2>&1 || true
-rm -f "$unit_dest/agent-network-verify@.service" \
-      "$unit_dest/agent-network-verify@.timer"
-rm -f "$unit_dest/agent-network-verify.service" \
-      "$unit_dest/agent-network-verify.timer"
-
 systemctl daemon-reload
-
-legacy_prefix="${EGRESSLOCK_LEGACY_PREFIX:-/opt/agent-network}"
-if [[ -d "$legacy_prefix" ]]; then
-    echo "WARNING: leftover pre-rename kit at $legacy_prefix — its timers would" >&2
-    echo "run the OLD engine. Remove it or run the cutover in docs/setup/upgrade.md." >&2
-fi
 
 echo
 echo "successfully installed! kit is at: $prefix"
@@ -438,30 +383,30 @@ echo "  $(tr '\n' ' ' < "$prefix/VERSION")"
 echo
 # EGL-39 / D39-2 surface 2: one-line AppArmor conditionality advisory
 # (read-only; recommend, never auto-apply — ARC-22-D3). The ERE is
-# shared with egresslock-setup podman_labeled() (D39-3): ANY mode in
-# the kernel listing counts as labeled, including `(unconfined)` —
-# the label, not the mode, is the discriminator (EGL-33); anchored so
-# hat lines (`podman//…`) never match. Silence on UNKNOWN (missing or
+# shared with egresslock-setup podman_labeled() (D39-3): ANY mode in the
+# kernel listing counts as labeled, including `(unconfined)` — the
+# label, not the mode, is the discriminator (EGL-33); anchored so hat
+# lines (`podman//…`) never match. Silence on UNKNOWN (missing or
 # unreadable listing, grep rc 2): never claim "not needed" from an
-# unknown state (EGL-22-D2 discipline).
+# unknown state (EGL-22-D2).
 _aa_profiles="${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles}"
 if [[ -r "$_aa_profiles" ]]; then
     # grep rc: 0 = match (labeled), 1 = no match (unlabeled), 2 = read
-    # error (UNKNOWN — silence). `|| grc=$?` is the only capture form
-    # that keeps grep's real rc under `set -e` (a `!`-negated if would
-    # leave $? holding the negation's status).
+    # error (UNKNOWN — silence). `|| grc=$?` keeps grep's real rc under
+    # `set -e` (a `!`-negated if would leave the negation's status).
     _podman_grc=0
     grep -qE '^(podman|/usr/bin/podman) \([^)]*\)$' "$_aa_profiles" 2>/dev/null || _podman_grc=$?
     if (( _podman_grc == 0 )); then
-        echo "AppArmor: podman labeled; confirm pasta compatibility: sudo $prefix/egresslock-setup --apparmor-check"
+        echo "AppArmor: podman labeled; confirm pasta compatibility: sudo $prefix/egresslock-setup apparmor check"
     elif (( _podman_grc == 1 )); then
-        echo "AppArmor: podman unlabeled; --apparmor-add not needed on this host"
+        echo "AppArmor: this host's podman is not confined by AppArmor, so no extra AppArmor rule is needed — no action needed."
     fi
 fi
 echo
 echo "next step — per-account setup (from the installed kit):"
-echo "  sudo $prefix/egresslock-setup --account <acct> --init-conf --enable"
-echo "  (or --conf <conf> for a copy-step conf; the starter ships from"
-echo "  examples/ when the dest conf is missing — never overwritten)"
+echo "  sudo $prefix/egresslock-setup init --account <acct> --init-conf --enable"
+echo "  (or --from <conf> to import a pair; import never overwrites a"
+echo "  differing/torn dest — use import --force deliberately; the starter"
+echo "  ships from examples/ only when the dest conf is missing)"
 echo
 echo "or try the engine directly:  $prefix/egresslock --help"

@@ -77,8 +77,8 @@ podman logs egresslock-gateway-main --tail 5
 systemctl list-timers 'egresslock-verify@*' --no-pager
 # Last verify run (exit 0 + 'verified (ensured)' = healthy; FAILED = drift, heal with ensure)
 systemctl status egresslock-verify@<account>.service --no-pager -n 10
-# Recent verify log lines
-journalctl -u egresslock-verify@<account>.service --no-pager -n 10
+# Recent verify log lines (the system journal — this one needs root)
+sudo journalctl -u egresslock-verify@<account>.service --no-pager -n 10
 ```
 
 ## What "healthy" looks like

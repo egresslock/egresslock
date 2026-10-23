@@ -6,7 +6,7 @@
 podman unshare --rootless-netns true                # as the account
  ├─ rc 0 → not this page (see ../troubleshooting.md index)
  └─ rc != 0 ('kill network process: permission denied')?
-      ├─ sudo egresslock-setup --apparmor-check
+      ├─ sudo egresslock-setup apparmor check
       │    ├─ "podman label: labeled" + "pasta amendment: required on
       │    │      this host"
       │    │      → apply the amendment (Fix below), then re-probe
@@ -28,7 +28,7 @@ Error: rootless netns: kill network process: permission denied
 ```
 
 The engine's preflight message emits the one-line fix itself
-(`sudo egresslock-setup --apparmor-add`); this page is the deep
+(`sudo egresslock-setup apparmor add`); this page is the deep
 diagnosis.
 
 ## Diagnosis
@@ -70,7 +70,7 @@ long-lived stale holder masks the bug (podman reuses the netns without
 signaling) — fresh boots, `sudo -u`, systemd user timers, and CI
 typically have no holder.
 
-`egresslock-setup --apparmor-check` reports the actual state on your
+`egresslock-setup apparmor check` reports the actual state on your
 host; the matrix below explains why it differs between hosts.
 
 ## Affected OS / stack matrix (snapshot, verified 2026-09-10)
@@ -125,8 +125,8 @@ often `/etc/apparmor.d/usr.bin.pasta`, but it may ship as
 `/etc/apparmor.d/pasta` — never assume the path exists):
 
 ```sh
-sudo /opt/egresslock/egresslock-setup --apparmor-add
-#   (.deb hosts: sudo egresslock-setup --apparmor-add)
+sudo /opt/egresslock/egresslock-setup apparmor add
+#   (.deb hosts: sudo egresslock-setup apparmor add)
 # (apply notes: apparmor/README.md)
 ```
 
@@ -175,7 +175,7 @@ hosts only** (matrix above): Ubuntu >= 25.10 by default. It is an
 install prerequisite on those hosts, not a kit bug. The engine probes
 before every netns-touching command and emits the `--apparmor-add`
 guidance itself, so the first signal of a broken shared netns is
-actionable; the setup check (`egresslock-setup --apparmor-check`, the
+actionable; the setup check (`egresslock-setup apparmor check`, the
 install-kit advisory line) reports whether this host needs the
 amendment at all.
 

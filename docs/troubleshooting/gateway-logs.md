@@ -33,11 +33,20 @@ allow-grammar entry, de-duplicated, most recent last:
   `:80` port. An explicit `:port` in the URL is preserved (`:443`
   collapses to bare `host`).
 
+Denies Squid logged only after the client closed a `CONNECT` early
+(`TCP_DENIED_ABORTED/403`) are listed the same way.
+
 By default `denied` omits entries the allowlist already covers **on
 that same port**, so it shows only still-blocked destinations; `denied
 <profile> --all` prints the raw de-duplicated list. Both views only
 look at the last **14 days** by default —
 `denied <profile> --days 0` is the full log.
+
+The read itself is byte-capped (`EGRESSLOCK_DENIED_MAX_BYTES`, default
+32 MiB): when the log exceeds the cap, only the **newest** bytes are
+read (a stderr note names the cap and the remedy; set
+`EGRESSLOCK_DENIED_MAX_BYTES=0` for the full log). See
+[denied-log-cap](denied-log-cap.md).
 
 ## Reading the raw access log
 
@@ -47,6 +56,8 @@ Native Squid fields: `ts elapsed client code bytes method url ...`
   request denied; `denied` reports it as `host:80`.
 - `TCP_DENIED/403 ... CONNECT host:443` — an **HTTPS** request denied;
   `denied` reports it as `host`.
+- `TCP_DENIED_ABORTED/403 ...` — the same denial logged after the
+  client closed the connection early; `denied` reports it too.
 - `TCP_TUNNEL/200 ... CONNECT host:443` — an allowed HTTPS tunnel.
 
 `GET` vs `CONNECT` matters: a plain-`GET` denial means the client used

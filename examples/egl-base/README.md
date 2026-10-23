@@ -1,7 +1,7 @@
 # egl-base — shared example image
 
 A small Debian image with the clients the quickstarts use (curl, ssh,
-dig, ping, rsync). Built from the same pinned Debian base as the
+git, dig, ping, rsync, ncat). Built from the same pinned Debian base as the
 gateway. Build it once per account; later pages assume the tag exists.
 
 ## Build
@@ -33,18 +33,18 @@ First run (image missing) prints:
 
 ```text
 egl-base image: missing (localhost/egl-base:latest)
->> Building localhost/egl-base:latest FROM a29215f6a35e
+>> Building localhost/egl-base:latest FROM 62bd423aeee9
 >> Done: localhost/egl-base:latest
 ```
 
-(`a29215f6a35e` is the first 12 hex of the deployed Debian base pin
+(`62bd423aeee9` is the first 12 hex of the deployed Debian base pin
 in this Containerfile. podman build output sits between the Building
 and Done lines.)
 
 Re-run when current:
 
 ```text
-already built from deployed pin a29215f6a35e — use --force to rebuild
+already built from deployed pin 62bd423aeee9 — use --force to rebuild
 ```
 
 `--force` rebuilds even when current (refreshes the apt packages
@@ -63,8 +63,8 @@ podman build -t localhost/egl-base:latest \
 ## What's inside
 
 Debian 13 slim plus: `ca-certificates`, `curl`, `dnsutils` (`dig`),
-`iputils-ping`, `openssh-client`, `rsync`. No compilers or build
-toolchains.
+`git`, `iputils-ping`, `ncat`, `openssh-client`, `rsync`. No compilers
+or build toolchains.
 
 ## Extend it
 
@@ -83,5 +83,7 @@ workload containers, not to the build).
 
 Re-run the helper as the account. If this release moved the
 Debian base, it reports stale and rebuilds; if the pin did not
-move, it prints the up-to-date line. See
+move, it prints the up-to-date line. A release that changes the
+image's packages without moving the base cannot be detected — the
+release notes say when; rebuild that once with `--force`. See
 [The gateway image](../../docs/reference/gateway-image.md).

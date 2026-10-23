@@ -64,10 +64,9 @@ mkdir -p "$HOME/work/agent"
 # + layer 3 (disposable rootfs) — see the container hardening baseline
 egresslock ensure main \
  && egresslock verify main \
- && egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env \
  && podman run --rm -it --name agent-opencode \
     --network="$(egresslock network main)" \
-    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    --env-file="$(egresslock proxy-env main --out)" \
     --cap-drop=all --security-opt=no-new-privileges \
     --userns=keep-id \
     --passwd-entry="$USER:x:$(id -u):$(id -g)::/tmp/home:/bin/sh" \

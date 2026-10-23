@@ -70,10 +70,9 @@ mkdir -p "$HOME/work/build"
 # (disposable rootfs) — see the container hardening baseline
 egresslock ensure build \
  && egresslock verify build \
- && egresslock proxy-env build > /run/user/$(id -u)/egresslock-proxy-build.env \
  && podman run --rm -it --name safe-build \
     --network="$(egresslock network build)" \
-    --env-file=/run/user/$(id -u)/egresslock-proxy-build.env \
+    --env-file="$(egresslock proxy-env build --out)" \
     --cap-drop=all --security-opt=no-new-privileges \
     --userns=keep-id \
     --passwd-entry="$USER:x:$(id -u):$(id -g)::/tmp/home:/bin/sh" \

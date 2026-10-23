@@ -121,6 +121,7 @@ name with hyphens replaced by underscores.
 - Non-gateway profiles have no proxy path at all — the 403 row of the
   matrix cannot arise there; everything is direct.
 - IPv4-literal pins never emit `drift:` (there is no DNS to move);
-  hostname pins do (T13) — re-run `ensure` on a `drift:` warning.
+  hostname pins do on a set change (T13) — re-run `ensure` on a
+  `drift:` warning.
 - Rule order is safe by construction: allow-host accepts compile
   before the terminal drop.

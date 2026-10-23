@@ -18,7 +18,7 @@ On unaffected hosts (stock Debian, noble, Fedora/RHEL, ...) the
 denial cannot fire; the amendment is harmless there and applied
 anyway as future-proofing — a label can return (Debian removed its
 stub podman profile once; the upstream stub still exists).
-`egresslock-setup --apparmor-check` tells you which case your host
+`egresslock-setup apparmor check` tells you which case your host
 is in.
 
 ## Why this file
@@ -44,8 +44,8 @@ sudo aa-status | awk '/profiles are in enforce mode/{s=1} /profiles are in compl
 ```
 
 ```sh
-sudo /opt/egresslock/egresslock-setup --apparmor-add
-#   (.deb hosts: sudo egresslock-setup --apparmor-add)
+sudo /opt/egresslock/egresslock-setup apparmor add
+#   (.deb hosts: sudo egresslock-setup apparmor add)
 ```
 
 The profile file is **distro-dependent**: it may be
@@ -74,8 +74,8 @@ the pasta profile conffile, so the next `pasta` package upgrade will
 flag `/etc/apparmor.d/usr.bin.pasta` (or `pasta`) as locally modified
 and prompt you (or, with unattended-upgrades / `force-confnew`, may
 silently take the new file and drop the include). Keep the local
-include when prompted, or re-run `sudo egresslock-setup --apparmor-add`
-after the upgrade; `egresslock-setup --apparmor-check` reports the gap.
+include when prompted, or re-run `sudo egresslock-setup apparmor add`
+after the upgrade; `egresslock-setup apparmor check` reports the gap.
 
 The rule is applied **append-only** and **marker-scoped**:
 it lands between `# begin egresslock-setup --apparmor` and
@@ -92,7 +92,7 @@ podman unshare --rootless-netns true
 ```
 
 Diagnose the amendment state (read-only, no root needed) with
-`egresslock-setup --apparmor-check`; it reports
+`egresslock-setup apparmor check`; it reports
 `AppArmor: enabled|not enabled` and `pasta enforcement:
 enforced|NOT enforced|unknown|n/a` on two lines, then the podman
 label tri-state and the amendment verdict (`podman label:
@@ -132,7 +132,7 @@ grep -l 'local/pasta\|local/usr.bin.pasta' /etc/apparmor.d/usr.bin.pasta /etc/ap
 { echo ""; echo "# begin egresslock-setup --apparmor (manual)"; cat usr.bin.pasta.local; echo "# end egresslock-setup --apparmor (manual)"; } \
     | sudo tee -a /etc/apparmor.d/local/usr.bin.pasta >/dev/null   # or .../pasta
 sudo apparmor_parser -r /etc/apparmor.d/usr.bin.pasta   # reload the PROFILE FILE (or .../pasta)
-# (marker-scoped: `egresslock-setup --apparmor-remove` strips any
+# (marker-scoped: `egresslock-setup apparmor remove` strips any
 #  block between the begin/end markers, manual ones included)
 ```
 
@@ -142,8 +142,8 @@ Preferred — marker-scoped, keeps operator lines, never deletes the
 file:
 
 ```sh
-sudo /opt/egresslock/egresslock-setup --apparmor-remove
-#   (.deb hosts: sudo egresslock-setup --apparmor-remove)
+sudo /opt/egresslock/egresslock-setup apparmor remove
+#   (.deb hosts: sudo egresslock-setup apparmor remove)
 ```
 
 `--apparmor-remove` strips the marker block from the **resolved local include**

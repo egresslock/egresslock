@@ -39,8 +39,8 @@ Install + first run on the target host:
 
 ```sh
 sudo dpkg -i ./egresslock_<VERSION>_all.deb
-sudo egresslock-setup --account <acct> --init-conf --enable
-sudo egresslock-setup --apparmor-check   # confirm pasta AppArmor compatibility on this host
+sudo egresslock-setup init --account <acct> --init-conf --enable
+sudo egresslock-setup apparmor check   # confirm pasta AppArmor compatibility on this host
 ```
 
 The account setup needs no repo and no `--prefix` on a .deb-only host
@@ -83,7 +83,7 @@ network, then run `egresslock teardown --runtime` as the account
 enforcement but does not remove non-kit-named workloads. Do this for
 EVERY account with kit runtime — including accounts without an
 enabled verify timer — before the host-global steps
-(`egresslock-setup --apparmor-remove` if you applied the pasta
+(`egresslock-setup apparmor remove` if you applied the pasta
 amendment, then package removal). Podman state,
 account data (`~/.config/egresslock`), and the pasta local snippet are
 never touched by dpkg; then see the full order, the safety
@@ -100,7 +100,7 @@ fully gone.
 
 tar -xzf egresslock_<VERSION>.tar.gz && cd egresslock
 sudo ./install-kit.sh --prefix /opt/egresslock
-sudo /opt/egresslock/egresslock-setup --account <acct> --init-conf --enable
+sudo /opt/egresslock/egresslock-setup init --account <acct> --init-conf --enable
 ```
 
 The tarball is the full kit tree (engine, helpers, gateway, examples,
@@ -128,4 +128,6 @@ user.)
 
 Both scripts are exercised by the kit harness
 (`tests/test-kit.sh`; run all egresslock
-tests with `tests/run.sh`).
+tests with `tests/run.sh` — the default full battery; `--track fast`
+(EGL-270) is the per-push CI/iteration track and skips the registered
+slow sections).

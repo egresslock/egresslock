@@ -2,59 +2,43 @@
 #
 # tests/test-docs.sh — public docs ship-gate (EGL-163): every relative
 # link in the shipped markdown set must resolve to an existing file.
-# Broken links are a ship gate, so this harness runs in the default
-# battery (the `test-*.sh` glob includes it) and is selectable with
-# `tests/run.sh --harness docs`.
+# Broken links are a ship gate, so this runs in the default battery
+# (`test-*.sh` glob) and via `tests/run.sh --harness docs`.
 #
-# Scope (EGL-163-D2, first cut): exactly the markdown the public
-# snapshot stages — README.md, SECURITY.md, CHANGELOG.md,
-# packaging/README.md, apparmor/README.md, docs/** and examples/**.
-# docs/tickets/ and docs/BOARD.md are excluded (the snapshot's
-# process-file cut — the repo-tree sweep must mirror the shipped set);
-# docs/lp-*.txt and docs/debian-*.txt are not markdown and are not
-# swept (do not widen).
-#
-# What is a link: a markdown inline `](target)` occurrence or a
-# reference definition `]: target` whose target is RELATIVE — no
-# scheme (http/https/mailto/…), no leading `/`, no bare `#anchor`.
-# `.md` and non-md targets both (LICENSE and apparmor/README.md are
-# linked from README.md today). Validation is file existence with the
-# `#fragment` stripped — no heading/anchor parsing (a later widening).
-# A target whose lexically normalized path is not inside `$TREE_ROOT`
-# (the scan root) is a FAIL. Text inside ``` / ~~~ fences and
-# 4-space/tab-indented lines is literal, not a rendered link, and is
-# never swept.
-#
-# The self-test below exercises the extractor on a synthetic tree,
-# including the EGL-160 defect class: the recorded ad-hoc sweep
-# one-liner kept a trailing `)` on every extracted target
-# (`sed 's/](//'`), so every existence check failed wrongly. This
-# extractor's capture `[^)]*` cannot stick a `)` to a target; the
-# self-test proves it on a real target followed by trailing prose.
-#
+# Scope (EGL-163-D2, first cut): exactly the markdown the public snapshot
+# stages — README.md, SECURITY.md, CHANGELOG.md, packaging/README.md,
+# apparmor/README.md, docs/** and examples/**; docs/tickets/ and
+# docs/BOARD.md are excluded (the snapshot's process-file cut), and
+# docs/lp-*.txt / docs/debian-*.txt are not markdown (do not widen).
+# A link is an inline `](target)` or reference definition `]: target`
+# whose target is RELATIVE — no scheme, leading `/`, or bare `#anchor`;
+# `.md` and non-md targets both. Validation is file existence with
+# `#fragment` stripped (no heading parsing); a lexically normalized
+# target outside `$TREE_ROOT` FAILs. Fenced or 4-space/tab-indented text
+# is literal and never swept.
+# The self-test runs the extractor on a synthetic tree, including the
+# EGL-160 trailing-`)` defect (`sed 's/](//'` made every check fail); the
+# `[^)]*` capture cannot stick a `)` to a target.
 # Sourcing tests/lib.sh reuses the shared counters/check/skip/tree-tag
-# boilerplate (EGL-163-D3); its mock env is inert here (a mktemp and a
-# few mock files — no engine invocation, no AGENT_RUN). Run:
+# boilerplate (EGL-163-D3); its mock env is inert here. Run:
 #   bash tests/test-docs.sh   (or tests/run.sh --harness docs)
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 docs_root="$TREE_ROOT"   # scan root: the repo root (cwd-independent)
 
-# Link regexes live in variables: an unquoted regex inside [[ =~ ]] is a
-# bash syntax error, and a quoted one is matched literally.
+# Link regexes live in variables: unquoted in [[ =~ ]] is a syntax error;
+# quoted would match literally.
 docs_re_inline='\]\(([^)]*)\)'
 docs_re_refdef='^[[:space:]]*\[[^]]+\]:[[:space:]]*([^[:space:]]+)'
 docs_re_scheme='^[A-Za-z][A-Za-z0-9+.-]*:'
 
 # --- link validation ----------------------------------------------------
 docs_norm=""
-# docs_normalize <absolute-path>: pure lexical collapse of `.` and
-# `seg/..` (an above-`/` pop that cannot leave the `out=("")` root
-# sentinel is a no-op, leaving docs_norm empty). Containment is the
-# caller's prefix/strip test against the scan root (docs_root) — no
-# realpath, no symlink following; existence is the only thing checked
-# afterwards.
+# docs_normalize <absolute-path>: lexical collapse of `.` and `seg/..`
+# (an above-`/` pop cannot leave the `out=("")` sentinel; docs_norm stays
+# empty). Containment is the caller's prefix test against docs_root — no
+# realpath, no symlink following; existence is checked afterwards.
 docs_normalize() {
     local seg
     local -a segs=() out=("")
@@ -77,11 +61,10 @@ docs_normalize() {
 docs_pass=0
 docs_fail=0
 
-# docs_check_target <source-file> <raw-target> — classify and validate
-# one occurrence (an inline capture or a reference definition target).
-# Broken target: one FAIL line naming the source file and the original
-# target; the sweep continues (never aborts). Out-of-cut shapes (empty,
-# bare anchor, absolute `/…`, scheme'd) are skipped, not FAILs (D2).
+# docs_check_target <source-file> <raw-target> — validate one occurrence.
+# A broken target prints one FAIL naming the source and original target;
+# the sweep continues. Out-of-cut shapes (empty, bare anchor, absolute
+# `/…`, scheme'd) skip, not FAIL (D2).
 docs_check_target() {
     local f="$1" t="$2" t2 dir base
     t="${t#"${t%%[![:space:]]*}"}"    # ltrim (an inline capture may hold spaces)
@@ -93,10 +76,9 @@ docs_check_target() {
     [[ -z "$t2" ]] && return
     dir="${f%/*}"; [[ "$dir" == "$f" ]] && dir="."
     docs_normalize "$docs_root/$dir/$t2"
-    # Containment bar: inside-or-equal the scan root only (the
-    # "$docs_root"/* form, never a bare prefix — a sibling directory
-    # must not classify inside); empty docs_norm (an above-`/` pop)
-    # is outside. The D2 FAIL wording covers both escape shapes.
+    # Containment bar: inside-or-equal the scan root only (`"$docs_root"/*`,
+    # never a bare prefix); empty docs_norm is outside. The D2 FAIL wording
+    # covers both escape shapes.
     if [[ -z "$docs_norm" || ( "$docs_norm" != "$docs_root" && "$docs_norm" != "$docs_root"/* ) ]]; then
         docs_fail=$(( docs_fail + 1 ))
         echo "FAIL: $f: relative link '$t' resolves outside the repository root"
@@ -109,10 +91,9 @@ docs_check_target() {
 }
 
 # docs_sweep <file>... — paths relative to docs_root. Resolved
-# occurrences increment docs_pass; broken ones print FAIL lines and
-# increment docs_fail. Call it directly (streaming, counters live) for
-# the main sweep; under a command substitution the counters are lost,
-# so the self-test asserts on the captured output instead.
+# occurrences increment docs_pass; broken ones print FAIL and increment
+# docs_fail. Call directly (counters live); under command substitution the
+# counters are lost, so the self-test asserts on captured output.
 docs_sweep() {
     local f line rest t occ
     local infence
@@ -143,9 +124,8 @@ docs_sweep() {
 }
 
 # docs_require_nonempty — fail closed when the shipped-file list is empty
-# (EGL-194 item 3): a failed `find` / missing staged roots used to yield a
-# vacuously green `0 passed, 0 failed` sweep. The increment + FAIL line is
-# the signal; the harness's final `[[ "$docs_fail" -eq 0 ]]` yields rc 1.
+# (EGL-194 item 3): a failed `find` used to yield a vacuous green sweep.
+# The FAIL line + increment is the signal; the final docs_fail check is rc 1.
 docs_require_nonempty() {
     if (( ${#docs_files[@]} == 0 )); then
         docs_fail=$(( docs_fail + 1 ))
@@ -155,10 +135,9 @@ docs_require_nonempty() {
     return 0
 }
 
-# --- self-test (EGL-163-D2): synthetic tree; proves the extractor on
-# the EGL-160 defect class and the out-of-cut skips before the real
-# sweep runs. Asserts read the captured output (the sweep runs in a
-# command substitution here, so the shared counters are not consulted).
+# --- self-test (EGL-163-D2): synthetic tree; proves the EGL-160 defect
+# class and out-of-cut skips before the real sweep. Asserts read captured
+# output (the sweep runs in a command substitution; shared counters unused).
 sd="$TESTROOT/docs-selftest"
 mkdir -p "$sd/sub"
 printf 'see [ok](real.md). trailing prose stays outside the target\n' > "$sd/page.md"
@@ -219,10 +198,9 @@ else
     a_docs fail "self-test: climb-out-of-TREE_ROOT escape not flagged: $st_climb"
 fi
 
-# EGL-194 item 3 self-test: an empty shipped-file list fails closed (the
-# guard increments docs_fail and names the empty list). Do not wrap the
-# helper in $() — that is a subshell and would drop the docs_fail
-# increment; the counters are restored after the observation either way.
+# EGL-194 item 3 self-test: an empty shipped-file list fails closed. Do
+# not wrap the helper in $() — the subshell would drop the docs_fail
+# increment; counters are restored after the observation either way.
 docs_fail_saved=$docs_fail
 docs_files=()
 docs_require_nonempty >"$sd/empty.out" || true

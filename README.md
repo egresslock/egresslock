@@ -70,7 +70,10 @@ normative security claims and their limits).
 
 ### Requirements
 
-1. Linux with **systemd** and unprivileged user namespaces enabled
+1. **A Linux host or VM** 
+   * **systemd**
+   * which permits unprivileged user, network, and mount namespace creation
+   * up-to-date with security patches
 
 ### One-step install
 
@@ -100,14 +103,13 @@ rm -f ./packaging/egresslock_*_all.deb
 sudo dpkg -i ./packaging/egresslock_*_all.deb
 
 # --- apply the AppArmor pasta policy only if needed (root) --------------
-sudo egresslock-setup --apparmor-check | grep Summary
-sudo egresslock-setup --apparmor-check | grep -q "CHECK FAILED" && sudo egresslock-setup --apparmor-add
+sudo egresslock-setup apparmor check | grep Summary
+sudo egresslock-setup apparmor check | grep -q "CHECK FAILED" && sudo egresslock-setup apparmor add
 
 # --- set up the account: starter conf + drift timer + linger (root) ------
-# quiet run: the full stream (incl. the gateway image build) goes to
-# the log; the six-step map is what matters
-sudo egresslock-setup --init-conf --enable --account "$ACCOUNT" > ~/egresslock-setup.log 2>&1
-grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
+# the run is quiet: the six-step map is what matters; the gateway image
+# build stream goes to the account's ~/.config/egresslock/gateway-build.log
+sudo egresslock-setup init --init-conf --enable --account "$ACCOUNT"
 
 # --- build the policy and the shared example image (as the account) -----
 sudo -iu "$ACCOUNT" -- egresslock ensure main
@@ -117,20 +119,32 @@ sudo -iu "$ACCOUNT" -- /usr/share/egresslock/examples/egl-base/build-egl-base
 <details><summary>Expected output (the lines that matter):</summary>
 
 <pre>
-$ grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
+$ sudo egresslock-setup init --init-conf --enable --account egl-runner
+egresslock-setup: --init-conf: wrote starter /home/egl-runner/.config/egresslock/main.conf (+ /home/egl-runner/.config/egresslock/main-allowlist)
 1) validate conf … OK
 2) write unit.env … OK
+enabling linger for egl-runner
 3) linger … OK
 4) user manager … OK
+egresslock-setup: building the gateway image — first run downloads the base image and packages; a few minutes. Build log: /home/egl-runner/.config/egresslock/gateway-build.log
 5) gateway image … OK
+enabling verify timer for egl-runner (egresslock-verify@egl-runner.timer)
 6) timer … OK
+egresslock-setup: unit.env written for egl-runner -> /home/egl-runner/.config/egresslock/unit.env
+egresslock-setup: the scheduled check will verify every profile
+egresslock-setup: account 'egl-runner' is ready — it can ensure profiles now
+next steps (as the account):
+  sudo -iu egl-runner
+  egresslock ensure main
+  egresslock verify main
+read more: egresslock-setup help
 $ sudo -iu egl-runner -- egresslock ensure main
 created network egresslock-main (10.199.0.0/24)
 started anchor egresslock-anchor-main
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
 $ sudo -iu egl-runner -- /usr/share/egresslock/examples/egl-base/build-egl-base
->> Building localhost/egl-base:latest FROM a29215f6a35e
+>> Building localhost/egl-base:latest FROM 62bd423aeee9
 >> Done: localhost/egl-base:latest
 </pre>
 </details>
@@ -157,18 +171,23 @@ explains the DNS exception and other limits.
 ACCOUNT=egl-runner
 # the quoted command is one single line on purpose — a multi-line
 # sh -c payload breaks if a paste collapses the newlines
-sudo -iu "$ACCOUNT" -- sh -c 'egresslock ensure main && egresslock proxy-env main > /run/user/"$(id -u)"/egresslock-proxy-main.env && podman run --rm -it --cap-drop=all --security-opt=no-new-privileges --network="$(egresslock network main)" --env-file=/run/user/"$(id -u)"/egresslock-proxy-main.env localhost/egl-base:latest sh'
+sudo -iu "$ACCOUNT" -- sh -c 'egresslock ensure main && podman run --rm -it --cap-drop=all --security-opt=no-new-privileges --network="$(egresslock network main)" --env-file="$(egresslock proxy-env main --out)" localhost/egl-base:latest sh'
 ```
 
 A shell in an `egl-base` container on the profile network. The launch
 runs only if `ensure` succeeds; application connections follow your
 existing policy (denied by the fresh starter, apart from DNS above).
+(`--env-file="$(egresslock proxy-env main --out)"` regenerates the
+env file mode 0600 under the account's private runtime dir on every
+run; an explicit `--out=<path>` elsewhere is refused if its directory
+is world-writable — a directory your group can also write to is
+accepted for now — the runtime-dir default always qualifies.)
 
 <details><summary>Expected output:</summary>
 the container's shell prompt — you are inside the locked network:
 
 <pre>
-$ sudo -iu egl-runner -- sh -c 'egresslock ensure main && egresslock proxy-env main > … && podman run … sh'
+$ sudo -iu egl-runner -- sh -c 'egresslock ensure main && podman run … sh'
 gateway 'egresslock-gateway-main' ready (already converged, not restarted)
 profile 'main' ready (network egresslock-main, policy verified)
 root@9badc0ffee67:/#
@@ -212,12 +231,14 @@ exceptions stated, never silent):
 - [Supply-chain-safe build (compilation lockdown)](examples/recipes/supply-chain-safe-build.md) — constrain compilers/builders to a tiny allowlist.
 - [Malware analysis](examples/recipes/malware-analysis.md) — detonate samples in an isolated container with a deny-all profile, allow only the C2/sinkhole hosts you choose.
 - [CI runner (forgejo-runner)](examples/recipes/ci-runner.md) — restricted runner profile; job containers attached to the profile network with the gateway proxy.
+- [Fleet deploy (one pair, many hosts)](examples/recipes/fleet-deploy.md) — push one conf+allowlist pair to N matching hosts with `egresslock-setup import` + `init`; the account-side `ensure` that makes a re-pin take effect.
 
 ### Specific program or configuration
 
 - [Install opencode via npm](examples/recipes/opencode-npm-install.md) — tested path: apt + npm inside a `debian:13-slim` container reaching exactly deb.debian.org / registry.npmjs.org / github.com / openrouter.ai.
 - [Install hermes via curl | bash](examples/recipes/hermes-curl-install.md) — tested path: hermes (Nous Research) inside a `debian:13-slim` container reaching its install chain (Astral/uv, PyPI CDN, github.com).
 - [Local LLM (Ollama, etc.)](examples/recipes/local-llm.md) — reach an LLM server on the host or LAN from a container: the localhost patterns, raw-IP `allow-host`, and the long-request timeout knob.
+- [GitHub from a container](examples/recipes/github.md) — GitHub when `github.com`'s addresses rotate: clone/push over HTTPS through the gateway (no pin at all), or SSH via a name tunnel (`ssh.github.com:443`) or a pinned IPv4 pool.
 
 ## Reference
 
@@ -262,9 +283,18 @@ exceptions stated, never silent):
   — the per-layer health-check and inspection commands.
 - **[Proxy clients](docs/reference/proxy-clients.md)** — pointing
   proxy-unaware tools (Gradle, Maven, npm, ...) at the gateway.
+- **[Rotating names](docs/reference/rotating-names.md)** — a name whose
+  DNS serves one rotating address per query (`github.com` over SSH): why
+  the pin never stabilizes, how to find the pool's addresses, and the
+  ways out (`allow` by name, literals, or a tunnel).
 - **[Engine, scripts, and environment](docs/reference/scripts-and-environment.md)**
   — engine env overrides, config resolution, `unit.env`, and script
   defaults.
+- **[File locations](docs/reference/file-locations.md)** — where
+  egresslock keeps the account's files: profile confs and allowlists,
+  `unit.env`, `<profile>.pins`, the engine lock, the proxy env file,
+  and the temp files a killed run can leave behind (mode, lifecycle,
+  backup/cleanup).
 
 ### Troubleshooting
 
@@ -279,7 +309,10 @@ error.
 
 - The test battery is `bash tests/run.sh`, run from the repository
   root; it runs every `tests/test-*.sh` suite with no root, Podman, or
-  nftables required.
+  nftables required. For a quicker iteration loop, `bash tests/run.sh
+  --track fast` skips the registered slow sections (named `SKIP:` lines
+  keep the `RESULTS TOTAL` exact; `bash tests/run.sh` — the default —
+  still runs everything).
 - Found a vulnerability or a bypass? Report it privately — see
   [SECURITY.md](SECURITY.md). Do not open a public issue for it.
 - Other bug reports and changes go through public issues and pull

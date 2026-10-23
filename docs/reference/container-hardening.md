@@ -17,7 +17,8 @@ invariant I5, threats T9 and T10).
 ## Layer 1 — always on, every workload
 
 Every container on a profile network carries both of these, no
-exceptions:
+exceptions (one install-shell case adds five capabilities back on
+top — below; the flags themselves are never dropped):
 
 ```
 --cap-drop=all --security-opt=no-new-privileges
@@ -35,6 +36,18 @@ exceptions:
   launcher obligation).
 - `--security-opt=no-new-privileges` prevents privilege escalation via
   setuid binaries inside the container.
+
+**Install shells that run `apt` add five capabilities back — the
+baseline's one stated add-back.** With `--cap-drop=all` alone,
+`apt` fails `Operation not permitted`: it cannot drop to its
+sandbox user to serve downloads, and it cannot set file ownership
+during install. Such shells therefore carry
+`--cap-add=SETUID,SETGID,CHOWN,DAC_OVERRIDE,FOWNER` (the layer-1
+flags above are never dropped for it). The five restore
+identity/file operations only — none is `NET_ADMIN` or `NET_RAW`,
+so the network-policy line above is unchanged. State it in the
+recipe, with this reason. Host-side `podman build` needs no
+capabilities (a build is not a workload).
 
 ## Layer 2 — when the recipe bind-mounts a host directory
 
@@ -90,9 +103,12 @@ workloads must write the container rootfs: the install/eval shells
 0. For those, `--read-only` and layer 2's keep-id are deliberately
 **not** shipped — and the recipe says so, with the reason. An
 unexplained missing flag looks like an oversight; a stated exception
-is a decision. (keep-id specifically would fight these workloads:
-uid-remapped package managers cannot write the image root paths they
-expect to own.)
+is a decision. A shell that runs `apt` in the container also carries
+layer 1's five-capability add-back — the package manager's sandbox
+drop and file-ownership calls fail under plain `--cap-drop=all`.
+(keep-id specifically would fight these workloads: uid-remapped
+package managers cannot write the image root paths they expect to
+own.)
 
 ## Fail closed: `ensure` + `verify` before `podman run`
 
@@ -125,11 +141,13 @@ Not hardening, but part of the same block, defined once here:
 - `--network="$(egresslock network <profile>)"` — attach to the
   profile network; **only** there does the fail-closed policy apply
   (never `--network=host` or a second network).
-- `--env-file=/run/user/$(id -u)/egresslock-proxy-<profile>.env` —
-  wire the proxy env in as one file (`egresslock proxy-env <profile>
-  > /run/user/$(id -u)/egresslock-proxy-<profile>.env` immediately
-  before `podman run`; the account's private runtime dir — not a
-  world-writable tmp; regenerate after a policy change).
+- `--env-file="$(egresslock proxy-env <profile> --out)"` — wire the
+  proxy env in as one file (`--out` writes it immediately before
+  `podman run`: mode 0600, the account's private runtime dir — not a
+  world-writable tmp; regenerate after a policy change; an explicit
+  `--out=<path>` elsewhere is refused if its directory is
+  world-writable — a directory your group can also write to is
+  accepted for now — the runtime-dir default always qualifies).
 - **Never** bind-mount the account's home (or
   `~/.config/egresslock/`) into a workload — policy files must not
   enter the workload filesystem (I5/T10 in the threat model).

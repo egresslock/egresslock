@@ -5,11 +5,9 @@
 #
 # Supply chain: the base is pinned by digest in gateway/Containerfile
 # (docker.io/library/debian:13-slim@sha256:...) so a rebuild cannot
-# silently float to new base content. The `squid` apt package stays
-# UNPINNED on purpose: rebuilds take distro security updates for squid.
-# The pinned base is the opposite: its preinstalled libssl3t64/openssl
-# only move when the digest is refreshed — update the pin deliberately
-# (new digest = new recorded review).
+# float to new base content; refresh the digest deliberately (new digest
+# = new recorded review). The `squid` apt package stays UNPINNED on
+# purpose so rebuilds take distro security updates.
 #
 # Options:
 #   -h, --help   print this help
@@ -19,7 +17,7 @@
 #
 # Defaults that are not parameter-changeable:
 #   - builds with --format docker: the OCI image format silently drops
-#     HEALTHCHECK (on-host finding)
+#     HEALTHCHECK (an OCI format limitation)
 #   - build context: the gateway/ directory NEXT TO THIS SCRIPT
 #     (Containerfile, squid.conf, entrypoint) — the repo root, an
 #     installed prefix, or a tarball tree, whatever the script is
@@ -43,7 +41,7 @@ gw_dir="$(cd "$(dirname "$0")" && pwd)/gateway"
 
 echo ">> Building ${IMAGE} FROM debian:13-slim"
 # --format docker: HEALTHCHECK is not supported by the OCI image format
-# and would be silently ignored (on-host finding, ARC-5).
+# and would be silently ignored (ARC-5).
 podman build \
     --format docker \
     -t "${IMAGE}" \

@@ -1,33 +1,29 @@
 #!/usr/bin/env bash
 #
 # egresslock-verify — periodic policy verification for one account.
-# The instanced timer unit
-# `egresslock-verify@<account>.service` runs this as the account.
+# The instanced timer unit `egresslock-verify@<account>.service` runs
+# this as the account.
 #
 # Hybrid verify modes:
-#   - EGRESSLOCK_PROFILE set    -> verify exactly that profile, wired to
-#                             EGRESSLOCK_CONF (a missing network FAILS:
+#   - EGRESSLOCK_PROFILE set    -> verify exactly that profile (the
+#                             engine reads <account-home>/.config/egresslock/
+#                             <profile>.conf; a missing network FAILS:
 #                             drift/teardown signal).
 #   - EGRESSLOCK_PROFILE unset  -> bare `egresslock verify --ensured`:
 #                             verify every profile whose anchor is
 #                             running; none running exits 0 silently.
 #                             The engine aggregates every *.conf in the
-#                             account's DEFAULT confdir
-#                             (~/.config/egresslock): EGRESSLOCK_CONF is
-#                             neither passed as --config nor exported to
-#                             the engine child, or the sweep would
-#                             silently cover a single profile.
-# EGRESSLOCK_CONF is always REQUIRED here (fail-closed "account is
-# wired" sanity), but in sweep mode it is a wiring witness, not the
-# sweep scope: the engine probes the default confdir itself. Standard
-# kit layout always wires ~/.config/egresslock/<name>.conf; if unit.env
-# points at a conf OUTSIDE that directory, the sweep covers the default
-# confdir only and may not include that file.
+#                             account's fixed confdir
+#                             (<passwd-home>/.config/egresslock).
+#
+# There is no conf-path wiring: the engine does not read
+# EGRESSLOCK_CONF and it is not required here. unit.env is the wiring
+# witness the doctor checks; in named mode it carries
+# EGRESSLOCK_PROFILE.
 #
 # Environment:
 #   EGRESSLOCK_DIR     engine resolution: this var >
 #                         /opt/egresslock > this script's directory.
-#   EGRESSLOCK_CONF   profile config. REQUIRED.
 #   EGRESSLOCK_PROFILE         optional profile name (named-verify mode).
 #
 # Options:
@@ -48,20 +44,18 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     exit 0
 fi
 
-# ARC-16-D9.1 (amended, on-host gate finding): systemd's %U specifier
-# did not expand per-User= on the gate host (same failure class as %h),
-# so the unit must NOT supply XDG_RUNTIME_DIR — resolve it here from
-# the executing uid. Rootless Podman requires it to point at the
-# account's own runtime dir (/run/user/<uid>, kept alive by linger).
-# (Assigned before export so an id -u failure cannot silently mask a void
-# XDG_RUNTIME_DIR under set -eou pipefail — SC2155.)
+# ARC-16-D9.1 (amended): systemd's %U specifier does not expand per-User=
+# (same failure class as %h), so the unit must NOT supply
+# XDG_RUNTIME_DIR — resolve it here from the executing uid. Rootless
+# Podman requires the account's own runtime dir (/run/user/<uid>, kept
+# alive by linger). Assigned before export so an id -u failure cannot
+# silently mask a void XDG_RUNTIME_DIR under set -eou pipefail (SC2155).
 #
-# EGL-176-D2: the XDG_RUNTIME_DIR resolution above and the ARC-16-D4
-# engine-dir chain below are deliberately duplicated in egresslock-start
-# (its bootstrap section); the shareable surface is ~15 lines and the
-# env-guard sets differ, so a shared sourced fragment was rejected (it
-# would be a new shipped file with packaging/install/test deltas).
-# Keep the two copies in sync when editing either.
+# EGL-176-D2: this resolution and the ARC-16-D4 engine-dir chain are
+# deliberately duplicated in egresslock-start; the shareable surface is
+# ~15 lines and the env-guard sets differ, so a shared sourced fragment
+# was rejected (a new shipped file with packaging/install/test deltas).
+# Keep the two copies in sync.
 _euid="$(id -u)"
 export XDG_RUNTIME_DIR="/run/user/$_euid"
 
@@ -74,26 +68,17 @@ else
 fi
 tool="$kit_dir/egresslock"
 
-[[ -n "${EGRESSLOCK_CONF:-}" ]] || {
-    echo "egresslock-verify: EGRESSLOCK_CONF is required" >&2
-    exit 1
-}
-[[ -f "$EGRESSLOCK_CONF" ]] || {
-    echo "egresslock-verify: profile config not found: $EGRESSLOCK_CONF" >&2
-    exit 1
-}
 [[ -x "$tool" ]] || {
     echo "egresslock-verify: egresslock not found/executable: $tool" >&2
     exit 1
 }
 
 # ARC-26: same netns preflight as the engine, so the timer's
-# drift-signal failure is not misread as policy drift when the real
-# cause is a broken shared netns (e.g. enforce-mode AppArmor pasta
-# profile). Skippable in the mock harness.
-# EGL-78-D1/D3: bound the probe the same way the engine does — a wedged
+# drift-signal failure is not misread as policy drift when the cause is
+# a broken shared netns (e.g. enforce-mode AppArmor pasta profile).
+# EGL-78-D1/D3: bound the probe like the engine — a wedged
 # `podman unshare --rootless-netns true` is a named failure after 5s,
-# never an indefinite block of the drift timer.
+# never an indefinite block. Skippable in the mock harness.
 if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
     if ! command -v timeout >/dev/null 2>&1; then
         echo "egresslock-verify: timeout(1) (coreutils) is required for the netns probe but was not found in PATH" >&2
@@ -119,10 +104,7 @@ if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
 fi
 
 if [[ -n "${EGRESSLOCK_PROFILE:-}" ]]; then
-    exec "$tool" --config "$EGRESSLOCK_CONF" verify "$EGRESSLOCK_PROFILE"
+    exec "$tool" verify "$EGRESSLOCK_PROFILE"
 fi
-# Sweep mode: bare --ensured with EGRESSLOCK_CONF stripped from the
-# child env — the engine default-probes the default confdir and
-# aggregates every *.conf (passing --config or leaking EGRESSLOCK_CONF
-# would scope the whole sweep to that one file; EGL-115-D1).
-exec env -u EGRESSLOCK_CONF "$tool" verify --ensured
+# Sweep mode: bare --ensured; the engine aggregates the account confdir.
+exec "$tool" verify --ensured

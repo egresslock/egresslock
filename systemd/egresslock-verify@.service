@@ -13,8 +13,10 @@ Group=%i
 # some hosts. The kit entry scripts resolve it from the executing uid
 # (rootless Podman needs the account's own runtime dir, kept alive by
 # linger).
-# Per-account unit.env (0600, account-owned) supplies EGRESSLOCK_CONF
-# (required) and optionally EGRESSLOCK_PROFILE (named verify).
+# Per-account unit.env (0600, account-owned) is the wiring witness and
+# optionally supplies EGRESSLOCK_PROFILE (named verify). It carries no
+# conf path: the engine always reads
+# <account-home>/.config/egresslock/<profile>.conf.
 EnvironmentFile=-/home/%i/.config/egresslock/unit.env
 # The ExecStart prefix is substituted at install/deb-build time.
 ExecStart=__EGRESSLOCK_PREFIX__/egresslock-verify

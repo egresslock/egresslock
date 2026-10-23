@@ -3,8 +3,8 @@
 ## Symptom
 
 You want to check that egresslock is healthy — but there are four
-check commands (`egresslock doctor`, `egresslock-setup --doctor`,
-`egresslock-setup --apparmor-check`, `egresslock verify`) and it is
+check commands (`egresslock doctor`, `egresslock-setup doctor`,
+`egresslock-setup apparmor check`, `egresslock verify`) and it is
 not obvious which one answers your question.
 
 ## Cause
@@ -30,8 +30,8 @@ Pick the row that matches the question you actually have:
 | Layer | Question | Command | Missing → |
 |---|---|---|---|
 | Host env | Can this machine run rootless Podman + nft? | `egresslock doctor` | rc 1 |
-| Kit / account wiring | Is the kit installed and this account wired? | `egresslock-setup --doctor [--account]` | rc 1 |
-| Pasta AppArmor | Need/have the pasta signal patch? | `egresslock-setup --apparmor-check` | rc 1 |
+| Kit / account wiring | Is the kit installed and this account wired? | `egresslock-setup doctor [--account]` | rc 1 |
+| Pasta AppArmor | Need/have the pasta signal patch? | `egresslock-setup apparmor check` | rc 1 |
 | Profile runtime | Is this account's policy live? | `egresslock ensure` / `verify` | rc 1 (fail-closed) |
 
 `egresslock doctor` also carries labeled account-side advisory

@@ -7,8 +7,10 @@ replace a running gateway.
 ## What the gateway image is
 
 The gateway image (`localhost/egresslock-gateway:latest` by default) is
-built once — at account setup, or later by `egresslock build-gateway`
-(or the `egresslock-setup --build-gateway` alias) — from the deployed
+built once — at account setup (quiet; the stream goes to the account's
+`~/.config/egresslock/gateway-build.log`), or later by
+`egresslock build-gateway`
+(or the `egresslock-setup build-gateway` alias) — from the deployed
 `gateway/Containerfile`. Its base is a single Debian digest pin; the
 image never updates itself, and nothing rebuilds it automatically. A
 kit upgrade alone does not touch an existing image, and `egresslock
@@ -38,7 +40,7 @@ or before installing an update. Rebuild only when one of these is true:
 ### When does the doctor say the image is stale?
 
 `egresslock doctor` (account shell, no root) and `sudo
-egresslock-setup --doctor --account <acct>` both print the
+egresslock-setup doctor --account <acct>` both print the
 `gateway image:` row. The engine doctor is the same check without
 root or an account name. The row shows which base your
 image was built from and when. It reads `stale:` in two cases: (1)
@@ -101,7 +103,7 @@ a running gateway; a refusal at the preflight (missing or unsafe
 target image) did not — the old gateway keeps running. Check which
 happened before retrying.
 
-The build (`egresslock-setup --build-gateway` is an alias of the same
+The build (`egresslock-setup build-gateway` is an alias of the same
 verb) rebuilds the image into the account's store from the deployed
 `gateway/Containerfile`. `ensure --replace-gateway <profile>` replaces
 that profile's running gateway container with one from the rebuilt
@@ -130,11 +132,10 @@ other account's shell and replace that account's gateway profiles —
 rebuilding as one account does not deploy the image elsewhere.
 
 If you run the gateway on a non-default image (a custom
-`EGRESSLOCK_GW_IMAGE`) or select config explicitly (`--config`, or
-`EGRESSLOCK_CONF`), set the same values on **both** commands — the
+`EGRESSLOCK_GW_IMAGE`), set the same value on **both** commands — the
 build and every `ensure --replace-gateway` — the same way you already
-set them on plain `ensure`. The commands above assume the default
-image and the deployed conf.
+set it on plain `ensure`. The commands above assume the default image
+and the account's fixed confdir (`~/.config/egresslock/<profile>.conf`).
 
 ## Where the base pin and labels live
 

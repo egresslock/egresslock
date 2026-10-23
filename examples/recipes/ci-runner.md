@@ -26,17 +26,25 @@ registry-1.docker.io:443
 As root (the kit is on PATH from the .deb, or under the prefix for
 install-kit deploys):
 
+A service account can get the pair from deploy tooling without editing
+its conf; `init --from` imports it first, then validates and wires the
+named timer in one command:
+
 ```sh
-sudo egresslock-setup --account runner --init-conf --enable
+sudo egresslock-setup init --account runner \
+    --from /srv/runner/runner.conf --profile runner --enable
 ```
 
-This validates the conf, writes `unit.env`, builds the gateway image
-if missing, enables the verify timer, and enables linger (required so
+This validates the pair, writes `unit.env`, builds the gateway image if
+missing, enables the verify timer, and enables linger (required so
 `/run/user/<uid>` exists at boot for a runner started before login).
+To re-pin a changed conf later, use `import --force` and then
+`init --profile runner --enable`; split the installation from wiring
+with `import --account runner --from <path>` then
+`init --account runner --profile runner --enable`.
 
-Then replace the shipped starter conf with the runner conf above (or
-add the runner profile to it) and allow the VCS host and any
-registries the runner needs, as the account:
+Or, as the account, create the conf in place and allow the VCS host and
+the registries the runner needs:
 
 ```sh
 sudo -iu runner
@@ -45,9 +53,7 @@ egresslock allow runner vcs.example.test:443
 egresslock allow runner registry-1.docker.io:443
 ```
 
-If you would rather pin the conf path up front, the same bundle
-accepts `--conf <path> --profile <name>` — see
-[Install the kit](../../docs/setup/install.md) for that form.
+See [Install the kit](../../docs/setup/install.md) for both forms.
 
 (You may prefer a dedicated account for the runner — profiles are
 per-account.)
@@ -88,8 +94,8 @@ execs the daemon with the proxy env; `--enable` above wrote
 `unit.env` from the account's conf:
 
 ```
-# unit.env for the runner service
-EGRESSLOCK_CONF=/home/runner/.config/egresslock/runner.conf
+# unit.env for the runner service (the conf path is fixed:
+# /home/runner/.config/egresslock/runner.conf)
 EGRESSLOCK_PROFILE=runner
 ```
 

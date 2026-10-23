@@ -12,27 +12,20 @@
 #      --account.
 #   2. Removes the instanced unit templates and the installed kit from
 #      --prefix (egresslock, egresslock-start, egresslock-verify,
-#      egresslock-setup, gateway/, examples/, VERSION), then daemon-reloads.
-#      The PRE-RENAME unit names are swept the same way
-#      install-kit.sh does (agent-network-verify@.* templates + enabled
-#      instances + the legacy globals), and a leftover pre-rename
-#      prefix (/opt/agent-network, marker-guarded) is removed too.
+#      egresslock-setup, gateway/, apparmor/, examples/, VERSION) and
+#      this prefix's PATH wrappers, then daemon-reloads.
 #
 # What it deliberately does NOT touch (account-owned):
-#   - ~/.config/egresslock/ and the pre-rename ~/.config/agent-network/
-#     (conf, allowlist, unit.env) — operator runtime state. Pass
-#     --purge-account-data to remove both.
+#   - ~/.config/egresslock/ (conf, allowlist, unit.env) — operator
+#     runtime state. Pass --purge-account-data to remove it.
 #   - Podman state: anchor/gateway containers, networks, images. The
 #     uninstaller never runs podman. Teardown is the
 #     account's job, run while the engine still exists:
 #       egresslock teardown --runtime
 #     (as the account; no conf needed — it sweeps kit containers and
-#     networks of the CURRENT (egresslock-*) naming generation only.
-#     Pre-rename agent-* kit objects are NOT swept: if any remain,
-#     remove them by hand (podman rm -f / podman network rm) — see
-#     docs/setup/uninstall.md. If the engine is
+#     networks. If the engine is
 #     already gone, reinstall the kit and run `teardown --runtime` to
-#     recover the current-generation leftovers.)
+#     recover leftovers.)
 #
 # Options:
 #   --prefix <path>         kit prefix to remove (default:
@@ -41,8 +34,7 @@
 #                           repeatable; every enabled instance of the
 #                           timer is also swept regardless of --account
 #   --purge-account-data    also delete each account's
-#                           ~/.config/egresslock AND the pre-rename
-#                           ~/.config/agent-network (policy configs);
+#                           ~/.config/egresslock (policy configs);
 #                           Podman state is NEVER touched
 #   -h, --help              print this help
 #
@@ -51,8 +43,6 @@
 #   EGRESSLOCK_UNIT_DIR=<dir>         remove unit templates here
 #                                (default: /etc/systemd/system)
 #   EGRESSLOCK_ACCOUNT_HOME=<dir>     account home in non-root test mode
-#   EGRESSLOCK_LEGACY_PREFIX=<dir>    pre-rename kit prefix to sweep
-#                                (default: /opt/agent-network)
 #   EGRESSLOCK_PATH_BINDIR=<dir>     PATH wrapper dir for the engine
 #                                (default: /usr/local/bin; removes only
 #                                THIS prefix's wrappers)
@@ -61,16 +51,15 @@
 #                                /usr/local/sbin)
 #
 # Defaults that are not parameter-changeable:
-#   - a --prefix or EGRESSLOCK_LEGACY_PREFIX that is not an absolute,
-#     charset-clean kit path (no //, no /./ or /../ segments, not /,
-#     ., or ..) exits 2 before anything is removed
-#   - a kit prefix (new or pre-rename) is rm -rf'd ONLY when it is such
-#     a path AND carries the REAL kit markers — egresslock (executable),
-#     egresslock-verify, VERSION, and gateway/Containerfile (pre-rename
-#     legacy: agent-profiles AND VERSION) — anything else is warned
-#     and kept (a lone VERSION or egresslock file is not a kit)
+#   - a --prefix that is not an absolute, charset-clean kit path (no //,
+#     no /./ or /../ segments, not /, ., or ..) exits 2 before anything
+#     is removed
+#   - a kit prefix is rm -rf'd ONLY when it is such a path AND carries
+#     the REAL kit markers — egresslock (executable), egresslock-verify,
+#     VERSION, and gateway/Containerfile — anything else is warned and
+#     kept (a lone VERSION or egresslock file is not a kit)
 #   - account data (conf, allowlist, unit.env) is preserved by default;
-#     only --purge-account-data removes it (both confdirs)
+#     only --purge-account-data removes it
 #   - Podman state (anchors/gateways/networks/images) is never touched;
 #     run `egresslock teardown --runtime` as the account, while the
 #     engine still exists
@@ -132,8 +121,6 @@ _check_kit_path_shape() {
     fi
 }
 _check_kit_path_shape "$prefix" "--prefix"
-legacy_prefix="${EGRESSLOCK_LEGACY_PREFIX:-/opt/agent-network}"
-_check_kit_path_shape "$legacy_prefix" "EGRESSLOCK_LEGACY_PREFIX"
 
 # 1. Stop/disable the per-account timers (D2: conservative, explicit).
 for acct in "${accounts[@]:-}"; do
@@ -151,35 +138,20 @@ systemctl list-unit-files 'egresslock-verify@*.timer' --no-legend 2>/dev/null \
 unit_dest="${EGRESSLOCK_UNIT_DIR:-/etc/systemd/system}"
 rm -f "$unit_dest/egresslock-verify@.service" \
       "$unit_dest/egresslock-verify@.timer"
-# ARC-60-D3: sweep the PRE-RENAME unit names too, exactly like
-# install-kit.sh does (agent-network-verify@.* templates + enabled
-# instances, plus the pre-ARC-16 globals), so no old timer can survive
-# an uninstall. Never fatal if they were never installed.
-systemctl disable --now 'agent-network-verify@*.timer' 2>/dev/null || true
-rm -f "$unit_dest/agent-network-verify@.service" \
-      "$unit_dest/agent-network-verify@.timer"
-rm -f "$unit_dest/agent-network-verify.service" \
-      "$unit_dest/agent-network-verify.timer"
-systemctl disable --now egresslock-verify.timer 2>/dev/null || true
-rm -f "$unit_dest/egresslock-verify.service" \
-      "$unit_dest/egresslock-verify.timer"
-# EGL-102-D6-R2 (remediate within authority): a timers.target.wants
-# symlink whose template is already gone cannot be cleared by disable
-# and would leave a not-found timer forever after this uninstall. These
-# are the kit's own enablement symlinks (both name generations) — sweep
-# the dangling ones here. Anything else in wants/ is not ours.
-for _want in "$unit_dest"/timers.target.wants/egresslock-verify@*.timer \
-             "$unit_dest"/timers.target.wants/agent-network-verify@*.timer; do
+# EGL-102-D6-R2: a timers.target.wants symlink whose template is gone
+# cannot be cleared by disable and would leave a not-found timer after
+# this uninstall. Sweep only the kit's own dangling enablement symlinks;
+# anything else in wants/ is not ours.
+for _want in "$unit_dest"/timers.target.wants/egresslock-verify@*.timer; do
     [[ -L "$_want" && ! -e "$_want" ]] || continue
     rm -f "$_want"
     echo "uninstall-kit: removed dangling timer enablement: $_want"
 done
 unset _want
-# R-017-1 F5 / EGL-89-D1: only rm -rf a directory that actually IS a
-# kit prefix — an absolute, charset-clean path (checked above) carrying
-# the REAL kit markers: all four regular files. A checkout of this repo
-# has egresslock but no VERSION; a scratch dir may have only VERSION;
-# neither is a kit. A path missing any marker is warned and kept.
+# R-017-1 F5 / EGL-89-D1: only rm -rf a directory that IS a kit prefix —
+# an absolute, charset-clean path (checked above) carrying all four
+# regular-file markers. A checkout (egresslock, no VERSION) or a scratch
+# dir with one marker is not a kit; warn and keep it.
 prefix_removed=0
 if [[ -d "$prefix" \
       && -f "$prefix/egresslock" && -x "$prefix/egresslock" \
@@ -206,19 +178,6 @@ for _wdest in "$path_bindir/egresslock" "$path_sbindir/egresslock-setup"; do
         echo "uninstall-kit: removed PATH wrapper $_wdest"
     fi
 done
-# ARC-60-D3 / EGL-89-D1: the pre-rename prefix, same shape check and a
-# tightened marker guard (old kit markers: agent-profiles AND VERSION,
-# both required — a lone VERSION file is not the legacy kit). A
-# marker-less dir is warned and kept, never silently destroyed
-# (ARC-47-D3).
-if [[ "$legacy_prefix" != "$prefix" ]]; then
-    if [[ -d "$legacy_prefix" && -f "$legacy_prefix/agent-profiles" && -f "$legacy_prefix/VERSION" ]]; then
-        rm -rf "$legacy_prefix"
-        echo "uninstall-kit: removed leftover pre-rename kit at $legacy_prefix"
-    elif [[ -e "$legacy_prefix" ]]; then
-        echo "uninstall-kit: WARNING - $legacy_prefix exists but has no pre-rename kit markers (agent-profiles + VERSION); not removing" >&2
-    fi
-fi
 systemctl daemon-reload
 
 # 3. Account data: preserved unless explicitly purged.
@@ -233,22 +192,16 @@ for acct in "${accounts[@]:-}"; do
         continue
     fi
     if (( purge_account_data )); then
-        # ARC-60-D3: purge BOTH confdirs — the pre-rename tree must not
-        # outlive the kit either.
-        for cdir in "$home/.config/egresslock" "$home/.config/agent-network"; do
-            [[ -e "$cdir" ]] || continue
-            rm -rf "$cdir"
-            echo "uninstall-kit: purged $cdir (account data)"
-        done
+        if [[ -e "$home/.config/egresslock" ]]; then
+            rm -rf "$home/.config/egresslock"
+            echo "uninstall-kit: purged $home/.config/egresslock (account data)"
+        fi
     else
-        # ARC-60-D3: the reminder names `teardown --runtime` (no conf,
-        # both generations), run as the account. EGL-102-D6-R4 honesty:
-        # by this point the engine is already removed, so the reminder
-        # must say so instead of prescribing an unrunnable command.
+        # EGL-102-D6-R4 honesty: by this point the engine is already
+        # removed, so the reminder must say so instead of prescribing an
+        # unrunnable command.
         [[ -e "$home/.config/egresslock" ]] && \
             echo "uninstall-kit: kept $home/.config/egresslock (account-owned policy data; Podman state untouched — run 'egresslock teardown --runtime' as the account to remove kit containers/networks; it needs the engine, so reinstall the kit first if it is already gone)"
-        [[ -e "$home/.config/agent-network" ]] && \
-            echo "uninstall-kit: kept $home/.config/agent-network (pre-rename account data; mv it to $home/.config/egresslock or purge with --purge-account-data)"
     fi
 done
 

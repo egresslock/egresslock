@@ -4,6 +4,234 @@ All notable changes between egresslock releases. The public repository
 ships without history (each release is a fresh snapshot tree), so this
 file is the record of what changed since the previous release.
 
+## 0.9.0 - 2026-10-23
+
+> **Operator-important changes:**
+>
+> **Action required:**
+> 1. **Rebuild the gateway image to pick up the openssl and xz-utils
+>    security fixes (DSA-6531-1, DSA-6549-1, October 2026).** A kit
+>    upgrade alone does **not** patch a running gateway. Run the
+>    commands **as each workload account** (not root — the image is
+>    per-account), then replace every gateway profile in that account:
+>    ```sh
+>    sudo -iu <workload-account>
+>    ```
+>    then
+>    ```sh
+>    egresslock build-gateway --force && egresslock ensure --replace-gateway <profile>
+>    ```
+>    Rebuild once per account, and repeat `--replace-gateway` for every
+>    gateway profile in it. Until then, running gateways keep the old
+>    base; see
+>    [The gateway image](docs/reference/gateway-image.md#rebuild-and-replace-the-gateway).
+> 2. **Security — if you built the `egl-base` example image before
+>    2026-10-14, rebuild it in each `workload account` (account with
+>    egresslock profiles) to get the latest security patches.**
+>    Versions of curl in the image build prior
+>    to that have a security vulnerability (CVE-2026-92392; Debian
+>    DSA-6558-1). Run the image building helper **as the workload
+>    account** (not root — the image is per-account):
+>    ```sh
+>    sudo -iu <workload-account>
+>    ```
+>    then
+>    ```sh
+>    /usr/share/egresslock/examples/egl-base/build-egl-base --force
+>    ```
+>    If you are using the `egl-base` image, you should run this command,
+>    even if you don't upgrade to v0.9.0. You can skip this if you never built
+>    `egl-base`.
+> 3. **Config path option has been removed**
+>    - The `egresslock --config <file>` option and the `EGRESSLOCK_CONF`
+>    environment variable have been removed to simplify commands and
+>    improve security; `egresslock` now always expects a profile's config at 
+>    `<account-home>/.config/egresslock/<profile>.conf`, account home from
+>    `getent passwd`.
+>    - **If you used a custom path for `--config or EGRESSLOCK_CONF`** you must
+>    move the files to `<account-home>/.config/egresslock/` and no longer
+>    use those options.
+>    - **If you used the standard path but still specified `--config or
+>    EGRESSLOCK_CONF`**, simply don't use the options any more.
+> 4. **.conf files no longer allow multiple `profile` blocks.** It is
+>    unlikely you did so, but if you hand-edited a .conf to add added
+>    multiple profiles into one file, split them into one `<name>.conf`
+>    per profile.
+>
+> **Important but no action required:**
+> 1. **Drift warnings from `allow-host` entries can now be resolved.**
+>   The fix depends on the shape of the name's DNS answer:
+>    - **(a) several A records in one answer, the order rotating:**
+>   `egresslock verify` used to warn `drift:` every cycle because only the
+>   first address was pinned; it now pins the whole answer, so the warning
+>   stops once you run `egresslock ensure <profile>`.
+>    - **(b) one A record drawn from a rotating pool, the value changing
+>   over time** (e.g. `github.com` over SSH): a single-address answer has
+>   no stable set to pin, so it stays a documented workaround — see
+>   [Rotating names](docs/reference/rotating-names.md).
+> 2. Setup commands have been changed and new ones added to simplify
+>   install steps. Updated/changed steps can be found on readme, install
+>   guides, and help text. `sudo egresslock-setup init`, 
+>   `sudo egresslock-setup import`, and `sudo egresslock-setup help`
+> 3. New `egresslock` commands: `egresslock help <command>`,
+>    `egresslock drop-unauthorized`, and `egresslock proxy-env --out`;
+> 4. Other important changes are listed below.
+
+### Security
+
+- **`egresslock disallow-host` ends every revoked flow it can observe, and
+  proves it** — old DNS addresses, the peer-direction conntrack entry, and
+  half-closed or still-starting flows — keeps connections another remaining
+  rule still authorizes, and refuses with a named error instead of a bare
+  `removed:` when it cannot prove severance. One accepted gap behind a green
+  `removed:` (0.9.0): a packet accepted just before the swap but recorded in
+  conntrack only after the check runs is invisible to the check — in that
+  sub-second window one flow can still finish behind a green `removed:`.
+- **A failed `egresslock disallow-host` recovers.** It puts the rule
+  back when it can, or names the state and prints `egresslock
+  drop-unauthorized <profile> <port>` — one idempotent command that ends
+  the leftover revoked flows and keeps the still-allowed ones.
+- **`egresslock` serializes profile-mutating commands** under one
+  account-wide lock (`ensure`, `allow`, `disallow`, `allow-host`,
+  `disallow-host`, `teardown`, `init`), so two can no longer race or undo
+  each other; tune the wait with `EGRESSLOCK_LOCK_WAIT`.
+- **Gateway base refreshed for DSA-6531-1 (openssl) and DSA-6549-1
+  (xz-utils / liblzma5).** The pinned `debian:13-slim` digest now
+  carries `libssl3t64 3.5.7-1~deb13u3` and
+  `liblzma5 5.8.1-1+deb13u2`.
+  A kit upgrade alone does not patch a running gateway — see the
+  action-required item 1 above.
+
+### New features
+
+- **`allow-host` pins up to 16 addresses, not just one.** A profile that
+  allows a name resolving to several addresses now pins the whole answer
+  (deduplicated, sorted) instead of only the first record — so
+  `egresslock verify` stops warning `drift:` when the resolver merely
+  reorders the records, and every pinned member is reachable. A larger
+  answer truncates to 16 with a named `note:`. Existing profiles pick
+  this up on their next `egresslock ensure <profile>`.
+
+### Command syntax changes
+
+- **(new)** `egresslock-setup import --account <acct> --from <conf>`
+  copies a profile pair (conf + allowlist) into an account without
+  clobbering: it stages the files as the account, validates them with the
+  deployed engine, commits allowlist-first, and never touches
+  `unit.env`, linger, or the timer.
+- **(new)** `egresslock drop-unauthorized <profile> <port>` ends the
+  leftover connections a revocation could not clear and checks none
+  remain; safe to re-run.
+- **(new)** `egresslock help <command>` (plus `egresslock help config`
+  and `egresslock help env`) prints one command's flags and examples;
+  `egresslock --help` is now a short command index.
+- **(new)** `egresslock proxy-env <profile> --out` writes the proxy env
+  file (mode 0600) under your runtime dir and prints its path, so
+  `podman run --env-file="$(egresslock proxy-env <profile> --out)"`
+  replaces the `egresslock proxy-env <profile> > <file>` redirect you had
+  to write yourself; `--out=<path>` writes elsewhere and is refused if
+  the directory is world-writable.
+- **(changed)** `egresslock-setup init` is now pathless: it wires the
+  conf(s) already in the fixed confdir and, with `--enable`, arms linger
+  + the verify timer. Use `--from <conf>` (or `import` first) when the
+  conf is not in place yet.
+- **(changed)** `egresslock-setup` now takes verbs (`init`, `doctor`,
+  `build-gateway`, `apparmor add|remove|check`, `help`); the legacy flag
+  forms (`--doctor`, `--build-gateway`, `--apparmor-*`) keep working.
+- **(removed)** `egresslock --config <file>` and `EGRESSLOCK_CONF` — see
+  *Action required*.
+
+### Changed
+
+- **`egresslock-setup` ends with a next-step block** (become the account,
+  build the profile, verify) and the gateway build is quiet by default —
+  one line, with the full output in
+  `~/.config/egresslock/gateway-build.log` (last lines shown on failure).
+- **Removed the one-time pre-rename compatibility code** carried since
+  the product rename: the config-directory migration and its
+  both-directories refusal, the legacy unit/prefix sweeps in
+  `install-kit.sh`/`uninstall-kit.sh` and the `.deb` postinst, the
+  leftover-kit warning, `EGRESSLOCK_LEGACY_PREFIX`, and stale
+  `agent_policy` table handling. `/tmp` scratch files are now
+  `egresslock-*`. Current installs need no action; a host still on the
+  old config directory gets the normal missing-config error (move the
+  files by hand), and a leftover pre-rename timer enablement shows as a
+  doctor problem.
+
+### Fixed
+
+- **`egresslock-setup doctor` diagnoses a failed verify unit instead of
+  sending you to an empty journal.** It checks whether the account's
+  verify timer is armed first, names the real cause (a timer that could
+  not start versus a verify run that failed), shows a failed verify
+  service's last and next run, and prints a runnable clear/re-arm
+  command plus the check that proves the fix. A disabled, masked, or
+  static timer is named as such; the timer journal is shown only when
+  an enabled timer fails to start, and the service journal on service
+  failures. A 203/EXEC already explained by the verify-unit row is a
+  note, not a second problem. No configuration change or action is
+  needed.
+- **`egresslock denied <profile>` showed only the oldest 8 MB of the
+  gateway access log.** It now reads the newest bytes with a 32 MB
+  default, so the most recent denials are the ones shown; change the cap
+  with `EGRESSLOCK_DENIED_MAX_BYTES` (smaller reads less, `0` reads the
+  whole log).
+- **`egresslock denied <profile>` now also lists Squid
+  `TCP_DENIED_ABORTED/403`** CONNECT denies that were previously
+  invisible.
+- **`egresslock-setup doctor` output is actionable as printed:** real
+  unit names, runnable `journalctl` hints (bounded with `-n 20`), a
+  one-line health summary, and `--account` scoping.
+- **`egresslock doctor` no longer misreads Podman's `<no value>` base
+  label** — `base unknown (pre-label image)` replaces a false `stale:`
+  row.
+- **`egresslock verify` prints the real cause** of a gateway exec
+  failure instead of claiming an invalid Squid config.
+- **The `egresslock-setup` AppArmor hint is shorter** and prints only
+  when wiring an account.
+- **A torn starter conf pair is refused** with the missing path and fix,
+  never silently healed.
+- **One `egresslock ensure <profile>` recovers from an unclean
+  rootless-runtime stop** (retries the wedged container removal).
+- **`egresslock-setup doctor` rows carry `OK:`/`PROBLEM:`/`NOTE:`
+  tokens.**
+- **First-run gateway builds use docker image format** — the HEALTHCHECK
+  warning is gone and the healthcheck is honored.
+
+### Docs
+
+- **Threat model:** states what live testing confirmed for `allow-host`
+  pins and profile isolation, and names bash `/dev/tcp` / `/dev/udp` as
+  proxy-ignoring clients.
+- **Corrections:** install-walk file modes, the delete-profile `.pins`
+  move, and the `allow`/`disallow` pages now state the gateway-restart
+  session severance.
+- **New [Rotating names](docs/reference/rotating-names.md) reference**
+  and worked [GitHub recipe](examples/recipes/github.md) for names whose
+  DNS rotates a single address; the `drift:` troubleshooting guidance
+  names the case.
+- **Recipes:** the opencode/hermes in-container `apt` steps now carry the
+  capabilities they need under `--cap-drop=all`.
+- **New reference page: [File
+  locations](docs/reference/file-locations.md)** — where egresslock keeps
+  its files, with the mode and what removes or regenerates each.
+- **New troubleshooting page: [Revoking an allow-host rule whose name no
+  longer resolves](docs/troubleshooting/revocation-name-gone.md).**
+- **New recipe: [deploy one conf+allowlist pair across multiple servers
+  with `egresslock-setup import`](examples/recipes/fleet-deploy.md)** —
+  stage one pair, run root `import`/`init` per host, then the
+  account-side `ensure` that applies a re-pin.
+
+### Internal
+
+- **Code comments in the shipped scripts were corrected and tightened**
+  for accuracy and brevity; no behavior change.
+- **`bash tests/run.sh --track fast`** skips registered slow sections
+  (the default battery and the pre-release gate still run everything);
+  low-value tests pruned; per-section timings recorded.
+- **Test mocks no longer fork `basename`/`mkdir` on hot paths** — the
+  engine battery runs ~33% faster.
+
 ## 0.8.0 - 2026-10-10
 
 > **Operator-important changes:**

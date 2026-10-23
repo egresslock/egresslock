@@ -1,9 +1,16 @@
 # How to: allow non-HTTP egress (git-over-SSH example)
 
-`allow-host` permits direct egress for anything the HTTP gateway
-cannot proxy — ssh, git-over-SSH, rsync, databases — and for raw IP
-addresses; HTTP(S) by domain uses [allow-a-domain](allow-a-domain.md)
-instead.
+`allow-host` is for use with raw IP addresses, and non-HTTP(S)
+traffic (anything the HTTP gateway cannot proxy transparently:
+ssh, git-over-SSH, rsync, databases, other non-HTTP protocols).
+
+If you're connecting to a domain using HTTP(S), see
+[allow-a-domain](allow-a-domain.md) instead.
+
+If you are connecting to github specifically, see 
+[github recipe](../../examples/recipes/github.md), or for 
+any other destination that uses a rotating list of IPs, see
+   [Rotating names](../reference/rotating-names.md). 
 
 > **Before you start**
 >
@@ -26,11 +33,10 @@ instead.
    # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
    # prompt: egl-runner@host:~$
 
-   egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
    podman run --rm -it --name ssh-probe \
        --cap-drop=all --security-opt=no-new-privileges \
        --network="$(egresslock network main)" \
-       --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+       --env-file="$(egresslock proxy-env main --out)" \
        localhost/egl-base:latest \
        sh
    ```
@@ -54,7 +60,7 @@ instead.
    # TERMINAL 1 — the workload container
    # prompt: root@9badc0ffee67:/#
 
-   ssh -o ConnectTimeout=5 -T git@github.com
+   ssh -o ConnectTimeout=5 -T git@self-hosted-git.example
    ```
 
    <details>
@@ -62,8 +68,8 @@ instead.
    after 5 second delay…
 
    <pre>
-   root@9badc0ffee67:/# ssh -o ConnectTimeout=5 -T git@github.com
-   ssh: connect to host github.com port 22: Connection timed out
+   root@9badc0ffee67:/# ssh -o ConnectTimeout=5 -T git@self-hosted-git.example
+   ssh: connect to host self-hosted-git.example port 22: Connection timed out
    </pre>
 
    That hang is the signature of a missing `allow-host` rule, so next
@@ -73,23 +79,22 @@ instead.
 3. **Allow it.** In a second terminal — TERMINAL 2, the host — as the
    account. Grammar: `allow-host <profile> <host:port>` — a hostname
    or an IPv4 literal (`allow` rejects IP literals; CIDR ranges are
-   not yet supported). `github.com` resolves at ensure time and is
-   tied to its current IP. Why egress has two paths:
+   not yet supported). Why egress has two paths:
    [paths-and-signatures](../reference/paths-and-signatures.md).
    ```sh
    # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
    # prompt: egl-runner@host:~$
 
-   egresslock allow-host main github.com:22
+   egresslock allow-host main self-hosted-git.example:22
    ```
 
    <details>
    <summary>Expected output:</summary>
 
    <pre>
-   egl-runner@host:~$ egresslock allow-host main github.com:22
+   egl-runner@host:~$ egresslock allow-host main self-hosted-git.example:22
    using config /home/egl-runner/.config/egresslock/main.conf
-   added: rule allow-host github.com:22 -> /home/egl-runner/.config/egresslock/main.conf
+   added: rule allow-host self-hosted-git.example:22 -> /home/egl-runner/.config/egresslock/main.conf
    re-ensuring profile 'main' ...
    gateway 'egresslock-gateway-main' ready (already converged, not restarted)
    profile 'main' ready (network egresslock-main, policy verified)
@@ -101,37 +106,35 @@ instead.
    # TERMINAL 1 — the workload container
    # prompt: root@9badc0ffee67:/#
 
-   ssh -o ConnectTimeout=5 -T git@github.com
+   ssh -o ConnectTimeout=5 -T git@self-hosted-git.example
    ```
 
    <details>
    <summary>Expected output:</summary>
    first connect from a fresh container: ssh shows the host key.
-   Compare the presented `SHA256:…` fingerprint with GitHub's
-   published SSH key fingerprints
-   (https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)
-   before typing `yes`. Do not disable host-key checking.
+   Compare the presented `SHA256:…` fingerprint with the git server's
+   published SSH key fingerprints before typing `yes`. Do not disable host-key checking.
 
    <pre>
-   The authenticity of host 'github.com (140.82.113.4)' can't be established.
+   The authenticity of host 'self-hosted-git.example (10.0.0.1)' can't be established.
    ED25519 key fingerprint is SHA256:+<SHA>.
    This key is not known by any other names.
    Are you sure you want to continue connecting (yes/no/[fingerprint])? yes
    </pre>
 
    after `yes` — either response shows the TCP path opened to a
-   host at that name:port. It does not by itself prove GitHub
+   host at that name:port. It does not by itself prove self-hosted-git.example
    identity; the fingerprint check above is what does.
-   Without GitHub SSH keys set up:
+   Without self-hosted-git.example SSH keys set up:
 
    <pre>
-   git@github.com: Permission denied (publickey).
+   git@self-hosted-git.example: Permission denied (publickey).
    </pre>
 
    with SSH keys — the greeting:
 
    <pre>
-   Hi <you>! You've successfully authenticated, but GitHub does not provide shell access.
+   Hi <you>! You've successfully authenticated, but self-hosted-git.example does not provide shell access.
    </pre>
 
    Troubleshooting: still hanging after step 3 reported `policy
@@ -148,11 +151,10 @@ instead.
    # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
    # prompt: egl-runner@host:~$
 
-   egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
    podman run --rm \
        --cap-drop=all --security-opt=no-new-privileges \
        --network="$(egresslock network main)" \
-       --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+       --env-file="$(egresslock proxy-env main --out)" \
        localhost/egl-base:latest \
        sh -c 'curl -sS -o /dev/null -w "http_code=%{http_code}\n" --max-time 10 https://blocked.example.test 2>&1'
    ```
@@ -162,11 +164,10 @@ instead.
    immediately:
 
    <pre>
-   egl-runner@host:~$ egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
-   podman run --rm \
+   egl-runner@host:~$ podman run --rm \
        --cap-drop=all --security-opt=no-new-privileges \
        --network="$(egresslock network main)" \
-       --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+       --env-file="$(egresslock proxy-env main --out)" \
        localhost/egl-base:latest \
        sh -c 'curl -sS -o /dev/null -w "http_code=%{http_code}\n" --max-time 10 https://blocked.example.test 2>&1'
    curl: (56) CONNECT tunnel failed, response 403
@@ -227,7 +228,7 @@ goes away):
 # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
 # prompt: egl-runner@host:~$
 
-egresslock disallow-host main github.com:22
+egresslock disallow-host main self-hosted-git.example:22
 ```
 
 <details>
@@ -236,12 +237,12 @@ the `removed:` line comes last — it prints only after the re-ensure
 and the revoked rule's conntrack teardown:
 
 <pre>
-egl-runner@host:~$ egresslock disallow-host main github.com:22
+egl-runner@host:~$ egresslock disallow-host main self-hosted-git.example:22
 using config /home/egl-runner/.config/egresslock/main.conf
 re-ensuring profile 'main' ...
 gateway 'egresslock-gateway-main' ready (already converged, not restarted)
 profile 'main' ready (network egresslock-main, policy verified)
-removed: rule allow-host github.com:22 -> /home/egl-runner/.config/egresslock/main.conf
+removed: rule allow-host self-hosted-git.example:22 -> /home/egl-runner/.config/egresslock/main.conf
 </pre>
 
 Troubleshooting: rule not present? It fails closed — exit 1, nothing

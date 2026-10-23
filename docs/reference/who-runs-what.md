@@ -10,8 +10,18 @@ never runs the engine, never starts workloads, never edits policy:
 
 ```sh
 sudo dpkg -i ./egresslock_<VERSION>_all.deb          # once per host
-sudo egresslock-setup --init-conf --enable --account <account>   # once per account
+sudo egresslock-setup init --init-conf --enable --account <account>   # once per account
 ```
+
+`egresslock-setup` is real host root: run it with `sudo` from the host,
+not from inside a restricted container and not through container-mapped
+root. Root-mode `import` / `init --from` validates the staged pair in a
+private mount namespace, so root must be able to create one (`unshare -m`
+succeeds). A setup wrapper that blocks it
+(`RestrictNamespaces=`/`PrivateMounts=`) or a container that cannot run
+`unshare -m` makes the import path refuse; the destination is untouched.
+Pathless `init`, `init --init-conf`, and `doctor` do not need a mount
+namespace.
 
 ## 2. the container-owner account — everything else
 
@@ -49,12 +59,12 @@ model's operator obligations](threat-model.md#operator-obligations-the-kit-does-
 ## The tilde trap (one gotcha worth knowing)
 
 For a one-off from your own shell, `sudo -iu` switches to the
-account's home — but a bare `~` in an argument is expanded by YOUR
-shell first, pointing at the wrong home:
+account's home. Profile commands take only a profile name — there is no
+conf path to `~`-expand, because the engine always reads
+`<account-home>/.config/egresslock/<profile>.conf`:
 
 ```sh
-sudo -iu <account> -- egresslock --config '$HOME/.config/egresslock/main.conf' ensure main
-#                                             ^ quoted: expanded by the account's shell
+sudo -iu <account> -- egresslock ensure main
 ```
 
 ## Root, sudo, and NOPASSWD (no passwordless root)
@@ -63,7 +73,7 @@ The three root-running kit entry points — `install-kit.sh`,
 `uninstall-kit.sh`, and `egresslock-setup` — are **interactive root**
 tools. Do **not** grant them passwordless sudo (`NOPASSWD` in
 sudoers): their arguments are deliberately free-form (`--prefix`,
-`--account`, `--conf`), and `egresslock-setup` runs as the target
+`--account`, `--from`/`--conf`), and `egresslock-setup` runs as the target
 account via `runuser` — so a `NOPASSWD` rule on any of these binaries
 without an exact-argv restriction is **equivalent to full root**.
 

@@ -32,11 +32,10 @@ shell to leave behind:
 # the host, account shell: sudo -iu egl-runner
 # prompt: egl-runner@host:~$
 
-egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
 podman run --rm \
     --cap-drop=all --security-opt=no-new-privileges \
     --network="$(egresslock network main)" \
-    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    --env-file="$(egresslock proxy-env main --out)" \
     localhost/egl-base:latest \
     sh -c 'curl --max-time 10 -sS -o /dev/null -w "http_code=%{http_code}\n" https://example.com 2>&1'
 ```
@@ -46,11 +45,10 @@ podman run --rm \
 after up to 10 second delay…
 
 <pre>
-egl-runner@host:~$ egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
-podman run --rm \
+egl-runner@host:~$ podman run --rm \
     --cap-drop=all --security-opt=no-new-privileges \
     --network="$(egresslock network main)" \
-    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    --env-file="$(egresslock proxy-env main --out)" \
     localhost/egl-base:latest \
     sh -c 'curl --max-time 10 -sS -o /dev/null -w "http_code=%{http_code}\n" https://example.com 2>&1'
 curl: (56) CONNECT tunnel failed, response 403
@@ -102,6 +100,11 @@ Troubleshooting: empty when you expected a hit? Stale engine/env —
 egresslock allow main example.com:443
 ```
 
+> [!WARNING]
+> Allowing or disallowing a domain restarts the gateway to pick it
+> up, so connections going through the gateway drop briefly —
+> including those of other containers on the same profile network.
+
 <details>
 <summary>Expected output:</summary>
 
@@ -127,11 +130,10 @@ Same `podman run` as step 1:
 # the host, account shell: sudo -iu egl-runner
 # prompt: egl-runner@host:~$
 
-egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
 podman run --rm \
     --cap-drop=all --security-opt=no-new-privileges \
     --network="$(egresslock network main)" \
-    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    --env-file="$(egresslock proxy-env main --out)" \
     localhost/egl-base:latest \
     sh -c 'curl --max-time 10 -sS -o /dev/null -w "http_code=%{http_code}\n" https://example.com 2>&1'
 ```
@@ -140,11 +142,10 @@ podman run --rm \
 <summary>Expected output:</summary>
 
 <pre>
-egl-runner@host:~$ egresslock proxy-env main > /run/user/$(id -u)/egresslock-proxy-main.env
-podman run --rm \
+egl-runner@host:~$ podman run --rm \
     --cap-drop=all --security-opt=no-new-privileges \
     --network="$(egresslock network main)" \
-    --env-file=/run/user/$(id -u)/egresslock-proxy-main.env \
+    --env-file="$(egresslock proxy-env main --out)" \
     localhost/egl-base:latest \
     sh -c 'curl --max-time 10 -sS -o /dev/null -w "http_code=%{http_code}\n" https://example.com 2>&1'
 http_code=200

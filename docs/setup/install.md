@@ -18,8 +18,11 @@ is **interactive only** — do **not** grant `install-kit.sh`,
 
 ## Requirements
 
-1. **Linux with systemd and unprivileged user namespaces enabled** —
-   the kit drives rootless Podman; both are required.
+1. **A Linux host or VM** 
+   * **systemd**
+   * which permits unprivileged user, network, and mount namespace creation (the kit drives rootless Podman, but is not itself
+   supported running "incepted" inside a restricted container.)
+   * up-to-date with security patches
 
 2. **Debian packages** (install as root):
 
@@ -190,7 +193,7 @@ install-kit: unit templates -> /etc/systemd/system
 install-kit: PATH wrappers -> /usr/local/bin/egresslock, /usr/local/sbin/egresslock-setup
 
 next step — per-account setup (from the installed kit):
-  sudo /opt/egresslock/egresslock-setup --account <acct> --init-conf --enable
+  sudo /opt/egresslock/egresslock-setup init --account <acct> --init-conf --enable
 </pre>
 
 Set `PREFIX` to the chosen absolute path; `/opt/egresslock` above is
@@ -212,14 +215,14 @@ apply/verify/unapply steps):
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-sudo egresslock-setup --apparmor-check | grep Summary
+sudo egresslock-setup apparmor check | grep Summary
 ```
 
 <details><summary>Expected output (not needed):</summary>
 most hosts; nothing to do — continue with step 4.
 
 <pre>
-$ sudo egresslock-setup --apparmor-check | grep Summary
+$ sudo egresslock-setup apparmor check | grep Summary
 Summary: CHECK OK (AppArmor patch not needed)
 </pre>
 </details>
@@ -229,7 +232,7 @@ affected host — apply the amendment before step 4 (the first
 `ensure` fails without it):
 
 <pre>
-$ sudo egresslock-setup --apparmor-check | grep Summary
+$ sudo egresslock-setup apparmor check | grep Summary
 Summary: CHECK FAILED (AppArmor patch needed)
 </pre>
 </details>
@@ -239,8 +242,8 @@ One command, idempotent; the full apply/verify/unapply steps live in
 [apparmor/README.md](../../apparmor/README.md).
 
 <pre>
-$ sudo egresslock-setup --apparmor-add
-AppArmor: pasta profile reloaded (/etc/apparmor.d/usr.bin.pasta). Confirm with: sudo egresslock-setup --apparmor-check
+$ sudo egresslock-setup apparmor add
+AppArmor: pasta profile reloaded (/etc/apparmor.d/usr.bin.pasta). Confirm with: sudo egresslock-setup apparmor check
 </pre>
 </details>
 
@@ -254,7 +257,9 @@ AppArmor: pasta profile reloaded (/etc/apparmor.d/usr.bin.pasta). Confirm with: 
 - builds the gateway image,
 - arms the 15-minute verify timer and enables linger (`--enable`).
 
-Existing confs and allowlists are preserved, not reset. DNS queries
+Existing confs and allowlists are preserved, not reset: `import` (and
+`init --from`/`--conf`) stages and validates the pair, then refuses a
+differing or torn destination unless you pass `--force`. DNS queries
 to the bridge resolver remain allowed even with an empty allowlist
 and can carry data out — see the [threat model](../reference/threat-model.md).
 
@@ -265,23 +270,34 @@ Every flag and the step-by-step run map: the
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-sudo egresslock-setup --init-conf --enable --account <account> > ~/egresslock-setup.log 2>&1
-grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
+sudo egresslock-setup init --init-conf --enable --account <account>
 ```
 
 <details><summary>Expected output:</summary>
-the six-step run map — each step `OK` (the full stream goes to
-~/egresslock-setup.log; details below):
+the six-step run map — each step `OK`, then the next-step block (the
+gateway build stream goes to the account's
+`~/.config/egresslock/gateway-build.log`; details below):
 
 <pre>
-$ sudo egresslock-setup --init-conf --enable --account <account> > ~/egresslock-setup.log 2>&1
-$ grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
+$ sudo egresslock-setup init --init-conf --enable --account <account>
+egresslock-setup: --init-conf: wrote starter /home/<account>/.config/egresslock/main.conf (+ /home/<account>/.config/egresslock/main-allowlist)
 1) validate conf … OK
 2) write unit.env … OK
+enabling linger for <account>
 3) linger … OK
 4) user manager … OK
+egresslock-setup: building the gateway image — first run downloads the base image and packages; a few minutes. Build log: /home/<account>/.config/egresslock/gateway-build.log
 5) gateway image … OK
+enabling verify timer for <account> (egresslock-verify@<account>.timer)
 6) timer … OK
+egresslock-setup: unit.env written for <account> -> /home/<account>/.config/egresslock/unit.env
+egresslock-setup: the scheduled check will verify every profile
+egresslock-setup: account '<account>' is ready — it can ensure profiles now
+next steps (as the account):
+  sudo -iu <account>
+  egresslock ensure main
+  egresslock verify main
+read more: egresslock-setup help
 </pre>
 
 - `FAIL` is always the last printed step (the run stops there,
@@ -289,36 +305,22 @@ $ grep -E '^[0-9]\) |hint|FAIL' ~/egresslock-setup.log
 - re-runs are quieter still: steps not needed print `SKIP`.
 
 Troubleshooting:
-- `hint: pasta is AppArmor-enforced` on a host whose check said
-  "not needed": the label can return; re-run
-  [step 3](#3-check-the-pasta-policy-only-some-hosts-need-it).
+- `hint: the podman network helper (pasta) is confined by AppArmor`
+  on a host whose check said "not needed": the label can return;
+  re-run [step 3](#3-check-the-pasta-policy-only-some-hosts-need-it).
 </details>
 
-<details><summary>Prefer to watch the run instead?</summary>
-Drop the redirect — but expect the raw stream to be **~300 lines of
-build noise**: the AppArmor hint (affected hosts), the image pull,
-`debconf` frontend-fallback lines, and `HEALTHCHECK` warnings. It
-looks like it is installing things; it is building the gateway image,
-and every line shown is normal. The excerpts:
+<details><summary>Prefer to watch the gateway build instead?</summary>
+The build stream (image pull, package installs, `debconf` lines) goes to
+the account's `~/.config/egresslock/gateway-build.log`; the terminal
+shows one `building the gateway image` line. Follow the build live:
 
 <pre>
-$ sudo egresslock-setup --init-conf --enable --account <account>
-egresslock-setup: hint: pasta is AppArmor-enforced; if the netns probe fails, apply the shipped rule with --apparmor-add (snippet: /usr/share/egresslock/apparmor/usr.bin.pasta.local)
-1) validate conf … OK
-2) write unit.env … OK
-3) linger … OK
-4) user manager … OK
-5) gateway image … OK
-Trying to pull docker.io/library/debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f...
-Getting image source signatures
-Copying blob ecc510c1e359 done   |
-Copying config 567e3c17b1 done   |
-Writing manifest to image destination
-debconf: falling back to frontend: Noninteractive
-WARN[0011] HEALTHCHECK is not supported for OCI image format and will be ignored. Must use `docker` format
-6) timer … OK
-Created symlink '/etc/systemd/system/timers.target.wants/egresslock-verify@<account>.timer' → '/usr/lib/systemd/system/egresslock-verify@.timer'.
+$ tail -f /home/<account>/.config/egresslock/gateway-build.log
 </pre>
+
+If the build fails, the last 20 lines are shown on the terminal and the
+full stream stays in the log.
 </details>
 
 <details><summary>Restricted accounts (runner-style): bring your own conf</summary>
@@ -329,13 +331,17 @@ distributed by deploy tooling — same bundle, no starter shipped:
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-sudo egresslock-setup --account <account> --conf <pinned-conf> --profile <profile> --enable
+sudo egresslock-setup import --account <account> --from <pinned-conf>
+sudo egresslock-setup init --account <account> --profile <profile> --enable
 ```
 
-The same six-step map (the conf is validated as the account instead
-of shipped). The form to use for service accounts (CI runners,
-per-service daemons) — see
-[the CI runner recipe](../../examples/recipes/ci-runner.md).
+`import` copies the conf+allowlist pair and stops; `init` then validates
+as the account and prints the same six-step map. This is the form for
+service accounts (CI runners, per-service daemons) — see
+[the CI runner recipe](../../examples/recipes/ci-runner.md). For the
+same form at fleet scale — one pair pushed to N hosts, plus the
+account-side `ensure` a re-pin needs — see
+[the fleet deploy recipe](../../examples/recipes/fleet-deploy.md).
 </details>
 
 ### 5. Confirm what was installed (root)
@@ -491,22 +497,23 @@ profile 'main' policy and gateway verified
 # account — you are still in the account shell
 # prompt: <account>@host:~$
 
-ls -la ~/.config/egresslock/          # main.conf, main-allowlist, unit.env
-cat ~/.config/egresslock/unit.env     # EGRESSLOCK_CONF=...
+ls -la ~/.config/egresslock/          # main.conf, main-allowlist, unit.env, gateway-build.log
+cat ~/.config/egresslock/unit.env     # EGRESSLOCK_PROFILE=... only in named mode
 ```
 
 <details><summary>Expected output:</summary>
 
 <pre>
 <account>@host:~$ ls -la ~/.config/egresslock/
-total 16
-drwx------ 2 <account> <account> 4096 Oct  9 12:00 .
-drwx------ 4 <account> <account> 4096 Oct  9 12:00 ..
--rw------- 1 <account> <account>  137 Oct  9 12:00 main.conf
--rw-r--r-- 1 <account> <account>    0 Oct  9 12:00 main-allowlist
--rw------- 1 <account> <account>   62 Oct  9 12:00 unit.env
+total 20
+drwxr-xr-x 2 <account> <account> 4096 Oct  9 12:00 .
+drwxr-xr-x 4 <account> <account> 4096 Oct  9 12:00 ..
+-rw-r--r-- 1 <account> <account> 1234 Oct  9 12:00 gateway-build.log
+-rw------- 1 <account> <account> 1065 Oct  9 12:00 main.conf
+-rw------- 1 <account> <account>  644 Oct  9 12:00 main-allowlist
+-rw------- 1 <account> <account>    0 Oct  9 12:00 unit.env
 <account>@host:~$ cat ~/.config/egresslock/unit.env
-EGRESSLOCK_CONF=/home/<account>/.config/egresslock/main.conf
+<account>@host:~$
 </pre>
 </details>
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # egresslock-start — daemon-start wrapper for network-profile accounts
-# (Decision ARC-7-D5; genericized ARC-16-D2/D4).
+# (ARC-7-D5; ARC-16-D2/D4).
 #
 # Runs `egresslock ensure <profile>` BEFORE exec'ing the account's
 # daemon, so the profile network, anchor, gateway, and nftables policy
@@ -26,10 +26,12 @@
 #   EGRESSLOCK_DIR     dir holding egresslock. Resolution order
 #                         (ARC-16-D4): this var > /opt/egresslock >
 #                         this script's directory.
-#   EGRESSLOCK_CONF   profile config. REQUIRED.
 #   EGRESSLOCK_PROFILE         profile name to ensure. REQUIRED.
 #   RUNNER_BIN            daemon binary to exec. REQUIRED (no site
 #                         default — the unit or caller supplies it).
+#
+# The profile's conf is not passed to the engine: it always lives at
+# <account-home>/.config/egresslock/<profile>.conf (EGL-325).
 #
 # Defaults that are not parameter-changeable:
 #   - XDG_RUNTIME_DIR is forced to /run/user/$(id -u) (systemd %U does
@@ -45,18 +47,17 @@
 
 set -euo pipefail
 
-# ARC-16-D9.1 (amended, on-host gate finding): resolve XDG_RUNTIME_DIR
-# from the executing uid — systemd's %U did not expand per-User= on the
-# gate host, and rootless Podman requires the account's own runtime dir.
-# (Assigned before export so an id -u failure cannot silently mask a void
-# XDG_RUNTIME_DIR under set -eou pipefail — SC2155.)
+# ARC-16-D9.1 (amended): resolve XDG_RUNTIME_DIR from the executing uid —
+# systemd's %U did not expand per-User= (same failure class as %h), and
+# rootless Podman requires the account's own runtime dir. Assigned before
+# export so an id -u failure cannot silently mask a void XDG_RUNTIME_DIR
+# under set -eou pipefail (SC2155).
 #
-# EGL-176-D2: the XDG_RUNTIME_DIR resolution below and the ARC-16-D4
-# engine-dir chain are deliberately duplicated in egresslock-verify
-# (roughly its bootstrap section); the shareable surface is ~15 lines and
-# the env-guard sets differ, so a shared sourced fragment was rejected
-# (it would be a new shipped file with packaging/install/test deltas).
-# Keep the two copies in sync when editing either.
+# EGL-176-D2: this XDG_RUNTIME_DIR resolution and the ARC-16-D4
+# engine-dir chain are deliberately duplicated in egresslock-verify; the
+# shareable surface is ~15 lines and the env-guard sets differ, so a
+# shared sourced fragment was rejected (a new shipped file with
+# packaging/install/test deltas). Keep the two copies in sync.
 _euid="$(id -u)"
 export XDG_RUNTIME_DIR="/run/user/$_euid"
 
@@ -70,22 +71,20 @@ else
 fi
 tool="$kit_dir/egresslock"
 
-# ARC-16-D2: no site defaults — the unit (or caller) supplies ALL of the
-# conf, the profile, and the daemon binary (R-049 hygiene: the wrapper
-# used to default RUNNER_BIN to a site-specific daemon name; the site
-# unit has always set it explicitly).
+# ARC-16-D2: no site defaults — the unit (or caller) supplies the
+# profile and the daemon binary (R-049: a site-specific RUNNER_BIN
+# default was removed; the site unit always set it explicitly).
 [[ -n "${EGRESSLOCK_PROFILE:-}" ]] || { echo "egresslock-start: EGRESSLOCK_PROFILE is required (no site default)" >&2; exit 1; }
-[[ -n "${EGRESSLOCK_CONF:-}" ]] || { echo "egresslock-start: EGRESSLOCK_CONF is required (no site default)" >&2; exit 1; }
 [[ -n "${RUNNER_BIN:-}" ]] || { echo "egresslock-start: RUNNER_BIN is required (no site default)" >&2; exit 1; }
-conf="$EGRESSLOCK_CONF"
 profile="$EGRESSLOCK_PROFILE"
 
 [[ -x "$tool" ]] || { echo "egresslock-start: egresslock not found/executable: $tool" >&2; exit 1; }
-[[ -f "$conf" ]] || { echo "egresslock-start: profile config not found: $conf" >&2; exit 1; }
 
 # Fail the daemon start (and every restart) unless the profile is fully
 # ensured: network + anchor + gateway + nftables policy, verified.
-"$tool" --config "$conf" ensure "$profile"
+# The engine reads <account-home>/.config/egresslock/<profile>.conf and
+# fails closed (naming the path) when it is missing.
+"$tool" ensure "$profile"
 
 echo "egresslock-start: profile '$profile' ensured and verified; starting daemon" >&2
 exec "$RUNNER_BIN" "$@"

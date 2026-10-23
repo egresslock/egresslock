@@ -58,13 +58,13 @@ after every account's teardown:
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-sudo egresslock-setup --apparmor-remove
+sudo egresslock-setup apparmor remove
 ```
 
 <details><summary>Expected output:</summary>
 
 <pre>
-$ sudo egresslock-setup --apparmor-remove
+$ sudo egresslock-setup apparmor remove
 AppArmor: removed the egresslock pasta amendment from /etc/apparmor.d/local/usr.bin.pasta
 </pre>
 </details>

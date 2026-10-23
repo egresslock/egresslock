@@ -122,8 +122,8 @@ egresslock $version — manual install tarball
 Quick install (prefix deploy, root):
   tar -xzf $(basename "$out") && cd egresslock
   sudo ./install-kit.sh --prefix /opt/egresslock
-  sudo ./egresslock-setup --account <acct> --init-conf --enable
-  sudo ./egresslock-setup --apparmor-check  # confirm pasta AppArmor compatibility on this host
+  sudo ./egresslock-setup init --account <acct> --init-conf --enable
+  sudo ./egresslock-setup apparmor check  # confirm pasta AppArmor compatibility on this host
 
 On-box uninstall (root):
   sudo ./uninstall-kit.sh --prefix /opt/egresslock

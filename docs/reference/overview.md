@@ -244,4 +244,7 @@ Scoped to the dated dogfood captures in the
 - IPv4-only — forwarded IPv6 is dropped, not proxied;
 - an allowlisted hostname that re-resolves to a private address is
   connected *through the proxy* (open by design), and
-  `allow-host` pins drift with DNS until the next `ensure`.
+  `allow-host` pins drift with DNS until the next `ensure` (a set
+  change only — a resolver reorder of the same addresses is not drift);
+- The pinned set is capped at the first 16 sorted distinct addresses
+  (`DNS_SET_MAX`); a larger answer truncates with a named `note:`.

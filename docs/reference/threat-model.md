@@ -120,10 +120,9 @@ Two consequences follow from where the chain sits:
   profile egress; it is defense-in-depth only.
 - Inside the shared rootless netns, an nft `accept` is **not** final:
   any other forward-hook chain at the same or earlier priority still
-  sees the packet and can drop it. `verify` fails closed on leftover
-  legacy tables and foreign early forward hooks (observed on-host with
-  the pre-rename `agent_policy` table), and `ensure` deletes the legacy
-  table — but an operator-installed early drop chain remains a real
+  sees the packet and can drop it. `verify` fails closed on foreign
+  early forward hooks (observed on-host with a stale leftover policy
+  table) — but an operator-installed early drop chain remains a real
   hazard: it silently blocks traffic this kit believes it allowed,
   with no `denied` log entry (see T2 and T13).
 
@@ -259,27 +258,50 @@ attacks table or an explicit non-goal.
 - **Not host isolation**, not multi-tenant hardening.
 - **Same-profile L2 is open (T7):** siblings on one profile network can
   reach each other's ports and the gateway's proxy port directly.
+  The same netns-internal reach crosses profiles at the bridge resolver:
+  a workload on another profile can query this profile's bridge resolver
+  (the subnet's `.1:53`) and read its answers — an input-path delivery
+  that moves no profile-chain counter and grants no egress (accepted; the
+  profile chain hooks the forward path only).
 - **Single rootless account (A3/A5):** another account on the host is
   outside the model; the kit neither protects nor attacks it.
 - **IPv4-only:** forwarded IPv6 is dropped, never proxied.
-- **`allow-host` DNS pin drift (T13):** a pin keeps the first-A IP from
-  `ensure` time; if DNS moves, traffic still goes to the old address
-  (and `verify` warns) until `ensure` re-pins.
+- **`allow-host` DNS pin drift (T13):** a pin keeps the effective
+  ensure-time A set (the first 16 sorted distinct addresses —
+  `DNS_SET_MAX`; a larger answer truncates with a named stderr note)
+  from `ensure` time; if DNS changes (a member address appears or
+  disappears), traffic still goes to the old addresses
+  (and `verify` warns) until `ensure` re-pins. An established connection
+  to the old address does not move with the re-pin: it keeps working
+  until the connection ends (live-confirmed 2026-10-12; `verify` stays
+  green — its `drift:` warning tracks the pinned address set, not live
+  connections). The pin is the A set the host resolver returns for the
+  name at `ensure` time, trusted with no range validation — a poisoned
+  answer is pinned like any other (accepted; the account owns the
+  resolver's answer and the confdir). A name that serves one
+  rotating A per query (`github.com` SSH) can be pinned to one member
+  at a time — never stable (a `drift:` warning whenever a cycle
+  resolves another member; only the pinned member reachable); the
+  literal-pool recipe replaces the pin
+  ([Rotating names](rotating-names.md)).
 - **Kit path is distribution, not isolation:** a root-owned install
   prefix protects the tool's integrity, nothing more.
 - **Kit root tools are interactive-root only:** no
   sudoers file is shipped and `NOPASSWD` on `install-kit.sh`,
   `uninstall-kit.sh`, or `egresslock-setup` is unsupported — their
   arguments are free-form (`--prefix`, `--account` + `runuser`,
-  `--conf`), so passwordless sudo on them without exact argv is
+  `--from`/`--conf`), so passwordless sudo on them without exact argv is
   equivalent to root. The engine itself refuses root (T16).
 - **Gateway base is frozen by digest:** the kit-built gateway image
   pins its base and never updates in place — base-package fixes reach
   a running gateway only through a deliberate rebuild with a refreshed
   pin, and a stale image keeps the old base's vulnerabilities until
   that rebuild and replace. The gateway-image row in both doctors (`egresslock
-  doctor`, `egresslock-setup --doctor`) and kit release notes
-  surface staleness; the rebuild-and-replace steps are in
+  doctor`, `egresslock-setup doctor`) and kit release notes
+  surface **image** staleness — the deployed pin against the tagged
+  image's recorded base, not what is running: after a rebuild the row
+  clears while a profile can still be serving the old base until it is
+  replaced; the rebuild-and-replace steps are in
   [When to rebuild the gateway image](gateway-image.md#when-to-rebuild-the-gateway-image).
 - **Name rebind through the proxy (T17) is open by design:**
   the allowlist is name-based (dstdomain), names resolve at request
@@ -352,10 +374,10 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | # | Attacker action | Expected behavior | Operator sees | Status |
 |---|---|---|---|---|
 | T1 | `curl https://evil.test` with proxy env, host not allowlisted | Squid CONNECT deny | `denied` lists `evil.test`; 403 | lab-verified |
-| T2 | Same without proxy env (direct SYN to 443) | nft drop | hang; **not** in `denied` | lab-verified |
+| T2 | Same without proxy env (direct SYN to 443) — any proxy-ignoring client, e.g. `curl --noproxy '*'` or bash `exec 3<>/dev/tcp/<host>/<port>`; `/dev/tcp` is a bash socket, not a device | nft drop | hang; **not** in `denied` | lab-verified |
 | T3 | `curl http://deb.example/` (port 80) not allowlisted | Squid GET deny | `denied` lists `deb.example:80`; 403 | lab-verified |
 | T4 | `allow` of T3's host **without** `:80` | still denied on 80 (no-port group is 443) | `denied` still shows `:80` | design-intent |
-| T5 | UDP/TCP to 8.8.8.8:53; DoT 853; direct DoH 443 | drop (DNS only to bridge gw) | hang; no gateway log | lab-verified |
+| T5 | UDP/TCP to 8.8.8.8:53; DoT 853; direct DoH 443 — bash `exec 3<>/dev/udp/<host>/<port>` is the same direct UDP path (ordinary UDP socket) | drop (DNS only to bridge gw) | hang; no gateway log | lab-verified |
 | T6 | IPv6 destination | `p_v6deny` | fail; IPv4-only kit | lab-verified |
 | T7 | Sibling on same profile: connect to peer:22 | **allowed** (L2) | n/a — accepted risk | lab-verified (open L2; still accepted — 2026-09-21 ruling; the probe confirmed the strongest form: sibling↔sibling traffic never touches the IP-forward hook, it is pure L2 bridging, so *every* profile-internal port is open at L2) |
 | T8 | Sibling: gateway:3128; other gateway ports; cache manager | 3128 allowed + Squid ACL; other ports: nothing listens on them — **L2 does not filter them** (a service bound on one would be sibling-reachable); mgr 403 | can probe Squid; cannot widen nft | lab-verified (framing corrected by the probe: "other ports nft-dropped" was inaccurate — see T7) |
@@ -363,11 +385,11 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T10 | Workload reads `~/.config/egresslock/` | not mounted by the kit; the operator's launcher is the only path in | empty of policy files unless the operator bind-mounts `$HOME` or the confdir | code-verified (kit paths) |
 | T11 | `allow 'foo; rm -rf /'` | reject, exit 2, file unchanged | usage / invalid entry | code-verified |
 | T12 | Gateway container stopped | no useful exemption for the workload; default drop | connect fail; `denied` may be empty | design-intent |
-| T13 | `allow-host` then DNS changes | traffic still to **old** A until `ensure`; `verify` warns `drift:` | hang to new IP; `verify` rc=0 with warning | lab-verified (drift loop). E2E pin: lab-verified after leftover `agent_policy` removed |
+| T13 | `allow-host` then DNS changes | traffic still to the **old** effective A set (first 16 sorted distinct) until `ensure`; `verify` warns `drift:` on a set change | hang to new IP; `verify` rc=0 with warning | lab-verified (drift loop). E2E pin: lab-verified. A rotating single-A name (`github.com` SSH) is pinned to one member at a time — never stable; a warning whenever a cycle resolves another member, only the pinned member reachable; the literal-pool recipe replaces the pin |
 | T14 | `rule public-only` (drop-set narrower than all special-use ranges) | **retired** as of 0.6.0: the mode is gone, so the risk no longer exists to accept | n/a — see CHANGELOG | retired |
 | T15 | Another account's `podman network ls` | cannot see this account's nets | empty / other store | design-intent |
 | T16 | Engine run as root | refuse | error; root's store unused | design-intent |
-| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach: cloud metadata (`169.254.169.254`) is **not delivered** on this pasta (in-lab mitigation: connection times out); hosts-file rebind is **not injectable** from the gateway (non-root gateway; Squid resolves via internal DNS, not the hosts file); LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, nft-direct, not the name-rebind path. The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
+| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach: cloud metadata (`169.254.169.254`) is **not delivered** on this pasta (in-lab mitigation: connection times out); hosts-file rebind is **not injectable** from the gateway (non-root gateway; Squid resolves via internal DNS, not the hosts file); LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, nft-direct, not the name-rebind path. The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. The same name-at-request-time semantics cover **gateway-tunneled non-HTTP** (e.g. SSH via a client `ProxyCommand` CONNECT — optional recipe, docs only): the SSH host-key check remains the mitigation for SSH, and `denied` does see **denied** CONNECT-tunneled traffic (an allowed tunnel shows in the gateway access.log as `TCP_TUNNEL/200`). | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
 | T18 | Literal `http://127.0.0.1` (or other IPv4 URL) via proxy | Squid 403 (dstdomain is names). `allow` of an IPv4 literal is rejected. Use `allow-host` for addresses. | 403; `allow` exit 2 | lab-verified (unlisted literals); grammar: literals rejected. Since 0.5.0: 403 holds **including when the IP's PTR equals an allowlisted name** (generated dstdomain ACLs carry `-n`) |
 
 Rows read as "what should happen", not a pentest report:

@@ -28,7 +28,7 @@ fi
 # -z writes it as a side effect, and after a SIGKILLed container restart
 # a stale file (with a PID-reused number) makes -z or -N abort with
 # "Squid is already running" — causing a restart=always crash loop
-# (on-host finding, ARC-5).
+# (ARC-5).
 rm -f /tmp/squid.pid
 if ! squid -z -f "$CFG" >/dev/null 2>&1; then
     echo "egresslock-gateway: squid -z failed" >&2

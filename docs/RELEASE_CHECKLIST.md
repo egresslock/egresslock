@@ -54,12 +54,15 @@ workaround).
 All of these must hold on the snapshot tree (not the private
 development history):
 
-- [ ] `bash tests/run.sh` is green on the snapshot sources.
+- [ ] `bash tests/run.sh` is green on the snapshot sources (the full
+      battery, default track — not `--track fast`: the per-push CI
+      battery skips the registered slow sections, the release gate
+      runs everything).
 - [ ] Threat model matches the tree: no site launchers, accepted
       risks stated, no claim of sandbox or “any rootless Podman”.
 - [ ] README and setup docs match CLI names:
-      `egresslock-setup --apparmor-check` (AppArmor),
-      `egresslock-setup --doctor` (kit/account state),
+      `egresslock-setup apparmor check` (AppArmor),
+      `egresslock-setup doctor` (kit/account state),
       `egresslock doctor` (host environment), if those commands exist
       at this tag.
 - [ ] Full or focused review (below) ended **READY** or **READY WITH

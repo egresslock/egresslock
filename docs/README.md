@@ -47,11 +47,19 @@ docs/
                              counters, same-host pasta patterns
     proxy-clients.md         pointing proxy-unaware tools at the gateway;
                              what the six proxy vars are for
+    rotating-names.md        a name whose DNS serves one rotating A per
+                             query (`github.com` SSH): why `allow-host`
+                             can never pin it stably; the ways out
+                             (`allow` by name, literals, tunnel)
     check-everything.md      full per-layer health/inspection catalog
     scripts-and-environment.md  engine env overrides, config resolution,
                              unit.env, script defaults
     files-installed.md       what the kit installs (.deb / prefix layout,
                              unit templates) + what a checkout contains
+    file-locations.md        where the account's files live on the host:
+                             conf, allowlist, pins, unit.env, lock,
+                             proxy env file, temp leftovers — modes,
+                             lifecycle, backup/cleanup
     threat-model.md          assets, boundaries, threats, accepted risks
   troubleshooting.md         symptom index (ONLY entry point)
   troubleshooting/           one page per issue:
@@ -64,10 +72,12 @@ docs/
                                  the host / localhost (pasta hairpin)
     netns-inspection.md          shared netns inspection; root-run leak
     gateway-logs.md              Squid access.log / cache.log / denied
+    denied-log-cap.md            denied misses older denials (log read cap)
     verify-timer-signals.md      verified / FAILED / drift lines
     network-not-found.md         unable to find network ... network not found
     after-a-reboot.md            network looks fine after a reboot but
                                  workloads are unprotected (no policy)
+    revocation-name-gone.md      revoking a rule whose name no longer resolves (manual recovery)
 ```
 
 Component-local docs stay beside their component (`apparmor/README.md`,

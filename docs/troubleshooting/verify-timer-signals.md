@@ -11,23 +11,43 @@ lines are healthy.
 | Unit | Runs as | Purpose | Log |
 |---|---|---|---|
 | `egresslock-verify@<account>.timer` | (timer) | 15-min drift signal, `Persistent=true` | `journalctl -t systemd` / `list-timers` |
-| `egresslock-verify@<account>.service` | the account | `egresslock-verify`: named verify or `--ensured` | `journalctl -u egresslock-verify@<account>.service` |
-| your workload's daemon unit (e.g. a runner service) | the account | `egresslock-start`: `ensure` (fail closed) then exec | `journalctl -u <daemon>.service` |
+| `egresslock-verify@<account>.service` | the account | `egresslock-verify`: named verify or `--ensured` | `sudo journalctl -u egresslock-verify@<account>.service` |
+| your workload's daemon unit (e.g. a runner service) | the account | `egresslock-start`: `ensure` (fail closed) then exec | `sudo journalctl -u <daemon>.service` |
 
 Signal semantics (learned the hard way — check for these):
 
 - Healthy: `profile '<name>' verified (ensured)` lines, exit 0.
 - `verify: ... FAILED` / exit 1: policy drift or a half-dead profile
   (e.g. gateway container down). Heal with `ensure <profile>` **as the
-  account**; verify never auto-fixes. (The kit's
-  `egresslock-setup --doctor` reports the same exit-1 instance as
-  "verify drift, or the entry wrapper failed" — the journal line above
-  tells you which.)
+  account**; verify never auto-fixes. The kit's `egresslock-setup
+  doctor` reports the same exit-1 instance with its last and next run,
+  a manual re-run command that sources the unit environment, and the
+  service journal — the `sudo journalctl -u` line in the table above is
+  where the details are.
+- A failed verify **timer** (rather than the service) means the timer
+  could not start and the verify service never ran: its journal, not
+  the service log, is the evidence. Doctor checks the timer's armed
+  state first and names it: a disabled timer is reported as disarmed
+  (with the re-arm command), masked/static/not-found states get their
+  own fix, and an enabled-but-failed timer prints `reset-failed` +
+  `restart` plus the timer journal. A stale failure stays visible until
+  it is cleared — `enable --now` does not clear it.
+- `verify: gateway container '<name>' not exec-able (...)` / exit 1:
+  the gateway was stopped or mid-restart when verify inspected it —
+  commonly a concurrent `ensure`/`allow` restarting the same profile.
+  Not a config fault. Re-run after the concurrent command finishes —
+  or `egresslock ensure <profile>` **as the account** if the gateway
+  stayed down. Only `verify: gateway squid config invalid: ...` means
+  Squid itself rejected the deployed config.
 - `status=203/EXEC` (systemd start failure, no verify output at all):
   the unit file itself is broken — e.g. a stale template left in
   `/etc/systemd/system` shadowing the package's unit after a
-  prefix→deb switch. Run `sudo egresslock-setup --doctor`: it names
+  prefix→deb switch. Run `sudo egresslock-setup doctor`: it names
   the shadowing file (or missing ExecStart target) and the exact fix.
+  When that verify-unit row already explains the failed instance,
+  doctor reports the instance as a note instead of a second problem
+  (no repeated target/reinstall text); a 203/EXEC it cannot explain
+  keeps the service journal as the lead evidence.
   If the shadow is the postinst co-install refusal (the `.deb` install
   FAILED because a prefix kit was still installed): remove the prefix
   kit with `uninstall-kit.sh`, then finish the install with
@@ -35,7 +55,20 @@ Signal semantics (learned the hard way — check for these):
   `apt-get install --reinstall egresslock`, which cannot resolve the
   half-installed (`iF`) state ("No file name for egresslock").
 - `drift: host <name> resolved to <new> but the policy pins <old>`:
-  DNS moved; policy is unchanged; `ensure` heals on the next run.
+  the host's address set changed at `ensure` time (a member address
+  appeared or disappeared — a resolver reorder of the same addresses
+  is not a change; multi-address values render comma-joined); policy
+  is unchanged; `ensure` heals on the next run. The pinned set is
+  capped at the first 16 sorted distinct addresses (`DNS_SET_MAX`); a
+  larger answer truncates with a named `note:`.
+- A name that serves **one address per query from a rotating pool**
+  (e.g. `github.com` over SSH) is the exception: each `ensure` pins
+  only the one answer it saw, so a later cycle that resolves another
+  member warns again, and re-`ensure` only swaps which member is
+  pinned. Replace the name with one IPv4-literal
+  `allow-host` line per member (literals never resolve, so they never
+  drift), or tunnel the connection through the gateway by name — see
+  [Rotating names](../reference/rotating-names.md).
 - `verify: network exists but policy does not — run: egresslock
   ensure <profile>` / exit 1: the post-reboot stale window — the
   profile's podman network object survived the reboot (on disk) but

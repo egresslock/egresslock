@@ -24,7 +24,7 @@ port come from `egresslock proxy-env <profile>`; in the table below
 | Gradle | no | `-Dhttp.proxyHost=<gw-ip> -Dhttp.proxyPort=<gw-port> -Dhttps.proxyHost=<gw-ip> -Dhttps.proxyPort=<gw-port>`, or `gradle.properties` `systemProp.*`; mirror NO_PROXY in `http.nonProxyHosts`; `JAVA_TOOL_OPTIONS` injects the properties without touching the command line (prints a "Picked up" notice) |
 | Maven | no | `~/.m2/settings.xml` `<proxies>` block |
 | npm / yarn | partially (some operations) | `npm config set proxy "http://<gw-ip>:<gw-port>"` + `https-proxy`, or `.npmrc` |
-| ssh / scp / rsync-over-ssh | never (not HTTP) | no proxy concept — `allow-host <profile> <host:port>` direct rule instead |
+| ssh / scp / rsync-over-ssh | never (not HTTP) | not natively — direct `allow-host <profile> <host:port>`, or wrap in an HTTP CONNECT tunnel: `allow <profile> ssh.github.com` + a `ProxyCommand` (helper `ncat` — included in the shared example image) — see [Rotating names](rotating-names.md) |
 | docker/podman pull INSIDE the workload | daemon-level, not workload env | point the daemon/containers.conf proxy settings at the gateway |
 
 Exclusions mirror `NO_PROXY`: whatever the profile keeps off the proxy
@@ -54,7 +54,13 @@ of the same pair:
 
 One environment-change rule to remember: proxy env is baked at
 container start — after any policy or env change, **regenerate**
-the env file (`egresslock proxy-env <profile> >
-/run/user/$(id -u)/egresslock-proxy-<profile>.env` — the account's
-private runtime dir) and **recreate** the
+the env file (`egresslock proxy-env <profile> --out` writes it —
+mode 0600, the account's private runtime dir — and prints the path;
+an explicit `--out=<path>` elsewhere is refused if its directory is
+world-writable — a directory your group can also write to is
+accepted for now — the runtime-dir default always qualifies) and
+**recreate** the
 container (see [allow-non-http](../quickstart/allow-non-http.md)).
+
+Where the generated env file lives on disk (and the rest of the
+account-side file catalog): [File locations](file-locations.md).

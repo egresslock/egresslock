@@ -1,35 +1,28 @@
-# tests/lib.sh — shared mock environment for the engine and
-# consumer test harnesses (ARC-15).
+# tests/lib.sh — shared mock environment for the engine and consumer test
+# harnesses (ARC-15). Mocks podman, nft and getent to emulate rootless-
+# netns state transitions (netns/policy destroyed when the last container
+# stops, nft listings with counters). No root, Podman or nftables needed.
 #
-# Mocks the podman, nft and getent to emulate the rootless-netns state
-# transitions observed on-host (netns/policy destroyed when the last
-# container stops, nft chain listings with counter expansion, etc.).
-# No root, no Podman, no nftables needed.
+# Callers may set beforehand: EGRESSLOCK_PROFILES (engine binary; default
+# <tree-root>/egresslock), AGENT_RUN (consumer wrapper; default unset),
+# ARCMOCK_DNS_BASE (base DNS mapping "host=ip,host=ip"; the engine harness
+# uses neutral example.test).
 #
-# Callers source this file and may set beforehand:
-#   EGRESSLOCK_PROFILES  engine binary under test (default:
-#                        <tree-root>/egresslock)
-#   AGENT_RUN            consumer wrapper under test (default: unset)
-#   ARCMOCK_DNS_BASE  base DNS mapping "host=ip,host=ip" for the getent
-#                     mock (the engine harness uses neutral example.test
-#                     hosts as site data)
-#
-# Default paths are relative to the egresslock tree (the parent of
-# tests/), so this file keeps working when the tree relocates to the
-# standalone egresslock repository (ARC-74-D4).
-#   EGRESSLOCK_MOCK_DNS    per-call DNS overrides (drift knob, ARC-12)
-#   ARCMOCK_PASSWD_HOME  when set, the getent mock answers
-#                     `getent passwd <uid>` with this home so the
-#                     default-config probe's HOME fallback
-#                     (confdir_default) is hermetic (ARC-24)
-#   ARCMOCK_LINGER_ANSWER  loginctl mock's `show-user … Linger
-#                     --value` answer (default `yes`); set `no` to
-#                     exercise egresslock-setup's fail-closed linger
-#                     branch (ARC-28)
+# Defaults are relative to the egresslock tree (parent of tests/), so the
+# file keeps working when the tree relocates (ARC-74-D4).
+#   EGRESSLOCK_MOCK_DNS   per-call DNS overrides (drift knob, ARC-12)
+#   ARCMOCK_PASSWD_HOME   getent passwd <uid> home; keeps the default-config
+#                         HOME fallback hermetic (ARC-24)
+#   ARCMOCK_LINGER_ANSWER loginctl Linger answer (`yes` default; `no`
+#                         exercises setup's fail-closed branch, ARC-28)
 
 set -u
 
 TESTROOT="$(mktemp -d /tmp/egresslock-test.XXXXXX)"
+# EGL-246 launcher note: deliberately NO battery-wide `egresslock` PATH
+# launcher. Both harnesses put the tree root on PATH at their top
+# (`export PATH="$TESTROOT/bin:$TREE_ROOT:$PATH"`); the egl246 section
+# owns a SECTION-LOCAL absolute launcher for its PATH-shimmed legs.
 trap 'rm -rf "$TESTROOT"' EXIT
 STATE="$TESTROOT/state"
 export ARCMOCK_STATE="$STATE"
@@ -38,6 +31,58 @@ mkdir -p "$STATE/nft" "$STATE/networks" "$STATE/running" "$STATE/containers" "$S
 TREE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AGENT_RUN="${AGENT_RUN:-}"
 EGRESSLOCK_PROFILES="${EGRESSLOCK_PROFILES:-$TREE_ROOT/egresslock}"
+
+# EGL-325: fixed-confdir helper. The engine no longer accepts --config or
+# EGRESSLOCK_CONF; a profile's conf is always
+# <passwd-home>/.config/egresslock/<profile>.conf. conf_home builds a
+# synthetic home whose confdir symlinks the fixture directory (not
+# per-file copies), so conf RMW and .pins records land in the fixture.
+#
+# The home path is DETERMINISTIC per fixture directory (not mktemp): the
+# engine embeds the path in generated configs and tests call this in
+# `$(...)` subshells, so a cache would not survive. Stability lets a
+# second ensure converge (EGL-114 byte-identity).
+__conf_home_key() { # <path> -> stable short digest
+    printf '%s' "$1" | sha256sum | cut -c1-16
+}
+conf_home() { # conf_home <conf-file-or-dir> -> synthetic home for the passwd mock
+    local src="$1" dir home key
+    if [[ -d "$src" ]]; then
+        dir="$(cd "$src" && pwd)" || return 1
+    else
+        dir="$(cd "$(dirname "$src")" && pwd)" || return 1
+    fi
+    key="$(__conf_home_key "$dir")" || return 1
+    home="$TESTROOT/confhome.$key"
+    if [[ ! -L "$home/.config/egresslock" ]]; then
+        mkdir -p "$home/.config" || return 1
+        ln -sfn "$dir" "$home/.config/egresslock" || return 1
+    fi
+    printf '%s\n' "$home"
+}
+
+# EGL-325: read-only fixture isolation. Reads that used `--config` need a
+# confdir holding only the named profile (the fixed-confdir rule).
+# conf_home_ro copies the fixture per call (picks up source edits) and
+# links non-conf siblings. Never use for mutating commands — rewrites
+# would land on the copy.
+conf_home_ro() { # conf_home_ro <conf-file> -> synthetic home, isolated confdir
+    local src="$1" prof home key
+    src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")" || return 1
+    key="$(__conf_home_key "$src")" || return 1
+    home="$TESTROOT/confhome-ro.$key"
+    mkdir -p "$home/.config/egresslock" || return 1
+    prof="$(sed -n 's/^[[:space:]]*profile[[:space:]][[:space:]]*\([^[:space:]]*\).*/\1/p' "$src" 2>/dev/null | head -n1)"
+    [[ -n "$prof" ]] || prof="$(basename "$src" .conf)"
+    rm -f -- "$home/.config/egresslock/"*.conf
+    cp -- "$src" "$home/.config/egresslock/$prof.conf" || return 1
+    local f
+    for f in "$(dirname "$src")"/*; do
+        [[ -f "$f" && "$f" != *.conf ]] || continue
+        ln -sfn -- "$f" "$home/.config/egresslock/$(basename "$f")"
+    done
+    printf '%s\n' "$home"
+}
 
 # --- mocks ------------------------------------------------------------
 mkdir -p "$TESTROOT/bin"
@@ -134,6 +179,14 @@ case "$cmd" in
                 printf '%s\n' "$sect" > "$D/$table.$ch"
             fi
         done
+        # EGL-305 test seam: transaction-applied marker (gates the
+        # post-swap list-chain fault injection to a failure AFTER the
+        # successful atomic -f request reached the mock).
+        : > "$D/f-done"
+        # EGL-307 test seam: the ordinal list-chain read counter resets
+        # on every -f transaction, so fail-list-chain-read-n always
+        # counts POST-swap reads only.
+        : > "$D/f-list-reads"
         exit 0
         ;;
     delete)
@@ -190,15 +243,108 @@ case "$cmd" in
                 [[ "$1" == inet ]] || { echo "mock nft: list chain needs a family" >&2; exit 2; }
                 f="$D/$2.$3"
                 [[ -f "$f" ]] || { echo "Error: No such file or directory" >&2; exit 1; }
+                # EGL-305 test seam (EGL-314 re-point): after the conf
+                # delete, make the conf dir unwritable (content = the
+                # conf dir path) so the trap-context restore's mktemp
+                # fails — the state-(i) restore-failure injection. In a
+                # disallow-host run the first `list chain` is
+                # live_pin_daddr's pre-delete capture; the seam must
+                # fire on the NEXT read (ensure_snapshot_pins' probe,
+                # post-delete, pre-die), so the delete itself is
+                # unaffected. Consumed once (marker + one-shot seen
+                # flag).
+                if [[ -f "$D/confdir-unwritable" ]]; then
+                    if [[ -f "$D/confdir-unwritable-seen" ]]; then
+                        _cdir="$(cat "$D/confdir-unwritable")"
+                        rm -f "$D/confdir-unwritable" "$D/confdir-unwritable-seen"
+                        chmod 0555 "$_cdir" 2>/dev/null || true
+                    else
+                        : > "$D/confdir-unwritable-seen"
+                    fi
+                fi
+                # EGL-307 test seam: the Nth POST-(-f) chain read fails
+                # once with a netlink-style error. The counter
+                # ($D/f-list-reads, reset on every -f) increments per
+                # read while the swap marker ($D/f-done) is present;
+                # fail-list-chain-read-n names N. The marker is consumed
+                # when it fires, so later reads pass (e307-c: the guard's
+                # read fails, the reconcile's own read succeeds).
+                if [[ -f "$D/f-done" ]]; then
+                    _n307=0
+                    [[ -s "$D/f-list-reads" ]] && read -r _n307 < "$D/f-list-reads"
+                    _n307=$((_n307 + 1))
+                    echo "$_n307" > "$D/f-list-reads"
+                    if [[ -f "$D/fail-list-chain-read-n" ]] \
+                       && [[ "$_n307" == "$(cat "$D/fail-list-chain-read-n")" ]]; then
+                        rm -f "$D/fail-list-chain-read-n"
+                        echo "Error: mock nft: netlink read of chain '$3' failed once (fail-list-chain-read-n)" >&2
+                        exit 1
+                    fi
+                fi
+                # EGL-305 test seam: fail the FIRST post-swap chain read
+                # once, with a netlink-style error, when both markers
+                # are present (f-done gates it to AFTER the -f swap;
+                # the engine's 2>/dev/null swallows the message so the
+                # mock just exits 1). Consumes both markers.
+                if [[ -f "$D/fail-list-chain-after-f" && -f "$D/f-done" ]]; then
+                    rm -f "$D/fail-list-chain-after-f" "$D/f-done"
+                    echo "Error: mock nft: netlink read of chain '$3' failed once (fail-list-chain-after-f)" >&2
+                    exit 1
+                fi
+                # EGL-311 test seams: the post-swap read AFTER the member
+                # flush (the conntrack log already carries a -D). Each
+                # marker is consumed once.
+                if [[ -f "$D/f-done" ]] \
+                   && grep -q '^conntrack -D ' "${ARCMOCK_STATE:?}/conntrack.log" 2>/dev/null; then
+                    if [[ -f "$D/fail-list-chain-after-flush" ]]; then
+                        rm -f "$D/fail-list-chain-after-flush"
+                        echo "Error: mock nft: netlink read of chain '$3' failed once (fail-list-chain-after-flush)" >&2
+                        exit 1
+                    fi
+                    if [[ -f "$D/partial-list-chain-after-flush" ]]; then
+                        rm -f "$D/partial-list-chain-after-flush"
+                        sed -E 's/counter (drop|accept)$/counter packets 0 bytes 0 \1/; s/priority -150/priority mangle/' "$f" \
+                            | awk '/\{|\}/ { print; next } { print "        " $0 }'
+                        echo "Error: mock nft: netlink read of chain '$3' failed after data (partial-list-chain-after-flush)" >&2
+                        exit 1
+                    fi
+                    if [[ -f "$D/empty-list-chain-after-flush" ]]; then
+                        rm -f "$D/empty-list-chain-after-flush"
+                        exit 0
+                    fi
+                    if [[ -f "$D/header-list-chain-after-flush" ]]; then
+                        rm -f "$D/header-list-chain-after-flush"
+                        printf 'chain %s {\n        type filter hook forward priority -150; policy accept;\n}\n' "$3"
+                        exit 0
+                    fi
+                    if [[ -f "$D/garbage-list-chain-after-flush" ]]; then
+                        rm -f "$D/garbage-list-chain-after-flush"
+                        printf 'not a firewall chain\n'
+                        exit 0
+                    fi
+                fi
                 # Mimic real nft output: expanded counters, mangle priority
                 # alias, and INDENTED body lines inside the chain.
-                sed -E 's/counter (drop|accept)$/counter packets 0 bytes 0 \1/; s/priority -150/priority mangle/' "$f" \
-                    | awk '/\{|\}/ { print; next } { print "        " $0 }'
+                # EGL-296 F1 (ER-EGL-296-5) test seams: a failed read
+                # whose stdout still looks usable. Consumed once each,
+                # like fail-list-chain-after-f.
+                body="$(sed -E 's/counter (drop|accept)$/counter packets 0 bytes 0 \1/; s/priority -150/priority mangle/' "$f" \
+                    | awk '/\{|\}/ { print; next } { print "        " $0 }')"
+                if [[ -f "$D/fail-list-chain-output-rc1" ]]; then
+                    rm -f "$D/fail-list-chain-output-rc1"
+                    printf '%s\n' "$body"
+                    exit 1
+                fi
+                if [[ -f "$D/fail-list-chain-partial-rc1" ]]; then
+                    rm -f "$D/fail-list-chain-partial-rc1"
+                    printf '%s\n' "$body" | head -1
+                    exit 1
+                fi
+                printf '%s\n' "$body"
                 ;;
             table)
                 # Keyed on the TABLE name ($2), not the family: a table
-                # exists iff it has chain state files (ARC-54 uses rc +
-                # output scoping to detect the legacy table precisely).
+                # exists iff it has chain state files.
                 found=0
                 for f in "$D/$2".*; do
                     [[ -f "$f" ]] || continue
@@ -215,7 +361,7 @@ case "$cmd" in
                 declare -A rseen_t=()
                 for f in "$D"/*; do
                     [[ -f "$f" ]] || continue
-                    rbase="$(basename "$f")"
+                    rbase="${f##*/}"
                     [[ "$rbase" == last-transaction.nft ]] && continue
                     [[ "$rbase" == *.* ]] || continue
                     rtable="${rbase%%.*}"
@@ -234,12 +380,18 @@ EOF
 
 cat > "$TESTROOT/bin/getent" <<'EOF'
 #!/usr/bin/env bash
-# ARC-24 HOME-fallback knob: answer `getent passwd <uid>` with the
-# configured home so the default-config probe's getent fallback is
-# hermetic when a test unsets HOME.
-if [[ "$1" == passwd && -n "${ARCMOCK_PASSWD_HOME:-}" ]]; then
-    echo "testuser:x:$(id -u):0:test:$ARCMOCK_PASSWD_HOME:/bin/bash"
-    exit 0
+# ARC-24 HOME-fallback knob, EGL-227 F1 rework: the mock answers NUMERIC
+# `getent passwd <uid>` queries with the configured home (the engine's
+# confdir_default HOME fallback and engine_lock_path are both numeric);
+# name lookups still reach the real database.
+if [[ "$1" == passwd && "$2" =~ ^[0-9]+$ ]]; then
+    if [[ -n "${ARCMOCK_PASSWD_MISSING:-}" ]]; then
+        exit 2
+    fi
+    if [[ -n "${ARCMOCK_PASSWD_HOME:-}" ]]; then
+        echo "testuser:x:$(id -u):0:test:$ARCMOCK_PASSWD_HOME:/bin/bash"
+        exit 0
+    fi
 fi
 [[ "$1" == ahostsv4 ]] || exec /usr/bin/getent "$@"
 # Numeric IPv4 queries: real getent answers a dotted quad from the
@@ -254,7 +406,9 @@ if [[ "$2" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
 fi
 # ARC-12 drift knob: EGRESSLOCK_MOCK_DNS="host=newip,host2=" overrides the
 # pinned base mapping per call; host= (empty value) means "no longer
-# resolves". Unlisted hosts keep the base mapping.
+# resolves". Unlisted hosts keep the base mapping. EGL-219: a value may
+# carry '+'-separated ADDRESSES (multi-A; both ARCMOCK_DNS_BASE and the
+# override accept the same grammar); ',' is never an address separator.
 declare -A BASE=()
 if [[ -n "${ARCMOCK_DNS_BASE:-}" ]]; then
     IFS=, read -ra basepairs <<<"$ARCMOCK_DNS_BASE"
@@ -269,9 +423,41 @@ if [[ -n "${EGRESSLOCK_MOCK_DNS:-}" ]]; then
         BASE[$h]="$v"
     done
 fi
+# EGL-219-D14: stateful-resolver seam for the single-query regression.
+# $ARCMOCK_STATE/dns-seq-<host>, when present and non-empty, serves (and
+# pops) its first line — same '+'-grammar as the base mapping — so
+# consecutive lookups of one host can differ. When
+# $ARCMOCK_STATE/dns-queries.log exists, every served answer is appended
+# as '<host>=<value>' (base path included), making the lookup count
+# observable; with neither file the mock is byte-identical to before.
+if [[ -n "${ARCMOCK_STATE:-}" && -s "$ARCMOCK_STATE/dns-seq-$2" ]]; then
+    seq_ip="$(head -n 1 "$ARCMOCK_STATE/dns-seq-$2")"
+    sed -i '1d' "$ARCMOCK_STATE/dns-seq-$2"
+    if [[ -f "$ARCMOCK_STATE/dns-queries.log" ]]; then
+        printf '%s=%s\n' "$2" "$seq_ip" >> "$ARCMOCK_STATE/dns-queries.log"
+    fi
+    if [[ -n "$seq_ip" ]]; then
+        IFS='+' read -ra seq_addrs <<<"$seq_ip"
+        for seq_addr in "${seq_addrs[@]}"; do
+            echo "$seq_addr STREAM $2"
+        done
+        exit 0
+    fi
+    exit 2
+fi
 ip="${BASE[$2]-}"
 if [[ -n "$ip" ]]; then
-    echo "$ip STREAM $2"
+    # EGL-219: a '+'-separated value is several A records for the
+    # host — one emitted line per address, in the GIVEN order (a
+    # resolver's order is not canonical; the engine sorts). ',' stays
+    # the pair separator (never an address separator).
+    IFS='+' read -ra mock_addrs <<<"$ip"
+    for mock_addr in "${mock_addrs[@]}"; do
+        echo "$mock_addr STREAM $2"
+    done
+    if [[ -n "${ARCMOCK_STATE:-}" && -f "$ARCMOCK_STATE/dns-queries.log" ]]; then
+        printf '%s=%s\n' "$2" "$ip" >> "$ARCMOCK_STATE/dns-queries.log"
+    fi
     exit 0
 fi
 exit 2
@@ -282,7 +468,8 @@ cat > "$TESTROOT/bin/podman" <<'EOF'
 # Mock podman: persistent-enough state for the egresslock flow.
 set -u
 D="${ARCMOCK_STATE:?}"
-mkdir -p "$D/nft" "$D/networks" "$D/running" "$D/containers"
+[[ -d "$D/nft" && -d "$D/networks" && -d "$D/running" && -d "$D/containers" ]] \
+    || mkdir -p "$D/nft" "$D/networks" "$D/running" "$D/containers"
 cmd="$1"; shift
 case "$cmd" in
     unshare)
@@ -390,7 +577,7 @@ case "$cmd" in
                 # too, or a wrong template passes green while vacuous
                 # on real hosts, which is exactly the ARC-67 bug).
                 if [[ "${2:-}" == "--format" && "${3:-}" == "{{.Name}}" ]]; then
-                    for f in "$D/networks"/*; do [[ -f "$f" ]] && basename "$f"; done
+                    for f in "$D/networks"/*; do [[ -f "$f" ]] && echo "${f##*/}"; done
                     exit 0
                 fi
                 echo "mock podman: unsupported network ls" >&2
@@ -415,6 +602,13 @@ case "$cmd" in
         # EGL-114: opslog mirror (rm/restart/run argv for the
         # converged-ensure pins; opslog has no other consumers).
         echo "podman run $*" >> "$D/opslog"
+        # EGL-227 D10: a container-starting child (run/restart) must
+        # never inherit fd 9 (the account lock) — rt_run/rt_restart
+        # close it in the child. Record any leak; the egl227 section
+        # asserts the marker absent.
+        if [[ -e /proc/self/fd/9 ]]; then
+            echo "container child inherited fd 9: $*" >> "$D/egl227-fd9-leak"
+        fi
         name=""; net=""; ip=""; mac=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -477,13 +671,14 @@ case "$cmd" in
         declare -A ps_seen=()
         for f in "$D/running"/*; do
             [[ -f "$f" ]] || continue
-            ps_seen[$(basename "$f")]=1
-            basename "$f"
+            _ps_name="${f##*/}"
+            ps_seen[$_ps_name]=1
+            echo "$_ps_name"
         done
         if [[ "${1:-}" == "-a" ]]; then
             for f in "$D/containers"/*.net; do
                 [[ -f "$f" ]] || continue
-                n="$(basename "$f" .net)"
+                n="${f##*/}"; n="${n%.net}"
                 [[ -n "${ps_seen[$n]:-}" ]] && continue
                 echo "$n"
             done
@@ -536,6 +731,14 @@ case "$cmd" in
         # ARC-32-D1: record exec argv — separate file, because runlog
         # line counts are how existing tests assert "no new podman run".
         echo "exec $name $*" >> "$D/execlog"
+        # EGL-283: model podman's own exec failure (container stopped or
+        # mid-restart — e.g. a concurrent ensure) while the container
+        # still lists as running, so the engine's earlier liveness check
+        # passed. Podman rc 125 + the real container-state error.
+        if [[ -f "$D/exec-fails-$name" || -f "$D/exec-fails" ]]; then
+            echo "Error: can only create exec sessions on running containers: container state improper" >&2
+            exit 125
+        fi
         case "$1" in
             squid)
                 # ARC-32-D1: `squid -k rotate` reopens the stdio logs;
@@ -576,6 +779,18 @@ case "$cmd" in
                     exit 1
                 fi
                 echo "mock podman: unsupported stat $*" >&2
+                exit 2
+                ;;
+            tail)
+                # EGL-252: cmd_denied tail-reads the newest log bytes
+                # when access.log exceeds the read cap (tail -c <N>).
+                if [[ "${2:-}" == "-c" && "${4:-}" == /var/log/squid/access.log ]]; then
+                    f="$D/containers-$name.access.log"
+                    if [[ -f "$f" ]]; then tail -c "$3" "$f"; exit 0; fi
+                    echo "tail: cannot open '$4' for reading: No such file or directory" >&2
+                    exit 1
+                fi
+                echo "mock podman: unsupported tail $*" >&2
                 exit 2
                 ;;
             mv)
@@ -680,7 +895,7 @@ case "$cmd" in
         name="${dst%%:*}"; path="${dst#*:}"
         [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
         cp "$src" "$D/allowlist-staged"
-        cp "$src" "$D/containers-$name.$(basename "$src")"
+        cp "$src" "$D/containers-$name.${src##*/}"
         cp "$src" "$D/containers-$name.allowlist.last"
         exit 0
         ;;
@@ -696,6 +911,15 @@ case "$cmd" in
             case "$1" in -*) ;; *) name="$1"; break ;; esac
             shift
         done
+        # EGL-97: rm-wedged[-<name>] — the FIRST rm of that name fails like
+        # a conmon-wedged removal (rc 125, real libpod error shape; state
+        # untouched); the fired marker makes later calls take the normal path.
+        if [[ ! -f "$D/rm-wedged-fired-$name" ]] \
+            && { [[ -f "$D/rm-wedged" ]] || [[ -f "$D/rm-wedged-$name" ]]; }; then
+            echo "Error: cannot remove container $name as it could not be stopped: container $name conmon exited prematurely: internal libpod error" >&2
+            : > "$D/rm-wedged-fired-$name"
+            exit 125
+        fi
         if [[ -f "$D/rm-container-fails" ]]; then
             echo "Error: unable to remove container $name: device or resource busy" >&2
             exit 1
@@ -724,6 +948,12 @@ case "$cmd" in
         # NO restart of a healthy gateway (and existing pins can keep
         # counting restarts where they already do).
         echo "podman restart $*" >> "$D/opslog"
+        # EGL-227 D10: same fd-9 leak witness as the run arm (a restart
+        # is a stop+start — its fresh monitor must not inherit the
+        # account-lock fd); the egl227 section asserts the marker absent.
+        if [[ -e /proc/self/fd/9 ]]; then
+            echo "container child inherited fd 9: $*" >> "$D/egl227-fd9-leak"
+        fi
         name=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -779,6 +1009,10 @@ case "$cmd" in
         # failed, so "no build" asserts (empty buildlog) stay exact.
         echo "build $*" >> "$D/buildlog"
         echo "podman build $*" >> "$D/callorder.log"
+        # EGL-200 P3-C: opt-in noisy build stream for the quiet-build pins.
+        if [[ -f "$D/build-noisy" ]]; then
+            echo "MOCK-BUILD-OUTPUT"
+        fi
         if [[ -f "$D/build-fails" ]]; then
             exit 125
         fi
@@ -812,15 +1046,11 @@ case "$cmd" in
     *) echo "mock podman: unsupported op $cmd" >&2; exit 2 ;;
 esac
 EOF
-# EGL-80-L1: hermetic dpkg-query — the host dpkg database must not leak
-# into the harness. On a host where the egresslock .deb is installed,
-# install-kit's real dpkg-query call answered "install ok installed" and
-# its ARC-22-D1 refusal failed ~30 prefix-install tests. Mock emulates
-# dpkg-query for an UNKNOWN package: rc 1, no stdout (exactly what the
-# real tool prints for a package it does not know), so install-kit's
-# `deb_status` is empty and it proceeds. Tests that need an
-# installed-deb answer (the p43 refusal case) stub their own dpkg-query
-# earlier on PATH and still win.
+# EGL-80-L1: hermetic dpkg-query — the host dpkg database must not leak.
+# An installed .deb made install-kit's real query answer "install ok
+# installed", failing ~30 prefix-install tests. The mock answers an
+# unknown package: rc 1, no stdout, so `deb_status` is empty. The p43
+# refusal stubs its own dpkg-query earlier on PATH.
 cat > "$TESTROOT/bin/dpkg-query" <<'EOF'
 #!/usr/bin/env bash
 # EGL-80-L1 mock: egresslock is never installed in the harness world.
@@ -828,27 +1058,19 @@ exit 1
 EOF
 
 # EGL-139-D2 mock seam: a state-file conntrack mirroring the ctnetlink
-# verbs the engine uses. State: $D/conntrack-table holds /proc/net/
-# nf_conntrack-shaped lines (the render the -D/-L filters against);
-# $D/conntrack.log records every argv so tests can pin the scoped -D
-# tuple and its ordering against the `removed:` line. Markers:
-# $D/conntrack-probe-fails makes `-C` fail (unavailable ctnetlink
-# shape); $D/conntrack-delete-fails makes `-D` fail with the table
-# untouched (a surviving-ESTABLISHED drill); $D/conntrack-list-fails
-# makes `-L` fail with empty output, and $D/conntrack-list-<shape>
-# markers (R-EGL-231-3 finding 1) render the other failed-list shapes:
-# conntrack-list-nonzero-empty (rc 1 + the 0-shown summary),
-# conntrack-list-zero-summary-error (rc 1 + a zero summary AND an error
-# line — the transcript shape the withdrawn D6 exception wrongly
-# blessed), conntrack-list-nonzero-count (rc 1 + a positive summary
-# ending in zero), conntrack-list-partial-rows-fail (rc 1 + partial
-# rows on stdout). RCs match the real tool (R-EGL-231-3): -D deletes
-# nothing -> rc 1 + the banner summary on stderr; -L matches nothing ->
-# rc 0 + the banner summary on stderr (upstream print_stats exempts the
-# list summary from the zero-count failure — the empty dump is rc 0).
-# Both -D and -L filter on the ORIGINAL-direction tuple fields only
-# (what the real -d/--dport select), so a reply-side-only match never
-# counts.
+# verbs the engine uses. $D/conntrack-table holds nf_conntrack-shaped
+# lines; $D/conntrack.log pins argv/order. Markers: conntrack-probe-fails
+# (-C), conntrack-delete-fails (-D, table untouched), conntrack-list-fails
+# (-L, empty), and conntrack-list-<shape> for other failed-list shapes
+# (R-EGL-231-3 finding 1): nonzero-empty, zero-summary-error,
+# nonzero-count, partial-rows-fail, and port-fails (EGL-295: only the
+# port-only enumerate read fails). RCs match the real tool: -D deletes
+# nothing -> rc 1 + banner summary on stderr; -L matches nothing -> rc 0
+# + summary on stderr. Both filter ONLY original-direction tuple fields,
+# so a reply-side-only match never counts; EGL-312 (R-EGL-306-3 F2)
+# reaches that shape through the original fields (src=<peer>
+# sport=<port>), so -D/-L also accept -s/--src and --sport and match
+# every provided filter (no filter => no match).
 cat > "$TESTROOT/bin/conntrack" <<'EOF'
 #!/usr/bin/env bash
 set -u
@@ -872,44 +1094,65 @@ case "$op" in
         fi
         # Scoped delete: drop entries whose ORIGINAL-direction fields
         # (the first src/dst/sport/dport set in the row — the fields the
-        # real -d/--dport select) name BOTH the -d daddr and the --dport
-        # dport; other pins, DNS, gateway-exemption traffic, and rows
-        # matching only on the reply side stay untouched.
-        dip=""; dport=""
+        # real filters select) match EVERY provided filter (EGL-312:
+        # -s/--src and --sport admitted for the peer-direction
+        # exact-tuple deletes); other pins, DNS, gateway-exemption
+        # traffic, and rows matching only on the reply side stay
+        # untouched. No filter set ⇒ nothing matches (never delete
+        # unscoped).
+        dip=""; dport=""; sip=""; sport=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -d) dip="$2"; shift 2 ;;
                 --dport) dport="$2"; shift 2 ;;
+                -s|--src|--orig-src) sip="$2"; shift 2 ;;
+                --sport|--orig-port-src) sport="$2"; shift 2 ;;
                 *) shift ;;
             esac
         done
         n=0
-        if [[ -f "$TABLE" && -n "$dip" && -n "$dport" ]]; then
-            n="$(awk -v a="$dip" -v b="$dport" '{
-                    delete seen; od = ""; dport_o = ""
+        if [[ -f "$TABLE" && ( -n "$dip" || -n "$sip" || -n "$dport" || -n "$sport" ) ]]; then
+            n="$(awk -v a="$dip" -v b="$dport" -v s="$sip" -v p="$sport" '{
+                    delete seen; od = ""; dport_o = ""; os = ""; sport_o = ""
                     for (i = 1; i <= NF; i++) {
                         split($i, kv, "=")
                         if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
                             if (seen[kv[1]]++ == 0) {
                                 if (kv[1] == "dst") od = kv[2]
                                 if (kv[1] == "dport") dport_o = kv[2]
+                                if (kv[1] == "src") os = kv[2]
+                                if (kv[1] == "sport") sport_o = kv[2]
                             }
                         }
                     }
-                    if (od == a && dport_o == b) { c++ }
+                    ok = 1
+                    if (a != "") { if (od != a) ok = 0 }
+                    if (b != "") { if (dport_o != b) ok = 0 }
+                    if (s != "") { if (os != s) ok = 0 }
+                    if (p != "") { if (sport_o != p) ok = 0 }
+                    if (a == "" && b == "" && s == "" && p == "") ok = 0
+                    if (ok) { c++ }
                 } END { print c+0 }' "$TABLE")"
-            awk -v a="$dip" -v b="$dport" '{
-                    delete seen; od = ""; dport_o = ""
+            awk -v a="$dip" -v b="$dport" -v s="$sip" -v p="$sport" '{
+                    delete seen; od = ""; dport_o = ""; os = ""; sport_o = ""
                     for (i = 1; i <= NF; i++) {
                         split($i, kv, "=")
                         if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
                             if (seen[kv[1]]++ == 0) {
                                 if (kv[1] == "dst") od = kv[2]
                                 if (kv[1] == "dport") dport_o = kv[2]
+                                if (kv[1] == "src") os = kv[2]
+                                if (kv[1] == "sport") sport_o = kv[2]
                             }
                         }
                     }
-                    if (od == a && dport_o == b) { next }
+                    ok = 1
+                    if (a != "") { if (od != a) ok = 0 }
+                    if (b != "") { if (dport_o != b) ok = 0 }
+                    if (s != "") { if (os != s) ok = 0 }
+                    if (p != "") { if (sport_o != p) ok = 0 }
+                    if (a == "" && b == "" && s == "" && p == "") ok = 0
+                    if (ok) { next }
                     { print }
                 }' "$TABLE" > "$TABLE.t" && mv "$TABLE.t" "$TABLE"
         fi
@@ -956,30 +1199,151 @@ case "$op" in
         # on stderr; an empty dump is rc 0 (upstream print_stats
         # exempts the list summary from the zero-count failure —
         # R-EGL-231-3, the D6 correction).
-        dip=""; dport=""
+        dip=""; dport=""; sip=""; sport=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -d) dip="$2"; shift 2 ;;
                 --dport) dport="$2"; shift 2 ;;
+                -s|--src|--orig-src) sip="$2"; shift 2 ;;
+                --sport|--orig-port-src) sport="$2"; shift 2 ;;
                 *) shift ;;
             esac
         done
+        # EGL-313 flush-shaped read counter (mirror of the EGL-312 peer
+        # counter): counts every -L carrying both `-d` and `--dport`
+        # (the flush helper's enumerate/witness shape) so the
+        # conntrack-flush-recheck-fails marker can fail ONLY the SECOND
+        # such read (the witness) and the witness's rc gate stays
+        # observable (gate dropped -> the survivor is declared absent).
+        # Leads the fail markers like the peer counter does: it counts
+        # every flush-shaped attempt, the marker's own die included.
+        if [[ -n "$dip" && -n "$dport" && -z "$sip" && -z "$sport" ]]; then
+            fc=0
+            [[ -f "$D/conntrack-flush-reads" ]] && fc="$(cat "$D/conntrack-flush-reads")"
+            fc=$(( fc + 1 ))
+            printf '%s\n' "$fc" > "$D/conntrack-flush-reads"
+            if [[ -f "$D/conntrack-flush-recheck-fails" && "$fc" -ge 2 ]]; then
+                echo "mock conntrack: flush recheck list failed" >&2
+                exit 1
+            fi
+        fi
+        # EGL-317 test seam: the lying scoped read. While the marker
+        # exists, EVERY flush-shaped -L (daddr+dport set, no -s/--sport —
+        # the helper's enumerate and its own witness share one argv)
+        # returns the empty dump with rc 0 while the table keeps its
+        # rows. Persistent, NOT consumed-once: consumed-once would fool
+        # the enumerate only, and the helper's real witness read would
+        # then die the EGL-297 survivor die before the reconcile witness
+        # runs (rc 1 but never F3). The reconcile's port-only enumerate
+        # is a different read shape and still sees the rows — the leg
+        # pins the F3 residue die.
+        if [[ -f "$D/conntrack-list-scoped-hides" \
+           && -n "$dip" && -n "$dport" && -z "$sip" && -z "$sport" ]]; then
+            echo "conntrack v1.4.8 (conntrack-tools): 0 flow entries have been shown." >&2
+            exit 0
+        fi
+        # EGL-312 stage markers (R-EGL-312-1 F3/F4, R-EGL-312-2 F1) —
+        # each failing ONLY its own read so the earlier reads succeed
+        # first; they sit after argv parse (before the table walk) so
+        # they never fire on the unrelated shapes. The per-source
+        # counter leads the fail marker: it counts every peer-shaped
+        # -L attempt (the marker's own die included), which keeps the
+        # pre-delete rc gate mutation observable in the peer-fails leg
+        # (counter==2 instead of 1).
+        if [[ -n "$sport" && -n "$sip" ]]; then
+            pc=0
+            [[ -f "$D/conntrack-peer-reads" ]] && pc="$(cat "$D/conntrack-peer-reads")"
+            pc=$(( pc + 1 ))
+            printf '%s\n' "$pc" > "$D/conntrack-peer-reads"
+            if [[ -f "$D/conntrack-list-peer-recheck-fails" && "$pc" -ge 2 ]]; then
+                # EGL-312 R-EGL-312-2 F1: the phase-selective witness
+                # recheck. The pre-delete peer enumerate and the
+                # post-delete witness read share one argv, so
+                # conntrack-list-peer-recheck-fails fails only the
+                # SECOND peer-shaped -L of the command (the witness),
+                # letting the delete run first. The leg removes the
+                # counter file before the command.
+                echo "mock conntrack: peer recheck list failed" >&2
+                exit 1
+            fi
+        fi
+        if [[ -n "$sport" && -n "$sip" && -f "$D/conntrack-list-peer-fails" ]]; then
+            echo "mock conntrack: peer list failed" >&2
+            exit 1
+        fi
+        if [[ -n "$sport" && -z "$dip" && -z "$dport" && -z "$sip" && -f "$D/conntrack-list-sport-fails" ]]; then
+            echo "mock conntrack: sport list failed" >&2
+            exit 1
+        fi
+        # EGL-317 test seam: the phase-selective port-only recheck —
+        # mirror of the EGL-312 peer counter. Counts every port-only
+        # enumerate (-L with a --dport and no -d/-s/--sport: the
+        # reconcile's step (2) read shape);
+        # conntrack-list-port-recheck-fails fails ONLY the SECOND such
+        # read (the witness pass's enumerate), so the flush pass's
+        # deletes run first. The leg removes the counter file before the
+        # command.
+        if [[ -z "$dip" && -n "$dport" && -z "$sip" && -z "$sport" ]]; then
+            prc=0
+            [[ -f "$D/conntrack-port-reads" ]] && prc="$(cat "$D/conntrack-port-reads")"
+            prc=$(( prc + 1 ))
+            printf '%s\n' "$prc" > "$D/conntrack-port-reads"
+            if [[ -f "$D/conntrack-list-port-recheck-fails" && "$prc" -ge 2 ]]; then
+                echo "mock conntrack: port recheck list failed" >&2
+                exit 1
+            fi
+        fi
+        # EGL-295: the port-only enumerate read (`-L` with a `--dport`
+        # but no `-d`) has its own marker — conntrack-list-port-fails
+        # fails ONLY that read (the member leg's -d-scoped -L read still
+        # runs first and succeeds); -D and the scoped reads are
+        # unchanged.
+        if [[ -z "$dip" && -n "$dport" && -f "$D/conntrack-list-port-fails" ]]; then
+            echo "mock conntrack: port list failed" >&2
+            exit 1
+        fi
+        # EGL-219-D14 (R4): the daddr-selective read-failure seam for the
+        # member-loop leg. The marker's content is one daddr: a `-L` whose
+        # `-d` matches fails with the netlink-error shape (rc 1, stderr)
+        # and consumes the marker, so exactly the first read of that
+        # member fails and the leg can observe the enumerate-before-delete
+        # ordering. Other reads are unchanged.
+        if [[ -n "$dip" && -f "$D/conntrack-list-fail-daddr" ]] \
+           && [[ "$dip" == "$(cat "$D/conntrack-list-fail-daddr")" ]]; then
+            rm -f "$D/conntrack-list-fail-daddr"
+            echo "mock conntrack: netlink error: Operation failed" >&2
+            exit 1
+        fi
         n=0
-        if [[ -f "$TABLE" && -n "$dip" && -n "$dport" ]]; then
+        if [[ -f "$TABLE" && ( -n "$dport" || -n "$sport" || -n "$dip" || -n "$sip" ) ]]; then
             while IFS= read -r row; do
                 [[ -z "$row" ]] && continue
-                orig="$(awk -v a="$dip" -v b="$dport" '{
-                        delete seen; od = ""; dport_o = ""
+                # -d sets the scoped member shape (both fields); the
+                # port-only enumerate read has no -d, so every row
+                # whose ORIGINAL-direction dport matches is returned
+                # (a=="" is the reconcile's enumerate shape, EGL-295).
+                # EGL-312: every provided filter must match (the peer
+                # reads add -s/--sport); no filter set ⇒ no match.
+                orig="$(awk -v a="$dip" -v b="$dport" -v s="$sip" -v p="$sport" '{
+                        delete seen; od = ""; dport_o = ""; os = ""; sport_o = ""
                         for (i = 1; i <= NF; i++) {
                             split($i, kv, "=")
                             if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
                                 if (seen[kv[1]]++ == 0) {
                                     if (kv[1] == "dst") od = kv[2]
                                     if (kv[1] == "dport") dport_o = kv[2]
+                                    if (kv[1] == "src") os = kv[2]
+                                    if (kv[1] == "sport") sport_o = kv[2]
                                 }
                             }
                         }
-                        if (od == a && dport_o == b) { print "y"; exit }
+                        ok = 1
+                        if (a != "") { if (od != a) ok = 0 }
+                        if (b != "") { if (dport_o != b) ok = 0 }
+                        if (s != "") { if (os != s) ok = 0 }
+                        if (p != "") { if (sport_o != p) ok = 0 }
+                        if (a == "" && b == "" && s == "" && p == "") ok = 0
+                        if (ok) { print "y"; exit }
                     }' <<<"$row")"
                 if [[ "$orig" == "y" ]]; then
                     (( n += 1 ))
@@ -1001,14 +1365,12 @@ case "$op" in
 esac
 EOF
 
-# EGL-139-D2 mock seam: the epilogue reader for /proc/net/nf_conntrack
-# reads. Since EGL-231 the engine's disallow-host post-assert no longer
-# cats the proc table (it reads ctnetlink via the conntrack mock), but
-# the mock `cat` stays so a regressed proc reader still has a named
-# fail: conntrack-table-unreadable forces a read failure, and
-# conntrack-table-absent (EGL-231-D4, the reporter's host shape) is the
-# ENOENT the real rootless netns shows. Everything else delegates to
-# the real cat.
+# EGL-139-D2 mock seam: the epilogue reader for /proc/net/nf_conntrack.
+# Since EGL-231 disallow-host reads ctnetlink, not proc, but the mock
+# `cat` stays so a regressed proc reader fails named:
+# conntrack-table-unreadable forces a read failure and
+# conntrack-table-absent (EGL-231-D4) is the real netns ENOENT. Everything
+# else delegates to the real cat.
 cat > "$TESTROOT/bin/cat" <<'EOF'
 #!/usr/bin/env bash
 # Mock cat: intercept only /proc/net/nf_conntrack (EGL-139-D2 reader).
@@ -1038,12 +1400,9 @@ chmod +x "$TESTROOT/bin/nft" "$TESTROOT/bin/getent" "$TESTROOT/bin/podman" \
          "$TESTROOT/bin/dpkg-query" "$TESTROOT/bin/ip" "$EGRESSLOCK_PROFILES" \
          "$TESTROOT/bin/conntrack" "$TESTROOT/bin/cat"
 
-# Mock systemctl for kit-install tests (ARC-16): records every call.
-# EGL-51: every call is also mirrored into callorder.log so tests can
-# assert cross-tool ordering (loginctl enable-linger → systemctl start
-# user@ → podman build). The marker file systemctl-usermgr-fails makes
-# the user-manager liveness probe (`is-active --quiet user@…`) exit 3
-# the way an inactive user@<uid>.service would.
+# Mock systemctl (ARC-16): records every call, mirrored to callorder.log
+# for cross-tool ordering (EGL-51). systemctl-usermgr-fails makes the
+# user-manager liveness probe exit 3 like inactive user@<uid>.service.
 cat > "$TESTROOT/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 D="${ARCMOCK_STATE:?}"
@@ -1054,8 +1413,30 @@ if [[ -f "$D/systemctl-usermgr-fails" && "$*" == "is-active --quiet user@"* ]]; 
 fi
 # EGL-38: marker models a not-enabled verify timer for the --doctor
 # account slice (start/enable calls still log).
-if [[ -f "$D/systemctl-timer-off" && "$*" == "is-enabled --quiet egresslock-verify@"* ]]; then
-    exit 1
+# EGL-345: the armed-state probe asks NON-QUIET (`static`/`indirect`
+# exit 0, so --quiet cannot distinguish them from `enabled`); the
+# legacy marker answers `disabled` for both forms, and a
+# systemctl-is-enabled fixture names any other state (`masked`,
+# `static`, `not-found`, ...).
+if [[ "$1" == "is-enabled" && "$*" == *"egresslock-verify@"* ]]; then
+    if [[ -f "$D/systemctl-timer-off" && "$*" == *".timer"* ]]; then
+        echo disabled
+        exit 1
+    fi
+    if [[ -f "$D/systemctl-is-enabled" ]]; then
+        st="$(cat "$D/systemctl-is-enabled")"
+        echo "$st"
+        case "$st" in
+            enabled|enabled-runtime|static|indirect) exit 0 ;;
+            not-found) exit 4 ;;
+            *) exit 1 ;;
+        esac
+    fi
+    if [[ "$*" == *"--quiet"* ]]; then
+        exit 0
+    fi
+    echo enabled
+    exit 0
 fi
 # EGL-84: --doctor unit-health probes answer from fixture files.
 # Absent fixtures = a HEALTHY host (is-failed says active; show/list-units
@@ -1078,6 +1459,20 @@ if [[ "$1" == "is-failed" ]]; then
     echo active
     exit 1
 fi
+# EGL-345: `show` degrade fixture — a systemctl-show-fail marker makes
+# every property lookup fail (rc 1, no output); systemctl-show-fail-
+# <Property> fails only that property. Exercises the named-unknown
+# paths (a failed probe must never be reported as a real state).
+if [[ "$1" == "show" ]]; then
+    egl345_failprop="" egl345_fargs=("$@")
+    for ((i = 0; i < ${#egl345_fargs[@]}; i++)); do
+        if [[ "${egl345_fargs[i]}" == "-p" ]]; then egl345_failprop="${egl345_fargs[i+1]:-}"; break; fi
+    done
+    if [[ -f "$D/systemctl-show-fail" \
+            || ( -n "$egl345_failprop" && -f "$D/systemctl-show-fail-${egl345_failprop}" ) ]]; then
+        exit 1
+    fi
+fi
 if [[ "$1" == "show" && "$*" == *"ExecMainStatus"* ]]; then
     [[ -f "$D/systemctl-mainstatus" ]] && cat "$D/systemctl-mainstatus"
     exit 0
@@ -1090,18 +1485,48 @@ if [[ "$1" == "show" && "$*" == *"FragmentPath"* ]]; then
     fi
     exit 0
 fi
+if [[ "$1" == "show" ]]; then
+    # EGL-345: per-property fixtures for the recency/state probes.
+    # `systemctl-show-<Property>.<unit>` is unit-specific and wins when
+    # present; `systemctl-show-<Property>` is the shared fallback. An
+    # absent fixture is an empty (answered) value, matching real show.
+    egl345_prop="" egl345_unit="${!#}"
+    egl345_args=("$@")
+    for ((i = 0; i < ${#egl345_args[@]}; i++)); do
+        if [[ "${egl345_args[i]}" == "-p" ]]; then egl345_prop="${egl345_args[i+1]:-}"; break; fi
+    done
+    if [[ -n "$egl345_prop" ]]; then
+        if [[ -f "$D/systemctl-show-${egl345_prop}.${egl345_unit}" ]]; then
+            cat "$D/systemctl-show-${egl345_prop}.${egl345_unit}"
+        elif [[ -f "$D/systemctl-show-${egl345_prop}" ]]; then
+            cat "$D/systemctl-show-${egl345_prop}"
+        elif [[ "$egl345_prop" == "ActiveState" ]]; then
+            # R-EGL-345-4: ActiveState has no valid empty value — a real
+            # `show` always answers one. Default to a running unit so the
+            # normal cases exercise a real state; the empty-answer degrade
+            # is written as an explicitly empty fixture file above.
+            echo active
+        fi
+    fi
+    exit 0
+fi
 if [[ "$1" == "list-units" ]]; then
-    [[ -f "$D/systemctl-list-units" ]] && cat "$D/systemctl-list-units"
+    # EGL-201: a --failed query serves the split fixture when present;
+    # everything else (and the fallback) keeps the shared fixture.
+    if [[ "$*" == *"--failed"* && -f "$D/systemctl-list-units-failed" ]]; then
+        cat "$D/systemctl-list-units-failed"
+    elif [[ -f "$D/systemctl-list-units" ]]; then
+        cat "$D/systemctl-list-units"
+    fi
     exit 0
 fi
 exit 0
 EOF
 chmod +x "$TESTROOT/bin/systemctl"
 
-# Mock loginctl (ARC-28): records every call; show-user Linger -> yes so
-# the --enable linger check passes in the harness (override with
-# ARCMOCK_LINGER_ANSWER=no to exercise the fail-closed branch). EGL-51:
-# calls are mirrored into callorder.log (see systemctl mock above).
+# Mock loginctl (ARC-28): records calls; show-user Linger -> yes (set
+# ARCMOCK_LINGER_ANSWER=no for the fail-closed branch). EGL-51 mirrors
+# calls to callorder.log.
 cat > "$TESTROOT/bin/loginctl" <<'EOF'
 #!/usr/bin/env bash
 D="${ARCMOCK_STATE:?}"
@@ -1116,50 +1541,38 @@ chmod +x "$TESTROOT/bin/loginctl"
 
 export PATH="$TESTROOT/bin:$PATH"
 export HOME="$TESTROOT/home"
+# EGL-227 F1: the engine lock is keyed to the account's home from the
+# account database — the mock answers uid queries with the harness home
+# so the lock stays under $TESTROOT (and matches $HOME).
+export ARCMOCK_PASSWD_HOME="$TESTROOT/home"
 export USER="testuser"
 export EGRESSLOCK_ANCHOR_IMAGE="docker.io/library/alpine:latest"
 export AGENTS_ROOT="$TESTROOT/agents"
-# EGL-80-L2: the kit's deb-shape guard must not see the host's real
-# /usr/bin/egresslock (present on deployed hosts; the .deb's engine is
-# not a kit PATH wrapper, so install-kit would refuse). Default to an
-# absent path; tests that exercise the refusal point the hook at a
-# fixture file.
+# EGL-80-L2: the deb-shape guard must not see a host /usr/bin/egresslock
+# (install-kit would refuse). Default absent; refusal tests point at a
+# fixture.
 export EGRESSLOCK_UB_BIN="$TESTROOT/ub/egresslock"
-# EGL-107-D2: the EGL-83-D2 deb-libdir guard must not read real host
-# state — a bare /usr/lib/egresslock leftover (dpkg has no record) made
-# every install-kit-based battery test refuse on deployed hosts. Default
-# the hook to an EMPTY harness path (never a VERSION file, so the
-# `-e "$deb_libdir/VERSION"` guard is false); the dedicated refusal test
-# overrides it to its fixture. Unset-hook production behavior is
-# unchanged: install-kit.sh still defaults to the real /usr/lib/egresslock.
+# EGL-107-D2: the deb-libdir guard must not read host state — a bare
+# /usr/lib/egresslock leftover made every install-kit test refuse. Default
+# an empty harness path (never VERSION); the refusal test overrides it.
+# Unset stays production's real /usr/lib/egresslock.
 mkdir -p "$TESTROOT/deb-libdir"
 export EGRESSLOCK_DEB_LIBDIR="$TESTROOT/deb-libdir"
-# EGL-80-1-F1 note: EGRESSLOCK_PATH_BINDIR/SBINDIR are deliberately NOT
-# defaulted here. The battery installs many distinct prefixes; a single
-# shared wrapper dir would trip install-kit's ARC-22-D1 foreign-marker
-# refusal ("two prefix installs must not fight over PATH"). Instead,
-# every install-kit/uninstall-kit test invocation sets explicit
-# per-prefix wrapper hooks (grep EGRESSLOCK_PATH_BINDIR in
-# tests/test-kit.sh).
-# Gateway image exists in the mock (created below); keep the real default
-# name so the ensure flow exercises the image-exists check.
+# EGL-80-1-F1: EGRESSLOCK_PATH_BINDIR/SBINDIR are deliberately NOT
+# defaulted — a shared wrapper dir would trip install-kit's ARC-22-D1
+# foreign-marker refusal. Each kit test sets per-prefix hooks.
+# Gateway image exists in the mock; keep the real default name.
 mkdir -p "$STATE/images"
 : > "$STATE/images/localhost_egresslock-gateway_latest"
-# EGL-206-D2a: the checkpoint-annotation preflight inspects the RESOLVED
-# anchor image before the run. The harness anchors on alpine:latest
-# (env below); seed the marker the mock store would hold on a
-# provisioned account (the mock `podman run` never pulls).
-# localhost/base:latest stays ABSENT so the EGL-66-D2 fallback
-# resolution pin keeps its premise.
+# EGL-206-D2a: the checkpoint preflight inspects the RESOLVED anchor image
+# before running. Seed the mock store's alpine marker; localhost/base stays
+# ABSENT for the EGL-66-D2 fallback pin.
 : > "$STATE/images/docker.io_library_alpine_latest"
 
-# EGL-99 (direction 3): named-skip accounting. Every harness skip goes
-# through skip() so the RESULTS TOTAL line reports the exact skip count
-# with each skip's named cause — a tree-shape-gated assert (e.g. the
-# EGL-27 tarball-stamp gate, which needs .git metadata) becomes visible
-# as a skip, not silently absent, so totals are exact and comparable
-# 1:1 in every tree shape. The `SKIP: ` prefix is preserved: run.sh's
-# suite-end summary counts these lines (EGL-86-D3) and is unaffected.
+# EGL-99 (direction 3): named-skip accounting. Every skip goes through
+# skip() so TOTAL reports the exact count and cause; a tree-shape-gated
+# assert is visible instead of silently absent. The `SKIP: ` prefix feeds
+# run.sh's summary (EGL-86-D3).
 skip_count=0
 declare -A skip_causes=()
 skip() { # skip <cause-tag> <free-text message...>
@@ -1168,9 +1581,8 @@ skip() { # skip <cause-tag> <free-text message...>
     skip_causes["$cause"]=$(( ${skip_causes["$cause"]:-0} + 1 ))
     echo "SKIP: $*"
 }
-# skip_summary renders the TOTAL-line skip fragment: `, 0 skipped` when
-# nothing skipped, else `, N skipped (cause[, cause: k...])` — a
-# single-count cause is named bare (`, 1 skipped (git-metadata absent)`).
+# skip_summary renders `, 0 skipped` or `, N skipped (cause[, cause: k])`;
+# a single-count cause is named bare.
 skip_summary() {
     if (( skip_count == 0 )); then
         printf ', 0 skipped'
@@ -1186,11 +1598,9 @@ skip_summary() {
     done
     printf ', %d skipped (%s)' "$skip_count" "$detail"
 }
-# EGL-99 (direction 1, tree-shape half): the tree shape is recorded next
-# to the counts — a normal checkout (`.git` directory), a detached
-# review worktree (`.git` file), or an exported/staged tree (no `.git`)
-# — so a count delta between handoff and review shapes is attributable
-# from the TOTAL line itself instead of a bisect.
+# EGL-99 (direction 1): record the tree shape beside the counts (`.git`
+# dir, worktree file, or none) so a count delta is attributable from the
+# TOTAL line.
 tree_shape_tag() {
     if [[ -d "$TREE_ROOT/.git" ]]; then
         echo "tree: git-checkout"
@@ -1202,11 +1612,9 @@ tree_shape_tag() {
 }
 
 pass=0; fail=0
-# EGL-184 (F-022 remainder): _sect_bump is the only sanctioned increment
-# path for pass/fail. Inside an open section it bumps the section counters
-# and the grand accumulator; outside any section the increment is booked
-# into the stray bucket and results_total refuses to print a TOTAL (a
-# silent undercount becomes a named failure, EGL-184-D4).
+# EGL-184 (F-022 remainder): _sect_bump is the only sanctioned pass/fail
+# increment. Inside a section it bumps section + grand; outside, it books
+# a stray and results_total refuses a TOTAL (EGL-184-D4).
 _sect_open_cur=""
 _sect_open_label=""
 _sect_open_mode=""
@@ -1252,25 +1660,42 @@ assert() { # assert pass|fail [fail-message]
 }
 
 # EGL-184 (F-022 remainder): per-section RESULTS bookkeeping. Replaces the
-# hand-maintained reset -> capture -> RESULTS-echo -> hand-sum chain in
-# test-engine.sh / test-kit.sh (86 resets, 84 captures, 84 RESULTS lines,
-# two multi-term sums where every new section edits five distant places
-# and a forgotten sum term silently undercounts). EGL-99 freeze: the
-# RESULTS/TOTAL text is byte-pinned, so section_end only snapshots —
-# emission stays at today's echo sites (the EOF dumps plus the two
-# mid-file sections) via results_emit, never inside section_end.
+# hand-maintained reset -> capture -> RESULTS-echo -> hand-sum chain (86
+# resets, 84 captures/RESULTS lines, distant sum terms). EGL-99 freeze:
+# RESULTS/TOTAL text is byte-pinned, so section_end only snapshots and
+# emission stays at the echo sites via results_emit.
 #
 # Modes (section_begin <name> "<label>" [mode]):
-#   counted          — RESULTS line emitted at the migrated site, in TOTAL
-#   excluded         — RESULTS line emitted, NOT in TOTAL (declared gap;
-#                      engine e98: counted nowhere, never was)
+#   counted          — RESULTS line emitted, in TOTAL
+#   excluded         — RESULTS line emitted, NOT in TOTAL (engine e98)
 #   excluded-silent  — no RESULTS line, not in TOTAL (kit egl102r2)
-# Engine arc14 (own counters via the deliberately-untouched a14 delegate,
-# EGL-179-D3) and the egl140 witness alias stay manual (EGL-184-D2 /
-# EGL-194-D5): egl140 aliases egl139's in-window capture (before
-# section_end). arc14 enters the TOTAL as a declared external via
-# results_total's extra args; its increments bypass check/check_out/assert
-# and are invisible to the grand accumulator by design.
+# Engine arc14 (a14 delegate, EGL-179-D3) and the egl140 witness alias stay
+# manual (EGL-184-D2 / EGL-194-D5); arc14 enters TOTAL via results_total's
+# extra args and bypasses the grand accumulator by design.
+# EGL-270 (P4): the slow-section registry + track gate. run.sh --track fast
+# exports EGRESSLOCK_TEST_TRACK=fast; each registered section's whole
+# window is skipped (body never runs). Unset/empty (direct harness run) is
+# the full track. Membership is whole-section only (EGL-270 D2); security-
+# classed sections never register (operator G1=A). R-EGL-270-5 F1: egl223
+# stays fast-track (EGL-223-D9 anchor retention, EGL-206 checkpoint
+# refusal); the round-1 member is egl203r alone.
+declare -A _slow_sections=( [egl203r]=1 )
+declare -A _slow_skipped=()
+slow_section_run() { # slow_section_run <name> — 0 = run the window, 1 = skip it
+    local name="${1:-}"
+    if [[ "${EGRESSLOCK_TEST_TRACK:-full}" != "fast" || -z "${_slow_sections[$name]:-}" ]]; then
+        return 0
+    fi
+    # EGL-270/G4: go through skip() so TOTAL names the cause and run.sh
+    # counts it (EGL-86-D3).
+    _slow_skipped["$name"]=1
+    skip "slow-track $name" "slow-track: section '$name' skipped on --track fast (run: bash tests/run.sh --track full)"
+    return 1
+}
+
+# EGL-270 (P1): per-section runtime stamps. section_end emits one
+# `TIMING: <name> <n.n>s`; a slow-skipped section emits none. RESULTS text
+# stays byte-identical (EGL-99).
 declare -A _sect_snap=()   # name -> "mode|label|pass|fail" (ended only)
 section_begin() { # section_begin <name> "<label>" [counted|excluded|excluded-silent]
     local name="${1:-}" label="${2:-}" mode="${3:-counted}"
@@ -1292,8 +1717,9 @@ section_begin() { # section_begin <name> "<label>" [counted|excluded|excluded-si
     fi
     _sect_open_cur="$name"; _sect_open_label="$label"; _sect_open_mode="$mode"
     pass=0; fail=0
+    _sect_t0="${EPOCHREALTIME:-}"
 }
-section_end() { # section_end <name> — snapshot only; does NOT emit (EGL-184-D1)
+section_end() { # section_end <name> — snapshot only; does NOT emit RESULTS (EGL-184-D1)
     local name="${1:-}"
     if [[ -z "$_sect_open_cur" || "$_sect_open_cur" != "$name" ]]; then
         echo "FAIL: section_end: '$name' is not the open section (end without begin, ended twice, or out of order; EGL-184 fail-closed)"
@@ -1302,10 +1728,22 @@ section_end() { # section_end <name> — snapshot only; does NOT emit (EGL-184-D
     _sect_snap["$name"]="$_sect_open_mode|$_sect_open_label|$pass|$fail"
     _sect_booked_pass=$((_sect_booked_pass + pass))
     _sect_booked_fail=$((_sect_booked_fail + fail))
+    # EGL-270 (P1): the per-section runtime stamp is bookkeeping, not a
+    # verdict — one line, name-identical with the section name.
+    if [[ -n "${_sect_t0:-}" && -n "${EPOCHREALTIME:-}" ]]; then
+        echo "TIMING: $name $(LC_ALL=C awk -v a="$_sect_t0" -v b="${EPOCHREALTIME:-}" 'BEGIN{printf "%.1f", b-a}')s"
+    fi
+    _sect_t0=""
     _sect_open_cur=""; _sect_open_label=""; _sect_open_mode=""
 }
 results_emit() { # results_emit <name> — prints the pinned RESULTS line from the snapshot
     local name="${1:-}"
+    # EGL-270/G4: a section skipped on the fast track has no snapshot and
+    # emits no RESULTS line — its named SKIP: line is the record; TOTAL
+    # counts it via skip_summary.
+    if [[ -n "${_slow_skipped[$name]:-}" ]]; then
+        return 0
+    fi
     local snap="${_sect_snap[$name]:-}"
     if [[ -z "$snap" ]]; then
         echo "FAIL: results_emit: '$name' has no ended snapshot (emit before end, or never begun; EGL-184 fail-closed)"

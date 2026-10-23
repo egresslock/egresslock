@@ -66,10 +66,9 @@ converge the profile and assert it is live before the run:
 ```sh
 egresslock ensure <profile> \
  && egresslock verify <profile> \
- && egresslock proxy-env <profile> > "/run/user/$(id -u)/egresslock-proxy-<profile>.env" \
  && podman run --rm -it \
     --network="$(egresslock network <profile>)" \
-    --env-file="/run/user/$(id -u)/egresslock-proxy-<profile>.env" \
+    --env-file="$(egresslock proxy-env <profile> --out)" \
     --cap-drop=all --security-opt=no-new-privileges \
     docker.io/library/debian:13-slim \
     sh
