@@ -41,9 +41,13 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 # CAP_SETUID — it can neither write proxy-owned dirs nor setuid down to
 # the proxy user at runtime. Running the whole container as proxy avoids
 # all three.
+# EGL-369-D4: the real config dir is /etc/squid/egresslock; the relative
+# agent symlink is a temporary compatibility bridge for un-replaced
+# gateways, older engines, and pasted commands (removed by EGL-374).
 RUN chmod 755 /usr/local/bin/entrypoint.sh \
-    && mkdir -p /var/spool/squid /var/log/squid /etc/squid/agent \
-    && chown -R proxy:proxy /var/spool/squid /var/log/squid /etc/squid/agent
+    && mkdir -p /var/spool/squid /var/log/squid /etc/squid/egresslock \
+    && ln -s egresslock /etc/squid/agent \
+    && chown -R proxy:proxy /var/spool/squid /var/log/squid /etc/squid/egresslock
 
 # Health check: the proxy must accept a TCP connect on 3128 (bash
 # /dev/tcp avoids extra packages in the slim base).

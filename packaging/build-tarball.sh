@@ -7,7 +7,8 @@
 # apparmor, install-kit.sh, uninstall-kit.sh, README) plus the systemd/
 # unit templates, so the extracted tree is
 # SELF-CONTAINED: install-kit.sh prefers the in-kit systemd/ templates
-# (ARC-22 implementation decision — see docs/tickets/ARC-22.md), which
+# (ARC-22 implementation decision — see
+# internal_docs/tickets/completed/ARC-22.md), which
 # also means the kit can move to its own repository without layout
 # changes.
 #
@@ -39,11 +40,12 @@ repo="$(git -C "$kit" rev-parse --show-toplevel 2>/dev/null || echo "$kit")"
 # the install-kit-style root gate was over-conservative for a pure
 # build).
 
-# Version scheme (EGL-27-D1, EGL-72-D1/D2): same as build-deb.sh —
-# <VERSION_BASE>+git<YYYYMMDDHHMMSS>.<short12>; the UTC
+# Version scheme (EGL-27-D1, EGL-72-D1/D2, EGL-342-D1): same as
+# build-deb.sh — <VERSION_BASE>+git<YYYYMMDDHHMMSS>.<short12>; the UTC
 # second-resolution timestamp is the ordering key; the 12-char sha is
-# identification only. EGL-72-D1: fail closed if VERSION_BASE is
-# missing or empty.
+# identification only. VERSION_BASE carries the cycle marker
+# `<X.Y.Z>-dev` between H and T9 (T9 drops it). EGL-72-D1: fail closed
+# if VERSION_BASE is missing or empty.
 [[ -s "$kit/VERSION_BASE" ]] || {
     echo "build-tarball: FAIL - VERSION_BASE missing or empty at $kit/VERSION_BASE (EGL-72-D1)" >&2
     exit 2
@@ -80,21 +82,37 @@ mkdir -p "$stage/egresslock/systemd"
 (
     cd "$kit"
     # Copy everything at the kit root (the repo root since the EGL-1
-    # flatten) except the packaging build outputs and the repo-only
-    # process files (git dir, AGENTS.md, .gitignore, docs/tickets/,
-    # docs/BOARD.md) and the maintainer-internal internal_docs/
-    # (EGL-47-D2) — the shipped tarball carries kit payload only,
-    # exactly the file set the pre-flatten egresslock/ tree carried.
+    # flatten) except the packaging build outputs, the repo-only
+    # process files (git dir, CI workflows, AGENTS.md, .gitignore) and
+    # the maintainer-internal internal_docs/ (EGL-47-D2, now also
+    # holding the ticket flow and board) — the shipped tarball carries
+    # kit payload only, exactly the file set the pre-flatten egresslock/
+    # tree carried.
     tar -cf - --exclude=./packaging --exclude=./.git \
+        --exclude=./.forgejo \
         --exclude=./AGENTS.md --exclude=./.gitignore \
         --exclude=./internal_docs \
-        --exclude=./docs/tickets --exclude=./docs/BOARD.md \
         --exclude=./docs/lp-*.txt --exclude=./docs/debian-*.txt . | tar -xf - -C "$stage/egresslock"
 )
 # EGL-47-D2: tripwire — the maintainer-internal internal_docs/ must
-# never reach the tarball; a widened copy rule would leak it.
-if [[ -e "$stage/egresslock/internal_docs" ]]; then
+# never reach the tarball; a widened copy rule would leak it. `-e || -L`
+# (here and in the tripwires below) treats a dangling symlink as present.
+if [[ -e "$stage/egresslock/internal_docs" || -L "$stage/egresslock/internal_docs" ]]; then
     echo "build-tarball: FAIL - internal_docs leaked into the tarball stage" >&2
+    exit 1
+fi
+# EGL-364: with the old ticket/board excludes gone, a re-introduced old
+# layout must fail closed here too — including a dangling symlink.
+if [[ -e "$stage/egresslock/docs/tickets" || -L "$stage/egresslock/docs/tickets" \
+      || -e "$stage/egresslock/docs/BOARD.md" || -L "$stage/egresslock/docs/BOARD.md" ]]; then
+    echo "build-tarball: FAIL - old ticket/board path leaked into the tarball stage" >&2
+    ls -ld "$stage/egresslock/docs/tickets" "$stage/egresslock/docs/BOARD.md" >&2 2>/dev/null || true
+    exit 1
+fi
+# EGL-343: `.forgejo/` is CI metadata (including the nightly dispatcher),
+# not kit payload — a widened copy rule must fail closed here too.
+if [[ -e "$stage/egresslock/.forgejo" || -L "$stage/egresslock/.forgejo" ]]; then
+    echo "build-tarball: FAIL - .forgejo leaked into the tarball stage" >&2
     exit 1
 fi
 # EGL-65-D1: tripwire — the internal bug-report drafts (docs/lp-*.txt,

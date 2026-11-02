@@ -31,10 +31,10 @@ Each row is the SAME policy state — only the workload env differs.
 |---|---|---|
 | Squid error page; `TCP_DENIED/403` in access.log; `denied <profile>` lists the destination (with a one-time stderr note for IPv4) | Squid (proxy path) | Reached the gateway, not allowlisted — or a proxied request to an IP literal (never allowlistable). |
 | Hang, no error page, absent from access.log | nft (direct path) | Went direct with no direct allow — the profile's terminal drop, silently. |
-| Instant `Connection refused` (0 ms), allow-host counters stay 0 | netns itself | Destination is the HOST machine's own address — the pasta hairpin (below). The policy never sees the packet. |
+| Instant `Connection refused` (0 ms), direct-pin counters stay 0 | netns itself | Destination is the HOST machine's own address — the pasta hairpin (below). The policy never sees the packet. |
 
 `denied <profile>` lists IPv4 destinations and prints a one-time hint
-that they belong on allow-host, not allow — but it only sees traffic
+that they belong on the direct path, not the proxy path — but it only sees traffic
 that REACHED the gateway. A host absent from access.log was never
 proxied.
 
@@ -60,12 +60,12 @@ Same-host services therefore use one of:
   <GW_MAC> accept`, the MAC kit-derived and pinned) covers the
   upstream leg. The standard `denied`/`allow` loop applies.
 - **Non-HTTP, direct by IP literal**:
-  `allow-host <profile> 169.254.1.2:<port>` — `169.254.1.2` is
+  `allow <profile> 169.254.1.2:<port> --direct` — `169.254.1.2` is
   podman's pasta map-guest-addr address; traffic to it is translated
   to the host's loopback (verify inside any container: `getent hosts
   host.containers.internal`). The packet IS forwarded, so the profile
   policy governs it, and the literal lands in NO_PROXY automatically.
-  The NAME cannot be pinned: allow-host resolves on the
+  The NAME cannot be pinned: the direct path resolves on the
   host, where this name does not exist — ensure fails closed.
 - Run the service itself as a container on the profile network —
   same-bridge traffic reaches it directly (this is how the Squid
@@ -118,8 +118,9 @@ name with hyphens replaced by underscores.
 
 ## Scope notes
 
-- Non-gateway profiles have no proxy path at all — the 403 row of the
-  matrix cannot arise there; everything is direct.
+- Every profile has a gateway (the directive is required), so the proxy
+  path exists for every profile — the 403 row of the matrix can arise on
+  any of them, and direct pins are additional to it.
 - IPv4-literal pins never emit `drift:` (there is no DNS to move);
   hostname pins do on a set change (T13) — re-run `ensure` on a
   `drift:` warning.

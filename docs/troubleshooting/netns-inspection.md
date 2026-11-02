@@ -36,6 +36,10 @@ sudo nsenter -t "$pid" -n nft list ruleset 2>/dev/null   # the live policy
 Note: `nsenter --target` takes a **PID** (e.g. pasta's), not a netns
 filename. `cat` on a netns file just shows an empty bind-mount point.
 
+A bare `podman unshare` inherits the caller's working directory, so run
+it as the account from a directory the account can traverse; the engine
+and the timer wrapper run their own probes from `/` and are not affected.
+
 ## Symptom: a root run leaked into the account's netns
 
 Root-owned files under `/run/user/<uid>/netns/` mean a root/sudo run

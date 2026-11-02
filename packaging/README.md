@@ -49,11 +49,13 @@ The account setup needs no repo and no `--prefix` on a .deb-only host
 ## Version stamp
 
 One release base lives in `VERSION_BASE` at the repo root (a single
-line, e.g. `0.1.0`; no quotes, trailing newline is fine). `build-deb.sh`,
+line, e.g. `0.1.0`; no quotes, trailing newline is fine). From the
+release open (H) until the metadata cut (T9) it may carry the cycle
+marker `<X.Y.Z>-dev` (e.g. `0.2.0-dev`); T9 drops the marker, so
+released artifacts always use the bare `<X.Y.Z>`. `build-deb.sh`,
 `build-tarball.sh`, and `install-kit.sh` all read it and **fail closed**
-if it is missing or empty — bumping the release base is that one edit;
-the `+git<YYYYMMDDHHMMSS>.<short12>[-dirty]` suffix is
-unchanged.
+if it is missing or empty — the version edit is that one line; the
+`+git<YYYYMMDDHHMMSS>.<short12>[-dirty]` suffix is unchanged.
 
 Every `VERSION` stamp written by `install-kit.sh` or the .deb build
 starts with the full version string:

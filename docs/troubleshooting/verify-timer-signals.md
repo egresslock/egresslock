@@ -17,13 +17,15 @@ lines are healthy.
 Signal semantics (learned the hard way — check for these):
 
 - Healthy: `profile '<name>' verified (ensured)` lines, exit 0.
+- `warning: the account lock could not record who holds it (<lockf>): the lock is held for this run; a later "another egresslock command is running" message may show "holder: unknown" or a stale record` / **rc unchanged**: the account home was full when verify wrote its holder record; the lock is still held and verify continues. Free space on the account home; see [disk-full](disk-full.md).
 - `verify: ... FAILED` / exit 1: policy drift or a half-dead profile
   (e.g. gateway container down). Heal with `ensure <profile>` **as the
   account**; verify never auto-fixes. The kit's `egresslock-setup
   doctor` reports the same exit-1 instance with its last and next run,
-  a manual re-run command that sources the unit environment, and the
-  service journal — the `sudo journalctl -u` line in the table above is
-  where the details are.
+  a `systemctl start` re-run command (its output goes to the service
+  journal — the `sudo journalctl -u` line in the table above is where
+  the details are), and, when the named profile is known, the scoped
+  repair `sudo -iu <account> -- egresslock ensure <profile>`.
 - A failed verify **timer** (rather than the service) means the timer
   could not start and the verify service never ran: its journal, not
   the service log, is the evidence. Doctor checks the timer's armed
@@ -61,6 +63,12 @@ Signal semantics (learned the hard way — check for these):
   is unchanged; `ensure` heals on the next run. The pinned set is
   capped at the first 16 sorted distinct addresses (`DNS_SET_MAX`); a
   larger answer truncates with a named `note:`.
+- `verify: cannot write the temporary expected-ruleset file in /tmp; the policy could not be checked (exit 1)` / **exit 1**:
+  `/tmp` is full or otherwise unwritable, so verify could not build
+  its expected ruleset. The policy was **not checked** — this is not
+  drift, and no `policy chain … does not match` line follows. Free
+  `/tmp` space and re-run verify; do not re-ensure for this line alone.
+  See [disk-full](disk-full.md).
 - A name that serves **one address per query from a rotating pool**
   (e.g. `github.com` over SSH) is the exception: each `ensure` pins
   only the one answer it saw, so a later cycle that resolves another
@@ -70,11 +78,11 @@ Signal semantics (learned the hard way — check for these):
   drift), or tunnel the connection through the gateway by name — see
   [Rotating names](../reference/rotating-names.md).
 - `verify: network exists but policy does not — run: egresslock
-  ensure <profile>` / exit 1: the post-reboot stale window — the
-  profile's podman network object survived the reboot (on disk) but
-  the netns policy is gone (volatile). Heal with `ensure <profile>`
-  **as the account**; the timer never re-ensures. This is the
-  default sweep-mode timer's post-reboot drift signal.
+  ensure <profile> (as <account>)` / exit 1: the post-reboot stale
+  window — the profile's podman network object survived the reboot (on
+  disk) but the netns policy is gone (volatile). Heal with `ensure
+  <profile>` **as the account**; the timer never re-ensures. This is
+  the default sweep-mode timer's post-reboot drift signal.
 - SILENT exit 0 from `--ensured` means "no profiles ensured **and**
   no stale leftovers" — if you expected anchors, that itself is the
   signal (e.g. wrong XDG_RUNTIME_DIR context; the kit entry scripts

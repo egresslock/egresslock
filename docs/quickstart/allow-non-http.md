@@ -1,8 +1,9 @@
 # How to: allow non-HTTP egress (git-over-SSH example)
 
-`allow-host` is for use with raw IP addresses, and non-HTTP(S)
-traffic (anything the HTTP gateway cannot proxy transparently:
-ssh, git-over-SSH, rsync, databases, other non-HTTP protocols).
+The direct path (`egresslock allow <profile> <host:port> --direct`) is
+for use with raw IP addresses, and non-HTTP(S) traffic (anything the
+HTTP gateway cannot proxy transparently: ssh, git-over-SSH, rsync,
+databases, other non-HTTP protocols).
 
 If you're connecting to a domain using HTTP(S), see
 [allow-a-domain](allow-a-domain.md) instead.
@@ -72,28 +73,31 @@ any other destination that uses a rotating list of IPs, see
    ssh: connect to host self-hosted-git.example port 22: Connection timed out
    </pre>
 
-   That hang is the signature of a missing `allow-host` rule, so next
-   we add it.
+   That hang is the signature of a missing direct rule, so next we add
+   it.
    </details>
 
 3. **Allow it.** In a second terminal — TERMINAL 2, the host — as the
-   account. Grammar: `allow-host <profile> <host:port>` — a hostname
-   or an IPv4 literal (`allow` rejects IP literals; CIDR ranges are
-   not yet supported). Why egress has two paths:
-   [paths-and-signatures](../reference/paths-and-signatures.md).
+   account. Grammar: `allow <profile> <host:port> --direct` — a
+   hostname or an IPv4 literal, and the port is required. The direct
+   path installs a firewall rule; it does not change client proxy
+   settings. (`allow-direct <profile> <host:port>` is the same command
+   as a shortcut.) CIDR ranges are not yet supported. Why egress has
+   two paths: [paths-and-signatures](../reference/paths-and-signatures.md).
    ```sh
    # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
    # prompt: egl-runner@host:~$
 
-   egresslock allow-host main self-hosted-git.example:22
+   egresslock allow main self-hosted-git.example:22 --direct
    ```
 
    <details>
    <summary>Expected output:</summary>
 
    <pre>
-   egl-runner@host:~$ egresslock allow-host main self-hosted-git.example:22
+   egl-runner@host:~$ egresslock allow main self-hosted-git.example:22 --direct
    using config /home/egl-runner/.config/egresslock/main.conf
+   path: direct — firewall rule in /home/egl-runner/.config/egresslock/main.conf (does not change client proxy settings)
    added: rule allow-host self-hosted-git.example:22 -> /home/egl-runner/.config/egresslock/main.conf
    re-ensuring profile 'main' ...
    gateway 'egresslock-gateway-main' ready (already converged, not restarted)
@@ -138,7 +142,7 @@ any other destination that uses a rotating list of IPs, see
    </pre>
 
    Troubleshooting: still hanging after step 3 reported `policy
-   verified`? Check the entry for typos (`egresslock allowlist main`),
+   verified`? Check the entry for typos (`egresslock allowlist main --direct`),
    then [paths-and-signatures](../reference/paths-and-signatures.md)
    and [proxied-or-direct](../troubleshooting/proxied-or-direct.md).
    </details>
@@ -228,17 +232,19 @@ goes away):
 # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
 # prompt: egl-runner@host:~$
 
-egresslock disallow-host main self-hosted-git.example:22
+egresslock disallow main self-hosted-git.example:22 --direct
 ```
 
 <details>
 <summary>Expected output:</summary>
-the `removed:` line comes last — it prints only after the re-ensure
-and the revoked rule's conntrack teardown:
+the `path:` line names the store, and `removed:` comes last — it
+prints only after the re-ensure and the revoked rule's conntrack
+teardown:
 
 <pre>
-egl-runner@host:~$ egresslock disallow-host main self-hosted-git.example:22
+egl-runner@host:~$ egresslock disallow main self-hosted-git.example:22 --direct
 using config /home/egl-runner/.config/egresslock/main.conf
+path: direct — firewall rule in /home/egl-runner/.config/egresslock/main.conf (does not change client proxy settings)
 re-ensuring profile 'main' ...
 gateway 'egresslock-gateway-main' ready (already converged, not restarted)
 profile 'main' ready (network egresslock-main, policy verified)

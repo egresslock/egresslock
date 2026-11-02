@@ -16,10 +16,10 @@
 #                             account's fixed confdir
 #                             (<passwd-home>/.config/egresslock).
 #
-# There is no conf-path wiring: the engine does not read
-# EGRESSLOCK_CONF and it is not required here. unit.env is the wiring
-# witness the doctor checks; in named mode it carries
-# EGRESSLOCK_PROFILE.
+# There is no conf-path wiring: the engine warns about a set
+# EGRESSLOCK_CONF (retired selector; it is not read) and it is not
+# required here. unit.env is the wiring witness the doctor checks; in
+# named mode it carries EGRESSLOCK_PROFILE.
 #
 # Environment:
 #   EGRESSLOCK_DIR     engine resolution: this var >
@@ -64,7 +64,7 @@ if [[ -n "${EGRESSLOCK_DIR:-}" ]]; then
 elif [[ -x /opt/egresslock/egresslock ]]; then
     kit_dir=/opt/egresslock
 else
-    kit_dir="$(cd "$(dirname "$0")" && pwd)"
+    kit_dir="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
 fi
 tool="$kit_dir/egresslock"
 
@@ -84,21 +84,71 @@ if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
         echo "egresslock-verify: timeout(1) (coreutils) is required for the netns probe but was not found in PATH" >&2
         exit 1
     fi
+    # EGL-378-D4/D5: the probe runs from / for the same reason the
+    # engine's runtime calls do (rootless podman re-enters the inherited
+    # CWD as the account at startup); fail closed, named, before it runs.
+    # R-EGL-378-8: podman reads path-valued settings at startup, so a
+    # relative value must keep its invocation-directory meaning across
+    # the cd — same list/idiom as the engine's rt_absolutize_podman_env.
+    vprobe_env() {
+        local v val
+        for v in CONTAINERS_CONF CONTAINERS_CONF_OVERRIDE \
+                 CONTAINERS_REGISTRIES_CONF CONTAINERS_STORAGE_CONF \
+                 CONTAINERS_HELPER_BINARY_DIR PODMAN_CONNECTIONS_CONF \
+                 CONTAINER_SSHKEY REGISTRY_AUTH_FILE TMPDIR \
+                 XDG_CONFIG_HOME XDG_DATA_HOME XDG_RUNTIME_DIR; do
+            val="${!v:-}"
+            [[ -n "$val" && "$val" != /* ]] || continue
+            printf -v "$v" '%s/%s' "${PWD%/}" "$val"
+            export "${v?}"
+        done
+    }
+    if ! ( cd / ) 2>/dev/null; then
+        echo "egresslock-verify: cannot change directory to / before the netns probe; the probe was not run" >&2
+        exit 1
+    fi
     vprc=0
-    timeout 5 podman unshare --rootless-netns true 2>/dev/null || vprc=$?
+    vout="$( ( vprobe_env; cd / && timeout 5 podman unshare --rootless-netns true ) 2>&1)" || vprc=$?
     if (( vprc == 124 )); then
         echo "egresslock-verify: netns probe timed out after 5s (probe: 'timeout 5 podman unshare --rootless-netns true'); the rootless netns is not answering — check pasta/podman health before retrying" >&2
         exit 1
     elif (( vprc != 0 )); then
-        echo "egresslock-verify: podman rootless-netns is broken for this user (probe: 'podman unshare --rootless-netns true'). Check whether AppArmor blocks pasta:" >&2
-        echo "  sudo aa-status | grep -i pasta        # enforced profile?" >&2
-        echo "  # primary fix: add 'signal (receive) set=(term) peer=podman,' to the pasta profile, then" >&2
-        echo "  sudo apparmor_parser -r /etc/apparmor.d/usr.bin.pasta" >&2
-        echo "  # alternate but less secure workaround: sudo aa-complain /usr/bin/pasta" >&2
-        echo "Then re-run the probe. On some hosts this is instead a session problem:" >&2
-        echo "  sudo systemctl restart user@<uid>     # WARNING: stops user-unit children (containers); expect 'podman start <container>' / a reboot as follow-ups" >&2
-        echo "  systemctl --user is-system-running" >&2
-        echo "Do NOT reinstall the kit — nothing is installed wrong." >&2
+        # EGL-347-D1: same routing as the engine's netns_probe — report
+        # podman's own error, then the doctor's AppArmor shape rule
+        # (rc 126 / permission denied) with the `cannot chdir to`
+        # exclusion, then the netns pointer. The disruptive
+        # `systemctl restart user@` fallback is gone (session guidance
+        # lives in the page).
+        vmsg() { printf 'egresslock-verify: %s\n' "$*" >&2; }
+        vmsg "Error: podman rootless-netns is broken for this user (probe:"
+        vmsg "  'podman unshare --rootless-netns true', rc=$vprc):"
+        if [[ -n "$vout" ]]; then
+            while IFS= read -r vline; do
+                vmsg "  $vline"
+            done <<<"$vout"
+        else
+            vmsg "  (probe printed no output)"
+        fi
+        if { (( vprc == 126 )) || grep -qi 'permission denied' <<<"$vout"; } \
+            && ! grep -qi 'cannot chdir to' <<<"$vout"; then
+            vmsg "Check whether AppArmor is the cause:"
+            vmsg "  sudo egresslock-setup apparmor check"
+            vmsg "  If it reports \"podman label: labeled\" and"
+            vmsg "  \"pasta amendment: required on this host\", run:"
+            vmsg "  sudo egresslock-setup apparmor add"
+            vmsg "  If it reports \"podman label: unlabeled\" or"
+            vmsg "  \"pasta amendment: not required ...\", this is not AppArmor:"
+            vmsg "  check the account session — see"
+            vmsg "  docs/troubleshooting/pasta-apparmor"
+            vmsg "  If it reports \"condition unknown\", see"
+            vmsg "  docs/troubleshooting/pasta-apparmor (Diagnosis)"
+            vmsg "Then re-run the probe. If it still fails, see"
+            vmsg "docs/troubleshooting/pasta-apparmor"
+        else
+            vmsg "Check podman's output above; for shared-netns checks see"
+            vmsg "docs/troubleshooting/netns-inspection"
+        fi
+        vmsg "Do NOT reinstall the kit — nothing is installed wrong."
         exit 1
     fi
 fi

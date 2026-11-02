@@ -12,11 +12,12 @@ See `egresslock help env` for the full list:
 | Variable | What it does |
 |---|---|
 | `NFT_BIN` | path to the `nft` binary (default `/usr/sbin/nft`, else `$PATH`) |
-| `CONNTRACK_BIN` | absolute path to conntrack (default `/usr/sbin/conntrack`, then `$PATH`) — required by `disallow-host`'s revocation flush |
+| `CONNTRACK_BIN` | absolute path to conntrack (default `/usr/sbin/conntrack`, then `$PATH`) — required by `disallow --direct`'s revocation flush |
 | `EGRESSLOCK_ANCHOR_IMAGE` | anchor image (default: base image or alpine) |
 | `EGRESSLOCK_GW_IMAGE` | gateway image (default `localhost/egresslock-gateway:latest`) |
 | `EGRESSLOCK_ALLOW_ROOT=1` | allow running as root (NOT recommended — root's Podman store/netns is not an account) |
 | `EGRESSLOCK_SKIP_NETNS_PROBE=1` | skip the podman rootless-netns preflight probe (test harness only) |
+| `EGRESSLOCK_USERNS_SYSCTL` | path to the sysctl file the `userns:` doctor row reads (default: the kernel's unprivileged-userns sysctl; test harness only — requires `EGRESSLOCK_KIT_ALLOW_NON_ROOT=1`) |
 | `EGRESSLOCK_GW_LOG_MAX_BYTES` | gateway log rotation cap in bytes (default 32 MiB; `0` = no cap) |
 | `EGRESSLOCK_DENIED_MAX_BYTES` | `denied` log-read cap in bytes — the newest N bytes are read, partial first line dropped (default 32 MiB, same as the rotation cap; `0` = the full log) |
 | `EGRESSLOCK_LOCK_WAIT` | seconds to wait for the account lock before a writer fails closed (default 30; `verify` waits 5 and then proceeds without it; `0` = don't wait) |
@@ -31,15 +32,19 @@ cannot move the config directory or bypass another command's lock). A
 `getent` lookup failure fails closed.
 
 Named commands (ensure, verify <name>, network, proxy-env, rules,
-allowlist, denied, allow, disallow, allow-host, disallow-host,
+allowlist, denied, allow, disallow (either path),
 drop-unauthorized, teardown <name>) load exactly
 `<confdir>/<profile>.conf`. The file's basename must equal the single
 `profile` name it defines; a mismatch fails closed. There is no
 `main.conf` fallback for other profile names (`main.conf` is only the
-starter's own file, defining `profile main`). Bare `list` and bare
+starter's own file, defining `profile main`). `list` and
 `verify --ensured` aggregate every `*.conf` in that directory (each
-file must still obey the basename rule); bare `teardown all` stays
-`main.conf`-only.
+file must still obey the basename rule); `teardown all` reads
+`main.conf` only, and refuses (exit 2) while a legacy `all.conf`
+exists. `all` is reserved as a profile name — named commands,
+`init`, the loader, and `egresslock-setup --profile` refuse it before
+probing (see the policy reference's
+[Reserved profile name](policy-reference.md#reserved-profile-name)).
 
 Every conf-resolving invocation prints exactly one stderr line naming
 the winning source, every time, TTY-independent: `using config <path>`
@@ -48,8 +53,12 @@ aggregate. Missing files fail closed with `no profile config: '<path>'
 not found` (named) or `no profile config: no *.conf in '<dir>'`
 (aggregate).
 
-`--config <file>` has been removed (v0.9.0): passing it is a usage error
-(rc 2). `EGRESSLOCK_CONF` is no longer read; set neither.
+`--config <file>` has been removed (v0.9.0); passing the flag exits 2.
+A set `EGRESSLOCK_CONF` (including an empty assignment) is retired since
+v0.10.0: the engine prints
+`Warning: EGRESSLOCK_CONF is retired and is no longer read.` on stderr
+and continues as if the variable were unset. A profile's config is at
+`<account-home>/.config/egresslock/<profile>.conf`.
 
 Where each conf-side file lives and how it is managed (modes,
 lifecycle, temp leftovers): [File locations](file-locations.md).
@@ -87,7 +96,7 @@ in its help: `egresslock-setup help <verb>`).
 
 | Verb | What it does |
 |---|---|
-| `egresslock-setup import --account <name> --from <path> [--allowlist <path>] [--force] [--prefix <path>]` | copy one profile pair into `~/.config/egresslock/`: dest conf name from the source's `profile` line; a basename gateway allowlist is copied next to it. Never writes `unit.env`, never runs linger/timer/ensure. Multi-host form: [fleet deploy recipe](../../examples/recipes/fleet-deploy.md) |
+| `egresslock-setup import --account <name> --from <path> [--allowlist <path>] [--force] [--prefix <path>]` | copy one profile pair into `~/.config/egresslock/`: dest conf name from the source's `profile` line; the source gateway line must name exactly `<profile>-allowlist`, copied next to it (any other name or an absolute path is refused, rc 1). Both destination halves must be absent or regular non-symlink files: a directory, symbolic link, or special file is refused by name (rc 1, nothing moved or deleted). The pair is validated with the deployed engine before commit: an allowlist with an invalid entry is refused (rc 1, the error names the entry), including identical/in-place pairs. Never writes `unit.env`, never runs linger/timer/ensure. Multi-host form: [fleet deploy recipe](../../examples/recipes/fleet-deploy.md) |
 | `egresslock-setup init --account <name> [--from <path>] [--profile <name>] [--init-conf] [--prefix <path>] [--enable]` | the account bundle: import with `--from` (or ship the starter with `--init-conf`), then validate the conf(s) already in the fixed confdir, wire `unit.env`, build the gateway image (one line on the terminal; the full stream goes to the account's `~/.config/egresslock/gateway-build.log`), optionally enable linger + the verify timer. No conf path required |
 | `egresslock-setup doctor [--account <name>] [--prefix <path>]` | read-only kit/account state check with the fix command for each missing item (distinct from the engine's `egresslock doctor`) |
 | `egresslock-setup build-gateway [--force] [--prefix <path>]` | build the gateway image in the invoking user's own shell (an `egresslock build-gateway` alias) |
@@ -103,10 +112,10 @@ in its help: `egresslock-setup help <verb>`).
 | `--conf <path>` | legacy silent alias of `--from` for `init`; for `doctor`, only a display hint (it never selects a runtime conf) |
 | `--init-conf` | ship the deny-all starter conf pair (`profile main` + empty allowlist) when `~/.config/egresslock/main.conf` is missing — never overwrites; refuses only a conf-present/allowlist-missing pair (an allowlist-present/conf-missing directory is completed without touching the allowlist); `--init-conf --profile <name>` other than `main` is a usage error |
 | `--profile <name>` | write `EGRESSLOCK_PROFILE=<name>` (named verify mode) and validate exactly `<name>.conf`. Omit for aggregate/`--ensured` mode; a pathless re-run without `--profile` clears named mode. This is the only flag that chooses named mode (import never does) |
-| `--allowlist <path>` | with `import`: override the source allowlist; the destination name still comes from the conf's gateway line |
+| `--allowlist <path>` | with `import`: override the source allowlist; the destination is still `<profile>-allowlist` |
 | `--prefix <path>` | deployed kit prefix (default: derived from the installed unit template, else `/opt/egresslock`) — usually unnecessary: setup retries the `.deb` unit dir when a stale prefix unit points at a missing engine |
 | `--enable` | enable+start `egresslock-verify@<account>.timer` AND enable linger for the account (fails closed if linger does not stick) |
-| `--force` | with `build-gateway`: rebuild even when the image already matches the deployed pin; with `import`: replace a differing or torn destination pair |
+| `--force` | with `build-gateway`: rebuild even when the image already matches the deployed pin; with `import`: replace a differing or torn destination pair of regular files |
 
 The legacy flat flag forms — the flag-only account bundle
 (`--account A --conf C [flags]` with no verb), plus `--doctor`,
@@ -156,15 +165,23 @@ after it executed).
   named profile exists in it.
 - **Imports a pair** (`import`, or `init --from`/legacy `--conf`):
   copies the conf as `<home>/.config/egresslock/<profile>.conf` (0600)
-  and a basename gateway allowlist next to it. Both halves are staged,
-  validated as the account, then committed allowlist-first/conf-last;
-  a refusal or failed validation leaves the destination bytes
-  unchanged. Root-mode validation uses a private mount namespace
-  (`unshare -m`); run setup on the target host as real root, not inside a
-  restricted container. A host that denies `unshare -m` fails closed before
-  touching the destination. Existing identical halves are a no-op;
-  differing/torn halves are refused unless `--force` replaces the
-  whole pair.
+  and its `<profile>-allowlist` sibling next to it; a source gateway
+  line naming anything else (including an absolute path) is refused
+  before staging. Both destination halves must be absent or regular
+  non-symlink files: a directory, symbolic link (including dangling),
+  or special file is refused by name (rc 1, nothing moved or deleted),
+  and a forced replacement removes the regular files it replaces after
+  the staged pair validates. Both halves are staged, validated as the
+  account (including every allowlist entry — an invalid entry is
+  refused and named), then committed allowlist-first/conf-last; a
+  refusal or failed validation leaves the destination bytes unchanged.
+  Identical destination halves are still validated, so an
+  already-installed invalid pair is refused rather than reported
+  unchanged; differing or torn halves are refused unless `--force`
+  replaces the whole pair. Root-mode validation
+  uses a private mount namespace (`unshare -m`); run setup on the
+  target host as real root, not inside a restricted container. A host
+  that denies `unshare -m` fails closed before touching the destination.
 - **Writes `~/.config/egresslock/unit.env`** (0600): an
   `EGRESSLOCK_PROFILE=<name>` line only with `init --profile`, which
   also selects exactly `<name>.conf`. Every other `init` (including
@@ -188,8 +205,9 @@ after it executed).
   the user manager and gateway image. AppArmor is pointed at
   `apparmor check`, not duplicated. This is distinct from the
   engine's `egresslock doctor` (the host environment probe: podman,
-  netavark, nft, unprivileged userns, plus labeled account-side
-  advisories — backend, netns, gateway image base).
+  netavark, nft, conntrack, unprivileged userns, plus labeled
+  account-side advisories — backend, netns, bridge driver, gateway
+  image base).
 - `build-gateway` (also `egresslock build-gateway`) builds the
   gateway image in the **invoking user's own shell** from the deployed
   `gateway/` directory next to the engine — no root, no `--account`.
@@ -220,9 +238,10 @@ stderr.
 
 - **The profile conf** (engine input): profiles, subnets, rules,
   allowlist references. Account-owned site data. Gateway profiles need
-  an allowlist file **next to the conf** (conf-relative path in the
-  `gateway` directive); missing/invalid allowlists fail `ensure`
-  closed. Grammar: the [policy reference](policy-reference.md).
+  an allowlist file **next to the conf**, and the `gateway` directive
+  must name it exactly `<profile>-allowlist`; missing/invalid
+  allowlists and non-pair names fail `ensure` closed. Grammar: the
+  [policy reference](policy-reference.md).
 - **`~/.config/egresslock/unit.env`** (0600) — *pure systemd wiring*
   (see [the table above](#the-accounts-unitenv)): no conf path, an
   `EGRESSLOCK_PROFILE` line only when `init --profile` was given.
@@ -238,3 +257,23 @@ parameter-changeable, e.g. `XDG_RUNTIME_DIR=/run/user/$(id -u)` for
 the entry scripts and `egresslock`' nft table `egresslock`).
 `egresslock-start` deliberately has no `-h` — every argument is
 passed through to the daemon unchanged; its header is the reference.
+
+A few environment variables are test-harness hooks, not operator
+knobs: `EGRESSLOCK_APPARMOR_D`, `EGRESSLOCK_SYSTEMCTL`,
+`EGRESSLOCK_USERNS_SYSCTL`, and `EGRESSLOCK_ACCOUNT_HOME` are honored
+only when `EGRESSLOCK_KIT_ALLOW_NON_ROOT=1` is set; without it each
+command uses its production default (`/etc/apparmor.d`, `systemctl` on
+`$PATH`, the kernel's unprivileged-userns sysctl, the passwd home).
+That flag is a harness-only bypass and is never meant to be set
+outside the test harness. It reaches a privileged run only by
+inheritance — `sudo -E`, or a unit that carries a test environment —
+and any environment carrying it makes these four hooks live,
+including as root. Keep it out of shells and units that run
+privileged commands.
+`EGRESSLOCK_APPARMOR_PROFILES` follows a wider rule: a root run reads
+the kernel listing unless `EGRESSLOCK_KIT_ALLOW_NON_ROOT=1` is set,
+while a non-root run may point it at a copied listing (the kernel
+listing is root-only on many kernels). The installer's advisory read is
+test-mode only.
+`EGRESSLOCK_DIR` selects the engine directory for the entry scripts;
+the default is `/opt/egresslock`, then the script's own directory.

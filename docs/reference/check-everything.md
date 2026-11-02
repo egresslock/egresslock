@@ -52,14 +52,16 @@ in the reference for why the tilde must stay unexpanded).
 ### 2. Per profile (needs the profile name — `main` below; one set per profile)
 
 ```sh
-# Build + verify the policy (fail closed; re-resolves allow-host pins, heals DNS drift)
+# Build + verify the policy (fail closed; re-resolves direct pins, heals DNS drift)
 /opt/egresslock/egresslock ensure main
 # Read-only drift check — a `drift:` line means "re-run ensure", not an error
 /opt/egresslock/egresslock verify main
 # The nftables rules the engine installs
 /opt/egresslock/egresslock rules main
-# What the gateway allows (raw allowlist file — comments included)
+# What the proxy lane allows (configured entries; file comments are not shown)
 /opt/egresslock/egresslock allowlist main
+# What the direct path is configured to allow (profile conf; read-only, no DNS)
+/opt/egresslock/egresslock allowlist main --direct
 # Hosts the gateway blocked (feed for `allow`; last 14 days by default — --days 0 for the full log)
 /opt/egresslock/egresslock denied main
 # Every request, one line each (last 5)

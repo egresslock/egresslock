@@ -5,18 +5,20 @@
 ```text
 podman unshare --rootless-netns true                # as the account
  ├─ rc 0 → not this page (see ../troubleshooting.md index)
- └─ rc != 0 ('kill network process: permission denied')?
-      ├─ sudo egresslock-setup apparmor check
-      │    ├─ "podman label: labeled" + "pasta amendment: required on
-      │    │      this host"
-      │    │      → apply the amendment (Fix below), then re-probe
-      │    ├─ "podman label: unlabeled" / "pasta amendment: not
-      │    │      required…" → NOT AppArmor — go to the session path
-      │    │      (bottom)
-      │    └─ "condition unknown" → re-run as root, or confirm via the
-      │          journal DENIED line (Diagnosis below)
-      └─ no pasta profile on the system → pasta runs unconfined; the
-            SIGTERM is never mediated — session path (bottom)
+ └─ rc != 0
+      ├─ 'kill network process: permission denied'?
+      │    ├─ sudo egresslock-setup apparmor check
+      │    │    ├─ "podman label: labeled" + "pasta amendment: required on
+      │    │    │      this host"
+      │    │    │      → apply the amendment (Fix below), then re-probe
+      │    │    ├─ "podman label: unlabeled" / "pasta amendment: not
+      │    │    │      required…" → NOT AppArmor — go to the session path
+      │    │    │      (bottom)
+      │    │    └─ "condition unknown" → re-run as root, or confirm via the
+      │    │          journal DENIED line (Diagnosis below)
+      │    └─ no pasta profile on the system → pasta runs unconfined; the
+      │          SIGTERM is never mediated — session path (bottom)
+      └─ any other error → the engine prints it; see netns-inspection
 ```
 
 ## Symptom
@@ -27,8 +29,10 @@ podman unshare --rootless-netns true                # as the account
 Error: rootless netns: kill network process: permission denied
 ```
 
-The engine's preflight message emits the one-line fix itself
-(`sudo egresslock-setup apparmor add`); this page is the deep
+The engine and the timer wrapper print podman's actual error and
+route by its shape; the pasta signature leads with
+`sudo egresslock-setup apparmor check` (apply the amendment only
+when the check says it is required). This page is the deep
 diagnosis.
 
 ## Diagnosis
@@ -67,8 +71,8 @@ SIGTERM. The denial fires only when **both** hold:
 
 The netns is healthy; podman just cannot talk to its holder. A
 long-lived stale holder masks the bug (podman reuses the netns without
-signaling) — fresh boots, `sudo -u`, systemd user timers, and CI
-typically have no holder.
+signaling) — fresh boots, systemd user timers, and CI typically have
+no holder.
 
 `egresslock-setup apparmor check` reports the actual state on your
 host; the matrix below explains why it differs between hosts.
@@ -160,7 +164,8 @@ sudo apt-get install --reinstall -o Dpkg::Options::="--force-confmiss" pasta
 Then re-test **as the account**: `sudo -iu <account> -- podman unshare
 --rootless-netns true` must return rc=0.
 
-Only if the AppArmor fix is not it: check the session
+Only if the check says the amendment is required but applying it does
+not fix the probe: check the session
 (`systemctl --user is-system-running`, `loginctl list-sessions`,
 `/run/user/<uid>/netns/` ownership) — a
 `sudo systemctl restart user@<uid>` may be needed, but WARNING: it
@@ -172,12 +177,13 @@ stops user-unit children (containers); expect `podman start
 
 The denial fires on the first shared-netns operation **on affected
 hosts only** (matrix above): Ubuntu >= 25.10 by default. It is an
-install prerequisite on those hosts, not a kit bug. The engine probes
-before every netns-touching command and emits the `--apparmor-add`
-guidance itself, so the first signal of a broken shared netns is
-actionable; the setup check (`egresslock-setup apparmor check`, the
-install-kit advisory line) reports whether this host needs the
-amendment at all.
+install prerequisite on those hosts, not a kit bug. The engine and
+the timer wrapper probe before every netns-touching command; both
+print podman's actual error and route by its shape (the checker-led
+AppArmor route or the netns pointer), so the first
+signal of a broken shared netns is actionable. The setup check
+(`egresslock-setup apparmor check`, the install-kit advisory line)
+reports whether this host needs the amendment at all.
 
 Report/tracking context: the original Debian-BTS report premise was
 corrected — both defects were already tracked upstream (see

@@ -38,7 +38,7 @@ bypasses the proxy):
 ```sh
 egresslock ensure main
 egresslock allow main openrouter.ai:443
-egresslock allow-host main github.com:22   # git-over-SSH
+egresslock allow main github.com:22 --direct   # git-over-SSH
 ```
 
 ## 2. Build the image

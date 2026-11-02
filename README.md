@@ -177,11 +177,9 @@ sudo -iu "$ACCOUNT" -- sh -c 'egresslock ensure main && podman run --rm -it --ca
 A shell in an `egl-base` container on the profile network. The launch
 runs only if `ensure` succeeds; application connections follow your
 existing policy (denied by the fresh starter, apart from DNS above).
-(`--env-file="$(egresslock proxy-env main --out)"` regenerates the
-env file mode 0600 under the account's private runtime dir on every
-run; an explicit `--out=<path>` elsewhere is refused if its directory
-is world-writable — a directory your group can also write to is
-accepted for now — the runtime-dir default always qualifies.)
+(`--env-file="$(egresslock proxy-env main --out)"` uses the
+recommended bare `--out` form: it regenerates the env file mode 0600
+under the account's private runtime dir on every run.)
 
 <details><summary>Expected output:</summary>
 the container's shell prompt — you are inside the locked network:
@@ -214,7 +212,7 @@ Creating an additional profile (beyond the starter `main`) is
 optional — [Create a profile](docs/reference/policy-reference.md#profile-lifecycle).
 
 1. [Allow a domain (and see what's blocked)](docs/quickstart/allow-a-domain.md) <span style="color:#6a737d">(<1 minute)</span> — run a workload, 403 → `allow example.com` → re-run → `denied` → remove an entry.
-2. [Allow non-HTTP egress](docs/quickstart/allow-non-http.md) <span style="color:#6a737d">(<1 minute)</span> — `allow-host` for git-over-SSH and raw IPs, and the fail-closed proofs.
+2. [Allow non-HTTP egress](docs/quickstart/allow-non-http.md) <span style="color:#6a737d">(<1 minute)</span> — `allow … --direct` for git-over-SSH and raw IPs, and the fail-closed proofs.
 3. [First-run checks](docs/quickstart/first-run-checks.md) <span style="color:#6a737d">(<1 minute)</span> — the things that commonly go wrong right after initial setup.
 
 ## Recipes
@@ -237,7 +235,7 @@ exceptions stated, never silent):
 
 - [Install opencode via npm](examples/recipes/opencode-npm-install.md) — tested path: apt + npm inside a `debian:13-slim` container reaching exactly deb.debian.org / registry.npmjs.org / github.com / openrouter.ai.
 - [Install hermes via curl | bash](examples/recipes/hermes-curl-install.md) — tested path: hermes (Nous Research) inside a `debian:13-slim` container reaching its install chain (Astral/uv, PyPI CDN, github.com).
-- [Local LLM (Ollama, etc.)](examples/recipes/local-llm.md) — reach an LLM server on the host or LAN from a container: the localhost patterns, raw-IP `allow-host`, and the long-request timeout knob.
+- [Local LLM (Ollama, etc.)](examples/recipes/local-llm.md) — reach an LLM server on the host or LAN from a container: the localhost patterns, raw-IP direct pins (`allow … --direct`), and the long-request timeout knob.
 - [GitHub from a container](examples/recipes/github.md) — GitHub when `github.com`'s addresses rotate: clone/push over HTTPS through the gateway (no pin at all), or SSH via a name tunnel (`ssh.github.com:443`) or a pinned IPv4 pool.
 
 ## Reference
@@ -274,7 +272,7 @@ exceptions stated, never silent):
   behavior, and the security model summary.
 - **[Policy reference](docs/reference/policy-reference.md)** — the full
   profile-conf grammar, the allowlist format, the destination →
-  mechanism decision table, `allow-host` details, and the profile
+  mechanism decision table, direct-path details, and the profile
   lifecycle (create / verify / teardown / delete).
 - **[Paths and signatures](docs/reference/paths-and-signatures.md)** —
   why a request 403s, hangs, or gets refused: the two-path model, the

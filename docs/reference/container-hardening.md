@@ -142,12 +142,14 @@ Not hardening, but part of the same block, defined once here:
   profile network; **only** there does the fail-closed policy apply
   (never `--network=host` or a second network).
 - `--env-file="$(egresslock proxy-env <profile> --out)"` — wire the
-  proxy env in as one file (`--out` writes it immediately before
-  `podman run`: mode 0600, the account's private runtime dir — not a
-  world-writable tmp; regenerate after a policy change; an explicit
-  `--out=<path>` elsewhere is refused if its directory is
-  world-writable — a directory your group can also write to is
-  accepted for now — the runtime-dir default always qualifies).
+  proxy env in as one file. The bare `--out` is the recommended form:
+  it writes the file mode 0600 under the account's private runtime dir
+  immediately before `podman run` (not a world-writable tmp) and
+  prints the path; regenerate after a policy change. Use
+  `--out=<path>` only as a backup when you need the file at a specific
+  location; its directory must be writable only by your account (a
+  group- or world-writable directory is refused), otherwise pass them
+  to `podman run` with `--env KEY=value`.
 - **Never** bind-mount the account's home (or
   `~/.config/egresslock/`) into a workload — policy files must not
   enter the workload filesystem (I5/T10 in the threat model).

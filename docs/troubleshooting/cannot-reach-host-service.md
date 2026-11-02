@@ -37,7 +37,10 @@ egresslock allow main host.containers.internal:8000
 <pre>
 egl-runner@host:~$ egresslock allow main host.containers.internal:8000
 using config /home/egl-runner/.config/egresslock/main.conf
+path: proxy — gateway allowlist /home/egl-runner/.config/egresslock/main-allowlist
 added: host.containers.internal:8000 -> /home/egl-runner/.config/egresslock/main-allowlist
+note: port 8000 is not the usual HTTP(S) port. If host.containers.internal:8000 is a non-HTTP service, add a direct rule as well (this does not remove the allowlist entry):
+  egresslock allow main host.containers.internal:8000 --direct
 re-ensuring profile 'main' ...
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
@@ -74,17 +77,18 @@ or the service's own status code — the point is it answered.
 # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
 # prompt: egl-runner@host:~$
 
-egresslock allow-host main 169.254.1.2:8000
+egresslock allow main 169.254.1.2:8000 --direct
 ```
 
 <details>
 <summary>Expected output:</summary>
 
 <pre>
-egl-runner@host:~$ egresslock allow-host main 169.254.1.2:8000
+egl-runner@host:~$ egresslock allow main 169.254.1.2:8000 --direct
 using config /home/egl-runner/.config/egresslock/main.conf
+path: direct — firewall rule in /home/egl-runner/.config/egresslock/main.conf (does not change client proxy settings)
 added: rule allow-host 169.254.1.2:8000 -> /home/egl-runner/.config/egresslock/main.conf
-note: IPv4 allow-host pins are included in proxy-env NO_PROXY; recreate running workloads to pick up the new env.
+note: IPv4 direct pins are included in proxy-env NO_PROXY; recreate running workloads to pick up the new env.
 re-ensuring profile 'main' ...
 gateway 'egresslock-gateway-main' ready (already converged, not restarted)
 profile 'main' ready (network egresslock-main, policy verified)
@@ -92,8 +96,8 @@ profile 'main' ready (network egresslock-main, policy verified)
 
 `169.254.1.2` is pasta's host address (podman map-guest-addr):
 traffic to it is translated to the host's loopback, so the profile
-policy governs it — the `allow-host` direct path. The NAME cannot be
-pinned (allow-host resolves on the host, where that name does not
+policy governs it — the direct firewall path. The NAME cannot be
+pinned (the direct path resolves on the host, where that name does not
 exist) — only the literal works, and running workloads need a
 recreate to pick up the NO_PROXY change.
 </details>
@@ -107,7 +111,7 @@ client, ssh, nc) against `169.254.1.2:8000`.
   [policy reference](../reference/policy-reference.md).
 - Wrong pattern for the protocol — HTTP(S) → proxied-by-name; ssh,
   git-over-SSH, databases and other non-HTTP → direct-by-literal;
-  the `allow-host` walkthrough:
+  the direct-path walkthrough:
   [allow-non-http](../quickstart/allow-non-http.md).
 - Symptom-driven diagnosis: the
   [troubleshooting index](../troubleshooting.md) — instant refusal at

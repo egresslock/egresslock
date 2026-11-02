@@ -16,7 +16,7 @@ denied. The verify timer (default sweep mode) now fails named within
 ≤15 minutes (`Persistent=true`):
 
 ```text
-verify: network exists but policy does not — run: egresslock ensure main
+verify: network exists but policy does not — run: egresslock ensure main (as <account>)
 ```
 
 ## Cause
@@ -46,8 +46,8 @@ restarts the gateway in one non-disruptive pass.
 
 - The 15-minute `egresslock-verify@<account>.timer` (default sweep
   mode) fails named with `verify: network exists but policy does not
-  — run: egresslock ensure <profile>` — a drift **signal**, not a
-  repair. It never re-ensures by design.
+  — run: egresslock ensure <profile> (as <account>)` — a drift
+  **signal**, not a repair. It never re-ensures by design.
 - A named-mode wiring (`egresslock-setup --profile` at setup) fails
   the same named way on `verify <profile>`.
 - If no profile is ensured **and** nothing is stale, the sweep stays

@@ -16,10 +16,10 @@ routine health check see
 | my container can't reach a service on the host / localhost | same-host service — pasta hairpin (host-addressed traffic never leaves the netns) | [cannot-reach-host-service](troubleshooting/cannot-reach-host-service.md) |
 | `denied` shows nothing but clients still 403 | stale engine or stale container env | [proxied-or-direct](troubleshooting/proxied-or-direct.md) |
 | `denied` prints a "newest … bytes" note / misses older denials | the log-read cap keeps only the newest bytes of access.log | [denied-log-cap](troubleshooting/denied-log-cap.md) |
-| `kill network process: permission denied` | pasta/AppArmor blocker | [pasta-apparmor](troubleshooting/pasta-apparmor.md) |
+| `kill network process: permission denied` | pasta/AppArmor blocker — check whether this host needs the amendment first | [pasta-apparmor](troubleshooting/pasta-apparmor.md) |
 | `invalid internal status ... podman system migrate` / degraded user session | session/pause-process tangle | [session-tangles](troubleshooting/session-tangles.md) |
 | `verify: FAILED` / `drift:` lines in the timer journal | policy drift or DNS move | [verify-timer-signals](troubleshooting/verify-timer-signals.md) |
-| `disallow-host` refuses a drifted profile and the recommended `ensure` says `cannot resolve` | the revoked name no longer resolves — the automatic recovery cannot run | [revocation-name-gone](troubleshooting/revocation-name-gone.md) |
+| `disallow --direct` refuses a drifted profile and the recommended `ensure` says `cannot resolve` | the revoked name no longer resolves — the automatic recovery cannot run | [revocation-name-gone](troubleshooting/revocation-name-gone.md) |
 | weird policy/containers after running the engine as root | root run built policy in ROOT's store | [netns-inspection](troubleshooting/netns-inspection.md) |
 | where are the gateway logs / what do they mean | Squid access.log + cache.log reading | [gateway-logs](troubleshooting/gateway-logs.md) |
 | `pinger\| FATAL` noise in cache.log | benign (no ICMP in the gateway container) | [gateway-logs](troubleshooting/gateway-logs.md) |
@@ -28,6 +28,7 @@ routine health check see
 | `torn conf pair` / `allowlist file missing` when the allowlist half is missing | the starter pair lost its allowlist half and is never auto-healed | [torn-conf-pair](troubleshooting/torn-conf-pair.md) |
 | long request dies at exactly 15m00 | squid `read_timeout` — non-streaming origin idle, not a periodic breaker | [long-request-15m](troubleshooting/long-request-15m.md) |
 | a command says `another egresslock command is running` | a concurrent command holds the account lock | [concurrent-commands](troubleshooting/concurrent-commands.md) |
+| `No space left on device` / a lock, policy, pin-record, verify-temp, or conf write failure | the account home or `/tmp` is full — the named line says what changed and what did not | [disk-full](troubleshooting/disk-full.md) |
 
 The failure-signature model behind the first three rows (two-path
 model, env × destination matrix, counter proof):

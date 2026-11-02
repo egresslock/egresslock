@@ -42,7 +42,9 @@
 #   EGRESSLOCK_KIT_ALLOW_NON_ROOT=1   allow non-root runs (tests only)
 #   EGRESSLOCK_UNIT_DIR=<dir>         remove unit templates here
 #                                (default: /etc/systemd/system)
-#   EGRESSLOCK_ACCOUNT_HOME=<dir>     account home in non-root test mode
+#   EGRESSLOCK_ACCOUNT_HOME=<dir>     account home override in test mode
+#                                (requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1;
+#                                honored as root in test mode too)
 #   EGRESSLOCK_PATH_BINDIR=<dir>     PATH wrapper dir for the engine
 #                                (default: /usr/local/bin; removes only
 #                                THIS prefix's wrappers)
@@ -69,6 +71,11 @@
 
 set -euo pipefail
 
+# Testability hook: the mock harness runs non-root. This flag gates the
+# harness hook reads that follow; without it each gated site uses its
+# production default.
+kit_test_mode() { [[ "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]]; }
+
 prefix="/opt/egresslock"
 accounts=()
 purge_account_data=0
@@ -86,7 +93,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Testability hook (mirror of install-kit.sh): fail closed outside tests.
-[[ "$(id -u)" == 0 || "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]] || {
+[[ "$(id -u)" == 0 ]] || kit_test_mode || {
     echo "uninstall-kit: must run as root (sudo)" >&2
     exit 1
 }
@@ -183,10 +190,12 @@ systemctl daemon-reload
 # 3. Account data: preserved unless explicitly purged.
 for acct in "${accounts[@]:-}"; do
     [[ -n "$acct" ]] || continue
-    # EGRESSLOCK_ACCOUNT_HOME overrides the passwd lookup (mock harness);
-    # guard against a bogus resolution ever purging the wrong tree.
+    # EGRESSLOCK_ACCOUNT_HOME overrides the passwd lookup in test mode
+    # only; guard against a bogus resolution ever purging the wrong tree.
     home="$(getent passwd "$acct" | cut -d: -f6)"
-    [[ -n "${EGRESSLOCK_ACCOUNT_HOME:-}" ]] && home="$EGRESSLOCK_ACCOUNT_HOME"
+    if kit_test_mode && [[ -n "${EGRESSLOCK_ACCOUNT_HOME:-}" ]]; then
+        home="$EGRESSLOCK_ACCOUNT_HOME"
+    fi
     if [[ -z "$home" || "$home" == "/" || ! -d "$home" ]]; then
         echo "uninstall-kit: refusing account-data handling for '$acct' (unresolved home '$home')" >&2
         continue

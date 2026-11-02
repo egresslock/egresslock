@@ -1,16 +1,16 @@
-# Revoking an allow-host rule whose name no longer resolves
+# Revoking a direct rule whose name no longer resolves
 
 ## Symptom
 
-`egresslock disallow-host <profile> <host>:<port>` refuses — exit code 1,
+`egresslock disallow <profile> <host>:<port> --direct` refuses — exit code 1,
 `nothing was changed` — saying the profile's installed firewall rules no
 longer match its pin record; the `egresslock ensure <profile>` it
 recommends then fails with `cannot resolve <host>`, and retrying
-`disallow-host` refuses again. The revocation is stuck.
+`disallow --direct` refuses again. The revocation is stuck.
 
 ## Cause
 
-`disallow-host` refuses while the live firewall rules disagree with the
+`disallow --direct` refuses while the live firewall rules disagree with the
 profile's pin record (a tampered or drifted profile): it cannot prove which
 installed rule belongs to the one you are revoking. The healing step,
 `egresslock ensure <profile>`, rebuilds the rules from the profile conf and
@@ -26,7 +26,7 @@ connections with the engine's `drop-unauthorized` recovery command (the
 per-address `conntrack -D` fallback is in step 5 if that command cannot
 run). The procedure is **disruptive** — the profile's workloads stop,
 and (only if the profile has a gateway) the gateway restarts — and it is
-**not a `disallow-host` severance proof**: no `removed:` line is printed,
+**not a `disallow --direct` severance proof**: no `removed:` line is printed,
 and you run and verify every step. Work in order; do not start workloads
 again before step 5 passes.
 
@@ -39,15 +39,11 @@ again before step 5 passes.
 
    Stop every container in the list except `egresslock-anchor-<profile>` —
    the anchor keeps the profile's firewall alive and sends no workload
-   traffic. That includes the gateway `egresslock-gateway-<profile>` when
-   the profile has one (a profile without a gateway has no such container):
+   traffic. That includes the gateway `egresslock-gateway-<profile>`:
 
    ```sh
    podman stop <workload-name> [...] egresslock-gateway-<profile>
    ```
-
-   If the profile has no gateway, drop `egresslock-gateway-<profile>` from
-   the command.
 
    Run the first command again and confirm only the anchor remains.
 
@@ -90,7 +86,7 @@ again before step 5 passes.
    egresslock drop-unauthorized <profile> <port>
    ```
 
-   This is the same recovery command a failed `disallow-host` prints. It
+   This is the same recovery command a failed `disallow --direct` prints. It
    reads the rebuilt firewall rules, ends the connections on `<port>` the
    policy no longer allows — including any earlier address the rule held
    after a DNS change — keeps the connections the policy still allows, and
@@ -129,7 +125,7 @@ check itself failed and is **not** proof that no connections remain.
 
 ## What this recovery does not cover
 
-- It is not `disallow-host`: that command refused and printed no `removed:`;
+- It is not `disallow --direct`: that command refused and printed no `removed:`;
   this page's steps removed the rule from the conf by hand and ended its
   connections with `drop-unauthorized` (or the checked per-address
   fallback).

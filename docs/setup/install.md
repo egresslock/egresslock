@@ -57,7 +57,7 @@ is **interactive only** — do **not** grant `install-kit.sh`,
    | **podman** | runs the workload containers, the anchor, and the Squid gateway (validated on 5.4.2) |
    | **netavark** | Podman's rootless network backend; creates the profile bridge networks (validated on 1.14.0) |
    | **nftables** | the enforcement engine — the kit installs a fail-closed policy in the account's rootless netns (1.0+; `nft` at `/usr/sbin/nft` or set `NFT_BIN`) |
-   | **conntrack** | required by `disallow-host`'s revocation flush (the kit's `Depends:`) |
+   | **conntrack** | required by `disallow --direct`'s revocation flush (the kit's `Depends:`) |
 
    </details>
 
@@ -257,11 +257,10 @@ AppArmor: pasta profile reloaded (/etc/apparmor.d/usr.bin.pasta). Confirm with: 
 - builds the gateway image,
 - arms the 15-minute verify timer and enables linger (`--enable`).
 
-Existing confs and allowlists are preserved, not reset: `import` (and
-`init --from`/`--conf`) stages and validates the pair, then refuses a
-differing or torn destination unless you pass `--force`. DNS queries
-to the bridge resolver remain allowed even with an empty allowlist
-and can carry data out — see the [threat model](../reference/threat-model.md).
+Existing confs and allowlists are preserved, not reset — the starter
+is shipped only when the conf is missing. DNS queries to the bridge
+resolver remain allowed even with an empty allowlist and can carry data
+out — see the [threat model](../reference/threat-model.md).
 
 Every flag and the step-by-step run map: the
 [scripts and environment reference](../reference/scripts-and-environment.md#egresslock-setup--per-account-bootstrap).
@@ -323,8 +322,8 @@ If the build fails, the last 20 lines are shown on the terminal and the
 full stream stays in the log.
 </details>
 
-<details><summary>Restricted accounts (runner-style): bring your own conf</summary>
-Accounts that must not edit their conf get a pre-made conf
+<details><summary>Alternative: bring your own conf with <code>import</code></summary>
+Accounts that must not edit their own conf get a pre-made conf
 distributed by deploy tooling — same bundle, no starter shipped:
 
 ```sh
@@ -335,11 +334,18 @@ sudo egresslock-setup import --account <account> --from <pinned-conf>
 sudo egresslock-setup init --account <account> --profile <profile> --enable
 ```
 
-`import` copies the conf+allowlist pair and stops; `init` then validates
-as the account and prints the same six-step map. This is the form for
-service accounts (CI runners, per-service daemons) — see
-[the CI runner recipe](../../examples/recipes/ci-runner.md). For the
-same form at fleet scale — one pair pushed to N hosts, plus the
+`import` copies the conf+allowlist pair into the account's
+`~/.config/egresslock/` and stops; `init` then validates it as the
+account and prints the same six-step map. A destination pair that
+differs from the source, or a torn one, is refused unless you pass
+`--force`, which replaces only a regular-file pair — a destination
+directory, symbolic link, or special file is refused (rc 1, nothing
+changed) even with it; the exhaustive rules are in the
+[scripts and environment reference](../reference/scripts-and-environment.md#egresslock-setup--per-account-bootstrap).
+
+This is the form for service accounts (CI runners, per-service
+daemons) — see [the CI runner recipe](../../examples/recipes/ci-runner.md).
+For the same form at fleet scale — one pair pushed to N hosts, plus the
 account-side `ensure` a re-pin needs — see
 [the fleet deploy recipe](../../examples/recipes/fleet-deploy.md).
 </details>
@@ -455,9 +461,10 @@ profile 'main' ready (network egresslock-main, policy verified)
 </pre>
 
 Troubleshooting:
-- `rootless netns: kill network process: permission denied` — the
-  AppArmor step 3 was skipped on an affected host; apply the
-  amendment (see
+- `rootless netns: kill network process: permission denied` — check
+  whether this host needs the AppArmor amendment:
+  `sudo egresslock-setup apparmor check`; apply it only when the check
+  reports `pasta amendment: required on this host` (see
   [pasta/AppArmor blocker](../troubleshooting/pasta-apparmor.md)).
 </details>
 

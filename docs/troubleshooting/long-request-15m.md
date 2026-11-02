@@ -54,8 +54,11 @@ egresslock ensure <profile>
 
   ```sh
   podman exec egresslock-gateway-<profile> \
-      grep read_timeout /etc/squid/agent/squid.conf
+      grep read_timeout /etc/squid/egresslock/squid.conf
   ```
+
+  On a gateway not yet replaced from an older image, use
+  `/etc/squid/agent/squid.conf` instead.
 
 - Only `read_timeout` is overridden. Squid's `request_timeout`,
   `connect_timeout`, and `client_lifetime` keep their stock values —

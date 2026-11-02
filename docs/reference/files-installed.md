@@ -27,7 +27,7 @@ The kit is deployed ROOT-owned to `--prefix` (default
 
 | File / dir | What it is |
 |---|---|
-| `egresslock` | the engine CLI (`ensure`, `verify`, `list`, `network`, `rules`, `allowlist`, `denied`, `allow`/`disallow`, `allow-host`/`disallow-host`, `drop-unauthorized`, `init`, `doctor`, `teardown`, ...) |
+| `egresslock` | the engine CLI (`ensure`, `verify`, `list`, `network`, `rules`, `allowlist` (`--direct`), `denied`, `allow`/`disallow` (`--direct`), `drop-unauthorized`, `init`, `doctor`, `teardown`, ...) |
 | `egresslock-start` | daemon-start wrapper: `ensure` the profile, then exec the daemon |
 | `egresslock-verify` | entry point for the verify timer (named or `--ensured`) |
 | `egresslock-setup` | per-account bootstrap: import a pair or ship the starter conf, validate the fixed confdir, write `unit.env`, build gateway, enable timer |
@@ -57,7 +57,7 @@ repository root:
 
 | Path | What it is |
 |---|---|
-| `egresslock` | The engine CLI: `ensure`, `verify` (incl. `--ensured`), `list`, `network`, `proxy-env` (tokens: `proxyip`/`proxyport`/`noproxy`; `--out[=<path>]` — the `--out` form writes the env file mode 0600, default under the account's private runtime dir; an explicit `--out=<path>` is refused if its directory is world-writable — a directory your group can also write to is accepted for now — the runtime-dir default always qualifies), `rules`, `allowlist`, `denied` (`--all`, `--days N`), `allow`/`disallow`, `allow-host`/`disallow-host`, `drop-unauthorized`, `init`, `doctor`, `build-gateway` (incl. `--force`), `teardown` (incl. `--runtime`), `--version` |
+| `egresslock` | The engine CLI: `ensure`, `verify` (incl. `--ensured`), `list`, `network`, `proxy-env` (tokens: `proxyip`/`proxyport`/`noproxy`; `--out[=<path>]` — the bare `--out` (recommended) writes the env file mode 0600, default under the account's private runtime dir; `--out=<path>` is a backup for a specific location and is refused if its directory is group- or world-writable (use a directory only your account can write to, or pass them to `podman run` with `--env KEY=value`), `rules`, `allowlist` (bare = the configured proxy entries from the allowlist file; `--direct` lists the configured direct-path entries), `denied` (`--all`, `--days N`), `allow`/`disallow` (`--direct` selects the direct path), `drop-unauthorized`, `init`, `doctor`, `build-gateway` (incl. `--force`), `teardown` (incl. `--runtime`), `--version` |
 | `install-kit.sh` | (root) Deploy the kit to a prefix and install the instanced verify unit templates (no account changes) |
 | `egresslock-setup` | (root) One-command per-account setup: import a pair with `import --from` or ship the starter conf with `init --init-conf`, validate the fixed confdir, write `unit.env`, build the gateway image, optionally enable the timer |
 | `uninstall-kit.sh` | (root) Remove the kit; account data is preserved unless `--purge-account-data` |

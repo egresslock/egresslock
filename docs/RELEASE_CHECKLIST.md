@@ -58,6 +58,12 @@ development history):
       battery, default track — not `--track fast`: the per-push CI
       battery skips the registered slow sections, the release gate
       runs everything).
+- [ ] Revocation-walk pairing: if the delta under review touches the
+      policy compiler's accept emitters, the accepted-set walk, or the
+      reversed-orig walk, the paired walk change is present and the
+      revocation drift tripwire is green in the full battery. A new
+      accept shape that joins only one walk can mis-flush an accepted
+      address or miss a flow.
 - [ ] Threat model matches the tree: no site launchers, accepted
       risks stated, no claim of sandbox or “any rootless Podman”.
 - [ ] README and setup docs match CLI names:

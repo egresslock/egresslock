@@ -67,7 +67,7 @@ if [[ -n "${EGRESSLOCK_DIR:-}" ]]; then
 elif [[ -x /opt/egresslock/egresslock ]]; then
     kit_dir=/opt/egresslock
 else
-    kit_dir="$(cd "$(dirname "$0")" && pwd)"
+    kit_dir="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
 fi
 tool="$kit_dir/egresslock"
 

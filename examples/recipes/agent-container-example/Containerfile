@@ -1,8 +1,9 @@
 # Agent container for the agentic-tool-opencode recipe.
 #
 # Built on the DEFAULT rootless network — the profile's fail-closed
-# policy applies at runtime (`podman run --network=agent-main`), not at
-# build time. No proxy/network args needed here.
+# policy applies at runtime, not at build time:
+#   podman run --network="$(egresslock network main)"
+# No proxy/network args needed here.
 FROM docker.io/library/debian:13-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \

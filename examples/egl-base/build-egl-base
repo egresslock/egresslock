@@ -40,7 +40,10 @@ if (( $# > 0 )); then
 fi
 
 IMAGE="localhost/egl-base:latest"
-dir="$(cd "$(dirname "$0")" && pwd)"
+# CDPATH='' keeps a caller-exported CDPATH from redirecting this
+# own-directory lookup (R-EGL-378-12): the context is always the
+# directory containing this helper, never a foreign CDPATH hit.
+dir="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
 [[ -f "$dir/Containerfile" ]] || {
     echo "Error: no Containerfile at $dir/Containerfile (the helper must sit next to the egl-base Containerfile)" >&2
     exit 1
@@ -54,11 +57,38 @@ fi
 pin="$(grep -oE 'sha256:[0-9a-f]{64}' "$dir/Containerfile" | head -1 || true)"
 pin_short="${pin#sha256:}"; pin_short="${pin_short:0:12}"
 
+# EGL-378 R-EGL-378-15: rootless podman re-enters the inherited CWD at
+# startup as the account; from a directory the account cannot traverse
+# (`sudo -u` from a 0700 home) the call dies with `cannot chdir to <dir>:
+# Permission denied` before any work. Run podman from /, and keep the
+# invocation-directory meaning of relative path-valued Podman settings
+# (same list as the engine's rt_absolutize_podman_env).
+podman_in_root() { # podman_in_root cmd [arg...] — run one podman command from /
+    (
+        local v val
+        for v in CONTAINERS_CONF CONTAINERS_CONF_OVERRIDE \
+                 CONTAINERS_REGISTRIES_CONF CONTAINERS_STORAGE_CONF \
+                 CONTAINERS_HELPER_BINARY_DIR PODMAN_CONNECTIONS_CONF \
+                 CONTAINER_SSHKEY REGISTRY_AUTH_FILE TMPDIR \
+                 XDG_CONFIG_HOME XDG_DATA_HOME XDG_RUNTIME_DIR; do
+            val="${!v:-}"
+            [[ -n "$val" && "$val" != /* ]] || continue
+            printf -v "$v" '%s/%s' "${PWD%/}" "$val"
+            export "${v?}"
+        done
+        cd / || {
+            echo "Error: cannot change directory to / before running the container runtime; no runtime command was run" >&2
+            exit 1
+        }
+        "$@"
+    )
+}
+
 state=missing
 base=""
-if podman image exists "$IMAGE" 2>/dev/null; then
+if podman_in_root podman image exists "$IMAGE" 2>/dev/null; then
     state=present
-    base="$(podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}}' "$IMAGE" 2>/dev/null || true)"
+    base="$(podman_in_root podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}}' "$IMAGE" 2>/dev/null || true)"
     # Go template index of a missing key prints "<no value>".
     [[ "$base" == "<no value>" ]] && base=""
 fi
@@ -98,7 +128,7 @@ extra=()
 if (( force )); then
     extra+=(--no-cache)
 fi
-if ! podman build -t "$IMAGE" "${extra[@]}" -f "$dir/Containerfile" "$dir"; then
+if ! podman_in_root podman build -t "$IMAGE" "${extra[@]}" -f "$dir/Containerfile" "$dir"; then
     retry="$(printf '%q' "$dir/build-egl-base")"
     if (( force )); then
         retry="$retry --force"

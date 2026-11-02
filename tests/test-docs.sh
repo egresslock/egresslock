@@ -7,8 +7,8 @@
 #
 # Scope (EGL-163-D2, first cut): exactly the markdown the public snapshot
 # stages — README.md, SECURITY.md, CHANGELOG.md, packaging/README.md,
-# apparmor/README.md, docs/** and examples/**; docs/tickets/ and
-# docs/BOARD.md are excluded (the snapshot's process-file cut), and
+# apparmor/README.md, docs/** and examples/**. The ticket flow and board
+# live under internal_docs/ (not staged, not link-checked), and
 # docs/lp-*.txt / docs/debian-*.txt are not markdown (do not widen).
 # A link is an inline `](target)` or reference definition `]: target`
 # whose target is RELATIVE — no scheme, leading `/`, or bare `#anchor`;
@@ -220,8 +220,7 @@ while IFS= read -r f; do
     docs_files+=( "$f" )
 done < <(
     cd "$docs_root" || exit 1
-    find docs examples -name '*.md' \
-        -not -path 'docs/tickets/*' -not -path 'docs/BOARD.md' 2>/dev/null | sort
+    find docs examples -name '*.md' 2>/dev/null | sort
     for f in README.md SECURITY.md CHANGELOG.md packaging/README.md apparmor/README.md; do
         [[ -f "$f" ]] && printf '%s\n' "$f"
     done

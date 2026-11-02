@@ -111,16 +111,55 @@ egresslock allow main example.com:443
 <pre>
 egl-runner@host:~$ egresslock allow main example.com:443
 using config /home/egl-runner/.config/egresslock/main.conf
+path: proxy — gateway allowlist /home/egl-runner/.config/egresslock/main-allowlist
 added: example.com:443 -> /home/egl-runner/.config/egresslock/main-allowlist
 re-ensuring profile 'main' ...
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
 </pre>
 
-`allow` appends to the allowlist and applies the change (the gateway
-now permits `example.com`); batch as many entries as you like —
-multiple arguments, one re-ensure.
+`allow` defaults to the proxy path (a bare name means HTTPS/443); the
+`path:` line names the store every successful mutation changed. It
+adds the entries to the allowlist with a same-directory atomic
+replacement (not an in-place append) and applies the change (the
+gateway now permits `example.com`); batch as many entries as you like —
+multiple arguments, one re-ensure. A rewrite needs the allowlist to be
+a regular `0600` file — see
+[how proxy allow writes the allowlist](../reference/file-locations.md#how-proxy-allow-writes-the-allowlist).
 </details>
+
+### A proxy allow on a non-standard port
+
+A port other than 80/443 on the proxy path is still a gateway
+allowlist entry, but the command prints a two-line stderr note
+suggesting an additional direct rule. It is advice, not a switch: the
+allowlist entry stays.
+
+```sh
+# the host, account shell: sudo -iu egl-runner
+# prompt: egl-runner@host:~$
+
+egresslock allow main dev.example.com:8080
+```
+
+<details>
+<summary>Expected output:</summary>
+
+<pre>
+egl-runner@host:~$ egresslock allow main dev.example.com:8080
+using config /home/egl-runner/.config/egresslock/main.conf
+path: proxy — gateway allowlist /home/egl-runner/.config/egresslock/main-allowlist
+added: dev.example.com:8080 -> /home/egl-runner/.config/egresslock/main-allowlist
+note: port 8080 is not the usual HTTP(S) port. If dev.example.com:8080 is a non-HTTP service, add a direct rule as well (this does not remove the allowlist entry):
+  egresslock allow main dev.example.com:8080 --direct
+re-ensuring profile 'main' ...
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
+profile 'main' ready (network egresslock-main, policy verified)
+</pre>
+</details>
+
+For a non-HTTP service (ssh, git-over-SSH, databases), use the
+direct path instead: [allow-non-http](allow-non-http.md).
 
 ## 4. Re-run the probe — expect 200
 
@@ -171,10 +210,11 @@ egresslock disallow main example.com:443
 <pre>
 egl-runner@host:~$ egresslock disallow main example.com:443
 using config /home/egl-runner/.config/egresslock/main.conf
-removed: example.com:443 -> /home/egl-runner/.config/egresslock/main-allowlist
+path: proxy — gateway allowlist /home/egl-runner/.config/egresslock/main-allowlist
 re-ensuring profile 'main' ...
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
+removed: example.com:443 -> /home/egl-runner/.config/egresslock/main-allowlist
 </pre>
 
 Removes the exact line and applies the change. Re-run the probe —
@@ -183,11 +223,11 @@ changed:
 
 <pre>
 egl-runner@host:~$ egresslock disallow main example.com:443
-Error: entry not present: example.com:443
+Error: entry not present: example.com:443 (proxy path)
 </pre>
 </details>
 
 ## Next
 
-- [Allow non-HTTP egress](allow-non-http.md) — `allow-host` for
+- [Allow non-HTTP egress](allow-non-http.md) — `allow … --direct` for
   git-over-SSH and raw IPs, and the fail-closed proofs.

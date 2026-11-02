@@ -65,16 +65,17 @@ profile svc 10.199.8.0/24
     rule gateway-only
     gateway 10.199.8.2 3128 svc-allowlist
 
-# /srv/egress/svc-allowlist — the basename the gateway line names
+# /srv/egress/svc-allowlist — the file the gateway line must name
 svc.example.test:443
 packages.example.test:443
 ```
 
 The destination conf name comes from the pair's `profile` line
 (`svc.conf` here), and the allowlist is copied from the source
-directory by the basename in the `gateway` line. Keep the allowlist
-next to the conf and name it by basename — an absolute allowlist path
-is left as-is, and the account is warned when it cannot read it.
+directory as `<profile>-allowlist`. The source `gateway` line must
+name exactly that file; another basename or an absolute path is
+refused (with the line to fix, nothing written), so fix the source pair
+before importing.
 
 `import` takes the account from `--account`; it is never in the files.
 Check the exact flags on the host with `egresslock-setup help import`.

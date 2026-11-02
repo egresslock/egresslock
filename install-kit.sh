@@ -41,6 +41,7 @@
 #                                for the podman AppArmor label advisory
 #                                (default:
 #                                /sys/kernel/security/apparmor/profiles;
+#                                requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1;
 #                                same hook/ERE as egresslock-setup)
 #   EGRESSLOCK_UNIT_DIR=<dir>         install unit templates here
 #                                (default: /etc/systemd/system)
@@ -64,7 +65,7 @@
 set -euo pipefail
 
 prefix="/opt/egresslock"
-src="$(cd "$(dirname "$0")" && pwd)"
+src="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
 # Kit root = the script's own directory: the kit files always live
 # beside it (repo root or extracted tarball). Git facts (the VERSION
 # stamp) resolve from the checkout toplevel when the kit is a git checkout.
@@ -389,7 +390,13 @@ echo
 # lines (`podman//…`) never match. Silence on UNKNOWN (missing or
 # unreadable listing, grep rc 2): never claim "not needed" from an
 # unknown state (EGL-22-D2).
-_aa_profiles="${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles}"
+# EGL-390-D2: the profiles override is a test-mode hook here. This
+# advisory read is reached as root (production) or with the test flag;
+# without the flag read the kernel listing, silently (EGL-382-D3 family).
+_aa_profiles="/sys/kernel/security/apparmor/profiles"
+if [[ "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]]; then
+    _aa_profiles="${EGRESSLOCK_APPARMOR_PROFILES:-$_aa_profiles}"
+fi
 if [[ -r "$_aa_profiles" ]]; then
     # grep rc: 0 = match (labeled), 1 = no match (unlabeled), 2 = read
     # error (UNKNOWN — silence). `|| grc=$?` keeps grep's real rc under

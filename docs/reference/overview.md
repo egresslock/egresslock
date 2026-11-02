@@ -20,7 +20,7 @@ terminal drop rejects direct internet and LAN traffic. Omitting or changing
 `HTTP_PROXY` does not create an alternate egress path. HTTP/HTTPS traffic must
 use the configured gateway unless the profile explicitly permits a direct
 connection. Profiles may also define explicit direct-access rules, such as
-`allow-host`, for protocols that are not routed through the HTTP gateway,
+`allow … --direct`, for protocols that are not routed through the HTTP gateway,
 including SSH. These rules are part of the profile policy, are visible to the
 operator, and are enforced independently of proxy environment variables.
 
@@ -153,8 +153,8 @@ the same profile network; workload addresses can reach only the intended
 bridge DNS service and gateway proxy port, while the gateway's own source
 address is permitted to reach its upstream destinations.
 
-`ensure` creates or validates the bridge network, starts the anchor (and the
-gateway when configured), installs the policy, and verifies the result. The
+`ensure` creates or validates the bridge network, starts the anchor and the
+gateway, installs the policy, and verifies the result. The
 shipped daemon launcher (`egresslock-start`) refuses to start the daemon
 unless `ensure` succeeds. `verify` compares the live nftables chain with the
 expected policy;
@@ -194,9 +194,11 @@ summarize it.
 
 The kit assumes the host kernel's unprivileged user/network namespaces
 work (podman, pasta, nftables present), the account is dedicated and
-unprivileged, and the root-owned kit binaries are what root says they
-are (tool integrity, not a policy boundary). Workloads must be launched
-with capabilities dropped — the kit ships no workload launcher, so this is
+unprivileged, the host OS and kernel are kept security-patched
+(containers share the host kernel; a host may be a VM), and the
+root-owned kit binaries are what root says they are (tool integrity,
+not a policy boundary). Workloads must be launched with capabilities
+dropped — the kit ships no workload launcher, so this is
 the operator's launcher's job (`--cap-drop=all
 --security-opt=no-new-privileges`; plain `podman run` does not). The kit
 enforces that pair on the gateway and anchor containers it builds, and

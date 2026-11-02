@@ -5,12 +5,12 @@
 # privilege drops possible or needed).
 #
 # Config selection: egresslock generates a complete config at
-# /etc/squid/agent/squid.conf; on first boot only, fall back to the
+# /etc/squid/egresslock/squid.conf; on first boot only, fall back to the
 # image's bootstrap config (empty allowlist => fail closed).
 set -eu
 
-ALLOWLIST=/etc/squid/agent/allowlist.conf
-CFG=/etc/squid/agent/squid.conf
+ALLOWLIST=/etc/squid/egresslock/allowlist.conf
+CFG=/etc/squid/egresslock/squid.conf
 if [ ! -f "$CFG" ]; then
     CFG=/etc/squid/squid.conf
 fi

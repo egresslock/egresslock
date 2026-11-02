@@ -21,7 +21,7 @@ docs/
   README.md              this file
   quickstart/
     allow-a-domain.md        the 403 -> allow -> confirm loop
-    allow-non-http.md        allow-host recipes (git-over-SSH example,
+    allow-non-http.md        direct-path recipes (git-over-SSH example,
                              raw IPs) + the fail-closed proofs
     first-run-checks.md      brief checks right after initial setup
   setup/
@@ -48,8 +48,8 @@ docs/
     proxy-clients.md         pointing proxy-unaware tools at the gateway;
                              what the six proxy vars are for
     rotating-names.md        a name whose DNS serves one rotating A per
-                             query (`github.com` SSH): why `allow-host`
-                             can never pin it stably; the ways out
+                             query (`github.com` SSH): why a direct pin
+                             can never be stable; the ways out
                              (`allow` by name, literals, tunnel)
     check-everything.md      full per-layer health/inspection catalog
     scripts-and-environment.md  engine env overrides, config resolution,
@@ -66,6 +66,7 @@ docs/
     which-check.md               which doctor/check command answers which
                                  question (four commands, four layers)
     pasta-apparmor.md            kill network process: permission denied
+                                 (check whether the amendment is needed)
     session-tangles.md           pause process / migrate / degraded session
     proxied-or-direct.md         403 vs hang vs instant refusal
     cannot-reach-host-service.md container can't reach a service on

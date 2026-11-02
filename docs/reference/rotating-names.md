@@ -1,4 +1,4 @@
-# Rotating names: when an `allow-host` pin never stabilizes
+# Rotating names: when a direct pin never stabilizes
 
 **Why does `verify` warn `drift:` again and again for a name like `github.com`,
 and why does re-running `ensure` not fix it?** Because such a name serves **one
@@ -10,9 +10,9 @@ the gateway resolves the name per request.
 
 ## The mechanism
 
-`allow-host` resolves the name once per `ensure` and permits the addresses of
-that one answer (the pin — [`allow-host` in
-detail](policy-reference.md#allow-host-in-detail)). Two name shapes behave
+The direct path resolves the name once per `ensure` and permits the addresses of
+that one answer (the pin — [direct path in
+detail](policy-reference.md#direct-rules-in-detail)). Two name shapes behave
 differently:
 
 - **Several A records in one answer** — the whole set is pinned, and a later
@@ -27,7 +27,7 @@ differently:
     dropped until the next `ensure`, which swaps which single member is pinned.
     The warning then returns.
 
-This is a known, accepted limitation of `allow-host` pins — see the
+This is a known, accepted limitation of direct pins — see the
 [threat model](threat-model.md). `github.com` over SSH is the common
 case. **If the service speaks HTTP(S), none of this applies** — the first
 choice below is to stop pinning it; for a genuinely non-HTTP protocol, either
@@ -38,18 +38,18 @@ option below replaces the rotating name with something stable.
 The gateway matches HTTP(S) requests by name **at request time**: no
 pin, no `drift:`, nothing to maintain ([destination → mechanism
 table](policy-reference.md#destination--mechanism-decision-table)). If
-a rotating name is only used over HTTP(S), replace `allow-host` with
+a rotating name is only used over HTTP(S), replace the direct pin with
 the name on the `allow` list:
 
 ```sh
 # account — run as the dedicated account: sudo -iu <account>
 # prompt: <account>@host:~$
 
-egresslock disallow-host main github.com:22
+egresslock disallow main github.com:22 --direct
 egresslock allow main github.com
 ```
 
-`disallow-host` exits with `rule not present` and changes nothing when
+`disallow --direct` exits with `rule not present` and changes nothing when
 the name is not pinned — skip it if you never pinned the name. The
 bare host adds the port-443 group (add an explicit `:80` for plain
 HTTP). Run the workload with the proxy
@@ -63,7 +63,7 @@ recipe](../../examples/recipes/github.md).
 
 IPv4 literals never resolve, so they never drift, and every listed member is
 reachable. Find the pool's members first (below), then replace the name
-with one `allow-host` line per member.
+with one direct rule line per member.
 
 ### Finding the pool members
 
@@ -73,8 +73,8 @@ to replace the name with is every address you observe **plus** the
 address(es) the current pin holds — the pin was an answer too, and your
 observations need not return it again. Both methods read the pin record
 (`~/.config/egresslock/<profile>.pins`; one `<host>|<port> <addresses>`
-line per `allow-host` entry — [File locations](file-locations.md)), so pin
-the name first (`egresslock allow-host <profile> <name>:<port>`) and keep
+line per direct-pin entry — [File locations](file-locations.md)), so pin
+the name first (`egresslock allow <profile> <name>:<port> --direct`) and keep
 it pinned while you discover — a method that cannot read a pin (no record,
 or no entry for the name) stops with a message instead of printing a set
 that is missing the current pin. Both methods read the host resolver as
@@ -82,7 +82,7 @@ the account — the same resolver `ensure` and `verify` use; run these as
 the account.
 
 **Harvest the verify timer's own findings.** Pin the name
-`egresslock allow-host <profile> <name>:<port>` and wait. In its default
+`egresslock allow <profile> <name>:<port> --direct` and wait. In its default
 sweep mode the timer verifies every ensured profile, so the journal
 carries other hosts' `drift:` lines too; the filter keeps only the host
 you are replacing. Only the `resolved to` value is an observation — the
@@ -106,7 +106,7 @@ if [ -n "$pin" ]; then
       printf '%s\n' "$pin"
     } | tr ', ' '\n\n' | sort -u
 else
-    echo "no pin found for the name you are replacing ($rec) — pin the name first (egresslock allow-host), wait, then re-run" >&2
+    echo "no pin found for the name you are replacing ($rec) — pin the name first (egresslock allow <profile> <name>:<port> --direct), wait, then re-run" >&2
     false
 fi
 ```
@@ -115,8 +115,8 @@ Run it with your own name in place of `github\.com` (escape the dot) and
 your own port in place of `22`; `<account>` names the account whose home
 holds the pin record — the first line resolves that home from the account
 database, so a home outside `/home` works the same. When the message
-appears, the name is not pinned: run `egresslock allow-host <profile>
-<name>:<port>`, wait, and re-run — no address list is printed, so a set
+appears, the name is not pinned: run `egresslock allow <profile>
+<name>:<port> --direct`, wait, and re-run — no address list is printed, so a set
 missing the current pin cannot be mistaken for a result. Lines that say
 `no longer resolves` are skipped — there is no pool to replace until the
 name answers again. The pipeline prints each address once, one per line
@@ -152,14 +152,14 @@ if [ -n "$seen" ]; then
         esac
       done
 else
-  echo "no pin found for the name you are replacing — pin the name first (egresslock allow-host), wait, then re-run" >&2
+  echo "no pin found for the name you are replacing — pin the name first (egresslock allow <profile> <name>:<port> --direct), wait, then re-run" >&2
   false
 fi
 ```
 
 Run it with your own name and port in place of `github\.com` and `22`.
 When the message appears, the name is not pinned: run `egresslock
-allow-host <profile> <name>:<port>`, wait, and re-run. Stop with Ctrl-C
+allow <profile> <name>:<port> --direct`, wait, and re-run. Stop with Ctrl-C
 once no new address has appeared for a while; ten minutes of samples is a
 starting window. A longer run samples more of the pool,
 but no amount of sampling proves it complete. Ctrl-C is safe: everything
@@ -171,23 +171,23 @@ list.
 
 ### Replace the pin
 
-With the members known, replace the name line. `disallow-host` exits with
+With the members known, replace the name line. `disallow --direct` exits with
 `rule not present` and changes nothing when the name was never pinned
-(skip it); each `allow-host` line re-ensures:
+(skip it); each direct rule line re-ensures:
 
 ```sh
 # account — run as the dedicated account: sudo -iu <account>
 # prompt: <account>@host:~$
 
-egresslock disallow-host main github.com:22
-egresslock allow-host main <member-ip-1>:22
-egresslock allow-host main <member-ip-2>:22
+egresslock disallow main github.com:22 --direct
+egresslock allow main <member-ip-1>:22 --direct
+egresslock allow main <member-ip-2>:22 --direct
 # …one line per member you observed
 ```
 
 Add a line when you observe a new member, and remove a member's line when
-a fresh discovery pass no longer shows it (`egresslock disallow-host main
-<member-ip-1>:22` removes one) — nothing expires on its own, so re-running
+a fresh discovery pass no longer shows it (`egresslock disallow main
+<member-ip-1>:22 --direct` removes one) — nothing expires on its own, so re-running
 the method is what re-checks the set. A pass covers your observation
 window (the harvest's `--since`, or one sampling run), and an address the
 window no longer shows is your removal candidate; a rarely returned

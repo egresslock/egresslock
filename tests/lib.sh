@@ -4,8 +4,8 @@
 # stops, nft listings with counters). No root, Podman or nftables needed.
 #
 # Callers may set beforehand: EGRESSLOCK_PROFILES (engine binary; default
-# <tree-root>/egresslock), AGENT_RUN (consumer wrapper; default unset),
-# ARCMOCK_DNS_BASE (base DNS mapping "host=ip,host=ip"; the engine harness
+# <tree-root>/egresslock), ARCMOCK_DNS_BASE (base DNS mapping
+# "host=ip,host=ip"; the engine harness
 # uses neutral example.test).
 #
 # Defaults are relative to the egresslock tree (parent of tests/), so the
@@ -26,11 +26,14 @@ TESTROOT="$(mktemp -d /tmp/egresslock-test.XXXXXX)"
 trap 'rm -rf "$TESTROOT"' EXIT
 STATE="$TESTROOT/state"
 export ARCMOCK_STATE="$STATE"
-mkdir -p "$STATE/nft" "$STATE/networks" "$STATE/running" "$STATE/containers" "$STATE/runargs"
+mkdir -p "$STATE/nft" "$STATE/networks" "$STATE/running" "$STATE/containers" \
+    "$STATE/runargs" "$STATE/ips"
 
 TREE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AGENT_RUN="${AGENT_RUN:-}"
 EGRESSLOCK_PROFILES="${EGRESSLOCK_PROFILES:-$TREE_ROOT/egresslock}"
+# EGL-395: the mock container filesystem seeds the image bootstrap config
+# and the live (loaded) bytes from the shipped gateway tree.
+export ARCMOCK_TREE_ROOT="$TREE_ROOT"
 
 # EGL-325: fixed-confdir helper. The engine no longer accepts --config or
 # EGRESSLOCK_CONF; a profile's conf is always
@@ -131,28 +134,81 @@ D="${ARCMOCK_STATE:?}/nft"
 cmd="$1"; shift
 # Rule lines = anything containing 'counter' (mock simplification: every
 # generated rule carries a counter statement).
-populated() { grep -q 'counter' "$1"; }
+populated() {
+    local _pline=""
+    while IFS= read -r _pline || [[ -n "$_pline" ]]; do
+        [[ "$_pline" == *counter* ]] && return 0
+    done < "$1"
+    return 1
+}
+# EGL-362 P2: render `nft list chain` output (expanded counters, mangle
+# priority alias, indented body) with bash builtins. RENDERED is the
+# line array the caller prints, byte-identical to the old sed|awk body.
+RENDERED=()
+render_chain() { # render_chain <state-file>
+    local _rfile="$1" _rline=""
+    RENDERED=()
+    while IFS= read -r _rline || [[ -n "$_rline" ]]; do
+        if [[ "$_rline" =~ counter\ (drop|accept)$ ]]; then
+            _rline="${_rline%"counter ${BASH_REMATCH[1]}"}counter packets 0 bytes 0 ${BASH_REMATCH[1]}"
+        fi
+        _rline="${_rline/priority -150/priority mangle}"
+        if [[ "$_rline" == *"{"* || "$_rline" == *"}"* ]]; then
+            RENDERED+=("$_rline")
+        else
+            RENDERED+=("        $_rline")
+        fi
+    done < "$_rfile"
+}
 
 case "$cmd" in
     -c) shift 1; exec "$0" -f "$@" ;;  # -c -f file
     -f)
         file="$1"
         cp "$file" "$D/last-transaction.nft"
-        table="$(grep -oE 'table [a-z]+ [a-z_]+' "$file" | awk '{print $3}' | head -1)"
+        table=""
+        while IFS= read -r _fline || [[ -n "$_fline" ]]; do
+            if [[ "$_fline" =~ table\ ([a-z]+)\ ([a-z_]+) ]]; then
+                table="${BASH_REMATCH[2]}"
+                break
+            fi
+        done < "$file"
         [[ -n "$table" ]] || { echo "mock nft: no table in $file" >&2; exit 1; }
         # Inline 'flush chain' directives apply in order first: rules of
         # the named chain are removed (the chain itself stays).
-        while read -r _ _ fam tbl ch; do
+        while IFS= read -r _fline || [[ -n "$_fline" ]]; do
+            [[ "$_fline" == "flush chain "* ]] || continue
+            read -r _ _ fam tbl ch <<<"$_fline"
             f="$D/$tbl.$ch"
             if [[ -f "$f" ]]; then
-                grep -v 'counter' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+                # R-EGL-362-3: grep -v leaves the file (and an empty
+                # .tmp) untouched when every line is a rule; only a
+                # transaction that kept a non-rule line renames.
+                _kept=0
+                : > "$f.tmp"
+                while IFS= read -r _fbody || [[ -n "$_fbody" ]]; do
+                    [[ "$_fbody" == *counter* ]] && continue
+                    printf '%s\n' "$_fbody" >> "$f.tmp"
+                    _kept=1
+                done < "$f"
+                (( _kept )) && mv "$f.tmp" "$f"
             else
                 echo "Error: No such file or directory" >&2
                 exit 1
             fi
-        done < <(grep '^flush chain ' "$file" || true)
+        done < "$file"
         # exclude 'flush chain' directive lines from chain-block parsing
-        chains="$(grep -v '^flush chain ' "$file" | grep -oE 'chain [A-Za-z0-9_]+' | awk '{print $2}')"
+        # (grep -oE semantics: every `chain NAME` match on every other
+        # line, in file order).
+        chains=""
+        while IFS= read -r _fline || [[ -n "$_fline" ]]; do
+            [[ "$_fline" == "flush chain "* ]] && continue
+            _frest="$_fline"
+            while [[ "$_frest" =~ chain\ ([A-Za-z0-9_]+) ]]; do
+                chains+="${chains:+$'\n'}${BASH_REMATCH[1]}"
+                _frest="${_frest#*"${BASH_REMATCH[0]}"}"
+            done
+        done < "$file"
         [[ -n "$chains" ]] || { echo "mock nft: no chain in $file" >&2; exit 1; }
         # EGL-91: cross-tool ordering probe — one summary line per -f
         # transaction into callorder.log (chains touched, flush
@@ -160,23 +216,46 @@ case "$cmd" in
         # gateway-start ordering and that a first-create transaction
         # already carries rules. Existing callorder consumers are
         # grep-based and unaffected by the extra line type.
-        echo "nft -f chains=$(echo "$chains" | paste -sd, -) flush=$(grep -c '^flush chain ' "$file" || true) rules=$(grep -c 'counter' "$file" || true)" \
+        _chain_csv=""
+        while IFS= read -r _fc; do
+            _chain_csv+="${_chain_csv:+,}$_fc"
+        done <<<"$chains"
+        _flush_n=0; _rule_n=0
+        while IFS= read -r _fline || [[ -n "$_fline" ]]; do
+            [[ "$_fline" == "flush chain "* ]] && _flush_n=$((_flush_n + 1))
+            [[ "$_fline" == *counter* ]] && _rule_n=$((_rule_n + 1))
+        done < "$file"
+        echo "nft -f chains=$_chain_csv flush=$_flush_n rules=$_rule_n" \
             >> "$ARCMOCK_STATE/callorder.log"
         # Store or append each chain's own section (additive semantics).
         for ch in $chains; do
-            sect="$(awk -v ch="$ch" '
-                $0 ~ "^[[:space:]]*chain " ch "[[:space:]]*\\{" { inchain=1 }
-                inchain { print }
-                inchain && /^[[:space:]]*\}[[:space:]]*$/ { inchain=0 }
-            ' "$file")"
+            _sect=()
+            _inchain=0
+            while IFS= read -r _fline || [[ -n "$_fline" ]]; do
+                # Base awk matched exactly one space after `chain`
+                # (R-EGL-362-3); keep that byte-for-byte contract.
+                if [[ "$_fline" =~ ^[[:space:]]*chain\ ${ch}[[:space:]]*\{ ]]; then
+                    _inchain=1
+                fi
+                if (( _inchain )); then
+                    _sect+=("$_fline")
+                fi
+                if (( _inchain )) && [[ "$_fline" =~ ^[[:space:]]*\}[[:space:]]*$ ]]; then
+                    _inchain=0
+                fi
+            done < "$file"
             if [[ -f "$D/$table.$ch" ]]; then
                 # Append only rule lines to the existing chain.
                 # EGL-141: rule lines may also start with `iifname` (the
                 # anti-spoof drop is a first-class rule line now).
-                grep -E '^[[:space:]]*(ip |meta |iifname )' <<<"$sect" \
-                    | sed -E 's/^[[:space:]]+//' >> "$D/$table.$ch"
+                for _fline in "${_sect[@]}"; do
+                    [[ "$_fline" =~ ^[[:space:]]*(ip\ |meta\ |iifname\ ) ]] || continue
+                    _fstrip="$_fline"
+                    _fstrip="${_fstrip#"${_fstrip%%[![:space:]]*}"}"
+                    printf '%s\n' "$_fstrip"
+                done >> "$D/$table.$ch"
             else
-                printf '%s\n' "$sect" > "$D/$table.$ch"
+                printf '%s\n' "${_sect[@]}" > "$D/$table.$ch"
             fi
         done
         # EGL-305 test seam: transaction-applied marker (gates the
@@ -231,8 +310,17 @@ case "$cmd" in
             echo "Error: No such file or directory" >&2
             exit 1
         fi
-        # Keep non-rule lines (chain/type/hook), drop rule lines.
-        grep -v 'counter' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+        # Keep non-rule lines (chain/type/hook), drop rule lines. Match
+        # grep -v: an all-rule file is left byte-identical and its empty
+        # .tmp stays behind (R-EGL-362-3).
+        _kept=0
+        : > "$f.tmp"
+        while IFS= read -r _fline || [[ -n "$_fline" ]]; do
+            [[ "$_fline" == *counter* ]] && continue
+            printf '%s\n' "$_fline" >> "$f.tmp"
+            _kept=1
+        done < "$f"
+        (( _kept )) && mv "$f.tmp" "$f"
         exit 0
         ;;
     list)
@@ -243,6 +331,16 @@ case "$cmd" in
                 [[ "$1" == inet ]] || { echo "mock nft: list chain needs a family" >&2; exit 2; }
                 f="$D/$2.$3"
                 [[ -f "$f" ]] || { echo "Error: No such file or directory" >&2; exit 1; }
+                # EGL-389 test seam: make the conf dir unwritable on the
+                # FIRST chain read (the proxy disallow's ensure reaches
+                # ensure_snapshot_pins after cmd_disallow's rewrite), so
+                # the trap's source restore (same-dir rename) fails — the
+                # S-P2/S-P2n/S-P2r/S-P2s injection. Consumed once.
+                if [[ -f "$D/proxy-source-restore-fails" ]]; then
+                    _cdir="$(cat "$D/proxy-source-restore-fails")"
+                    rm -f "$D/proxy-source-restore-fails"
+                    chmod 0555 "$_cdir" 2>/dev/null || true
+                fi
                 # EGL-305 test seam (EGL-314 re-point): after the conf
                 # delete, make the conf dir unwritable (content = the
                 # conf dir path) so the trap-context restore's mktemp
@@ -294,8 +392,15 @@ case "$cmd" in
                 # EGL-311 test seams: the post-swap read AFTER the member
                 # flush (the conntrack log already carries a -D). Each
                 # marker is consumed once.
-                if [[ -f "$D/f-done" ]] \
-                   && grep -q '^conntrack -D ' "${ARCMOCK_STATE:?}/conntrack.log" 2>/dev/null; then
+                _ctd=0
+                if [[ -f "$D/f-done" && -f "${ARCMOCK_STATE:?}/conntrack.log" ]]; then
+                    # grep -q also matches an unterminated final line
+                    # (R-EGL-362-3), so keep the short-line branch.
+                    while IFS= read -r _ctline || [[ -n "$_ctline" ]]; do
+                        [[ "$_ctline" == "conntrack -D "* ]] && { _ctd=1; break; }
+                    done < "${ARCMOCK_STATE:?}/conntrack.log"
+                fi
+                if [[ -f "$D/f-done" ]] && (( _ctd )); then
                     if [[ -f "$D/fail-list-chain-after-flush" ]]; then
                         rm -f "$D/fail-list-chain-after-flush"
                         echo "Error: mock nft: netlink read of chain '$3' failed once (fail-list-chain-after-flush)" >&2
@@ -303,8 +408,11 @@ case "$cmd" in
                     fi
                     if [[ -f "$D/partial-list-chain-after-flush" ]]; then
                         rm -f "$D/partial-list-chain-after-flush"
-                        sed -E 's/counter (drop|accept)$/counter packets 0 bytes 0 \1/; s/priority -150/priority mangle/' "$f" \
-                            | awk '/\{|\}/ { print; next } { print "        " $0 }'
+                        render_chain "$f"
+                        # The base sed|awk pipeline wrote nothing for an
+                        # empty chain; printf with no elements would add
+                        # a blank line (R-EGL-362-3).
+                        (( ${#RENDERED[@]} )) && printf '%s\n' "${RENDERED[@]}"
                         echo "Error: mock nft: netlink read of chain '$3' failed after data (partial-list-chain-after-flush)" >&2
                         exit 1
                     fi
@@ -328,19 +436,18 @@ case "$cmd" in
                 # EGL-296 F1 (ER-EGL-296-5) test seams: a failed read
                 # whose stdout still looks usable. Consumed once each,
                 # like fail-list-chain-after-f.
-                body="$(sed -E 's/counter (drop|accept)$/counter packets 0 bytes 0 \1/; s/priority -150/priority mangle/' "$f" \
-                    | awk '/\{|\}/ { print; next } { print "        " $0 }')"
+                render_chain "$f"
                 if [[ -f "$D/fail-list-chain-output-rc1" ]]; then
                     rm -f "$D/fail-list-chain-output-rc1"
-                    printf '%s\n' "$body"
+                    printf '%s\n' "${RENDERED[@]}"
                     exit 1
                 fi
                 if [[ -f "$D/fail-list-chain-partial-rc1" ]]; then
                     rm -f "$D/fail-list-chain-partial-rc1"
-                    printf '%s\n' "$body" | head -1
+                    printf '%s\n' "${RENDERED[0]:-}"
                     exit 1
                 fi
-                printf '%s\n' "$body"
+                printf '%s\n' "${RENDERED[@]}"
                 ;;
             table)
                 # Keyed on the TABLE name ($2), not the family: a table
@@ -389,7 +496,7 @@ if [[ "$1" == passwd && "$2" =~ ^[0-9]+$ ]]; then
         exit 2
     fi
     if [[ -n "${ARCMOCK_PASSWD_HOME:-}" ]]; then
-        echo "testuser:x:$(id -u):0:test:$ARCMOCK_PASSWD_HOME:/bin/bash"
+        echo "testuser:x:$EUID:0:test:$ARCMOCK_PASSWD_HOME:/bin/bash"
         exit 0
     fi
 fi
@@ -467,9 +574,159 @@ cat > "$TESTROOT/bin/podman" <<'EOF'
 #!/usr/bin/env bash
 # Mock podman: persistent-enough state for the egresslock flow.
 set -u
+# EGL-378: real rootless podman re-enters the inherited CWD at startup
+# as the account; a directory the account cannot traverse kills the call
+# with `cannot chdir to <dir>: Permission denied` before any work. Model
+# that here so a missing CWD guard is a behavioral failure, not a silent
+# pass. ARCMOCK_PODMAN_CWD_LOG (optional) records each call's start CWD.
+[[ -n "${ARCMOCK_PODMAN_CWD_LOG:-}" ]] && printf '%s\n' "$PWD" >> "$ARCMOCK_PODMAN_CWD_LOG"
+if ! ( cd . ) 2>/dev/null; then
+    echo "Error: cannot chdir to $PWD: Permission denied" >&2
+    exit 125
+fi
+# EGL-378 R-EGL-378-8: podman reads path-valued environment settings at
+# startup, resolving a relative value against the inherited CWD. Model
+# that on request: ARCMOCK_PODMAN_CONFIG_VARS names the settings to read
+# (space/comma separated); each non-empty value must exist as seen from
+# this process's startup CWD, and each resolved path is logged as
+# VAR=<path> in ARCMOCK_PODMAN_CONFIG_LOG. A missing path is podman's own
+# startup failure (rc 125). Inert unless the knob is set.
+if [[ -n "${ARCMOCK_PODMAN_CONFIG_VARS:-}" ]]; then
+    read -ra _pvs <<<"${ARCMOCK_PODMAN_CONFIG_VARS//,/ }"
+    for _pv in "${_pvs[@]}"; do
+        _pp="${!_pv:-}"
+        [[ -n "$_pp" ]] || continue
+        if [[ ! -e "$_pp" ]]; then
+            echo "Error: reading configuration file \"$_pp\": no such file or directory" >&2
+            exit 125
+        fi
+        [[ -n "${ARCMOCK_PODMAN_CONFIG_LOG:-}" ]] \
+            && printf '%s=%s\n' "$_pv" "$_pp" >> "$ARCMOCK_PODMAN_CONFIG_LOG"
+    done
+fi
 D="${ARCMOCK_STATE:?}"
 [[ -d "$D/nft" && -d "$D/networks" && -d "$D/running" && -d "$D/containers" ]] \
     || mkdir -p "$D/nft" "$D/networks" "$D/running" "$D/containers"
+# EGL-369-D7: per-container gateway image layout. The current shipped image
+# carries the real /etc/squid/egresslock dir plus /etc/squid/agent as a
+# relative symlink (both answer `test -d`); an un-replaced old image carries
+# /etc/squid/agent only. Default = current image; the marker
+# $D/gw-layout-agent[-<name>] selects the old layout. Knob
+# $D/gw-probe-egresslock[-<name>] forces the new dir to answer on an
+# old-layout container to exercise the engine's fail-closed mismatch path.
+# $D/gw-probe-fails[-<name>] makes the probe a runtime/exec error (rc 125);
+# $D/gw-probe-old-once[-<name>] answers the old dir on the first probe only;
+# $D/gw-probe-fail-after-old-once[-<name>] then errors on every later probe
+# (R-EGL-369-13 F3: proves the apply layout is bound through verify/cleanup).
+mock_layout() { # <name> -> egresslock|agent
+    if [[ -f "$D/gw-layout-agent-$1" || -f "$D/gw-layout-agent" ]]; then
+        echo agent
+    else
+        echo egresslock
+    fi
+}
+mock_layout_has() { # <layout> <abs-dir> -> 0 when that layout has the dir
+    local layout="$1" dir="$2"
+    case "$dir" in
+        /etc/squid/egresslock) [[ "$layout" == egresslock ]] ;;
+        /etc/squid/agent) return 0 ;; # old image's real dir, or new image's symlink
+        *) return 1 ;;
+    esac
+}
+mock_layout_probe() { # <name> -> layout the `test -d` probe answers
+    local layout
+    layout="$(mock_layout "$1")"
+    [[ -f "$D/gw-probe-egresslock-$1" || -f "$D/gw-probe-egresslock" ]] \
+        && layout=egresslock
+    echo "$layout"
+}
+# EGL-395: separate staged/deployed models. The deployed config dir is
+# $D/containers-<name>.cfg/ (files by their final basename); per-run
+# private stages are real subdirectories ($D/...cfg/.egresslock-stage.*)
+# so a staged candidate is never aliased onto the deployed squid.conf.
+# Both layouts map onto the same deployed tree (the old image carries
+# only the agent path; the new image answers both).
+mock_cfg_local() { # <name> <in-container-abs-path> -> host path, rc 1 outside cfgdir
+    local name="$1" abs="$2" layout rel
+    layout="$(mock_layout "$name")"
+    case "$abs" in
+        /etc/squid/egresslock)
+            [[ "$layout" == egresslock ]] || return 1
+            rel="" ;;
+        /etc/squid/egresslock/*)
+            [[ "$layout" == egresslock ]] || return 1
+            rel="${abs#/etc/squid/egresslock/}" ;;
+        /etc/squid/agent)
+            rel="" ;;
+        /etc/squid/agent/*)
+            rel="${abs#/etc/squid/agent/}" ;;
+        *) return 1 ;;
+    esac
+    [[ "$rel" != *..* && "$rel" != /* ]] || return 1
+    echo "$D/containers-$name.cfg/$rel"
+}
+mock_cfg_abs() { # <name> -> the in-container cfgdir prefix for this layout
+    if [[ "$(mock_layout "$1")" == egresslock ]]; then
+        echo /etc/squid/egresslock
+    else
+        echo /etc/squid/agent
+    fi
+}
+mock_cfg_init() { # <name> — first boot / replace: bootstrap cfgdir + identity
+    local name="$1"
+    rm -rf "$D/containers-$name.cfg" "$D/containers-$name.candidate" \
+           "$D/containers-$name.pending-mv" "$D/containers-$name.started" \
+           "$D/containers-$name.id" "$D/containers-$name.live"
+    mkdir -p "$D/containers-$name.cfg"
+    : > "$D/containers-$name.cfg/allowlist.conf"
+    # A replacement container gets a NEW ID (the .gen counter survives the
+    # rm); restarts keep it. EGL-395's witness binds that instance ID.
+    local gen=0
+    [[ -f "$D/containers-$name.gen" ]] && read -r gen < "$D/containers-$name.gen"
+    [[ "$gen" =~ ^[0-9]+$ ]] || gen=0
+    gen=$((gen + 1))
+    printf '%s\n' "$gen" > "$D/containers-$name.gen"
+    printf 'mockid%s%sg%s\n' "$(printf '%s' "$name" | sha256sum | cut -c1-56)" "$gen" "$gen" \
+        > "$D/containers-$name.id"
+    printf '2026-01-01T00:00:00.000000000Z#1\n' > "$D/containers-$name.started"
+    if [[ -f "${ARCMOCK_TREE_ROOT:-}/gateway/squid.conf" ]]; then
+        cp "${ARCMOCK_TREE_ROOT}/gateway/squid.conf" "$D/containers-$name.live"
+    else
+        : > "$D/containers-$name.live"
+    fi
+}
+mock_cfg_load_live() { # <name> — a start/restart loads the deployed config (or bootstrap)
+    local name="$1" src
+    if [[ -f "$D/containers-$name.cfg/squid.conf" ]]; then
+        src="$D/containers-$name.cfg/squid.conf"
+    elif [[ -f "${ARCMOCK_TREE_ROOT:-}/gateway/squid.conf" ]]; then
+        src="${ARCMOCK_TREE_ROOT}/gateway/squid.conf"
+    else
+        : > "$D/containers-$name.live"
+        return 0
+    fi
+    cp "$src" "$D/containers-$name.live"
+}
+mock_bump_started() { # <name> — a restart changes StartedAt; Id stays
+    local name="$1" n
+    n="$(sed -n 's/.*#\([0-9][0-9]*\)$/\1/p' "$D/containers-$name.started" 2>/dev/null | head -1)"
+    [[ -n "$n" ]] || n=0
+    printf '2026-01-01T00:00:00.000000000Z#%s\n' "$((n + 1))" > "$D/containers-$name.started"
+}
+mock_perform_pending_mv() { # <name> <in-container stage dir> — delayed rename lands before sweep
+    local name="$1" stage="$2" src dst
+    [[ -f "$D/containers-$name.pending-mv" ]] || return 0
+    src="$(sed -n '1p' "$D/containers-$name.pending-mv")"
+    dst="$(sed -n '2p' "$D/containers-$name.pending-mv")"
+    if [[ "$src" == "$stage"/* ]]; then
+        local lsrc ldst
+        lsrc="$(mock_cfg_local "$name" "$src")" || return 0
+        ldst="$(mock_cfg_local "$name" "$dst")" || return 0
+        mkdir -p "${ldst%/*}" 2>/dev/null || true
+        mv -f "$lsrc" "$ldst" 2>/dev/null || true
+        rm -f "$D/containers-$name.pending-mv"
+    fi
+}
 cmd="$1"; shift
 case "$cmd" in
     unshare)
@@ -502,12 +759,32 @@ case "$cmd" in
                 local_args=("$@"); name="${local_args[-1]}"
                 f="$D/networks/$name"
                 [[ -f "$f" ]] || { echo "Error: unable to find network" >&2; exit 1; }
+                # EGL-362 P2: parse the state file once with bash builtins.
+                # grep|cut emits every matching line's value (newline-
+                # joined), so multi-line fields stay byte-identical.
+                m_iface=""; m_driver=""; m_ipv6=""
+                m_line=""
+                m_gws=(); m_subs=()
+                while IFS= read -r m_line || [[ -n "$m_line" ]]; do
+                    case "$m_line" in
+                        interface=*) m_iface+="${m_line#interface=}"$'\n' ;;
+                        driver=*) m_driver+="${m_line#driver=}"$'\n' ;;
+                        gateway=*) m_gws+=("${m_line#gateway=}") ;;
+                        subnet=*) m_subs+=("${m_line#subnet=}") ;;
+                        ipv6_enabled=*) m_ipv6+="${m_line#ipv6_enabled=}"$'\n' ;;
+                    esac
+                done < "$f"
+                # command substitution strips ALL trailing newlines; an
+                # empty last match (e.g. `interface=`) must not leave one.
+                m_iface="${m_iface%"${m_iface##*[!$'\n']}"}"
+                m_driver="${m_driver%"${m_driver##*[!$'\n']}"}"
+                m_ipv6="${m_ipv6%"${m_ipv6##*[!$'\n']}"}"
                 # EGL-141-D1: the bridge device token. interface= line
                 # when present; hand-seeded state files (mocknet) are
                 # deterministic as podman1 (the lowest slot, exactly
                 # what a fresh one-network account gets). Churn tests
                 # hand-edit interface= to pin re-resolution.
-                mock_iface_of(){ local v; v="$(grep '^interface=' "$f" | cut -d= -f2-)"; echo "${v:-podman1}"; }
+                mock_iface_of(){ echo "${m_iface:-podman1}"; }
                 # local_args[0] is the `inspect` verb itself (the case
                 # consumed `network`); the template pair follows it.
                 if [[ "${local_args[1]:-}" == "--format" && "${local_args[2]:-}" == "{{.NetworkInterface}}" ]]; then
@@ -520,17 +797,14 @@ case "$cmd" in
                 echo '['
                 echo "     \"name\": \"$name\","
                 echo "     \"network_interface\": \"$(mock_iface_of)\","
-                echo "     \"driver\": \"$(grep '^driver=' "$f" | cut -d= -f2-)\","
+                echo "     \"driver\": \"$m_driver\","
                 echo "     \"subnets\": ["
                 # gateway= lines (in order) override the computed value so
                 # gateway-mismatch scenarios are reproducible.
-                mapfile -t gws < <(grep '^gateway=' "$f" | cut -d= -f2-)
                 first=1
                 i=0
-                while IFS= read -r line; do
-                    sub="${line#subnet=}"
-                    [[ "$sub" == "$line" ]] && continue
-                    gw="${gws[$i]:-${sub%0/24}1}"
+                for sub in "${m_subs[@]}"; do
+                    gw="${m_gws[$i]:-${sub%0/24}1}"
                     [[ $first -eq 0 ]] && echo ","
                     first=0
                     echo "          {"
@@ -538,10 +812,10 @@ case "$cmd" in
                     echo "               \"gateway\": \"$gw\""
                     printf '          }'
                     i=$((i+1))
-                done < <(grep '^subnet=' "$f")
+                done
                 echo
                 echo "     ],"
-                echo "     \"ipv6_enabled\": $(grep '^ipv6_enabled=' "$f" | cut -d= -f2-)"
+                echo "     \"ipv6_enabled\": $m_ipv6"
                 echo "]"
                 ;;
             create)
@@ -650,6 +924,10 @@ case "$cmd" in
         # state files are written (so `ps -a` still lists it and cleanup's
         # existence oracle sees it) but the `running/` marker is skipped,
         # so the engine's wait loops never see it running.
+        # EGL-395: a new container gets a fresh bootstrap config dir and
+        # its own instance identity; the shipped image config is what
+        # PID 1 starts on until the first apply publishes squid.conf.
+        mock_cfg_init "$name"
         if [[ -f "$D/run-sick-$name" || -f "$D/run-sick" ]]; then
             echo "$net" > "$D/containers/$name.net"
             [[ -n "$ip" ]] && { echo "$ip" > "$D/containers/$name.ip"; echo "$name" > "$D/ips/$ip"; }
@@ -668,6 +946,15 @@ case "$cmd" in
         # --format '{{.Names}}' (ARC-60 teardown --runtime sweep) also
         # lists stopped-but-registered ones (the *.net state files, which
         # is what survives a stopped/exited container in the real store).
+        # EGL-389-D7: a failed container list (wedged runtime).
+        # $D/ps-fails fails every call; $D/ps-fails-late arms
+        # $D/ps-fails-active at the first host -> container staging copy,
+        # so the ensure path before the apply is unaffected and only the
+        # disclosure's observation and the cleanup probe fail.
+        if [[ -f "$D/ps-fails-active" || -f "$D/ps-fails" ]]; then
+            echo "Error: unable to connect to Podman: cannot invoke Podman API" >&2
+            exit 125
+        fi
         declare -A ps_seen=()
         for f in "$D/running"/*; do
             [[ -f "$f" ]] || continue
@@ -719,6 +1006,19 @@ case "$cmd" in
                     echo ""
                 fi
                 ;;
+            '{{.Id}}')
+                # EGL-395: instance identity for the activation witness.
+                # A hand-seeded container (tests that only write the
+                # running/net markers) still answers an identity.
+                cat "$D/containers-$name.id" 2>/dev/null \
+                    || printf 'mockid%s\n' "$(printf '%s' "$name" | sha256sum | cut -c1-56)"
+                ;;
+            '{{.State.StartedAt}}')
+                # EGL-395: a real container always has an identity even
+                # when a test hand-seeded only the running/net markers.
+                cat "$D/containers-$name.started" 2>/dev/null \
+                    || echo '2026-01-01T00:00:00.000000000Z#1'
+                ;;
             *)
                 :
                 ;;
@@ -740,6 +1040,71 @@ case "$cmd" in
             exit 125
         fi
         case "$1" in
+            test)
+                # EGL-369-D3/D7: gw_config_dir's layout probe. The current
+                # image has both the new dir and the old-path symlink; an
+                # old image has only /etc/squid/agent (the forced-probe
+                # knob can make it answer the new dir to test fail-closed).
+                # R-EGL-369-10 F1: the probe-fails knob models a runtime/
+                # exec error (rc 125) — distinct from an absent dir (rc 1).
+                if [[ "${2:-}" == -d ]]; then
+                    if [[ -f "$D/gw-probe-fails-$name" || -f "$D/gw-probe-fails" ]]; then
+                        echo "Error: can only create exec sessions on running containers: container state improper" >&2
+                        exit 125
+                    fi
+                    # R-EGL-369-10 F1: one-shot "absent new dir" answer,
+                    # consumed by the first probe of /etc/squid/egresslock.
+                    # Models a transient probe disagreement between apply
+                    # and a later independent re-probe.
+                    if [[ "${3:-}" == /etc/squid/egresslock \
+                          && -f "$D/gw-probe-old-once-$name" ]]; then
+                        rm -f "$D/gw-probe-old-once-$name"
+                        exit 1
+                    fi
+                    # R-EGL-369-13 F3: after the one-shot old answer is
+                    # consumed, every later probe is a runtime error. With
+                    # the apply layout bound through verify/cleanup there
+                    # is no later probe; a re-probe fails closed, so the
+                    # binding mutants cannot pass silently.
+                    if [[ "${3:-}" == /etc/squid/egresslock \
+                          && -f "$D/gw-probe-fail-after-old-once-$name" ]]; then
+                        echo "Error: can only create exec sessions on running containers: container state improper" >&2
+                        exit 125
+                    fi
+                    layout="$(mock_layout_probe "$name")"
+                    mock_layout_has "$layout" "${3:-}" && exit 0
+                    exit 1
+                fi
+                # EGL-395: `test [-e|-f|-L] [!] <path>` against the
+                # modeled deployed tree (files and stage dirs).
+                tneg=0; topt="${2:-}"; tpath="${3:-}"
+                if [[ "$topt" == "!" ]]; then tneg=1; topt="${3:-}"; tpath="${4:-}"; fi
+                if [[ "$topt" == "-e" && -f "$D/exec-test-e-fails-$name" ]] \
+                    || [[ "$topt" == "-e" && -f "$D/exec-test-e-fails" ]] \
+                    || [[ "$topt" == "-e" && -f "$D/exec-test-e-fails-witness" && "$tpath" == */.egresslock-activated ]] \
+                    || [[ "$topt" == "-e" && -f "$D/exec-test-e-fails-stage" && "$tpath" == */.egresslock-stage.* ]] \
+                    || [[ "$topt" == "-L" && -f "$D/exec-test-L-fails-$name" ]] \
+                    || [[ "$topt" == "-L" && -f "$D/exec-test-L-fails-witness" && "$tpath" == */.egresslock-activated ]] \
+                    || [[ "$topt" == "-L" && -f "$D/exec-test-L-fails-deployed" && "$tpath" == */squid.conf && "$tpath" != */.egresslock-stage.* ]]; then
+                    echo "Error: can only create exec sessions on running containers: container state improper" >&2
+                    exit 125
+                fi
+                tstate=1
+                case "$topt" in
+                    -e|-f|-L)
+                        lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath=""
+                        if [[ -n "$lpath" ]]; then
+                            case "$topt" in
+                                -e) [[ -e "$lpath" ]] && tstate=0 ;;
+                                -f) [[ -f "$lpath" && ! -L "$lpath" ]] && tstate=0 ;;
+                                -L) [[ -L "$lpath" ]] && tstate=0 ;;
+                            esac
+                        fi
+                        ;;
+                esac
+                (( tneg == 1 )) && tstate=$(( tstate == 0 ? 1 : 0 ))
+                exit "$tstate"
+                ;;
             squid)
                 # ARC-32-D1: `squid -k rotate` reopens the stdio logs;
                 # model that by recreating fresh (empty) log files. The
@@ -759,9 +1124,39 @@ case "$cmd" in
                     echo "mock squid: config invalid" >&2
                     exit 1
                 fi
+                # EGL-389: a parse failure only for the DEPLOYED config
+                # (verify_gateway), not the staged candidate — lets the
+                # ensure's apply succeed and its final verify fail.
+                if [[ -f "$D/deployed-config-invalid" && "$*" == *"/squid.conf"* \
+                    && "$*" != *"/.egresslock-stage."* ]]; then
+                    # EGL-389-D7 leg 9b: model the gateway stopping between
+                    # the converged skip and the disclosure (the verify
+                    # parse is the first exec after the skip).
+                    if [[ -f "$D/gateway-stops-at-verify" ]]; then
+                        rm -f "$D/gateway-stops-at-verify"
+                        rm -f "$D/running/$name"
+                    fi
+                    # EGL-389-D7 leg 8b: the same late point models a
+                    # container list that fails only at disclosure time.
+                    if [[ -f "$D/ps-fails-at-verify" ]]; then
+                        : > "$D/ps-fails-active"
+                    fi
+                    echo "mock squid: deployed config invalid" >&2
+                    exit 1
+                fi
                 exit 0
                 ;;
             stat)
+                # EGL-395: cleanup age reads (mtime epoch).
+                if [[ "${2:-}" == "-c" && "${3:-}" == "%Y" ]]; then
+                    lpath="$(mock_cfg_local "$name" "${4:-}" 2>/dev/null)" || lpath=""
+                    if [[ -n "$lpath" && -e "$lpath" ]]; then
+                        stat -c %Y "$lpath"
+                        exit 0
+                    fi
+                    echo "stat: cannot stat '${4:-}': No such file or directory" >&2
+                    exit 1
+                fi
                 # ARC-32-D1: gw_log_cap sizes the overlay logs. Report
                 # the byte size of the mocked log fixture file. ($1 is
                 # the command word 'stat' after the name shift.)
@@ -796,8 +1191,9 @@ case "$cmd" in
             mv)
                 # ARC-32-D1: simulate mv inside the gateway's log dir so
                 # the rotated .1 generation is observable in the mock
-                # state. mv outside /var/log/squid (e.g. the staged
-                # squid.conf swap) stays a no-op success.
+                # state. EGL-389: model the config-dir swap/moves too
+                # (check.conf -> squid.conf and the rollback's file
+                # moves); $D/mv-check-fails exercises the swap die.
                 if [[ "${2:-}" == /var/log/squid/* && "${3:-}" == /var/log/squid/* ]]; then
                     s="$D/containers-$name.${2##*/}"; d="$D/containers-$name.${3##*/}"
                     if [[ -f "$s" ]]; then
@@ -807,18 +1203,133 @@ case "$cmd" in
                     echo "mv: cannot stat '$2': No such file or directory" >&2
                     exit 1
                 fi
+                if [[ "${2:-}" == "-T" && "${3:-}" == /etc/squid/* && "${4:-}" == /etc/squid/* ]]; then
+                    # `mv -T <src> <dst>`: argv is mv, -T, src, dst.
+                    if [[ "${2:-}" != "-T" ]]; then
+                        echo "mock podman: unsupported mv $*" >&2
+                        exit 2
+                    fi
+                    msrc="${3:-}"; mdst="${4:-}"
+                    lsrc="$(mock_cfg_local "$name" "$msrc" 2>/dev/null)" || lsrc=""
+                    ldst="$(mock_cfg_local "$name" "$mdst" 2>/dev/null)" || ldst=""
+                    if [[ -f "$D/mv-rc0-old" || -f "$D/mv-rc0-absent" || -f "$D/mv-rc0-other" ]]; then
+                        # EGL-395: a zero rc reports a completed rename; a
+                        # later read-back that is not the candidate is
+                        # Unknown. Model an outside writer / lying
+                        # primitive: report success without publishing.
+                        if [[ -f "$D/mv-rc0-absent" ]]; then
+                            [[ -n "$ldst" ]] && rm -f "$ldst"
+                        elif [[ -f "$D/mv-rc0-other" && -n "$ldst" ]]; then
+                            printf 'tampered\n' > "$ldst"
+                        fi
+                        exit 0
+                    fi
+                    if [[ -f "$D/mv-check-fails" ]]; then
+                        echo "mv: cannot move '$msrc': simulated swap failure" >&2
+                        exit 1
+                    fi
+                    if [[ -f "$D/mv-arm-read-fails" ]]; then
+                        # EGL-395: the rename client result is lost and the
+                        # container read path then fails. The resolution
+                        # must classify the read error as Unknown, never
+                        # as a proven pre-publication state.
+                        : > "$D/read-fails-$name"
+                        echo "Error: error moving file: simulated lost rename result" >&2
+                        exit 1
+                    fi
+                    if [[ -f "$D/mv-arm-probe-fails" ]]; then
+                        # EGL-395 R-EGL-395-4 F1(a): the rename reports a
+                        # failure and the deployed read-back then fails on
+                        # both the hash and the -L probe. With a bootstrap
+                        # (old generation absent) tree this must stay
+                        # Unknown/S-P4: a failed probe is never `absent`,
+                        # so it cannot prove pre-publication.
+                        : > "$D/read-fails-$name"
+                        : > "$D/exec-test-L-fails-deployed"
+                        echo "Error: error moving file: simulated lost rename result" >&2
+                        exit 1
+                    fi
+                    if [[ -f "$D/mv-lost-result-landed" || -f "$D/mv-lost-result-not-landed" \
+                        || -f "$D/mv-delayed-lands" || -f "$D/mv-unknown" ]]; then
+                        if [[ -f "$D/mv-lost-result-landed" ]]; then
+                            [[ -n "$lsrc" && -f "$lsrc" && -n "$ldst" ]] && mv -f "$lsrc" "$ldst"
+                        elif [[ -f "$D/mv-delayed-lands" ]]; then
+                            printf '%s\n%s\n' "$msrc" "$mdst" > "$D/containers-$name.pending-mv"
+                        fi
+                        echo "Error: error moving file: simulated lost rename result" >&2
+                        exit 1
+                    fi
+                    if [[ -z "$lsrc" || ! -f "$lsrc" ]]; then
+                        echo "mv: cannot stat '$msrc': No such file or directory" >&2
+                        exit 1
+                    fi
+                    if [[ -z "$ldst" ]]; then
+                        echo "mv: cannot move '$msrc' to '$mdst': No such file or directory" >&2
+                        exit 1
+                    fi
+                    if [[ -d "$ldst" && ! -L "$ldst" ]]; then
+                        echo "mv: cannot overwrite directory '$mdst'" >&2
+                        exit 1
+                    fi
+                    mv -f "$lsrc" "$ldst"
+                    exit 0
+                fi
                 exit 0
                 ;;
             rm)
                 # ARC-32-D1: simulate rm of the rotated .1 generation;
-                # other paths (e.g. the staged check.conf cleanup) are
-                # no-op successes.
+                # EGL-389/EGL-395: config-path rm (rollback removal,
+                # cleanup, stage sweep) removes the modeled path.
                 if [[ "${2:-}" == -f && "${3:-}" == /var/log/squid/* ]]; then
                     rm -f "$D/containers-$name.${3##*/}"
+                fi
+                if [[ "${2:-}" == -f || "${2:-}" == -rf ]]; then
+                    rpath="${3:-}"
+                    if [[ "$rpath" == /etc/squid/agent/* || "$rpath" == /etc/squid/egresslock/* ]]; then
+                        if [[ "$rpath" == *"/.egresslock-stage."* ]]; then
+                            if [[ -f "$D/rm-stage-fails" ]]; then
+                                echo "Error: simulated stage sweep failure" >&2
+                                exit 1
+                            fi
+                            mock_perform_pending_mv "$name" "$rpath"
+                        elif [[ -f "$D/rm-config-fails-${rpath##*/}" ]]; then
+                            echo "rm: cannot remove '$rpath': simulated config removal failure" >&2
+                            exit 1
+                        elif [[ -f "$D/cleanup-rm-enospc" ]]; then
+                            echo "rm: cannot remove '$rpath': No space left on device" >&2
+                            exit 1
+                        elif [[ -f "$D/cleanup-rm-fails" ]]; then
+                            echo "rm: cannot remove '$rpath': simulated cleanup failure" >&2
+                            exit 1
+                        fi
+                        lpath="$(mock_cfg_local "$name" "$rpath" 2>/dev/null)" || lpath=""
+                        if [[ -n "$lpath" ]]; then
+                            if [[ -d "$lpath" && ! -L "$lpath" ]]; then
+                                rm -rf "$lpath"
+                            else
+                                rm -f "$lpath"
+                            fi
+                        fi
+                    fi
                 fi
                 exit 0
                 ;;
             cat)
+                # EGL-395: PID 1's argv as NUL-separated tokens. The
+                # default is the shipped entrypoint shape for the
+                # container's current deployed config (bootstrap before
+                # the first publication). Knob $D/argv-bad[-<name>]
+                # models an unconfirmed/wrong process argv.
+                if [[ "${2:-}" == /proc/1/cmdline ]]; then
+                    if [[ -f "$D/argv-bad-$name" || -f "$D/argv-bad" ]]; then
+                        printf 'squid\0-N\0-f\0/etc/squid/squid.conf\0-d\00\0'
+                    elif [[ -f "$D/containers-$name.cfg/squid.conf" ]]; then
+                        printf 'squid\0-N\0-f\0%s/squid.conf\0-d\00\0' "$(mock_cfg_abs "$name")"
+                    else
+                        printf 'squid\0-N\0-f\0/etc/squid/squid.conf\0-d\00\0'
+                    fi
+                    exit 0
+                fi
                 # EGL-206-D2b: the live-hardening oracle reads PID 1's
                 # /proc/1/status inside the container. Default fixture is
                 # healthy (CapEff all-zero, NoNewPrivs 1 — exactly what
@@ -853,18 +1364,12 @@ case "$cmd" in
                 # container FS with the files podman cp staged (stored
                 # by src basename); a missing file fails like a real
                 # missing path (a missing live file is a DIFFER, never a
-                # skip).
-                if [[ "${2:-}" == /etc/squid/agent/* ]]; then
-                    deployed="${2##*/}"
-                    # The candidate is stored by its STAGING name
-                    # (squid-gw.conf — podman cp records the src
-                    # basename) but deployed as squid.conf (the mv
-                    # swap); serve the payload under either name.
-                    f="$D/containers-$name.$deployed"
-                    if [[ "$deployed" == squid.conf && -f "$D/containers-$name.squid-gw.conf" ]]; then
-                        f="$D/containers-$name.squid-gw.conf"
-                    fi
-                    if [[ -f "$f" ]]; then
+                # skip). EGL-369-D7: both layouts are modeled — the old
+                # path resolves through the symlink on a new image, while
+                # an old image has no new path.
+                if [[ "${2:-}" == /etc/squid/agent/* || "${2:-}" == /etc/squid/egresslock/* ]]; then
+                    f="$(mock_cfg_local "$name" "$2" 2>/dev/null)" || f=""
+                    if [[ -n "$f" && -f "$f" ]]; then
                         cat "$f"
                         exit 0
                     fi
@@ -873,7 +1378,116 @@ case "$cmd" in
                 fi
                 exit 0
                 ;;
+            mktemp)
+                # EGL-395: private in-container stage. Only the engine's
+                # .egresslock-stage template is supported; the returned
+                # path is inside the detected cfgdir.
+                if [[ "${2:-}" == -d && "${3:-}" == /etc/squid/agent/.egresslock-stage.XXXXXX \
+                    || "${2:-}" == -d && "${3:-}" == /etc/squid/egresslock/.egresslock-stage.XXXXXX ]]; then
+                    absdir="${3%/*}"
+                    ldir="$(mock_cfg_local "$name" "$absdir/.x" 2>/dev/null)" || ldir=""
+                    if [[ -z "$ldir" ]]; then
+                        echo "mktemp: failed to create directory via template '${3}': No such file or directory" >&2
+                        exit 1
+                    fi
+                    ldir="${ldir%/.x}"
+                    stageme=".egresslock-stage.$$$RANDOM"
+                    mkdir -p "$ldir/$stageme"
+                    printf '%s/%s\n' "$absdir" "$stageme"
+                    exit 0
+                fi
+                echo "mock podman: unsupported mktemp $*" >&2
+                exit 2
+                ;;
+            ln)
+                # EGL-395: no-clobber hard-link publication. `ln -T` is
+                # required (a plain ln into an existing directory is a
+                # false success); an existing destination (including a
+                # dangling symlink) fails with EEXIST.
+                if [[ "${2:-}" != -T || -z "${3:-}" || -z "${4:-}" ]]; then
+                    echo "mock podman: unsupported ln $*" >&2
+                    exit 2
+                fi
+                lsrc="$(mock_cfg_local "$name" "$3" 2>/dev/null)" || lsrc=""
+                ldst="$(mock_cfg_local "$name" "$4" 2>/dev/null)" || ldst=""
+                [[ -n "$ldst" ]] || { echo "ln: failed to create hard link '${4}': No such file or directory" >&2; exit 1; }
+                if [[ -e "$ldst" || -L "$ldst" ]]; then
+                    echo "ln: failed to create hard link '${4}': File exists" >&2
+                    exit 1
+                fi
+                [[ -n "$lsrc" && -f "$lsrc" ]] || { echo "ln: failed to access '${3}': No such file or directory" >&2; exit 1; }
+                ln -T -- "$lsrc" "$ldst" || { echo "ln: failed to create hard link '${4}'" >&2; exit 1; }
+                exit 0
+                ;;
+            sha256sum)
+                # EGL-395 cleanup seam: fail the deployed-config hash read
+                # only (never a staged candidate), so cleanup sees an
+                # unreadable reference set.
+                if [[ -f "$D/cleanup-sha-fails" && "${2:-}" == */squid.conf \
+                    && "${2:-}" != *"/.egresslock-stage."* ]]; then
+                    echo "sha256sum: ${2:-}: Input/output error" >&2
+                    exit 1
+                fi
+                # EGL-395 publication-resolution seam: a lost rename
+                # result leaves the deployed read failing. Only the
+                # deployed squid.conf is affected.
+                if [[ -f "$D/read-fails-$name" && "${2:-}" == */squid.conf \
+                    && "${2:-}" != *"/.egresslock-stage."* ]]; then
+                    echo "sha256sum: ${2:-}: Input/output error" >&2
+                    exit 1
+                fi
+                lpath="$(mock_cfg_local "$name" "${2:-}" 2>/dev/null)" || lpath=""
+                if [[ -n "$lpath" && -f "$lpath" ]]; then
+                    sha256sum "$lpath" | sed "s|  $lpath$|  ${2}|"
+                    exit 0
+                fi
+                echo "sha256sum: ${2:-}: No such file or directory" >&2
+                exit 1
+                ;;
+            find)
+                # EGL-395 cleanup enumeration: find <cfgdir> -maxdepth 1
+                # -mindepth 1 -type f|d|l -printf '%f\n'.
+                if [[ "${2:-}" == /etc/squid/agent* || "${2:-}" == /etc/squid/egresslock* ]] \
+                    && [[ "$*" == *"-maxdepth 1"* && "$*" == *"-mindepth 1"* && "$*" == *"-printf %f\\n"* ]]; then
+                    ldir="$(mock_cfg_local "$name" "${2%/}" 2>/dev/null)" || ldir=""
+                    if [[ -z "$ldir" ]]; then
+                        echo "find: '${2}': No such file or directory" >&2
+                        exit 1
+                    fi
+                    # Real find includes dotfiles; the stage dirs and
+                    # the witness are dot-named, so glob with explicit
+                    # dot patterns instead of relying on * alone.
+                    shopt -s dotglob nullglob
+                    _found=("$ldir"/*)
+                    shopt -u dotglob nullglob
+                    if [[ "$*" == *"-type f"* ]]; then
+                        for f in "${_found[@]}"; do [[ -f "$f" && ! -L "$f" ]] && echo "${f##*/}"; done
+                        exit 0
+                    elif [[ "$*" == *"-type d"* ]]; then
+                        for f in "${_found[@]}"; do [[ -d "$f" && ! -L "$f" ]] && echo "${f##*/}"; done
+                        exit 0
+                    elif [[ "$*" == *"-type l"* ]]; then
+                        for f in "${_found[@]}"; do [[ -L "$f" ]] && echo "${f##*/}"; done
+                        exit 0
+                    fi
+                fi
+                echo "mock podman: unsupported find $*" >&2
+                exit 2
+                ;;
             bash)
+                # EGL-395: argv proof — `bash -c 'exec tr "\0" "\n" <
+                # /proc/1/cmdline'` returns the NUL-separated tokens as
+                # one token per line.
+                if [[ "${2:-}" == "-c" && "${3:-}" == *"/proc/1/cmdline"* ]]; then
+                    if [[ -f "$D/argv-bad-$name" || -f "$D/argv-bad" ]]; then
+                        printf 'squid\n-N\n-f\n/etc/squid/squid.conf\n-d\n0\n'
+                    elif [[ -f "$D/containers-$name.cfg/squid.conf" ]]; then
+                        printf 'squid\n-N\n-f\n%s/squid.conf\n-d\n0\n' "$(mock_cfg_abs "$name")"
+                    else
+                        printf 'squid\n-N\n-f\n/etc/squid/squid.conf\n-d\n0\n'
+                    fi
+                    exit 0
+                fi
                 # gw_probe /dev/tcp check. EGL-217: the probe-fails knob
                 # ($D/probe-fails[-<name>]) models a proxy that never
                 # answers — scoped to containers STARTED or RESTARTED
@@ -889,15 +1503,102 @@ case "$cmd" in
         esac
         ;;
     cp)
-        # cp <src> <dst>: record the allowlist payload; allow tests to
-        # flag invalid content.
+        # cp <src> <dst>: host -> container (private stage copy / EGL-389
+        # rollback restore) or container -> host (pre-staging snapshot).
+        # EGL-395: the deployed tree is a real directory model; a stage
+        # path is a real subdirectory, so a staged candidate is never
+        # aliased onto the deployed squid.conf. EGL-369-D7: the
+        # destination parent must exist in the container's modeled
+        # layout — copying the new path into an old-layout gateway fails
+        # as podman cp would.
         src="$1"; dst="$2"
-        name="${dst%%:*}"; path="${dst#*:}"
-        [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
-        cp "$src" "$D/allowlist-staged"
-        cp "$src" "$D/containers-$name.${src##*/}"
-        cp "$src" "$D/containers-$name.allowlist.last"
-        exit 0
+        if [[ "$dst" == *:* ]]; then
+            name="${dst%%:*}"; path="${dst#*:}"
+            [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
+            layout="$(mock_layout "$name")"
+            base="${path##*/}"
+            [[ -z "$base" || "$path" == */ ]] && base="${src##*/}"
+            lpath="$(mock_cfg_local "$name" "$path" 2>/dev/null)" || lpath=""
+            if [[ -z "$lpath" ]]; then
+                echo "Error: copying to '$path': no such directory in container $name (layout $layout)" >&2
+                exit 1
+            fi
+            # EGL-395 R-EGL-395-4 F1(b): the container stops after the
+            # apply has begun. The registration and its config remain, so
+            # the failure disclosure must select the proven not-running
+            # body rather than a running/indeterminate or removed one.
+            if [[ -f "$D/gateway-stops-late-$name" ]]; then
+                rm -f "$D/gateway-stops-late-$name"
+                rm -f "$D/running/$name"
+            fi
+            # EGL-389 D7/late seams, armed at the FIRST host -> container
+            # staging copy so the ensure up to the apply is unaffected:
+            #   $D/ps-fails-late        -> $D/ps-fails-active (failed ps)
+            #   $D/replace-src-with-dir -> replace the host source leaf
+            #     (content = path) with a directory, modelling an
+            #     out-of-band replacement just before the trap restore.
+            if [[ -f "$D/ps-fails-late" ]]; then
+                : > "$D/ps-fails-active"
+            fi
+            if [[ -f "$D/replace-src-with-dir" ]]; then
+                _rpath="$(cat "$D/replace-src-with-dir")"
+                rm -f "$D/replace-src-with-dir"
+                rm -f "$_rpath"
+                mkdir -p "$_rpath"
+            fi
+            # EGL-389 late seam: make the conf dir unwritable at the
+            # FIRST host -> container staging copy, so the gateway has
+            # already been started/replaced (owned) before the trap's
+            # source restore fails — S-P2r/S-P2s. Consumed once.
+            if [[ -f "$D/proxy-source-restore-fails-cp" ]]; then
+                _cdir="$(cat "$D/proxy-source-restore-fails-cp")"
+                rm -f "$D/proxy-source-restore-fails-cp"
+                chmod 0555 "$_cdir" 2>/dev/null || true
+            fi
+            if [[ "$src" == */prev/* ]]; then
+                if [[ -f "$D/cp-restore-fails-$base" ]]; then
+                    echo "Error: simulated restore copy failure for $base" >&2
+                    exit 1
+                fi
+            elif [[ -f "$D/cp-stage-fails-$base" ]]; then
+                echo "Error: simulated staging copy failure for $base" >&2
+                exit 1
+            fi
+            if [[ ! -d "${lpath%/*}" ]]; then
+                echo "Error: copying to '$path': no such directory in container $name (layout $layout)" >&2
+                exit 1
+            fi
+            cp "$src" "$lpath"
+            cp "$src" "$D/allowlist-staged"
+            # Test observation only: the exact candidate bytes copied into
+            # a private stage (the deployed squid.conf changes only at the
+            # publication rename).
+            if [[ "$base" == squid.conf && "$path" == *"/.egresslock-stage."* ]]; then
+                cp "$src" "$D/containers-$name.candidate"
+            fi
+            exit 0
+        fi
+        if [[ "$src" == *:* ]]; then
+            name="${src%%:*}"; path="${src#*:}"
+            [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
+            layout="$(mock_layout "$name")"
+            base="${path##*/}"
+            if [[ -f "$D/cp-snapshot-fails-$base" ]]; then
+                echo "Error: simulated snapshot copy failure for $base" >&2
+                exit 1
+            fi
+            f="$(mock_cfg_local "$name" "$path" 2>/dev/null)" || f=""
+            [[ -n "$f" && ( -f "$f" || -d "$f" ) ]] \
+                || { echo "Error: no such file in container $name: $path" >&2; exit 1; }
+            if [[ -d "$f" && ! -L "$f" ]]; then
+                cp -a "$f" "$dst"
+            else
+                cp "$f" "$dst"
+            fi
+            exit 0
+        fi
+        echo "mock podman: unsupported cp (neither side names a container)" >&2
+        exit 2
         ;;
     rm)
         # rm [-f] [-t N] <name>: remove container state, releasing any
@@ -928,12 +1629,21 @@ case "$cmd" in
               "$D/containers/$name.net" "$D/containers/$name.ip" \
               "$D/containers/$name.mac" "$D/probe-fails-active-$name"
         # EGL-114: a removed container's filesystem is gone — clear the
-        # modeled per-container files (staged squid/allowlist payloads,
-        # log fixtures) so a REPLACED gateway starts from a fresh
-        # bootstrap FS, exactly like the real image (empty
-        # /etc/squid/agent). The literal '.' keeps the glob prefix-safe
-        # (s50 cannot match s50n's files).
-        rm -f "$D/containers-$name."* 2>/dev/null || true
+        # modeled per-container files (deployed/staged configs, log
+        # fixtures) so a REPLACED gateway starts from a fresh bootstrap
+        # FS, exactly like the real image. The literal '.' keeps the glob
+        # prefix-safe (s50 cannot match s50n's files).
+        rm -rf "$D/containers-$name.cfg" "$D/containers-$name.candidate" \
+               "$D/containers-$name.pending-mv" "$D/containers-$name.started" \
+               "$D/containers-$name.id" "$D/containers-$name.live" 2>/dev/null || true
+        # EGL-395: the replacement counter is mock bookkeeping, not
+        # container state — it survives the removal so a replaced
+        # container gets a genuinely new instance ID.
+        for f in "$D/containers-$name."*; do
+            [[ -f "$f" ]] || continue
+            [[ "$f" == "$D/containers-$name.gen" ]] && continue
+            rm -f "$f"
+        done
         if [[ -d "$D/ips" ]]; then
             for ipf in "$D/ips"/*; do
                 [[ -f "$ipf" ]] || continue
@@ -962,7 +1672,27 @@ case "$cmd" in
                 *) name="$1"; break ;;
             esac
         done
+        # EGL-395: a restart that fails at the stop phase leaves the old
+        # instance running (the mock keeps the running marker and the
+        # old live config, so the live ACL is untouched).
+        if [[ -f "$D/restart-stop-fails-$name" || -f "$D/restart-stop-fails" ]]; then
+            echo "Error: failed to stop container $name: simulated stop failure" >&2
+            exit 1
+        fi
+        # EGL-389: model a container that vanished between the config
+        # swap and the restart (its name is gone from BOTH ps views), so
+        # the EGL-217 cleanup skips it — the S-P3n branch.
+        if [[ -f "$D/restart-vanishes-$name" ]]; then
+            rm -f "$D/running/$name" "$D/containers/$name.net" \
+                  "$D/containers/$name.ip" "$D/containers/$name.mac"
+            echo "Error: no such container $name" >&2
+            exit 1
+        fi
         [[ -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
+        # EGL-395: a restart is a new gateway instance start — StartedAt
+        # changes and the current deployed bytes become the live config.
+        mock_bump_started "$name"
+        mock_cfg_load_live "$name"
         # EGL-217: a RESTART while the probe-fails knob is armed puts the
         # swapped config live — from here the proxy never answers
         # (crash-loop), so the apply health wait fails.
@@ -1046,6 +1776,37 @@ case "$cmd" in
     *) echo "mock podman: unsupported op $cmd" >&2; exit 2 ;;
 esac
 EOF
+
+# EGL-395 test helpers for the content-addressed deployed model. The
+# deployed gateway config dir is $STATE/containers-<name>.cfg/; group
+# basenames carry a SHA-256, so tests resolve them through the deployed
+# squid.conf reference for the ACL label instead of hard-coding a name.
+mock_cfg_file() { # <container> <basename> -> host path in the deployed cfg dir
+    printf '%s\n' "$STATE/containers-$1.cfg/$2"
+}
+mock_cfg_ref() { # <container> <acl-label> -> in-container ref from squid.conf
+    local conf ref
+    conf="$(mock_cfg_file "$1" squid.conf)"
+    [[ -f "$conf" ]] || return 1
+    ref="$(sed -n "s|^acl $2 dstdomain -n \"\\([^\"]*\\)\"[[:space:]]*$|\\1|p" "$conf" | head -n1)"
+    [[ -n "$ref" ]] || return 1
+    printf '%s\n' "$ref"
+}
+mock_group_basename() { # <container> <acl-label> -> referenced group basename
+    local ref
+    ref="$(mock_cfg_ref "$@")" || return 1
+    printf '%s\n' "${ref##*/}"
+}
+mock_group_file() { # <container> <acl-label> -> host path of the deployed group
+    local base
+    base="$(mock_group_basename "$@")" || return 1
+    mock_cfg_file "$1" "$base"
+}
+mock_group_name() { # <kind> <bytes-with-newlines> -> content-addressed name
+    printf 'allowlist.%s.%s\n' "$1" \
+        "$(printf '%s' "$2" | sha256sum | cut -d' ' -f1)"
+}
+
 # EGL-80-L1: hermetic dpkg-query — the host dpkg database must not leak.
 # An installed .deb made install-kit's real query answer "install ok
 # installed", failing ~30 prefix-install tests. The mock answers an
@@ -1077,13 +1838,72 @@ set -u
 D="${ARCMOCK_STATE:?}/nft"
 LOG="${ARCMOCK_STATE:?}/conntrack.log"
 TABLE="${ARCMOCK_STATE:?}/nft/conntrack-table"
+# EGL-362 P2: first-occurrence original-direction field extraction (the
+# awk `seen[kv]++ == 0` semantics) in pure bash. ct_orig fills _od
+# (dst), _dport_o, _os (src), _sport_o; ct_match applies the active
+# filters, requiring every provided one.
+ct_orig() { # ct_orig <row>
+    local _row="$1" _tok="" _key="" _val=""
+    local _ss=0 _sd=0 _ssp=0 _sdp=0
+    _od=""; _dport_o=""; _os=""; _sport_o=""
+    local -a _toks=()
+    read -r -a _toks <<<"$_row"
+    for _tok in "${_toks[@]}"; do
+        case "$_tok" in
+            *=*) _key="${_tok%%=*}"; _val="${_tok#*=}"; _val="${_val%%=*}" ;;
+            *) _key="$_tok"; _val="" ;;
+        esac
+        case "$_key" in
+            src) (( _ss == 0 )) && { _os="$_val"; _ss=1; } ;;
+            dst) (( _sd == 0 )) && { _od="$_val"; _sd=1; } ;;
+            sport) (( _ssp == 0 )) && { _sport_o="$_val"; _ssp=1; } ;;
+            dport) (( _sdp == 0 )) && { _dport_o="$_val"; _sdp=1; } ;;
+        esac
+    done
+}
+# R-EGL-362-3 F1: awk compared numeric-looking values numerically
+# (443 == 0443; +443 and 4.43e2 too), and compared as strings otherwise.
+# Recreate that here: both numeric -> compare the doubles (printf is the
+# in-process strtod), else exact string equality. Ports with leading
+# zeros are accepted engine input, so this is producer-reachable.
+ct_num_re='^[[:space:]]*[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
+ct_eq() { # ct_eq <row-value> <filter-value>
+    local _a="$1" _b="$2" _na="" _nb="" _ca="" _cb=""
+    [[ "$_a" =~ $ct_num_re ]] && _na=1
+    [[ "$_b" =~ $ct_num_re ]] && _nb=1
+    if [[ -n "$_na" && -n "$_nb" ]]; then
+        _a="${_a#"${_a%%[![:space:]]*}"}"; _a="${_a%"${_a##*[![:space:]]}"}"
+        _b="${_b#"${_b%%[![:space:]]*}"}"; _b="${_b%"${_b##*[![:space:]]}"}"
+        printf -v _ca '%.17g' "$_a"
+        printf -v _cb '%.17g' "$_b"
+        [[ "$_ca" == "-0" ]] && _ca="0"
+        [[ "$_cb" == "-0" ]] && _cb="0"
+        [[ "$_ca" == "$_cb" ]]
+    else
+        [[ "$_a" == "$_b" ]]
+    fi
+}
+ct_match() { # ct_match <row> — true when every provided filter matches
+    local _ok=1
+    ct_orig "$1"
+    [[ -n "$dip" ]] && ! ct_eq "$_od" "$dip" && _ok=0
+    [[ -n "$dport" ]] && ! ct_eq "$_dport_o" "$dport" && _ok=0
+    [[ -n "$sip" ]] && ! ct_eq "$_os" "$sip" && _ok=0
+    [[ -n "$sport" ]] && ! ct_eq "$_sport_o" "$sport" && _ok=0
+    [[ -z "$dip" && -z "$dport" && -z "$sip" && -z "$sport" ]] && _ok=0
+    (( _ok ))
+}
 echo "conntrack $*" >> "$LOG"
 op="$1"; shift
 case "$op" in
     -C)
         [[ -f "$D/conntrack-probe-fails" ]] && { echo "mock conntrack: ctnetlink unavailable" >&2; exit 1; }
         n=0
-        [[ -f "$TABLE" ]] && n="$(grep -c . "$TABLE" || true)"
+        if [[ -f "$TABLE" ]]; then
+            while IFS= read -r _ctrow || [[ -n "$_ctrow" ]]; do
+                [[ -n "$_ctrow" ]] && n=$((n + 1))
+            done < "$TABLE"
+        fi
         echo "$n"
         exit 0
         ;;
@@ -1112,49 +1932,15 @@ case "$op" in
         done
         n=0
         if [[ -f "$TABLE" && ( -n "$dip" || -n "$sip" || -n "$dport" || -n "$sport" ) ]]; then
-            n="$(awk -v a="$dip" -v b="$dport" -v s="$sip" -v p="$sport" '{
-                    delete seen; od = ""; dport_o = ""; os = ""; sport_o = ""
-                    for (i = 1; i <= NF; i++) {
-                        split($i, kv, "=")
-                        if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
-                            if (seen[kv[1]]++ == 0) {
-                                if (kv[1] == "dst") od = kv[2]
-                                if (kv[1] == "dport") dport_o = kv[2]
-                                if (kv[1] == "src") os = kv[2]
-                                if (kv[1] == "sport") sport_o = kv[2]
-                            }
-                        }
-                    }
-                    ok = 1
-                    if (a != "") { if (od != a) ok = 0 }
-                    if (b != "") { if (dport_o != b) ok = 0 }
-                    if (s != "") { if (os != s) ok = 0 }
-                    if (p != "") { if (sport_o != p) ok = 0 }
-                    if (a == "" && b == "" && s == "" && p == "") ok = 0
-                    if (ok) { c++ }
-                } END { print c+0 }' "$TABLE")"
-            awk -v a="$dip" -v b="$dport" -v s="$sip" -v p="$sport" '{
-                    delete seen; od = ""; dport_o = ""; os = ""; sport_o = ""
-                    for (i = 1; i <= NF; i++) {
-                        split($i, kv, "=")
-                        if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
-                            if (seen[kv[1]]++ == 0) {
-                                if (kv[1] == "dst") od = kv[2]
-                                if (kv[1] == "dport") dport_o = kv[2]
-                                if (kv[1] == "src") os = kv[2]
-                                if (kv[1] == "sport") sport_o = kv[2]
-                            }
-                        }
-                    }
-                    ok = 1
-                    if (a != "") { if (od != a) ok = 0 }
-                    if (b != "") { if (dport_o != b) ok = 0 }
-                    if (s != "") { if (os != s) ok = 0 }
-                    if (p != "") { if (sport_o != p) ok = 0 }
-                    if (a == "" && b == "" && s == "" && p == "") ok = 0
-                    if (ok) { next }
-                    { print }
-                }' "$TABLE" > "$TABLE.t" && mv "$TABLE.t" "$TABLE"
+            : > "$TABLE.t"
+            while IFS= read -r _ctrow || [[ -n "$_ctrow" ]]; do
+                if ct_match "$_ctrow"; then
+                    n=$((n + 1))
+                else
+                    printf '%s\n' "$_ctrow" >> "$TABLE.t"
+                fi
+            done < "$TABLE"
+            mv "$TABLE.t" "$TABLE"
         fi
         # EGL-231-R2: honest rc + the banner summary on stderr like the
         # real tool — a no-op delete is nonzero with the delimited
@@ -1324,28 +2110,7 @@ case "$op" in
                 # (a=="" is the reconcile's enumerate shape, EGL-295).
                 # EGL-312: every provided filter must match (the peer
                 # reads add -s/--sport); no filter set ⇒ no match.
-                orig="$(awk -v a="$dip" -v b="$dport" -v s="$sip" -v p="$sport" '{
-                        delete seen; od = ""; dport_o = ""; os = ""; sport_o = ""
-                        for (i = 1; i <= NF; i++) {
-                            split($i, kv, "=")
-                            if (kv[1] == "src" || kv[1] == "dst" || kv[1] == "sport" || kv[1] == "dport") {
-                                if (seen[kv[1]]++ == 0) {
-                                    if (kv[1] == "dst") od = kv[2]
-                                    if (kv[1] == "dport") dport_o = kv[2]
-                                    if (kv[1] == "src") os = kv[2]
-                                    if (kv[1] == "sport") sport_o = kv[2]
-                                }
-                            }
-                        }
-                        ok = 1
-                        if (a != "") { if (od != a) ok = 0 }
-                        if (b != "") { if (dport_o != b) ok = 0 }
-                        if (s != "") { if (os != s) ok = 0 }
-                        if (p != "") { if (sport_o != p) ok = 0 }
-                        if (a == "" && b == "" && s == "" && p == "") ok = 0
-                        if (ok) { print "y"; exit }
-                    }' <<<"$row")"
-                if [[ "$orig" == "y" ]]; then
+                if ct_match "$row"; then
                     (( n += 1 ))
                     echo "${row#ipv4 2 }"
                 fi

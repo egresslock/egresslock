@@ -24,11 +24,11 @@ egresslock allow main host.containers.internal:11434
 
 ## Server on the LAN (by IP)
 
-`allow-host` pins a raw IP literal as a direct rule — e.g. a LAN
-Ollama:
+The direct path (`allow … --direct`) pins a raw IP literal as a
+firewall rule — e.g. a LAN Ollama:
 
 ```sh
-egresslock allow-host main 192.0.2.24:11434
+egresslock allow main 192.0.2.24:11434 --direct
 ```
 
 The full walkthrough, including why IP literals bypass the proxy

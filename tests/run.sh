@@ -17,6 +17,13 @@
 # 486/505/509/510 on the shared CI runner: all PASS, then the bound
 # fired). 600s leaves headroom while a real wedge is named in ~10 min.
 #
+# EGL-353: the 600s default is overridable per run with
+# EGRESSLOCK_HARNESS_TIMEOUT=<seconds> (positive integer; unset/empty
+# keeps 600) so a slow or loaded host can finish the engine battery.
+# Anything else — including 0, which `timeout 0` would turn into no
+# bound — is refused with rc 2 before any harness starts; CI sets no
+# env, so its 600s default is unchanged.
+#
 # EGL-79-D2: `--help/-h` prints usage and exits 0; `--harness
 # engine|kit|docs|all` selects a subset (default `all` = the `test-*.sh`
 # glob). Unknown options / bad values exit 2.
@@ -69,6 +76,13 @@ Usage: bash tests/run.sh [options]
                           (--foreground -k 15) so Ctrl+C cancels the
                           whole battery and a wedged harness is
                           SIGKILLed 15s after the TERM.
+
+Environment:
+  EGRESSLOCK_HARNESS_TIMEOUT=<seconds>
+                          Per-harness timeout bound: a positive integer
+                          of seconds (default: 600; unset or empty keeps
+                          600). Raise it on a slow or loaded host so the
+                          engine battery can finish (EGL-353).
 
 The battery must run as an unprivileged account (its mocked root-guard
 and non-root-hook cases are structurally invalid under uid 0 and root
@@ -198,7 +212,29 @@ if [[ "$harness_sel" == "all" && ${#harnesses[@]} -eq 0 ]]; then
     exit 2
 fi
 
+# EGL-353-D1/D2: one env seam for the per-harness bound. Unset/empty
+# keeps 600; anything else must be a positive integer of seconds and is
+# refused here, before any harness starts. `timeout 0` would disable the
+# bound (the EGL-78-D6 wedge class) and timeout(1) exits 125 on values it
+# cannot parse, so neither may reach it.
 HARNESS_TIMEOUT=600
+if [[ -n "${EGRESSLOCK_HARNESS_TIMEOUT:-}" ]]; then
+    _bound_raw="$EGRESSLOCK_HARNESS_TIMEOUT"
+    if [[ ! "$_bound_raw" =~ ^[0-9]+$ ]]; then
+        echo "run.sh: bad EGRESSLOCK_HARNESS_TIMEOUT value: '$_bound_raw' (expected a positive integer of seconds; default 600)" >&2
+        exit 2
+    fi
+    # Strip leading zeros without arithmetic (a bare `0NN` is octal in
+    # `$(( ))`); an all-zero value is `timeout 0`, i.e. unbounded.
+    _bound="${_bound_raw#"${_bound_raw%%[!0]*}"}"
+    if [[ -z "$_bound" ]]; then
+        echo "run.sh: bad EGRESSLOCK_HARNESS_TIMEOUT value: '$_bound_raw' (0 means no timeout; expected a positive integer of seconds; default 600)" >&2
+        exit 2
+    fi
+    HARNESS_TIMEOUT="$_bound"
+    # EGL-353-D3: confirm a set override; the default path stays quiet.
+    echo "run.sh: harness bound ${HARNESS_TIMEOUT}s (EGRESSLOCK_HARNESS_TIMEOUT)"
+fi
 
 # EGL-86-D3: per-harness tee logs for the end-of-suite skip summary.
 skip_logs=()
@@ -228,13 +264,13 @@ for h in "${harnesses[@]}"; do
     fi
     if (( hrc == 124 )); then
         # EGL-78-D3: a timeout is a FAIL, never a skip; keep rc clean (no 124).
-        echo "run.sh: FAIL $h timeout after ${HARNESS_TIMEOUT}s" >&2
+        echo "run.sh: FAIL $h timeout after ${HARNESS_TIMEOUT}s (set EGRESSLOCK_HARNESS_TIMEOUT=<seconds> to change the bound)" >&2
         rc=1
     elif (( hrc == 137 )); then
         # EGL-80-1-F2: a harness that defied the TERM is SIGKILLed at
         # bound+kill-after (timeout rc 137); same classification as 124.
         # rc 137 must never leak as the battery rc (contract 0/1/2).
-        echo "run.sh: FAIL $h timeout after ${HARNESS_TIMEOUT}s (TERM defied; kill-after SIGKILL fired)" >&2
+        echo "run.sh: FAIL $h timeout after ${HARNESS_TIMEOUT}s (TERM defied; kill-after SIGKILL fired; set EGRESSLOCK_HARNESS_TIMEOUT=<seconds> to change the bound)" >&2
         rc=1
     elif (( hrc != 0 )); then
         rc=$hrc; echo "run.sh: FAIL $h (rc=$rc)" >&2

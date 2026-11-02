@@ -2,8 +2,8 @@
 
 Goal: clone and push to GitHub from a workload container on a profile
 network, with the profile's fail-closed policy intact. `github.com` answers
-with **one rotating address per query**, so a plain `allow-host
-github.com:22` can never hold. The easiest path is HTTPS through the
+with **one rotating address per query**, so a plain direct pin
+(`allow github.com:22 --direct`) can never hold. The easiest path is HTTPS through the
 gateway — the name is resolved per request, so nothing is pinned and
 nothing drifts; SSH (deploy keys, agent forwarding) still works via a name
 tunnel or a pinned pool. The mechanism, the address-discovery methods, and
@@ -34,8 +34,8 @@ egresslock allow main github.com
 `allow main github.com` appends the name to the gateway
 allowlist (the bare host is the port-443 group); the gateway resolves it
 per request, so there is no address to drift. If an earlier
-`allow-host github.com:22` is still in the profile's conf, remove it as
-well (`egresslock disallow-host main github.com:22`) so its `drift:`
+direct `github.com:22` rule is still in the profile's conf, remove it as
+well (`egresslock disallow main github.com:22 --direct`) so its `drift:`
 warnings stop — [Rotating
 names](../../docs/reference/rotating-names.md) shows the replace flow.
 
@@ -172,10 +172,10 @@ see the [threat model](../../docs/reference/threat-model.md).
 ## Path 3 — SSH with pinned literals (direct, no client changes)
 
 No proxy config, no helper; the cost is a line whenever GitHub adds a
-member. While `allow-host github.com:22` is still in place, find the members
+member. While the direct pin `github.com:22` is still in place, find the members
 with the methods in [Finding the pool
 members](../../docs/reference/rotating-names.md#finding-the-pool-members),
-then replace the name (skip `disallow-host` if the pin is not in the conf):
+then replace the name (skip the `disallow … --direct` step if the pin is not in the conf):
 
 > [!NOTE]
 > it may take some time to identify all member IPs using this method.
@@ -184,9 +184,9 @@ then replace the name (skip `disallow-host` if the pin is not in the conf):
 # account — run as the dedicated account: sudo -iu egl-runner
 # prompt: egl-runner@host:~$
 
-egresslock disallow-host main github.com:22
-egresslock allow-host main <member-ip-1>:22
-egresslock allow-host main <member-ip-2>:22
+egresslock disallow main github.com:22 --direct
+egresslock allow main <member-ip-1>:22 --direct
+egresslock allow main <member-ip-2>:22 --direct
 ```
 
 A plain container — no proxy env needed:

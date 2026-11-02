@@ -16,6 +16,11 @@
 # Exit codes: 0 ok, 1 preflight/validation failure, 2 usage error.
 set -euo pipefail
 
+# Testability hook: the mock harness runs non-root. This flag gates the
+# harness hook reads that follow; without it each gated site uses its
+# production default.
+kit_test_mode() { [[ "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]]; }
+
 prefix=""
 account=""
 conf=""
@@ -184,10 +189,14 @@ egresslock-setup import --account <acct> --from <conf> [--allowlist <path>] [--f
 
 Copy one profile pair into the account's fixed config directory. The
 destination conf name comes from the source file's `profile` line
-(<profile>.conf); a basename `gateway … <name>` allowlist is copied
-from the source directory as <name>. An absolute allowlist reference is
-left unchanged (the account is warned if it cannot read it). No
-gateway line means conf only. Run as ROOT.
+(<profile>.conf). The source must carry a
+`gateway <ip> <port> <profile>-allowlist` line naming exactly
+<profile>-allowlist, copied from the source directory to the same name;
+a source without a `gateway` line is refused at staged validation
+(rc 1, nothing written) — every profile needs a gateway. An absolute
+path, another profile's allowlist basename, or any path component is
+refused (rc 1, with the line to fix, nothing written) — the source pair
+must be fixed before import. Run as ROOT.
 
 Pair rules:
   - absent destination      install both halves
@@ -196,22 +205,30 @@ Pair rules:
                             (a torn pair has only one half present)
   - --force                 replace the whole pair, allowlist first
                             (never heals a torn pair by writing only
-                            the missing half)
+                            the missing half; both destination halves
+                            must be regular files or absent)
+  - non-regular half        refuse, rc 1, nothing moved or deleted
+                            (a directory, symbolic link, or special
+                            file; --force does not apply)
 The pair is staged in the destination confdir as account-owned 0600
 files and validated as the account with the deployed engine before
 commit. Root mode validates through a private mount namespace
 (`unshare -m`); a host that denies it fails closed before the
 destination is touched. The conf is moved last; no copy lands on the
-live destination. Import never writes unit.env, never touches
-linger/timer/user@, and never runs ensure.
+live destination. Import does not write unit.env, alter
+linger/timer/user@, or run ensure. A forced replacement deletes the
+regular files it replaces, after the staged pair validates; a failed
+commit restores the pre-run bytes.
 
 Arguments and flags:
   --account <name>   target account (required)
   --from <path>      source conf (required; the source basename may
                      differ from the profile it defines)
-  --allowlist <path> override the source allowlist (the destination
-                     name still comes from the conf's gateway line)
+  --allowlist <path> override the source allowlist (the destination is
+                     still <profile>-allowlist)
   --force            replace a differing or torn destination pair
+                     (regular files only; refused for a directory,
+                     symbolic link, or special file)
   --prefix <path>    deployed kit prefix (validation engine)
 
 Examples:
@@ -377,7 +394,20 @@ Environment:
   EGRESSLOCK_DEB_UNIT_DIR=<dir>  harness-only override of the deb
                              unit dir in doctor shadow checks
                              (default: /usr/lib/systemd/system)
-  EGRESSLOCK_ACCOUNT_HOME=<dir>  account home in non-root test mode
+  EGRESSLOCK_APPARMOR_D=<dir>    AppArmor profile dir for tests
+                             (default: /etc/apparmor.d; requires
+                             EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+  EGRESSLOCK_APPARMOR_PROFILES=<f>  kernel profiles listing to probe
+                             for AppArmor checks (default:
+                             /sys/kernel/security/apparmor/profiles;
+                             a root run ignores it unless
+                             EGRESSLOCK_KIT_ALLOW_NON_ROOT=1; non-root
+                             runs may point it at a copied listing)
+  EGRESSLOCK_SYSTEMCTL=<path>    systemctl binary for tests
+                             (default: systemctl on the PATH;
+                             requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+  EGRESSLOCK_ACCOUNT_HOME=<dir>  account home override in test mode
+                             (requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
 
 Defaults that are not parameter-changeable:
   - unit.env path: ~/.config/egresslock/unit.env, mode 0600, with
@@ -622,7 +652,7 @@ fi
 # host slice only. Everything else (account slices, root actions) needs
 # root.
 [[ "$aa_check" == 1 || "$buildgw" == 1 || ( "$doctor" == 1 && -z "$account" ) \
-    || "$(id -u)" == 0 || "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]] || {
+    || "$(id -u)" == 0 ]] || kit_test_mode || {
     echo "egresslock-setup: must run as root (sudo)" >&2
     exit 1
 }
@@ -630,7 +660,7 @@ fi
 # dispatch (conf parse, gateway image), so it needs root like the
 # bundle (the test hook excepted). Account-less --doctor stays
 # read-only and rootless.
-[[ "$doctor" == 0 || -z "$account" || "$(id -u)" == 0 || "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]] || {
+[[ "$doctor" == 0 || -z "$account" || "$(id -u)" == 0 ]] || kit_test_mode || {
     echo "egresslock-setup: doctor --account needs root (sudo) to read the account state" >&2
     exit 1
 }
@@ -638,12 +668,13 @@ fi
 # alone is host-level and needs neither.
 home=""
 if [[ -n "$account" ]]; then
-    if [[ "$(id -u)" == 0 ]]; then
+    if [[ "$(id -u)" == 0 ]] || ! kit_test_mode; then
         id "$account" >/dev/null 2>&1 || { echo "egresslock-setup: no such account: $account" >&2; exit 1; }
         home="$(getent passwd "$account" | cut -d: -f6)"
     else
         # Hook mode (non-root tests): the account is virtual; the test
-        # supplies its home.
+        # supplies its home. EGRESSLOCK_ACCOUNT_HOME is honored only in
+        # test mode; otherwise the passwd home above is the default.
         home="${EGRESSLOCK_ACCOUNT_HOME:?egresslock-setup: non-root test mode requires EGRESSLOCK_ACCOUNT_HOME}"
     fi
     # EGL-38: --doctor reports a missing engine as a doctor row with the
@@ -666,7 +697,7 @@ fi
 # prefix for install-kit.sh deploys, and next to this script in a
 # checkout/kit tree. EGRESSLOCK_SHARE overrides (tests; explicit beats
 # implicit). The ENGINE still always comes from the deployed prefix.
-script_dir="$(cd "$(dirname "$0")" && pwd)"
+script_dir="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
 if [[ -n "${EGRESSLOCK_SHARE:-}" ]]; then
     share_dir="$EGRESSLOCK_SHARE"
 elif [[ "$prefix_explicit" == 1 ]]; then
@@ -705,6 +736,19 @@ apparmor_dir="$share_dir/apparmor"
 #       may skip on)
 #   2 = AppArmor enabled, enforcement UNKNOWN (listing missing/unreadable)
 #   3 = AppArmor not enabled
+# EGL-390-D1/D2: the profiles-listing override is a test/non-root hook.
+# A production root run always reads the kernel listing (silent fallback,
+# the EGL-382-D3 family failure mode); a non-root run keeps the override
+# so rootless --apparmor-check can point at a copied listing (the kernel
+# listing is root-only on many kernels).
+apparmor_profiles_path() {
+    if [[ "$(id -u)" == 0 ]] && ! kit_test_mode; then
+        printf '%s\n' "/sys/kernel/security/apparmor/profiles"
+    else
+        printf '%s\n' "${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles}"
+    fi
+}
+
 podman_label_state=2
 podman_labeled() {
     # EGL-39 / D39-3: podman LABEL tri-state from the same kernel
@@ -714,7 +758,7 @@ podman_labeled() {
     # match. rc: 0 labeled/unlabeled (state 0/1), 1 unknown (state 2;
     # grep rc 2 = EACCES, never "no").
     local profiles grc
-    profiles="${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles}"
+    profiles="$(apparmor_profiles_path)"
     podman_label_state=2
     if [[ ! -r "$profiles" ]]; then
         return 1
@@ -745,7 +789,7 @@ podman_noop_note() {
 pasta_enforce_state=3
 pasta_enforced() {
     local profiles grc
-    profiles="${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles}"
+    profiles="$(apparmor_profiles_path)"
     pasta_enforce_state=3
     if [[ -r "$profiles" ]]; then
         # The mode bits on /sys/kernel/security/apparmor/profiles are 0444
@@ -992,7 +1036,9 @@ pasta_rule_loaded() {
 
 setup_apparmor() {
     local aa_d already installed_patch
-    aa_d="${EGRESSLOCK_APPARMOR_D:-/etc/apparmor.d}"   # test hook (mock harness)
+    # Test hook (mock harness); honored only in test mode.
+    aa_d="/etc/apparmor.d"
+    kit_test_mode && aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
     # EGL-22-D2: apply skips ONLY on known not-enforced. Unknown
     # enforcement refuses (rc 1) — a host whose pasta profile we cannot
     # confirm is unenforced must not silently skip the amendment.
@@ -1008,7 +1054,7 @@ setup_apparmor() {
     fi
     if (( pasta_enforce_state == 2 )); then
         echo "egresslock-setup: --apparmor-add: cannot determine whether pasta is AppArmor-enforced" >&2
-        echo "  (${EGRESSLOCK_APPARMOR_PROFILES:-/sys/kernel/security/apparmor/profiles} unreadable by this user — root-only on this kernel);" >&2
+        echo "  ($(apparmor_profiles_path) unreadable by this user — root-only on this kernel);" >&2
         echo "  refusing to skip — run as root, then re-run." >&2
         return 1
     fi
@@ -1105,7 +1151,9 @@ setup_apparmor() {
 unapply_apparmor() {
     local aa_d tmp rc
     local -a targets=()
-    aa_d="${EGRESSLOCK_APPARMOR_D:-/etc/apparmor.d}"   # test hook (mock harness)
+    # Test hook (mock harness); honored only in test mode.
+    aa_d="/etc/apparmor.d"
+    kit_test_mode && aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
     resolve_pasta_profile "$aa_d" >/dev/null 2>&1 || true
     [[ -n "$pasta_local_file" && -f "$pasta_local_file" ]] && targets+=("$pasta_local_file")
     if [[ -f "$aa_d/local/usr.bin.pasta" && "$aa_d/local/usr.bin.pasta" != "$pasta_local_file" ]]; then
@@ -1226,7 +1274,9 @@ unapply_apparmor() {
 # "loaded" (only the kernel knows that).
 doctor_apparmor() {
     local aa_d rc=0
-    aa_d="${EGRESSLOCK_APPARMOR_D:-/etc/apparmor.d}"
+    # Test hook (mock harness); honored only in test mode.
+    aa_d="/etc/apparmor.d"
+    kit_test_mode && aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
     # R-EGL-22-1 Finding 1: the predicate returns rc 1 for states 2/3;
     # a bare call under set -euo pipefail aborts BEFORE any echo, so
     # --apparmor-check would print nothing on unknown/not-enabled. Use a
@@ -1478,6 +1528,13 @@ if [[ -n "$profile_name" && ! "$profile_name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
     usage >&2
     exit 2
 fi
+# EGL-380: 'all' is the engine's teardown keyword, never a profile name —
+# refuse at the CLI edge before any account-side read or write.
+if [[ "$profile_name" == "all" ]]; then
+    echo "egresslock-setup: profile name 'all' is reserved ('teardown all' names the main profile); choose another name" >&2
+    usage >&2
+    exit 2
+fi
 
 # EGL-325 F5: --init-conf ships the `profile main` starter only. A
 # --profile other than main has no conf to probe (the starter defines
@@ -1591,7 +1648,9 @@ run_as_account() { # $@ = command words
 }
 
 # EGL-328: the pair writer. `import` copies a conf and (when the conf's
-# gateway line names a basename) its allowlist into the fixed confdir.
+# gateway line names the pair half) its allowlist into the fixed
+# confdir. EGL-381-D3: the source conf must name exactly
+# "<profile>-allowlist"; a non-pair source is refused before any write.
 # Staging and validation happen under the account; the live destination
 # is untouched until commit (allowlist first, conf last). No `cp` ever
 # lands on the live dest.
@@ -1603,10 +1662,151 @@ account_can_read() { # account_can_read <path>
     fi
 }
 
-validate_staged_pair() { # validate_staged_pair <stage-dir> <profile> <check-allowlist>
-    local stage="$1" profile="$2" check_al="$3" err sh rc
+# EGL-366 F1: map the engine's staged error paths back to the --from source
+# in ONE pass. Sequential substitutions used to reprocess paths inserted by
+# an earlier substitution: a source nested under the destination prefix got
+# the directory rewrite twice (<dir>/inbox/inbox/<file>), and a source named
+# like the profile's allowlist was rewritten to an explicit --allowlist.
+# Placeholder every ORIGINAL engine token first, then resolve; inserted
+# paths are never matched again. Most specific tokens are placed first.
+relay_source_paths() { # <line> <shown-prefix> <stage> <profile> <src-conf> <src-allowlist>
+    local line="$1" shown="$2" stage="$3" profile="$4" src_conf="$5" src_al="$6"
+    local src_dir; src_dir="$(dirname -- "$src_conf")"
+    local -a tokens=() values=()
+    # Exact staged/destination file tokens first (most specific). In root
+    # mode the engine names the bind-mounted destination; in the harness
+    # hook it names the temporary passwd home.
+    if [[ -n "$stage" ]]; then
+        tokens+=("$stage/$profile.conf"); values+=("$src_conf")
+        [[ -n "$src_al" ]] && { tokens+=("$stage/$profile-allowlist"); values+=("$src_al"); }
+    fi
+    if [[ -n "$shown" ]]; then
+        tokens+=("$shown/$profile.conf"); values+=("$src_conf")
+        [[ -n "$src_al" ]] && { tokens+=("$shown/$profile-allowlist"); values+=("$src_al"); }
+    fi
+    # Protect a source path that itself sits under a shown prefix from the
+    # broad directory fallback below (it must map to itself, once).
+    tokens+=("$src_conf"); values+=("$src_conf")
+    [[ -n "$src_al" ]] && { tokens+=("$src_al"); values+=("$src_al"); }
+    # Any other engine path under the staging/destination prefix maps to
+    # the source directory, keeping the file name.
+    if [[ -n "$stage" ]]; then
+        tokens+=("$stage/"); values+=("$src_dir/")
+    fi
+    if [[ -n "$shown" ]]; then
+        tokens+=("$shown/"); values+=("$src_dir/")
+    fi
+    local i placeholder
+    for i in "${!tokens[@]}"; do
+        placeholder=$'\x1f'"EGL366M$i"$'\x1e'
+        line="${line//"${tokens[$i]}"/"$placeholder"}"
+    done
+    for i in "${!tokens[@]}"; do
+        placeholder=$'\x1f'"EGL366M$i"$'\x1e'
+        line="${line//"$placeholder"/"${values[$i]}"}"
+    done
+    printf '%s\n' "$line"
+}
+
+# EGL-418: classify a destination half without following a symbolic link.
+# A dangling symlink is a link (never "absent"), and a FIFO/socket/device
+# is "special" so cmp never opens it.
+dest_half_kind() { # <path> -> absent|regular|symlink|directory|special
+    local p="$1"
+    if [[ -L "$p" ]]; then
+        printf 'symlink\n'
+    elif [[ -d "$p" ]]; then
+        printf 'directory\n'
+    elif [[ -e "$p" ]]; then
+        if [[ -f "$p" ]]; then printf 'regular\n'; else printf 'special\n'; fi
+    else
+        printf 'absent\n'
+    fi
+}
+
+# EGL-418 S2: a destination half is a directory, symbolic link, or other
+# special file. --force cannot replace it.
+import_refuse_nonregular() { # <conf|allowlist> <path> <kind>
+    local label="$1" p="$2" kind="$3"
+    case "$kind" in
+        directory)
+            echo "egresslock-setup: import: refusing: destination $label is a directory: $p" >&2
+            echo "  fix: move it aside (only that directory moves; its contents are not deleted), then re-run this import; --force cannot replace it:" >&2
+            ;;
+        symlink)
+            echo "egresslock-setup: import: refusing: destination $label is a symbolic link: $p" >&2
+            echo "  fix: move the link aside (only the link moves; the file it points to is not touched), then re-run this import; --force cannot replace it:" >&2
+            ;;
+        *)
+            echo "egresslock-setup: import: refusing: destination $label is not a regular file: $p" >&2
+            echo "  fix: move it aside (only that path moves), then re-run this import; --force cannot replace it:" >&2
+            ;;
+    esac
+    printf "         mv '%s' '%s.bak'\n" "$p" "$p" >&2
+}
+
+# EGL-418 S5a: a forced run sees a non-regular half at commit time.
+import_refuse_changed() { # <conf|allowlist> <path> <kind>
+    local label="$1" p="$2" kind="$3" what
+    case "$kind" in
+        directory) what="a directory" ;;
+        symlink) what="a symbolic link" ;;
+        *) what="not a regular file" ;;
+    esac
+    echo "egresslock-setup: import: refusing: destination $label changed during the import and is now $what: $p" >&2
+    echo "  fix: move it aside (only that path moves), then re-run this import; nothing from this run was kept" >&2
+}
+
+# EGL-418 S5b: a non-forced run sees a half appear at commit time.
+import_refuse_appeared() { # <conf|allowlist> <path>
+    echo "egresslock-setup: import: refusing: destination $1 appeared during the import: $2" >&2
+    echo "  fix: re-run this import to apply the normal pair rules; nothing from this run was kept" >&2
+}
+
+# EGL-418: remove only known files from an import-private directory, then
+# the directory itself. Never recurse: an unexpected entry (or a directory
+# that will not empty) is left in place and named (S6).
+import_cleanup() { # <dir> <installed|unchanged> [known-file...]
+    local dir="$1" outcome="$2" name
+    shift 2
+    [[ -n "$dir" && -d "$dir" ]] || return 0
+    for name in "$@"; do
+        [[ -n "$name" ]] || continue
+        rm -f -- "$dir/$name" 2>/dev/null || true
+    done
+    if ! rmdir -- "$dir" 2>/dev/null; then
+        echo "egresslock-setup: import: leftover not empty: $dir" >&2
+        if [[ "$outcome" == installed ]]; then
+            echo "  inspect it, then remove it; the destination pair was installed" >&2
+        else
+            echo "  inspect it, then remove it; the destination was not changed" >&2
+        fi
+    fi
+    return 0
+}
+
+# EGL-418: the harness validation home is one symlink under one temp
+# directory; remove exactly those, never recursively.
+import_cleanup_validation_home() { # <temp-root>
+    local sh="$1"
+    [[ -n "$sh" ]] || return 0
+    rm -f -- "$sh/.config/egresslock" 2>/dev/null || true
+    rmdir -- "$sh/.config" 2>/dev/null || true
+    if ! rmdir -- "$sh" 2>/dev/null; then
+        echo "egresslock-setup: import: leftover not empty: $sh" >&2
+        echo "  inspect it, then remove it; the destination was not changed" >&2
+    fi
+    return 0
+}
+
+validate_staged_pair() { # <stage-dir> <profile> <check-allowlist> <src-conf> <src-allowlist>
+    local stage="$1" profile="$2" check_al="$3" src_conf="$4" src_al="${5:-}"
+    local err sh="" rc shown_prefix=""
     err="$(mktemp)"
     if [[ "$(id -u)" == 0 ]]; then
+        # The stage is bind-mounted over the destination confdir, so the
+        # engine names the destination path for staged bytes (F4).
+        shown_prefix="$confdir"
         if ! command -v unshare >/dev/null 2>&1 || ! unshare -m --propagation private true >/dev/null 2>&1; then
             rm -f "$err"
             echo "egresslock-setup: import: cannot validate the staged pair: mount namespaces are unavailable on this host (unshare -m failed); refusing to touch the destination" >&2
@@ -1630,19 +1830,59 @@ validate_staged_pair() { # validate_staged_pair <stage-dir> <profile> <check-all
         sh="$(mktemp -d)"
         mkdir -p "$sh/.config"
         ln -s "$stage" "$sh/.config/egresslock"
+        shown_prefix="$sh/.config/egresslock"
         env ARCMOCK_PASSWD_HOME="$sh" HOME="$home" "$prefix/egresslock" network "$profile" >/dev/null 2>"$err"
         rc=$?
         if (( rc == 0 )) && [[ "$check_al" == 1 ]]; then
             env ARCMOCK_PASSWD_HOME="$sh" HOME="$home" "$prefix/egresslock" allowlist "$profile" >/dev/null 2>>"$err"
             rc=$?
         fi
-        rm -rf "$sh"
     fi
     if (( rc != 0 )); then
         echo "egresslock-setup: import: staged pair failed validation as $account:" >&2
-        sed 's/^/  /' "$err" >&2 2>/dev/null || true
+        # F4: the staged copy is temporary. Name the --from source as the
+        # file to fix, and drop the engine's staged-path hints (they would
+        # point at a removed temp home / the live destination, and suggest
+        # `ensure` before a successful import).
+        local line
+        while IFS= read -r line; do
+            case "$line" in
+                "  fix: "*|"       ("*) continue ;;
+            esac
+            # F4: map the FULL staged file names back to the --from paths
+            # (F1: once, via relay_source_paths — never reprocessing an
+            # inserted source path).
+            line="$(relay_source_paths "$line" "$shown_prefix" "$stage" \
+                "$profile" "$src_conf" "$src_al")"
+            printf '  %s\n' "$line" >&2
+        done < "$err"
+        echo "  fix: edit the source conf $src_conf (and the allowlist next to it), then re-run this import; the destination was not changed." >&2
         rm -f "$err"
+        import_cleanup_validation_home "$sh"
         return "$rc"
+    fi
+    rm -f "$err"
+    import_cleanup_validation_home "$sh"
+    return 0
+}
+
+# F3: the unchanged path returns success without staging, so it must
+# still prove the live destination pair loads under this engine. Reads
+# only; the destination (and the source) stay byte-identical.
+validate_live_pair() { # <profile> <check-allowlist> <src-conf> <dest-conf>
+    local profile="$1" check_al="$2" src_conf="$3" dest_conf="$4" err rc=0
+    err="$(mktemp)"
+    if ! run_as_account "$prefix/egresslock" network "$profile" >/dev/null 2>"$err"; then
+        rc=1
+    elif [[ "$check_al" == 1 ]] && ! run_as_account "$prefix/egresslock" allowlist "$profile" >/dev/null 2>>"$err"; then
+        rc=1
+    fi
+    if (( rc != 0 )); then
+        echo "egresslock-setup: import: destination pair failed validation: $dest_conf" >&2
+        sed 's/^/  /' "$err" >&2 2>/dev/null || true
+        echo "  fix: edit the source conf $src_conf (and the allowlist next to it), then re-run this import with --force; the destination was not changed." >&2
+        rm -f "$err"
+        return 1
     fi
     rm -f "$err"
     return 0
@@ -1651,8 +1891,10 @@ validate_staged_pair() { # validate_staged_pair <stage-dir> <profile> <check-all
 import_pair() { # import_pair [expected-profile]
     local expected="${1:-}"
     local src_conf="$from_src" src_profile gwline al_name src_al="" dest_conf dest_al=""
-    local check_al=0 absolute_al=0
+    local check_al=0
     local dest_conf_exists=0 dest_al_exists=0 conf_same=0 al_same=0
+    local dest_conf_kind="" dest_al_kind="" now_conf_kind="" now_al_kind=""
+    local bad=0
     local stage="" backup="" rc=0 had_conf=0 had_al=0 new_conf=0 new_al=0
 
     [[ -n "$src_conf" ]] || { echo "egresslock-setup: import: --from is required" >&2; return 2; }
@@ -1664,62 +1906,73 @@ import_pair() { # import_pair [expected-profile]
         echo "egresslock-setup: import: account $account cannot read $src_conf (owner/permissions?)" >&2
         return 1
     }
-    src_profile="$(awk '$1 == "profile" { print $2; exit }' "$src_conf" 2>/dev/null || true)"
+    # EGL-381-R4 (F1): read the source the way the engine's load_config
+    # does — strip a `#` comment, then trim [[:space:]] (space, tab, CR,
+    # VT, FF) before recognizing a directive. Selecting with raw awk
+    # fields missed any gateway line whose indentation starts with CR/VT,
+    # so a conforming pair imported as a conf-only success and a non-pair
+    # could reach staging before its refusal (D3). One scan drives both
+    # the profile and the gateway line so the two records cannot disagree.
+    local raw line
+    src_profile=""
+    gwline=""
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        line="${raw%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        if [[ -z "$src_profile" && "$line" == "profile "* ]]; then
+            read -r _ src_profile _ <<<"$line"
+        fi
+        if [[ -z "$gwline" && "$line" == "gateway "* ]]; then
+            gwline="$line"
+        fi
+        [[ -n "$src_profile" && -n "$gwline" ]] && break
+    done < "$src_conf"
     [[ "$src_profile" =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
         echo "egresslock-setup: import: cannot determine a valid profile from $src_conf (expected a 'profile <name>' line with [a-z0-9][a-z0-9-]*)" >&2
         return 1
     }
+    # EGL-380: 'all' is the engine's teardown keyword, never a profile name
+    # — refuse the source before any dest write (this boundary's rc is 1).
+    if [[ "$src_profile" == "all" ]]; then
+        echo "egresslock-setup: import: profile name 'all' is reserved ('teardown all' names the main profile); choose another name ($src_conf)" >&2
+        return 1
+    fi
     if [[ -n "$expected" && "$expected" != "$src_profile" ]]; then
         echo "egresslock-setup: --profile '$expected' does not match the source conf's profile '$src_profile' ($src_conf); pass --profile $src_profile (or edit the conf)" >&2
         return 2
     fi
     dest_conf="$confdir/$src_profile.conf"
 
-    # The gateway line names one allowlist (basename copied next to the
-    # conf, absolute-path left in place). Missing basename file is A2:
-    # refuse before any dest write.
-    gwline="$(awk '$1 == "gateway" { print; exit }' "$src_conf" 2>/dev/null || true)"
+    # EGL-381-D3: the source gateway line must name exactly
+    # "<profile>-allowlist" — the co-located pair the engine accepts.
+    # Refuse before staging or any dest write; the fix belongs in the
+    # source conf. Missing basename file is A2: refuse before any dest
+    # write too.
     if [[ -n "$gwline" ]]; then
-        al_name="$(awk '{ print $4 }' <<<"$gwline")"
-        [[ -n "$al_name" ]] || {
-            echo "egresslock-setup: import: the gateway line in $src_conf names no allowlist: $gwline" >&2
+        read -r _ _ _ al_name _ <<<"$gwline"
+        if [[ "$al_name" != "$src_profile-allowlist" ]]; then
+            echo "egresslock-setup: import: gateway allowlist must be '$src_profile-allowlist' (the pair next to the conf), got '$al_name' ($src_conf)" >&2
+            echo "  fix: edit the gateway line in $src_conf to name '$src_profile-allowlist'" >&2
+            echo "       first compare the named file with '$(dirname "$src_conf")/$src_profile-allowlist': copy the entries you intend and merge into an existing file; if the named file is shared, outside the confdir, or still used by another conf, keep it in place and copy — do not move or overwrite it" >&2
+            return 1
+        fi
+        check_al=1
+        dest_al="$confdir/$src_profile-allowlist"
+        if [[ -n "$allowlist_src" ]]; then
+            src_al="$allowlist_src"
+        else
+            src_al="$(dirname "$src_conf")/$src_profile-allowlist"
+        fi
+        [[ -f "$src_al" ]] || {
+            echo "egresslock-setup: import: allowlist not found: $src_al (the conf's gateway line names '$al_name'; expected next to --from)" >&2
             return 1
         }
-        case "$al_name" in
-            /*) absolute_al=1 ;;
-            */*) echo "egresslock-setup: import: gateway allowlist must be a single basename or an absolute path, got '$al_name' ($src_conf)" >&2
-                 return 1 ;;
-            *.conf|unit.env|.|..)
-                 echo "egresslock-setup: import: gateway allowlist basename '$al_name' collides with the confdir's conf/unit.env namespace ($src_conf); name it <profile>-allowlist" >&2
-                 return 1 ;;
-            *) dest_al="$confdir/$al_name" ;;
-        esac
-        if [[ -n "$allowlist_src" ]]; then
-            if [[ "$absolute_al" == 1 ]]; then
-                echo "egresslock-setup: import: --allowlist cannot override an absolute gateway allowlist ($al_name in $src_conf)" >&2
-                return 1
-            fi
-            src_al="$allowlist_src"
-        elif [[ "$absolute_al" == 1 ]]; then
-            src_al="$al_name"
-        else
-            src_al="$(dirname "$src_conf")/$al_name"
-        fi
-        if [[ "$absolute_al" == 1 ]]; then
-            if [[ ! -f "$src_al" ]] || ! account_can_read "$src_al"; then
-                echo "egresslock-setup: import: warning: the account cannot read absolute allowlist $src_al; the reference is left unchanged" >&2
-            fi
-        else
-            check_al=1
-            [[ -f "$src_al" ]] || {
-                echo "egresslock-setup: import: allowlist not found: $src_al (the conf's gateway line names '$al_name'; expected next to --from)" >&2
-                return 1
-            }
-            account_can_read "$src_al" || {
-                echo "egresslock-setup: import: account $account cannot read $src_al (owner/permissions?)" >&2
-                return 1
-            }
-        fi
+        account_can_read "$src_al" || {
+            echo "egresslock-setup: import: account $account cannot read $src_al (owner/permissions?)" >&2
+            return 1
+        }
     elif [[ -n "$allowlist_src" ]]; then
         echo "egresslock-setup: import: --allowlist was passed but $src_conf has no gateway line to reference it" >&2
         return 1
@@ -1741,16 +1994,46 @@ import_pair() { # import_pair [expected-profile]
             return 1
         fi
         rm -f "$pv_err"
-        if [[ "$check_al" == 1 ]] && ! run_as_account "$prefix/egresslock" allowlist "$src_profile" >/dev/null 2>&1; then
-            echo "egresslock-setup: import: allowlist failed validation in place: $dest_al" >&2
-            return 1
+        if [[ "$check_al" == 1 ]]; then
+            local al_err
+            al_err="$(mktemp)"
+            if ! run_as_account "$prefix/egresslock" allowlist "$src_profile" >/dev/null 2>"$al_err"; then
+                echo "egresslock-setup: import: allowlist failed validation in place: $dest_al" >&2
+                # EGL-375-D8: relay the engine's named error (invalid
+                # entry) instead of only the generic wrapper.
+                sed 's/^/  /' "$al_err" >&2 2>/dev/null || true
+                rm -f "$al_err"
+                return 1
+            fi
+            rm -f "$al_err"
         fi
         echo "egresslock-setup: import: unchanged ($dest_conf; source is the destination)"
         return 0
     fi
 
-    [[ -e "$dest_conf" ]] && dest_conf_exists=1
-    [[ -n "$dest_al" && -e "$dest_al" ]] && dest_al_exists=1
+    # EGL-418-D2: before cmp, staging, or mkdir, both destination halves
+    # must be absent or regular non-symlink files. A directory, symbolic
+    # link (including dangling), or special file is refused by name, with
+    # or without --force; nothing is read, moved, or created. Name every
+    # offending half (conf then allowlist).
+    dest_conf_kind="$(dest_half_kind "$dest_conf")"
+    if [[ "$dest_conf_kind" != "absent" && "$dest_conf_kind" != "regular" ]]; then
+        import_refuse_nonregular conf "$dest_conf" "$dest_conf_kind"
+        bad=1
+    fi
+    if [[ "$check_al" == 1 ]]; then
+        dest_al_kind="$(dest_half_kind "$dest_al")"
+        if [[ "$dest_al_kind" != "absent" && "$dest_al_kind" != "regular" ]]; then
+            import_refuse_nonregular allowlist "$dest_al" "$dest_al_kind"
+            bad=1
+        fi
+    fi
+    if (( bad )); then
+        return 1
+    fi
+
+    [[ "$dest_conf_kind" == "regular" ]] && dest_conf_exists=1
+    [[ "$dest_al_kind" == "regular" ]] && dest_al_exists=1
     (( dest_conf_exists )) && cmp -s "$src_conf" "$dest_conf" && conf_same=1
     if [[ "$check_al" == 1 ]] && (( dest_al_exists )); then
         cmp -s "$src_al" "$dest_al" && al_same=1
@@ -1759,36 +2042,38 @@ import_pair() { # import_pair [expected-profile]
     if [[ "$import_force" == 0 ]]; then
         if [[ "$check_al" == 1 ]]; then
             if (( dest_conf_exists && dest_al_exists && conf_same && al_same )); then
+                validate_live_pair "$src_profile" "$check_al" "$src_conf" "$dest_conf" || return 1
                 echo "egresslock-setup: import: unchanged ($dest_conf and $dest_al already match)"
                 return 0
             fi
             if (( dest_conf_exists && ! dest_al_exists )); then
                 echo "egresslock-setup: import: refusing: destination pair is torn: present $dest_conf, missing $dest_al" >&2
-                echo "  fix: re-run with --force to replace the whole pair, or restore the missing half first" >&2
+                echo "  fix: re-run with --force to replace the whole pair (both halves must be regular files), or restore the missing half first" >&2
                 return 1
             fi
             if (( ! dest_conf_exists && dest_al_exists )); then
                 echo "egresslock-setup: import: refusing: destination pair is torn: missing $dest_conf, present $dest_al" >&2
-                echo "  fix: re-run with --force to replace the whole pair, or move the stray allowlist aside" >&2
+                echo "  fix: re-run with --force to replace the whole pair (both halves must be regular files), or move the stray allowlist aside" >&2
                 return 1
             fi
             if (( dest_conf_exists && ! conf_same )); then
                 echo "egresslock-setup: import: refusing: destination conf differs: $dest_conf" >&2
-                echo "  fix: re-run with --force to replace the whole pair, or move the destination pair aside" >&2
+                echo "  fix: re-run with --force to replace the whole pair (both destination halves must be regular files), or move the destination pair aside" >&2
                 return 1
             fi
             if (( dest_conf_exists && dest_al_exists && ! al_same )); then
                 echo "egresslock-setup: import: refusing: destination allowlist differs: $dest_al" >&2
-                echo "  fix: re-run with --force to replace the whole pair, or move the destination pair aside" >&2
+                echo "  fix: re-run with --force to replace the whole pair (both destination halves must be regular files), or move the destination pair aside" >&2
                 return 1
             fi
         elif (( dest_conf_exists )); then
             if (( conf_same )); then
+                validate_live_pair "$src_profile" "$check_al" "$src_conf" "$dest_conf" || return 1
                 echo "egresslock-setup: import: unchanged ($dest_conf already matches)"
                 return 0
             fi
             echo "egresslock-setup: import: refusing: destination conf differs: $dest_conf" >&2
-            echo "  fix: re-run with --force to replace it, or move the destination conf aside" >&2
+            echo "  fix: re-run with --force to replace it (the destination conf must be a regular file), or move the destination conf aside" >&2
             return 1
         fi
     fi
@@ -1813,52 +2098,87 @@ import_pair() { # import_pair [expected-profile]
     import_stage_al_name=""
     [[ "$check_al" == 1 ]] && import_stage_al_name="$al_name"
     if ! run_as_account bash -c "$import_stage_script"; then
-        rm -rf "$stage"
+        import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
         echo "egresslock-setup: import: could not stage the pair as $account" >&2
         return 1
     fi
 
-    if ! validate_staged_pair "$stage" "$src_profile" "$check_al"; then
-        rm -rf "$stage"
+    if ! validate_staged_pair "$stage" "$src_profile" "$check_al" "$src_conf" "$src_al"; then
+        import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
+        return 1
+    fi
+
+    # EGL-418-D3: re-classify immediately before commit. A non-forced run
+    # never overwrites a half it did not observe; a forced run replaces
+    # only regular files (a half that became non-regular is refused).
+    # Commit and restore use mv -T so a directory is refused, never
+    # absorbed.
+    bad=0
+    now_conf_kind="$(dest_half_kind "$dest_conf")"
+    if [[ "$import_force" == 1 ]]; then
+        if [[ "$now_conf_kind" != "absent" && "$now_conf_kind" != "regular" ]]; then
+            import_refuse_changed conf "$dest_conf" "$now_conf_kind"
+            bad=1
+        fi
+    elif [[ "$now_conf_kind" != "absent" ]]; then
+        import_refuse_appeared conf "$dest_conf"
+        bad=1
+    fi
+    if [[ "$check_al" == 1 ]]; then
+        now_al_kind="$(dest_half_kind "$dest_al")"
+        if [[ "$import_force" == 1 ]]; then
+            if [[ "$now_al_kind" != "absent" && "$now_al_kind" != "regular" ]]; then
+                import_refuse_changed allowlist "$dest_al" "$now_al_kind"
+                bad=1
+            fi
+        elif [[ "$now_al_kind" != "absent" ]]; then
+            import_refuse_appeared allowlist "$dest_al"
+            bad=1
+        fi
+    fi
+    if (( bad )); then
+        import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
         return 1
     fi
 
     # Commit: allowlist first, conf last. Back up existing halves so a
     # failed rename can restore the pre-run bytes (never a partial dest).
     backup="$(mktemp -d "$confdir/.import-backup.XXXXXX")" || {
-        rm -rf "$stage"
+        import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
         echo "egresslock-setup: import: cannot create a backup directory in $confdir" >&2
         return 1
     }
-    if [[ -e "$dest_conf" ]]; then
-        if mv -f "$dest_conf" "$backup/conf"; then
+    if [[ "$now_conf_kind" == "regular" ]]; then
+        if mv -T "$dest_conf" "$backup/conf"; then
             had_conf=1
         else
-            rm -rf "$backup" "$stage"
+            import_cleanup "$backup" unchanged conf allowlist
+            import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
             echo "egresslock-setup: import: could not set the destination conf aside; nothing changed" >&2
             return 1
         fi
     fi
-    if [[ "$check_al" == 1 && -e "$dest_al" ]]; then
-        if mv -f "$dest_al" "$backup/allowlist"; then
+    if [[ "$check_al" == 1 && "$now_al_kind" == "regular" ]]; then
+        if mv -T "$dest_al" "$backup/allowlist"; then
             had_al=1
         else
-            if (( had_conf )) && ! mv -f "$backup/conf" "$dest_conf"; then
-                rm -rf "$stage"
+            if (( had_conf )) && ! mv -T "$backup/conf" "$dest_conf"; then
+                import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
                 echo "egresslock-setup: import: could not restore $dest_conf; the pre-run bytes are preserved in $backup" >&2
                 echo "  fix: move $backup/conf back to $dest_conf" >&2
                 return 1
             fi
-            rm -rf "$backup" "$stage"
+            import_cleanup "$backup" unchanged conf allowlist
+            import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
             echo "egresslock-setup: import: could not set the destination allowlist aside; nothing changed" >&2
             return 1
         fi
     fi
     if [[ "$check_al" == 1 ]]; then
-        if mv -f "$stage/$al_name" "$dest_al"; then new_al=1; else rc=1; fi
+        if mv -T "$stage/$al_name" "$dest_al"; then new_al=1; else rc=1; fi
     fi
     if (( rc == 0 )); then
-        if mv -f "$stage/$src_profile.conf" "$dest_conf"; then new_conf=1; else rc=1; fi
+        if mv -T "$stage/$src_profile.conf" "$dest_conf"; then new_conf=1; else rc=1; fi
     fi
     if (( rc != 0 )); then
         # Remove only halves this run installed, then restore pre-run
@@ -1868,20 +2188,22 @@ import_pair() { # import_pair [expected-profile]
         # only remaining copy of the pre-run bytes).
         local restore_failed=0
         if (( new_conf )) && ! rm -f "$dest_conf"; then restore_failed=1; fi
-        if (( had_conf )) && ! mv -f "$backup/conf" "$dest_conf"; then restore_failed=1; fi
+        if (( had_conf )) && ! mv -T "$backup/conf" "$dest_conf"; then restore_failed=1; fi
         if (( new_al )) && ! rm -f "$dest_al"; then restore_failed=1; fi
-        if (( had_al )) && ! mv -f "$backup/allowlist" "$dest_al"; then restore_failed=1; fi
+        if (( had_al )) && ! mv -T "$backup/allowlist" "$dest_al"; then restore_failed=1; fi
         if (( restore_failed )); then
-            rm -rf "$stage"
+            import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
             echo "egresslock-setup: import: could not commit the pair, and automatic restore failed; pre-run bytes are preserved in $backup" >&2
             echo "  fix: restore the pre-run halves from $backup before retrying" >&2
             return 1
         fi
-        rm -rf "$backup" "$stage"
+        import_cleanup "$backup" unchanged conf allowlist
+        import_cleanup "$stage" unchanged "$src_profile.conf" "$al_name"
         echo "egresslock-setup: import: could not commit the pair; destination restored" >&2
         return 1
     fi
-    rm -rf "$backup" "$stage"
+    import_cleanup "$backup" installed conf allowlist
+    import_cleanup "$stage" installed "$src_profile.conf" "$al_name"
     if [[ "$check_al" == 1 ]]; then
         echo "egresslock-setup: import: installed allowlist $dest_al"
     fi
@@ -1896,10 +2218,9 @@ import_pair() { # import_pair [expected-profile]
 # ud, duid, conf_ok) stays aggregator-owned; helpers write those locals
 # directly (no namerefs, no new bash-version floor). Dynamic-scope
 # second-tier: e84_etc (kit_check_verify_units -> service/shadow rows),
-# e84_verify_execstart/e84_verify_target_bad (service row -> failed-row
-# emitter; EGL-345), systemctl_bin (units -> timer/gateway; call order
-# matters). R1/R3/R4/R5 comments ride the helper that carries their rows
-# (EGL-176 precedent).
+# e84_verify_target_bad (service row -> failed-row emitter; EGL-345),
+# systemctl_bin (units -> timer/gateway; call order matters). R1/R3/R4/R5
+# comments ride the helper that carries their rows (EGL-176 precedent).
 
 kit_check_engine() {
     local rc=0
@@ -2049,19 +2370,36 @@ kit_verify_service_cause() { # $1 ExecMainStatus, $2 Result
     esac
 }
 
+# EGL-346: the invoked account's named profile — --profile when set,
+# else the regex-validated EGRESSLOCK_PROFILE in the account's unit.env.
+# Empty for another account (host-sweep rows cannot know its mode), for
+# unnamed mode, and for the EGL-325 --conf display hint (strict named
+# mode only: a display hint never seeds a printed repair).
+# Call-order note: kit_check_verify_units runs before
+# doctor_resolve_account, so this reads unit.env itself; doctor_named_mode
+# is not set at emit time.
+kit_verify_named_profile() {
+    local e84_p_acct="$1" e84_p_prof=""
+    if [[ -n "$account" && "$account" == "$e84_p_acct" ]]; then
+        if [[ -n "${profile_name:-}" && "$profile_name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            e84_p_prof="$profile_name"
+        elif [[ -f "$confdir/unit.env" ]]; then
+            e84_p_prof="$(awk -F= '$1 == "EGRESSLOCK_PROFILE" { print $2; exit }' "$confdir/unit.env" 2>/dev/null || true)"
+            # EGL-380: 'all' is reserved — never render it as --profile.
+            if [[ "$e84_p_prof" == "all" || ! "$e84_p_prof" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+                e84_p_prof=""
+            fi
+        fi
+    fi
+    printf '%s' "$e84_p_prof"
+}
+
 # EGL-345: the re-arm command for <acct>'s timer. --profile is printed
 # only when named mode is known for the invoked account (the --profile
 # flag or unit.env); a host-sweep row cannot know another account's mode.
 kit_verify_rearm_fix() {
     local e84_r_acct="$1" e84_r_prof=""
-    if [[ -n "$account" && "$account" == "$e84_r_acct" ]]; then
-        if [[ -n "${profile_name:-}" && "$profile_name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-            e84_r_prof="$profile_name"
-        elif [[ -f "$confdir/unit.env" ]]; then
-            e84_r_prof="$(awk -F= '$1 == "EGRESSLOCK_PROFILE" { print $2; exit }' "$confdir/unit.env" 2>/dev/null || true)"
-            [[ "$e84_r_prof" =~ ^[a-z0-9][a-z0-9-]*$ ]] || e84_r_prof=""
-        fi
-    fi
+    e84_r_prof="$(kit_verify_named_profile "$e84_r_acct")"
     if [[ -n "$e84_r_prof" ]]; then
         printf 'sudo egresslock-setup init --account %s --profile %s --enable' "$e84_r_acct" "$e84_r_prof"
     else
@@ -2137,7 +2475,7 @@ kit_verify_next_line() {
 # failures only) -> remedy -> check, with the journal secondary only
 # where it can hold the cause. Read-only: remedies are printed, never run.
 kit_emit_verify_failed() {
-    local e84_e_unit="$1" e84_e_acct e84_e_tmr e84_e_status="" e84_e_result="" e84_e_why=""
+    local e84_e_unit="$1" e84_e_acct e84_e_tmr e84_e_status="" e84_e_result="" e84_e_why="" e84_e_prof=""
     e84_e_acct="${e84_e_unit#egresslock-verify@}"
     e84_e_acct="${e84_e_acct%.service}"
     e84_e_acct="${e84_e_acct%.timer}"
@@ -2217,43 +2555,63 @@ kit_emit_verify_failed() {
         armed)
             echo "PROBLEM: $e84_e_unit: FAILED — $e84_e_why"
             ;;
-        unknown)
-            # No is-enabled answer: the state is named as unknown, never
-            # asserted enabled or disabled (D1 / design item 7).
-            echo "PROBLEM: $e84_e_unit: FAILED — $e84_e_why; the timer's armed state could not be determined, so whether further checks are scheduled is unknown"
+        disabled|masked|static|not-found)
+            # EGL-356 (D2): the probe classified these as disarmed, so the
+            # row can say so.
+            echo "PROBLEM: $e84_e_unit: FAILED — $e84_e_why; the timer is not enabled, so no further checks are scheduled"
             ;;
         *)
-            echo "PROBLEM: $e84_e_unit: FAILED — $e84_e_why; the timer is not enabled, so no further checks are scheduled"
+            # EGL-356 (D2): unknown/indirect, or a raw is-enabled answer
+            # the probe did not classify — name the unknown, never assert
+            # disabled (D1 / design item 7).
+            echo "PROBLEM: $e84_e_unit: FAILED — $e84_e_why; the timer's armed state could not be determined, so whether further checks are scheduled is unknown"
             ;;
     esac
     kit_verify_last_line "$e84_e_unit"
     kit_verify_next_line
-    if [[ -n "${e84_verify_execstart:-}" ]]; then
-        echo "  fix: sudo -iu $e84_e_acct bash -c 'set -a; . ~/.config/egresslock/unit.env 2>/dev/null || true; set +a; exec $e84_verify_execstart'"
-    else
-        echo "  fix: run the verify program manually as $e84_e_acct with the unit environment (ExecStart not resolved; see: systemctl cat $e84_e_unit)"
+    # EGL-346: on an exit-1 run with a known named profile, the repair is
+    # an account-scoped re-ensure ahead of the re-run (the doctor is
+    # read-only; this is printed, never run).
+    if [[ "$e84_e_status" == "1" ]]; then
+        e84_e_prof="$(kit_verify_named_profile "$e84_e_acct")"
+        if [[ -n "$e84_e_prof" ]]; then
+            echo "  fix: sudo -iu $e84_e_acct -- egresslock ensure $e84_e_prof"
+        fi
     fi
+    # EGL-346: reset-failed first so a start-limit state cannot block the
+    # re-run; systemctl applies the unit's own User=/EnvironmentFile=, and
+    # the re-run's output lands in the service journal named below.
     echo "  fix: sudo systemctl reset-failed $e84_e_unit"
+    echo "  fix: sudo systemctl start $e84_e_unit"
     if [[ "$e84_armed_class" != "armed" ]]; then
         if [[ -n "${e84_failset[$e84_e_tmr]:-}" ]]; then
-            echo "  fix: re-arm the timer — see its FAILED row above for the exact command"
+            case "$e84_armed_class" in
+                disabled|masked|static|not-found)
+                    echo "  fix: re-arm the timer — see its FAILED row above for the exact command"
+                    ;;
+                *)
+                    # EGL-356 (D3): the failed unknown/raw timer row prints
+                    # clear + restart, not a re-arm command.
+                    echo "  fix: the timer is failed too — see its FAILED row above for the reset-failed and restart commands"
+                    ;;
+            esac
         else
             kit_verify_rearm_lines "$e84_e_acct"
         fi
     fi
     echo "  inspect: sudo journalctl -u $e84_e_unit -n 20"
-    echo "  note: an empty journal means the run's details were rotated out; the manual re-run above still reproduces the failure"
+    echo "  note: an empty journal means earlier details were rotated out; the systemctl start above writes fresh output there"
     echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
     return 0
 }
 
 kit_check_verify_service() {
     local rc=0
-    local e84_frag e84_deb e84_es e84_shadow_dir e84_shadow_tmr e84_shadow_rm e84_deb_libdir e84_es_path
-    # EGL-345: shared state for the failed-row emitter — the resolved
-    # ExecStart (manual re-run) and whether the ExecStart target row
-    # fired (203 rows it already explains downgrade to a NOTE).
-    e84_verify_execstart=""
+    local e84_frag e84_deb e84_es e84_shadow_dir e84_shadow_tmr e84_shadow_rm
+    local e84_deb_libdir e84_es_path e84_verify_execstart=""
+    # EGL-345: shared state for the failed-row emitter — whether the
+    # ExecStart target row fired (203 rows it already explains downgrade
+    # to a NOTE).
     e84_verify_target_bad=0
     # 1. Which unit file does systemd ACTUALLY load? (the account
     #    instance when set — systemd resolves it to the template —
@@ -2441,10 +2799,11 @@ kit_check_verify_units() {
     # the deb's unit, ExecStart pointing at an uninstalled prefix,
     # dangling wants symlinks). Read-only: show/is-failed/list-units
     # only — never start/stop/reset-failed/enable (doctor is a drift
-    # signal, not auto-fix). systemctl hook (EGRESSLOCK_SYSTEMCTL, unset
-    # = production systemctl); no usable systemctl → named skip,
-    # rc-neutral (D5).
-    systemctl_bin="${EGRESSLOCK_SYSTEMCTL:-systemctl}"
+    # signal, not auto-fix). systemctl hook (EGRESSLOCK_SYSTEMCTL,
+    # honored only in test mode; unset = production systemctl); no
+    # usable systemctl → named skip, rc-neutral (D5).
+    systemctl_bin="systemctl"
+    kit_test_mode && systemctl_bin="${EGRESSLOCK_SYSTEMCTL:-$systemctl_bin}"
     if ! command -v "$systemctl_bin" >/dev/null 2>&1; then
         echo "NOTE: verify units: skipped (systemctl not found)"
     else
@@ -2468,7 +2827,8 @@ kit_check_verify_units() {
 kit_verify_accounts() {
     local e84_row e84_tok e84_acct
     local -a e84_accts=()
-    local e84_sctl="${EGRESSLOCK_SYSTEMCTL:-systemctl}"
+    local e84_sctl="systemctl"
+    kit_test_mode && e84_sctl="${EGRESSLOCK_SYSTEMCTL:-$e84_sctl}"
     command -v "$e84_sctl" >/dev/null 2>&1 || return 1
     while IFS= read -r e84_row; do
         [[ "$e84_row" == *not-found* ]] && continue
@@ -2495,7 +2855,8 @@ kit_check_accounts() {
     local -a e84_acs=()
     local -A e84_fs=()
     local e84_a e84_row e84_tok e84_noun
-    local e84_sctl="${EGRESSLOCK_SYSTEMCTL:-systemctl}"
+    local e84_sctl="systemctl"
+    kit_test_mode && e84_sctl="${EGRESSLOCK_SYSTEMCTL:-$e84_sctl}"
     local e84_n e84_f e84_join
     [[ -n "$account" ]] && return 0
     command -v "$e84_sctl" >/dev/null 2>&1 || return 0
@@ -2553,9 +2914,11 @@ doctor_resolve_account() {
     doctor_named_mode=0
     if [[ -f "$ue" ]]; then
         raw="$(awk -F= '$1 == "EGRESSLOCK_PROFILE" { print $2; exit }' "$ue" 2>/dev/null || true)"
-        if [[ -n "$raw" && "$raw" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        if [[ -n "$raw" && "$raw" != "all" && "$raw" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
             doctor_unit_env_profile="$raw"
         elif [[ -n "$raw" ]]; then
+            # EGL-380: 'all' is reported by the reserved row, not joined
+            # into a path and never offered as --profile.
             doctor_invalid_env_profile="$raw"
         fi
     fi
@@ -2570,7 +2933,7 @@ doctor_resolve_account() {
         doctor_named_mode=1
     elif [[ -n "$conf" && -f "$conf" ]]; then
         hint="$(awk '$1 == "profile" { print $2; exit }' "$conf" 2>/dev/null || true)"
-        if [[ "$hint" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        if [[ "$hint" =~ ^[a-z0-9][a-z0-9-]*$ && "$hint" != "all" ]]; then
             profile_name="$hint"
         fi
     fi
@@ -2668,7 +3031,11 @@ kit_check_unit_env() {
         echo "  fix: install the pair with: sudo egresslock-setup import --account $account --from <path>"
         rc=1
     elif [[ -n "$doctor_invalid_env_profile" && -z "$doctor_requested_profile" ]]; then
-        echo "PROBLEM: unit.env: invalid EGRESSLOCK_PROFILE '$doctor_invalid_env_profile' (expected [a-z0-9][a-z0-9-]*; see $ue)"
+        if [[ "$doctor_invalid_env_profile" == "all" ]]; then
+            echo "PROBLEM: unit.env: EGRESSLOCK_PROFILE 'all' is reserved ('teardown all' names the main profile); rename this profile and its conf file (see $ue)"
+        else
+            echo "PROBLEM: unit.env: invalid EGRESSLOCK_PROFILE '$doctor_invalid_env_profile' (expected [a-z0-9][a-z0-9-]*; see $ue)"
+        fi
         echo "  fix: $(doctor_init_fix)"
         rc=1
     elif [[ -n "$doctor_requested_profile" ]] && ! grep -qx "EGRESSLOCK_PROFILE=$doctor_requested_profile" "$ue"; then

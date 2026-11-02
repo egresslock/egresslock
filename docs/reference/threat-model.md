@@ -168,7 +168,14 @@ What the kit's claims rest on:
   `~/.config/egresslock/`: whoever controls those controls the policy;
 - root-owned `/opt/egresslock` as **tool integrity** only — it stops a
   workload from rewriting the kit, but it is not a policy boundary: the
-  policy is what the conf says, not where the script lives.
+  policy is what the conf says, not where the script lives;
+- the kernel's pathname resolution for the kit's own fail-closed path
+  checks: when a decision depends on what a path leads to, the kernel
+  decides it (`stat(2)` via `test -d`/`-ef`), not a host utility's
+  interpretation; `realpath` only produces the canonical path
+  `proxy-env --out` writes and prints, and a disagreement refuses
+  before writing (a legitimate host-tool difference, not a hostile
+  PATH — A5);
 
 Convenience-only, **not** trusted: the `HTTP_PROXY`/`HTTPS_PROXY`
 environment the operator wires into workloads. Removing it does not
@@ -236,6 +243,13 @@ Operator obligations the kit does not enforce:
   carries a genuine profile-subnet address on one leg, so every layer
   keys it as an ordinary workload of that profile. The kit does not
   reject these launch modes — they are operator obligations.
+
+- **keep the host OS and kernel security-patched.** Every container —
+  workload, gateway, and anchor — runs on the **host's kernel**, which
+  is part of the trusted computing base above; a host may be a
+  physical machine or a VM. egresslock enforces egress *inside* the
+  host and cannot patch the host's OS or kernel;
+  vulnerabilities in either are outside its control.
 
 ## Invariants
 
@@ -315,7 +329,7 @@ attacks table or an explicit non-goal.
   (operator-intentional, nft-direct). A hostile container on the
   profile network can answer the rebind at L2 (ARP/proxy-MITM,
   demonstrated end-to-end). LAN hosts the operator meant
-  to allow directly stay on `allow-host`; `disallow` closes the hole.
+  to allow directly stay on the direct path; `disallow` closes the hole.
 - **Profile rules are source-scoped; cap-drop is what makes them bite
   (T9 neighbor):** the profile chain matches `ip saddr <profile subnet>`
   over a base accept policy. The probe's controls confirmed the drop
@@ -390,7 +404,7 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T15 | Another account's `podman network ls` | cannot see this account's nets | empty / other store | design-intent |
 | T16 | Engine run as root | refuse | error; root's store unused | design-intent |
 | T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach: cloud metadata (`169.254.169.254`) is **not delivered** on this pasta (in-lab mitigation: connection times out); hosts-file rebind is **not injectable** from the gateway (non-root gateway; Squid resolves via internal DNS, not the hosts file); LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, nft-direct, not the name-rebind path. The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. The same name-at-request-time semantics cover **gateway-tunneled non-HTTP** (e.g. SSH via a client `ProxyCommand` CONNECT — optional recipe, docs only): the SSH host-key check remains the mitigation for SSH, and `denied` does see **denied** CONNECT-tunneled traffic (an allowed tunnel shows in the gateway access.log as `TCP_TUNNEL/200`). | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
-| T18 | Literal `http://127.0.0.1` (or other IPv4 URL) via proxy | Squid 403 (dstdomain is names). `allow` of an IPv4 literal is rejected. Use `allow-host` for addresses. | 403; `allow` exit 2 | lab-verified (unlisted literals); grammar: literals rejected. Since 0.5.0: 403 holds **including when the IP's PTR equals an allowlisted name** (generated dstdomain ACLs carry `-n`) |
+| T18 | Literal `http://127.0.0.1` (or other IPv4 URL) via proxy | Squid 403 (dstdomain is names). `allow` of an IPv4 literal is rejected. Use `allow <profile> <ip>:<port> --direct` for addresses. | 403; `allow` exit 2 | lab-verified (unlisted literals); grammar: literals rejected. Since 0.5.0: 403 holds **including when the IP's PTR equals an allowlisted name** (generated dstdomain ACLs carry `-n`) |
 
 Rows read as "what should happen", not a pentest report:
 `design-intent` rows are untested; `open-by-design` rows are gaps the

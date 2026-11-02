@@ -123,9 +123,8 @@ though the rebuilt image is in the store and the doctor's `stale:` has
 cleared, which compares the image, not the running containers. Walk
 the account's profile configs for their `gateway <ip> <port>
 <allowlist>` lines — the directive is defined in the
-[policy reference](policy-reference.md), and a profile whose conf
-carries no `gateway` line is not a gateway profile — and replace each
-gateway profile in turn.
+[policy reference](policy-reference.md) — and replace each profile's
+gateway in turn.
 
 A rebuilt image lives in **one account's store**. Build again in each
 other account's shell and replace that account's gateway profiles —

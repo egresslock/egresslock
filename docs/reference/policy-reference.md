@@ -12,7 +12,7 @@ and which mechanism allows which destination?"** The practical
 [Concepts](#concepts) · [Runtime and verification](#runtime-and-verification) ·
 [Account ownership](#account-ownership) · [File names (the convention)](#file-names-the-convention) ·
 [Rules to keep straight](#rules-to-keep-straight) · [Profile lifecycle](#profile-lifecycle) ·
-[The allowlist file](#the-allowlist-file) · [`allow-host` in detail](#allow-host-in-detail)
+[The allowlist file](#the-allowlist-file) · [Direct rules in detail](#direct-rules-in-detail)
 
 ## Destination → mechanism decision table
 
@@ -20,11 +20,11 @@ and which mechanism allows which destination?"** The practical
 |---|---|---|---|
 | domain, HTTP(S), standard port | Squid allowlist | `allow main example.com` (bare = 443 group) | Squid resolves at request time — no pin drift; apt/wget/git/pip read only the LOWERCASE proxy vars |
 | domain, HTTP(S), non-standard port | Squid allowlist, explicit port | `allow main example.com:8443` | becomes its own per-port dstdomain group; a plain-HTTP GET denial needs an explicit `:80` entry (a bare 443 entry does NOT cover port 80) |
-| domain, non-HTTP protocol (ssh, git-over-SSH, rsync) | nft allow-host (direct) | `allow-host main git.example.test:2222` | bypasses the gateway; ssh ignores HTTP(S)_PROXY so no no-proxy needed; pins the host's A set at `ensure` (up to the first 16 sorted distinct addresses; a larger answer truncates with a named stderr note) — drift only if a member address appears/disappears (T13); a name that serves one rotating A per query (`github.com` SSH) can never be pinned stably — see [`allow-host` in detail](#allow-host-in-detail) |
-| IPv4 literal, any port/protocol | nft allow-host (direct) | `allow-host main 192.0.2.24:11434` | literals are REJECTED by `allow`; never drifts; `proxy-env` unions the pin into NO_PROXY — check `proxy-env main noproxy`, and **recreate** the workload; see [allow-non-http](../quickstart/allow-non-http.md) |
+| domain, non-HTTP protocol (ssh, git-over-SSH, rsync) | nft allow-host (direct) | `allow main git.example.test:2222 --direct` | bypasses the gateway; ssh ignores HTTP(S)_PROXY so no no-proxy needed; pins the host's A set at `ensure` (up to the first 16 sorted distinct addresses; a larger answer truncates with a named stderr note) — drift only if a member address appears/disappears (T13); a name that serves one rotating A per query (`github.com` SSH) can never be pinned stably — see [Direct rules in detail](#direct-rules-in-detail) |
+| IPv4 literal, any port/protocol | nft allow-host (direct) | `allow main 192.0.2.24:11434 --direct` | literals are REJECTED on the proxy path and accepted here (the proxy-path error names this retry); never drifts; `proxy-env` unions the pin into NO_PROXY — check `proxy-env main noproxy`, and **recreate** the workload; see [allow-non-http](../quickstart/allow-non-http.md) |
 | HTTP(S) service on the SAME host | Squid allowlist | `allow main host.containers.internal:8000` | proxied; the gateway resolves the podman-injected name; the host's LAN IP itself can never work (pasta hairpin — [paths-and-signatures](paths-and-signatures.md); fix: [cannot-reach-host-service](../troubleshooting/cannot-reach-host-service.md)) |
-| non-HTTP service on the SAME host | nft allow-host, IP literal | `allow-host main 169.254.1.2:8000` | `169.254.1.2` is pasta's host address (podman map-guest-addr); the NAME cannot be pinned — [paths-and-signatures](paths-and-signatures.md); fix: [cannot-reach-host-service](../troubleshooting/cannot-reach-host-service.md) |
-| domain that must NOT go through the proxy | nft allow-host + `no-proxy` | `allow-host` + `no-proxy <host>` in the conf | for gateway profiles whose clients honor proxy env |
+| non-HTTP service on the SAME host | nft allow-host, IP literal | `allow main 169.254.1.2:8000 --direct` | `169.254.1.2` is pasta's host address (podman map-guest-addr); the NAME cannot be pinned — [paths-and-signatures](paths-and-signatures.md); fix: [cannot-reach-host-service](../troubleshooting/cannot-reach-host-service.md) |
+| domain that must NOT go through the proxy | nft allow-host + `no-proxy` | `allow … --direct` + `no-proxy <host>` in the conf | for gateway profiles whose clients honor proxy env |
 | IP/CIDR range | not yet supported | — | (planned: conf rule, nft-only — dstdomain cannot express CIDRs) |
 
 ## Profile conf
@@ -34,14 +34,19 @@ Each profile is a `<profile>.conf` + `<profile>-allowlist` pair under
 [Profile lifecycle](#profile-lifecycle)). `#`
 comments and blank lines are ignored; any unparseable or contradictory
 content fails closed with exit 2. Host fields may use `${VAR}` /
-`${VAR:-default}` (parsed manually, never eval'd).
+`${VAR:-default}` (parsed manually, never eval'd); the value comes from
+the environment `egresslock` was started with, and a `${VAR}` with no
+default that is unset or empty there fails the load. An exported name
+takes its exported value, even when it collides with an engine variable;
+an unexported name takes its `:-default`, or fails the load when it has
+none.
 
 | Directive | Meaning |
 |---|---|
-| `profile <name> <cidr>` | starts the profile block; IPv4 CIDR, prefixlen 8-29, canonical network address; exactly one `profile` block per conf file — a second is rejected at load (exit 2) |
+| `profile <name> <cidr>` | starts the profile block. `<cidr>` is the private subnet for the profile's own bridge network (`egresslock-<name>`) — the range its containers get addresses from; it is internal plumbing, not a LAN or an access grant (egress is controlled by the rules and allowlist). IPv4 CIDR, prefixlen 8-29, canonical network address. Exactly one `profile` block per conf file — a second is rejected at load (exit 2). The name `all` is reserved — see [Reserved profile name](#reserved-profile-name) |
 | `rule allow-host <host>:<port>` | direct host:port allow (repeatable; resolved at ensure time) |
-| `rule gateway-only` | egress only through the profile's gateway (requires a `gateway` directive) |
-| `gateway <ip> <port> <file>` | static gateway IP inside the subnet + Squid port + allowlist file (conf-relative unless absolute) |
+| `rule gateway-only` | egress only through the profile's gateway |
+| `gateway <ip> <port> <file>` | **required in every profile**: static gateway IP inside the subnet + Squid port + the co-located allowlist, which the line must name exactly `<profile>-allowlist`. Any other basename, an absolute path, or a path with a directory component is rejected at load (exit 2, naming the line and the expected file), so the line can never name another profile's file. A symlink or hardlink placed at `<profile>-allowlist` inside the account's own confdir is an explicit operator act and is not detected. A profile without a `gateway` directive is rejected at load (exit 2) — there is no direct-only profile mode |
 | `no-proxy <host,...>` | extra NO_PROXY entries (hosts the profile may reach directly) |
 | `read-timeout <seconds>` | gateway profiles: Squid `read_timeout` override, positive integer seconds (default 900 — Squid's stock 15 minutes). Raise it for long silent non-streaming calls (LLM completions); lower it for CI-style tight failure timing. The generated gateway config always carries the explicit `read_timeout <N> seconds` line. See [troubleshooting: long request dies at exactly 15m00](../troubleshooting/long-request-15m.md) |
 
@@ -49,30 +54,41 @@ content fails closed with exit 2. Host fields may use `${VAR}` /
 
 | Concept | What it is | Per profile? |
 |---|---|---|
-| profile | a class in a config file: subnet + rules (+ optional gateway) | one conf block |
+| profile | a class in a config file: subnet + rules + gateway | one conf block |
 | conf file | the declarative config; exactly one profile per file | one file per profile: `~/.config/egresslock/<name>.conf` |
-| allowlist file | the gateway's allowed destinations (`dstdomain`) | one per gateway profile |
+| allowlist file | the gateway's allowed destinations (`dstdomain`) | one per profile |
 | Podman network | `egresslock-<profile>` | created by `ensure` |
 | anchor | `egresslock-anchor-<profile>` keeps the netns/policy alive | created by `ensure` |
-| gateway | `egresslock-gateway-<profile>` Squid container (gateway profiles); explicit direct-access rules use a separate path | created by `ensure` |
+| gateway | `egresslock-gateway-<profile>` Squid container; explicit direct-access rules use a separate path | created by `ensure` |
 | verify | compares the live nftables policy with the expected profile rules | run per profile or by the verify timer |
 
 ## Runtime and verification
 
 `ensure <profile>` creates or validates the profile network, starts the
-anchor, starts or refreshes the gateway when configured, installs the
+anchor, starts or refreshes the gateway, installs the
 nftables policy, and verifies the result before a workload should start. The
 anchor keeps the account's rootless network namespace and policy alive between
 workloads.
 
 `ensure` on an already-converged profile is **non-disruptive**: healthy
 containers are kept and no session is severed. Converged means the anchor is
-running, the gateway is running and answers its probe, and the newly
-generated gateway config and allowlist files are byte-identical to what is
-deployed — such an ensure skips the restart (the ready line says `already
-converged, not restarted`). The nftables policy refresh (atomic;
+running, the gateway is running and answers its probe, the newly generated
+gateway config and allowlist files are byte-identical to what is deployed,
+and a durable activation record (`.egresslock-activated`) shows that the
+current gateway instance started with and loaded that exact deployed config.
+The record is written only after the restart, the health probe, a read-back
+of the deployed bytes and a PID 1 argument check; byte equality alone is not
+proof of the live ACL. A missing, stale or mismatched record takes the apply
+path, so the first `ensure` after an upgrade, a reboot or a crash restarts
+that gateway once to record the new instance. A converged ensure skips the
+restart (the ready line says `already converged, not restarted`). The
+deployed allowlist groups are content-addressed and immutable, and the
+single `squid.conf` rename publishes them; unreferenced old group files and
+private stage directories are removed only after verification and a grace
+window (default 3600 s), never a deployed reference, `allowlist.conf` or the
+activation record. The nftables policy refresh (atomic;
 established/related keeps direct flows) and DNS-pin healing still run on
-every ensure; those never sever sessions. `disallow-host` is the exception:
+every ensure; those never sever sessions. `disallow --direct` is the exception:
 it ends every revoked flow it can observe, and proves it — old DNS
 addresses, the peer-direction conntrack entry, and half-closed or
 still-starting flows — keeps connections another remaining rule still
@@ -83,10 +99,10 @@ only after the check runs is invisible to the check — in that sub-second
 window one flow can still finish behind a green `removed:`. Revocation is
 the documented kill-switch, the opposite intent of a refresh. A
 manual
-conf edit that removes an allow-host followed by `ensure`
+conf edit that removes a direct rule followed by `ensure`
 is a policy refresh, not the kill-switch: it does not flush conntrack, so
 any established flow to the address that rule had installed persists until
-it expires naturally or until a later `disallow-host` on that port ends
+it expires naturally or until a later `disallow --direct` on that port ends
 it. An unhealthy container or a genuinely changed config takes the replace/restart
 path as before — `ensure` remains the crash-recovery command.
 
@@ -124,19 +140,58 @@ assumptions and limits are in the
 Each profile is a **`<profile>.conf` + `<profile>-allowlist`** pair next
 to each other under `~/.config/egresslock/` — e.g. `main.conf` +
 `main-allowlist`, `dev.conf` + `dev-allowlist`. The `gateway`
-directive's file argument is that allowlist (conf-relative), so the
-pair must stay siblings with the same base name. Do **not** invent
-`*-profile.conf` names — the `<profile>.conf` + `<profile>-allowlist`
-pairing is the convention. (The gateway container's runtime
-file `/etc/squid/agent/allowlist.conf` is a generated engine-side
-artifact inside the container, not one of these profile pairs —
-different directory, never user-edited.)
+directive's file argument must be exactly `<profile>-allowlist`: the
+parser refuses any other basename, an absolute path, or a path with a
+directory component (exit 2, naming the conf line and the expected
+file), so a gateway line can never name another profile's file. A
+symlink or hardlink placed at `<profile>-allowlist` inside the
+account's own confdir is an explicit operator act and is not detected.
+Do **not** invent `*-profile.conf` names — the `<profile>.conf` +
+`<profile>-allowlist` pairing is the convention. (The gateway container's runtime
+file `/etc/squid/egresslock/allowlist.conf` — still
+`/etc/squid/agent/allowlist.conf` on a gateway not yet replaced from
+an older image — is the image's empty bootstrap allowlist (the active
+allowlist is the content-addressed group files the generated
+`squid.conf` references), not one of these profile pairs — different
+directory, never user-edited.)
 
 A conf file holds exactly one `profile` block. A conf with a second
 `profile` block is rejected when it loads (exit 2, naming the file, the
 line, and the profile already defined); if you keep several profiles in
 one conf, split each `profile` block into its own `<profile>.conf` file
 in `~/.config/egresslock/`. The engine reads that fixed path directly.
+
+**Migrating an older hand-written pair:** the refusal happens while the
+conf loads, so it leaves an already-running gateway and its current
+grants in place — and blocks `disallow <profile>` until the conf is
+migrated. To stop enforcement urgently without a loadable conf,
+`egresslock teardown --runtime` sweeps the kit containers, networks,
+and firewall table by name. That sweep is best-effort: it can skip a
+failed listing, leave an object it could not remove, and still exit 0
+(its `no kit runtime` summary alone is not proof), so confirm the
+account is clean afterwards (`podman ps -a`, `podman network ls`, and
+the nft-table check in [Checking everything](check-everything.md)).
+Stop automation and workloads first, because it also removes
+enforcement for every other profile.
+
+1. Compare the file the current `gateway` line names with
+   `~/.config/egresslock/<profile>-allowlist` (if it exists): read both
+   before changing either.
+2. Copy the entries you intend into
+   `~/.config/egresslock/<profile>-allowlist` (create it 0600). Leave
+   the named file where it is — never move or overwrite it. If it is
+   another profile's, outside the confdir, or still named by another
+   conf, moving it would break that other profile or the external
+   owner.
+3. If `<profile>-allowlist` already exists, merge the intended entries
+   into it instead of replacing it.
+4. Edit the `gateway` line to name `<profile>-allowlist`, then re-run
+   `egresslock list` and `egresslock ensure <profile>`.
+
+There is no auto-rename and no silent fallback. Until it is migrated,
+every load of that conf fails closed (exit 2) — including `list` and
+`verify --ensured`, so one legacy conf breaks the account-wide
+aggregate, not only `ensure`/the timer.
 
 ## Rules to keep straight
 
@@ -146,8 +201,10 @@ in `~/.config/egresslock/`. The engine reads that fixed path directly.
 - **Gateway IP must be inside the subnet's usable range**: not the
   network address, not the bridge gateway (first usable = `.1`), not
   the anchor (last usable). `.2` is valid for a `/24`.
-- **Each gateway profile needs its own allowlist file** (referenced
-  from its `gateway` directive).
+- **Each profile needs its own allowlist file** — its `gateway`
+  directive must name exactly `<profile>-allowlist`, the sibling of the
+  conf. Another profile's file, an absolute path, or a path component
+  is refused at load.
 - **Run every command as the account** (`sudo -iu <account>`), never
   root.
 - **Commands that change a profile serialize.** `ensure`, the four
@@ -169,11 +226,46 @@ in `~/.config/egresslock/`. The engine reads that fixed path directly.
   scans the default folder).
 - `teardown <profile>` stops the anchor (and gateway) and removes the
   network; `teardown all` only ever touches `main.conf`, never sibling
-  confs.
+  confs. While a legacy `all.conf` exists, `teardown all` refuses
+  (exit 2) instead of reading `main.conf` — see
+  [Reserved profile name](#reserved-profile-name).
 - `teardown --runtime` is the no-conf recovery sweep: it
   name-scans this store for kit containers and networks
-  (`egresslock-*`) and removes them — for leftovers whose conf is
-  already gone. `all` stays main.conf-only.
+  (`egresslock-*`) and removes what it can — best-effort, so
+  confirm the store is clean (see
+  [Checking everything](check-everything.md)). `all` stays
+  main.conf-only.
+
+### Reserved profile name
+
+`all` is not a profile name. Every name boundary refuses it: `init`,
+named commands (`ensure`, `verify`, `network`, `rules`, `allow`,
+`disallow`, …), the config loader, and `egresslock-setup --profile`
+exit 2 with a named `reserved` error before a conf is read or a file
+is written. `egresslock-setup import` refuses a source whose `profile`
+line names `all` with exit 1, before any destination write. `main` and
+every other `[a-z0-9][a-z0-9-]*` name are unchanged.
+
+A profile named `all` written by an earlier release is not
+auto-healed: its `all.conf` fails to load (so `list` and
+`verify --ensured` fail closed), and `teardown all` refuses while
+`all.conf` exists instead of tearing down `main` on your behalf. To
+migrate:
+
+1. Rename `~/.config/egresslock/all.conf` and its allowlist to a valid
+   name, and update the `profile` line inside the conf; rename
+   `all.pins` too if present. Update the `gateway` line's allowlist
+   basename to match.
+2. If the old profile was ever ensured, its runtime objects keep the
+   reserved name: `egresslock-all` (network),
+   `egresslock-anchor-all`, and `egresslock-gateway-all`. Remove them
+   with the account-wide `egresslock teardown --runtime` (the only kit
+   name sweep), or delete those Podman objects by hand; the sweep is
+   best-effort, so confirm nothing remains.
+3. `egresslock ensure <new-name>`.
+
+After `all.conf` is gone, `teardown all` keeps its main.conf-only
+meaning; `teardown main` is the explicit equivalent.
 
 ### Create a profile
 
@@ -193,9 +285,12 @@ fifth. Normal install already created `main`.
 
 #### The steps
 
-1. **Write the starter pair** — `init` auto-picks a free /24 and
-   writes an empty allowlist (denies application connections; DNS
-   to the bridge resolver is still allowed):
+1. **Write the starter pair** — `init` writes the profile's config
+   and an empty allowlist (denies application connections; DNS to the
+   bridge resolver is still allowed). It auto-picks a free /24 for
+   the profile's own bridge network; pass `--subnet` only to avoid a
+   range the host already uses or to keep a stable per-profile range —
+   it does not change what the profile can reach:
 
    ```sh
    # the host, account shell: sudo -iu egl-runner
@@ -291,12 +386,13 @@ fifth. Normal install already created `main`.
 
    `--env-file="$(egresslock proxy-env dev --out)"` injects
    the profile's six proxy vars in one go (what they are and why
-   there are six: [proxy-clients](proxy-clients.md); `--out` writes
-   the env file mode 0600 under your private runtime dir and prints
-   its path; an explicit `--out=<path>` elsewhere is refused if its
-   directory is world-writable — a directory your group can also
-   write to is accepted for now — the runtime-dir default always
-   qualifies).
+   there are six: [proxy-clients](proxy-clients.md)). The bare
+   `--out` is the recommended form: it writes the env file mode 0600
+   under your private runtime dir and prints its path. Use
+   `--out=<path>` only as a backup when you need the file at a
+   specific location; its directory must be writable only by your
+   account (a group- or world-writable directory is refused),
+   otherwise pass them to `podman run` with `--env KEY=value`.
    </details>
 
 #### What you should have
@@ -373,13 +469,24 @@ runtime half; archiving the files is a filesystem step:
 
 ## The allowlist file
 
-The `gateway` directive names the profile's allowlist file
-(conf-relative unless absolute). One `host[:port]` per line, matched by
+The `gateway` directive names the profile's allowlist file: exactly
+`<profile>-allowlist`, the conf's co-located sibling. One `host[:port]`
+per line, matched by
 Squid `dstdomain`; entries without a port form the 443 group, `host:port`
-entries get their own port group. Entries are **hostnames only** — a
-literal IPv4 is rejected by `allow`/`disallow` and fails `ensure` closed
-(use `allow-host` for address pins). Missing or invalid allowlists fail
-`ensure` closed.
+entries get their own port group. This file is the PROXY path: read it
+with `egresslock allowlist <profile>`, which renders the configured
+entries one per line in file order (comments and blank lines are not
+shown; an explicit `:443` and the entered spelling are preserved). An
+empty file prints a header with `0 proxy entries`; an invalid entry
+fails the command closed and names the line. The direct path's
+configured `rule allow-host` entries are a separate view — see
+[Direct rules in detail](#direct-rules-in-detail).
+
+Entries are **hostnames only** — a literal IPv4 is rejected by
+`allow`/`disallow` and fails `ensure` closed (use `allow … --direct`
+for address pins). Missing or invalid allowlists fail `ensure` closed;
+`egresslock-setup import`/`init` also refuse a pair with an invalid
+entry before commit (rc 1, the engine error names the entry).
 
 Entries are **bare names** — a trailing dot (`name.`) is rejected by
 `allow`/`disallow` and fails `ensure` closed: the gateway's `dstdomain`
@@ -391,20 +498,34 @@ does not need to carry one.
 A numeric-host (IP-literal) CONNECT/GET through the proxy is denied even
 when a PTR of that IP equals an allowlisted name: the generated
 `dstdomain` ACLs carry `-n` (no reverse-DNS adoption), so the name
-contract is exactly the allowlist. Address pins stay `allow-host`.
+contract is exactly the allowlist. Address pins stay on the direct path.
 
 A changed allowlist is applied by restarting the gateway, so the
 profile's proxied sessions drop briefly — including other containers'
 sessions on the same profile network.
 
-## `allow-host` in detail
+## Direct rules in detail
 
-`allow-host` compiles to a direct `ip daddr <ip> tcp dport <port>
-accept` rule enforced independently of the HTTP gateway.
+The direct path (`egresslock allow <profile> <host:port> --direct`)
+compiles to a direct `ip daddr <ip> tcp dport <port> accept` rule
+enforced independently of the HTTP gateway.
 
-- **Hostname or IPv4 literal** — `allow-host` accepts a hostname or a
-  literal IPv4 address (`host:port` always required). CIDR ranges are
-  not accepted here (a whole-subnet allow is not expressible yet).
+- **Inventory** — `egresslock allowlist <profile> --direct` lists the
+  configured entries (one `host:port` per `rule allow-host` line, conf
+  order), without resolving names and without reading the pin record;
+  `egresslock allowlist-direct <profile>` is the shortcut. This is the
+  configured-entry view, not a witness of what is installed. Both views
+  share the header shape:
+  `profile '<name>' — <N> <lane> entries from the <source> (<resolution>)`;
+  a profile with no direct entries prints `0 direct entries` and no
+  rows. To see the
+  compiled accept rules, use `egresslock rules <profile>` (it
+  re-resolves names fresh and fails closed if one no longer resolves);
+  the pin record remains the ensure-time witness.
+- **Hostname or IPv4 literal** — `allow … --direct` accepts a hostname
+  or a literal IPv4 address (`host:port` always required; there is no
+  default direct port). CIDR ranges are not accepted here (a
+  whole-subnet allow is not expressible yet).
 - **DNS drift** — the rule pins the host's A record set at
   `ensure` time (deduplicated, sorted; one accept per address; at most
   the first 16 distinct addresses — `DNS_SET_MAX` — with a named
@@ -420,7 +541,7 @@ accept` rule enforced independently of the HTTP gateway.
   case) goes stale as soon as the answer moves on: a cycle that
   resolves another member fires `drift:`, and only the pinned member
   is reachable — accepted risk T13. The replacements are the
-  literal pool (one `allow-host` line per observed member — never
+  literal pool (one `rule allow-host` line per observed member — never
   drifts) or the gateway name path when the client can tunnel
   ([Rotating names](rotating-names.md)).
 - **Tamper detection** — `ensure` records every installed pin address in
@@ -429,7 +550,7 @@ accept` rule enforced independently of the HTTP gateway.
   on divergence — an in-place chain edit cannot adopt its own addresses
   as the expected values. A missing record fails closed with a re-ensure
   hint (upgrade path: run `ensure` once after upgrading).
-- **Revocation** — `disallow-host <profile> <host:port>` is the
+- **Revocation** — `disallow <profile> <host:port> --direct` is the
   kill-switch: it removes the conf line, re-ensures (atomic ruleset
   swap), then ends every revoked flow it can observe, and proves it — old
   DNS addresses, the peer-direction conntrack entry, and half-closed or
@@ -440,20 +561,20 @@ accept` rule enforced independently of the HTTP gateway.
   in conntrack only after the check runs is invisible to the check — in
   that sub-second window one flow can still finish behind a green
   `removed:`.
-  A `disallow-host` that cannot prove severance
+  A `disallow --direct` that cannot prove severance
   fails loudly with the state disclosed, and it requires the `conntrack`
   tool. When the profile's installed firewall rules cannot be read, or
   no longer match its pin record (a tampered or drifted profile),
-  `disallow-host` refuses before anything changes (exit code 1, nothing
+  `disallow --direct` refuses before anything changes (exit code 1, nothing
   removed): run `egresslock ensure <profile>`, then retry the command.
-  That healing `ensure` re-resolves and re-installs every `allow-host`
+  That healing `ensure` re-resolves and re-installs every direct
   rule in the profile — the rule being revoked included, so it is
   enforced again (or stays enforced) until the retry removes it — and
   it keeps established direct flows; it is a separate run from the
   retry. If a name the profile uses no longer resolves, that `ensure`
   cannot heal the profile: use the manual recovery,
   [Revoking a rule whose name no longer resolves](../troubleshooting/revocation-name-gone.md).
-- **What "direct" changes (and what it does not)** — an allow-host rule
+- **What "direct" changes (and what it does not)** — a direct rule
   bypasses the Squid gateway but does NOT widen egress: the terminal
   scoped drop still applies and fail-closed is unchanged. What moves is
   the enforcement point and its visibility: identity is the pinned A
@@ -473,7 +594,7 @@ accept` rule enforced independently of the HTTP gateway.
 
 ### HTTP vs non-HTTP: gateway vs direct
 
-| | gateway allowlist | `allow-host` |
+| | gateway allowlist | `allow … --direct` |
 |---|---|---|
 | protocols | HTTP(S) CONNECT via Squid | any TCP port the rule names |
 | identity | hostname at request time | A-set pinned at `ensure` (first 16 sorted distinct) |
@@ -494,5 +615,11 @@ name through the gateway —
 - `gateway-only` profiles: egress goes through the Squid gateway
   (allowlist-controlled); the nftables chain only permits the gateway
   IP. Use the allowlist / `allow` to grow it.
-- `allow-host` in a gateway profile coexists with the gateway (direct
+- A direct rule in a gateway profile coexists with the gateway (direct
   destinations use the separate nftables-enforced path).
+
+The same host:port may exist in both stores at once — the gateway
+allowlist and a `rule allow-host` line. `disallow` removes from one
+store only: without `--direct` it removes the allowlist entry; with
+`--direct` it removes the firewall rule. Removing one does not
+remove the other.

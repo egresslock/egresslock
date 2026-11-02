@@ -97,9 +97,10 @@ rc=0
 
 Troubleshooting: rc!=0 with `kill network process: permission
 denied`? The pasta/AppArmor blocker —
-[pasta-apparmor](../troubleshooting/pasta-apparmor.md) (fix:
-`egresslock-setup apparmor add`, health:
-`egresslock-setup apparmor check`).
+[pasta-apparmor](../troubleshooting/pasta-apparmor.md). Check first:
+`egresslock-setup apparmor check`; apply
+`egresslock-setup apparmor add` only when the check reports
+`pasta amendment: required on this host`.
 </details>
 
 ## 4. Are the anchor and gateway containers up?

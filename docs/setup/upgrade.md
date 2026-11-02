@@ -280,6 +280,21 @@ Troubleshooting:
   [check-everything](../reference/check-everything.md).
 </details>
 
+The first `ensure` after this upgrade (and after any reboot or crash)
+restarts each gateway once even when the allowlist text is unchanged:
+the engine records a durable activation witness that binds the deployed
+configuration to the current gateway container and its start time, and
+does not trust a missing or stale witness. Subsequent redundant ensures
+are non-disruptive again. Old unreferenced content-addressed
+`allowlist.*` group files are kept for a grace window (default 3600 s)
+and removed by a later ensure; letting them age is normal and does not
+require operator action. A failed apply that cannot prove whether the
+new configuration was published tells you to run `egresslock ensure`
+and does not promise that the old policy is still live. That includes a
+rename that reported success but did not leave the expected config
+bytes, and a missing config is treated as absent only when the
+container probes explicitly report not found.
+
 ## Next
 
 - [Check everything is working](../reference/check-everything.md) —

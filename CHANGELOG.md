@@ -4,6 +4,405 @@ All notable changes between egresslock releases. The public repository
 ships without history (each release is a fresh snapshot tree), so this
 file is the record of what changed since the previous release.
 
+## 0.10.0 - 2026-11-02
+
+> **Operator-important changes:**
+>
+> **Action required:**
+> 1. **Keep your host OS and kernel security-patched.** egresslock's
+>    Podman containers share the **host's kernel**; the kit cannot patch
+>    the host's OS or kernel.
+> 2. **Likely no action is needed. Only if you hand-edited a `.conf`
+>    file to point to a different allowlist.** The `gateway` line must
+>    now name exactly `<profile>-allowlist`, the file next to the conf.
+>    Any other basename, a path component, or an absolute path fails
+>    every load (exit 2, naming the conf line and the expected file);
+>    `egresslock-setup import` refuses such a source (rc 1, nothing
+>    written). `egresslock init` and the starter already write the pair.
+>    For a conf that needs migrating, see
+>    [migrating an older hand-written pair](docs/reference/policy-reference.md#file-names-the-convention).
+> 3. **Likely no action is needed. Only if you launch podman with an
+>    explicit `--out=<path>` whose directory other users can write to.**
+>    The shipped examples use the bare `--out`
+>    (`--env-file="$(egresslock proxy-env <profile> --out)"`), which is
+>    unaffected — as is the default runtime dir. An explicit path like
+>    that is now refused with a named error (exit 1, nothing written)
+>    instead of a warning. See
+>    [Proxy clients](docs/reference/proxy-clients.md) for a private
+>    directory, the bare `--out`, and the `podman run --env KEY=value`
+>    alternative.
+> 4. **Likely no action is needed. Only if you named a profile
+>    `all`.** `all` is now reserved for the `teardown all` keyword, so a
+>    profile of that name no longer works: its `all.conf` fails to load
+>    (exit 2, named `reserved`; `list` and `verify --ensured` fail
+>    closed until it is migrated), and `teardown all` refuses (exit 2)
+>    while the file exists instead of tearing down `main`. Rename the
+>    conf, allowlist, and `all.pins`, then remove the old profile's
+>    runtime objects — the steps are in
+>    [Reserved profile name](docs/reference/policy-reference.md#reserved-profile-name).
+>    No other profile name is affected; `teardown all` keeps its
+>    main.conf-only meaning once no `all.conf` exists.
+>
+> **Important but no action required:**
+> 1. **One verb for allowing and disallowing.** `allow`/`disallow` now
+>    accepts the `--direct` flag for the direct firewall path (direct
+>    path is for 1) non-HTTP(s) traffic and 2) bare IP destinations);
+>    e.g.
+>    ```
+>    egresslock allow <profile> self-hosted-git.example:22 --direct
+>    ```
+>    without `--direct`, the command acts normally (proxy path).
+>    `allow-direct`/`disallow-direct` are new
+>    shortcuts; `allow-host`/`disallow-host` still work as compatibility
+>    aliases but are no longer shown in `usage` and are planned for
+>    removal in a later release. Every successful mutation now prints one
+>    `path:` line naming the store it changed; a proxy allow on a port
+>    other than 80/443 shows a hint. Since those are likely to require a
+>    --direct rule, it will print a two-line stderr note with the command
+>    to add the direct rule.
+> 2. **One verb for viewing allowlists.** You can see normal allowlist
+>    (proxy) and direct with
+>    ```
+>    egresslock allowlist <profile>
+>    egresslock allowlist <profile> --direct
+>    ```
+> 3. **The gateway's in-container config path moved.** `/etc/squid/agent/`
+>    is now `/etc/squid/egresslock/`. Gateways you have not yet replaced
+>    keep working unchanged with the new engine. The new gateway image
+>    keeps the old path available through a temporary `/etc/squid/agent`
+>    symlink for backwards compatibility (which will be in place at least
+>    through v0.12), so older engines and scripts that
+>    still name it keep working. Nothing is required; the first `ensure`
+>    after the upgrade rewrites the generated config and restarts each
+>    gateway once. Optional: to adopt the new gateway image, run
+>    `egresslock build-gateway --force && egresslock ensure --replace-gateway <profile>`
+>    per gateway profile — a vocabulary-only rebuild leaves the base pin
+>    unchanged, so plain `build-gateway` no-ops.
+> 4. **Gateway allowlists are now deployed as immutable, content-addressed
+>    group files, and the running gateway's activation is recorded.** The
+>    published `squid.conf` references files such as
+>    `allowlist.domains.<sha256>`; a failed apply no longer overwrites the
+>    files the running configuration uses. The first `ensure` after this
+>    upgrade, after a reboot, or after a crash may restart each gateway
+>    once to record which deployed generation the current container
+>    loaded. Nothing is required: later redundant ensures return to
+>    `already converged, not restarted`. Unreferenced old group files are
+>    removed only after a grace window (default 3600 s) and a successful
+>    verification; an apply that cannot prove whether publication
+>    happened tells you to run `egresslock ensure` and does not claim the
+>    old policy is still live.
+> 5. **A leftover `EGRESSLOCK_CONF` now warns and is ignored.** The
+>    variable was already not read; setting it (including an empty
+>    assignment) now prints
+>    `Warning: EGRESSLOCK_CONF is retired and is no longer read.` on
+>    stderr, and the command continues as if it were unset. You do not
+>    need to unset it before upgrading. If it comes from a stale
+>    `unit.env`, `egresslock-setup doctor` still reports
+>    `PROBLEM: unit.env: STALE` and the pathless setup re-run that
+>    cleans it.
+
+### Security
+
+- **Four test-harness environment overrides no longer steer a
+  privileged command.** They are ignored unless the harness's test-mode
+  flag is set; without it each command uses its production default.
+  Nothing in a normal deployment sets that flag. No action is needed;
+  the overrides are listed in
+  [scripts and environment](docs/reference/scripts-and-environment.md).
+- **Conf `${VAR}` values come only from the invoking environment.** A
+  `rule allow-host` / `no-proxy` host field's `${VAR}` (or
+  `${VAR:-default}`) is expanded from the environment of the `egresslock`
+  command that parses it — never from the engine's own variables. An
+  exported name takes its exported value, even when it collides with an
+  engine variable; an unset or empty name takes its `:-default`, or
+  fails the load closed.
+- **Out-of-range ports are rejected, not wrapped.** A port token such as
+  `18446744073709551617` now fails closed with the named `invalid port`
+  error (exit 2) instead of passing 64-bit arithmetic.
+- **Leading-zero ports are emitted and compared in decimal.** An accepted
+  spelling such as `:0443` is normalized to `443` before it reaches a pin
+  record, nft chain, or conntrack comparison, so nft never reads it as
+  octal 291 and `drop-unauthorized`/revocation name the same rule as the
+  canonical listing.
+- **`proxy-env --out` refuses a directory another user can write to.**
+  An explicit `--out=<path>` whose directory is group-writable now
+  exits 1 with a named error instead of being accepted with a
+  warning (world-writable directories were already refused): a group
+  member could replace the env file and point the container's
+  proxied traffic at a proxy they control. The path printed is the
+  real file path, so the consumer opens the directory we checked. A
+  runtime dir writable only by your account is unaffected; an
+  operator who needs a shared location can pass them to `podman run`
+  with `--env KEY=value` instead.
+
+### New features
+
+- **Unified `allow`/`disallow` with an explicit direct path.** The two
+  pairs of commands are now one verb per direction: `allow`/`disallow`
+  handle both stores, with `--direct` selecting the direct firewall rule
+  (today's `allow-host`/`disallow-host` operation) and the default
+  staying the proxy allowlist. A name with or without a port is a
+  proxied destination (a bare name is the 443 group); the direct path
+  takes exactly one `host:port`; an IPv4 literal on the proxy path is
+  refused with the exact `--direct` retry. `disallow` is path-scoped —
+  the same destination can exist in both stores, and each removal names
+  its path.
+- **You can now easily see a profile's direct-path entries.**
+  `egresslock allowlist <profile> --direct` lists the configured
+  rules for allow-host (direct) entries in a readable format
+  (one `host:port` per line, in conf order) from the profile conf. It
+  does not resolve names, read the pin record, or change anything;
+  `egresslock allowlist-direct <profile>` is a new alias for
+  `egresslock allowlist <profile> --direct`.
+
+### Command syntax changes
+
+- **(new)** `egresslock allow-direct <profile> <host:port>` and
+  `egresslock disallow-direct <profile> <host:port>` are shortcuts for
+  `allow`/`disallow … --direct` (the path is already selected, so they
+  take no flags).
+- **(new)** `egresslock allow --direct <profile> <host:port>` /
+  `disallow --direct`: `--direct` is accepted before or after the
+  profile, at most once.
+- **(renamed)** `allow-host`/`disallow-host` are now `allow-direct`/
+  `disallow-direct`. The old names remain accepted compatibility
+  aliases, hidden from `usage`/`--help` but fully gated, and are planned
+  for removal in a later release.
+- **(removed)** `EGRESSLOCK_CONF` — a set variable (including an empty
+  assignment) now prints a warning and is not read, instead of being
+  silently ignored; a profile's config is at
+  `<account-home>/.config/egresslock/<profile>.conf`. No operator action
+  is required; see *Important but no action required*.
+
+### Changed
+
+- **`egresslock allowlist <profile>` lists the configured proxy entries,
+  not the allowlist file's raw bytes.** Comments and blank lines are no
+  longer printed; each stored entry prints once, in file order, under a
+  header naming the lane, the entry count, the source, and how names are
+  resolved. An empty allowlist prints `0 proxy entries`. An invalid
+  allowlist line now fails the command closed (rc 1) and names the
+  entry. `egresslock allowlist <profile> --direct` keeps its rows and
+  uses the same header shape. There is no `--raw` flag; use the file
+  itself if you need the comments.
+- **`egresslock-setup import` and `init` refuse an invalid allowlist
+  entry before commit.** They validate a staged or live pair with the
+  deployed engine, which now checks every allowlist entry; an invalid
+  entry fails the import (rc 1, the error names the entry) and leaves
+  the destination untouched. Identical halves are still validated, so
+  re-importing an already-installed invalid pair is refused rather than
+  reported `unchanged`, and `--force` has improved validation. The
+  files-in-place refusal now also prints the engine's error.
+- **Gateway config deployment is atomic and activation is proved.** Each
+  non-empty allowlist group is generated as an immutable
+  `allowlist.domains.<sha256>` / `allowlist.p<port>.<sha256>` file whose
+  name is the hash of its exact bytes; a same-filesystem `mv -T` of the
+  generated `squid.conf` is the single publication boundary. A run that
+  finds an existing same-name group reuses it only when it is a regular,
+  non-symlink file with identical bytes, and otherwise fails closed
+  without clobbering it. The engine invalidates `.egresslock-activated`
+  before publication and records it only after the restart, health probe,
+  deployed-byte read-back and a PID 1 argv check
+  (`squid -N -f <cfgdir>/squid.conf`); the converged skip now requires
+  that witness to match the deployed generation, current container ID and
+  `StartedAt`. If a rename reports failure or loses its result, the engine
+  reads back and, when needed, removes the per-run container stage to
+  quiesce a delayed rename. Only a non-zero rename result whose read-back
+  equals the pre-publication config is a proven pre-publication failure;
+  a zero result with any other read-back, a read/probe error, or an
+  ambiguous sweep is disclosed as unknown instead of restoring the source
+  or claiming the old config. A missing config is proved absent only when
+  the probes explicitly report not found. Cleanup runs only after
+  verification, keeps `squid.conf`,
+  `allowlist.conf`, the witness and every deployed reference, and removes
+  only unreferenced regular `allowlist.*`/`check.conf` files and private
+  stage directories older than `EGRESSLOCK_GW_CLEANUP_GRACE` (default
+  3600 s); an unreadable reference set skips cleanup. The EGL-389
+  rollback and source-restore disclosures remain in place.
+- **The `EGRESSLOCK_APPARMOR_PROFILES` listing override is ignored on a
+  production root run.** A root `egresslock-setup apparmor add|check`
+  (and the installer's advisory) reads the kernel profiles listing
+  unless `EGRESSLOCK_KIT_ALLOW_NON_ROOT=1` is set, the same rule as the
+  other test-harness hooks. A non-root `apparmor check` may still point
+  it at a copied listing, since the kernel listing is root-only on many
+  kernels. No operator action is needed.
+- **Proxy `allow` rewrites only a regular 0600 allowlist.** A proxy
+  `allow` that needs to add an entry or repair the final newline now
+  refuses a symlink or any source mode other than exactly 0600: named
+  error, source unchanged, no entry lines, no `ensure`. The refusal
+  names `chmod 600 -- <path>` and says to retry the same `egresslock
+  allow` command — an allowlist left at `0644` by a default umask is
+  fixed that way; `allow` never changes the mode itself, and group or
+  other access on the allowlist is not a supported sharing model. A
+  clean no-op still works for a readable 0444/0644 or symlinked source.
+  The rewrite preserves the source uid/gid and exact 0600 and needs a
+  writable source parent with room for a full copy; replacing a hard
+  link leaves its peers unchanged. POSIX ACL identity and other
+  security metadata (including SELinux labels, capabilities and other
+  xattrs) are not preserved; inherited dormant ACL entries can differ
+  from the source and become effective after a later `chmod`. A signal
+  around the rename can leave the commit outcome unknown — inspect the
+  file before retrying. Operators must serialize editors,
+  `egresslock-setup import` and other accounts sharing the source with
+  engine commands; the engine lock covers this account's engine verbs
+  only. If you rely on ACLs or security labels, make a
+  metadata-preserving external edit while serialized, then run
+  `egresslock ensure <profile>`; do not `chmod` a file whose access
+  other users rely on.
+- **Every profile must have a `gateway` line.** A conf whose profile
+  block has no `gateway` directive is rejected at load (exit 2) with one
+  named error pointing at the `profile` line; it names the gateway line
+  to add, the allowlist file to create, and the `egresslock ensure` to
+  run. Only a hand-written or hand-edited conf can lack the line —
+  `egresslock init` always writes one — and a conf whose line was
+  deleted now fails to load with the exact line to restore. Direct
+  `rule allow-host` entries still work, but the profile needs a gateway
+  beside them.
+- **Path disclosure and the port hint.** Every successful `allow`/
+  `disallow` mutation prints exactly one `path: proxy — gateway
+  allowlist <path>` or `path: direct — firewall rule in <conf> (does
+  not change client proxy settings)` line before `added:`/`removed:`.
+  A proxy `allow` of an explicit port other than 80/443 prints a
+  two-line stderr note offering an additional direct rule (the
+  allowlist entry stays); it never changes the chosen path or port.
+- **Canonical direct-path messages.** Failure and recovery text for the
+  direct path now prints `allow … --direct`/`disallow … --direct`, even
+  when an older compatibility name was used. An IPv4 literal on the
+  proxy path likewise names that retry instead of `allow-host`.
+- **Verify-failure guidance.** The engine's verify hints now say to run
+  `ensure` as the account, e.g. `run: egresslock ensure <profile> (as
+  <account>)`. The doctor's failed-verify rows re-run the check with
+  `sudo systemctl start egresslock-verify@<account>.service` (output in
+  the service journal) and, when the named profile is known, print the
+  scoped repair `sudo -iu <account> -- egresslock ensure <profile>`. No
+  rc or policy behavior change.
+- **Help and usage-error text refreshed.** `egresslock help <command>`
+  pages use plainer wording, the summary index says what each command
+  does, and a usage error points at the command index or the command's
+  help page instead of dumping a generic screen. No command behavior
+  changed; no action needed.
+
+### Fixed
+
+- **`import --force` can no longer replace a directory or a symbolic
+  link.** It replaces only a regular-file pair: a destination half that
+  is a directory, symbolic link, or special file is refused (rc 1) with
+  the path and kind, and nothing is moved or deleted. The import path no
+  longer deletes recursively; a refused or failed import leaves the
+  destination bytes untouched. Normal re-pin use is unchanged: a
+  differing or torn pair of regular files is still replaced allowlist-
+  first, conf last.
+- **An unreadable profile conf now exits 2.** It prints the named
+  `Error: config file cannot be read: <path> (check the file's
+  permissions)` instead of exit 1 with a raw `Permission denied` line;
+  only a conf with broken permissions is affected.
+- **A full disk now fails named and applies no partial policy.** An
+  incomplete nftables candidate is never installed; a failed conf or
+  pin-record write exits 1 with a named line instead of a false
+  `already present`/`removed:` claim; a pin write that fails after a
+  successful apply says what is known about the live firewall; and
+  `verify` refuses to report a match when its expected ruleset could
+  not be written (including the forward-hook header). The lock's
+  holder record is diagnostic only — `verify` warns and keeps the lock.
+  See [a full disk breaks an egresslock write](docs/troubleshooting/disk-full.md).
+- **Proxy `allow` replaces the allowlist atomically.** A proxy-path
+  `allow` now builds the complete new allowlist — existing bytes, the
+  one-newline repair when a nonempty file lacks a final newline, and the
+  missing entries in argument order — in a private 0700 directory beside
+  the source, then commits it with a same-filesystem rename. A detected
+  read, write or metadata failure before the commit exits 1 with a
+  named error, leaves the source bytes/mode/owner unchanged, prints no
+  `added:`/`entry already present:` lines, and does not run `ensure`.
+  Entry lines are printed only after the source commit (or a clean
+  no-op), still in argument order and before the hints and
+  `re_ensuring`. A clean no-op still performs a full read check but does
+  not write or need source/parent write permission. A failed or
+  interrupted rename reports that the outcome may be unknown, so
+  inspect the source before retrying. `added:` reports the source
+  change, not successful gateway activation; a later apply failure does
+  not roll the source back.
+- **A failed proxy `disallow` puts the allowlist back and never claims a
+  removal.** If the reinstall fails before the gateway applies the new
+  allowlist, the source file is restored byte-identically (same-directory
+  hard-link/rename, one retry), the staged `allowlist.*` set inside the
+  gateway is rolled back, the running gateway is left untouched, and the
+  command exits 1 with a phase-aware `nothing was revoked` disclosure and
+  the exact retry. A failure after the config swap keeps the removal and
+  names `ensure` instead; if the source cannot be put back, the disclosure
+  states the file/live divergence without stopping a healthy pre-existing
+  gateway. `removed:` is printed only after a successful reinstall (now
+  after the ready lines, matching the direct path), so a failed attempt
+  cannot claim the entry was removed, and the ordinary retry re-attempts
+  instead of failing `entry not present`.
+- **`init` names the real cause when Podman cannot list networks.** If
+  `egresslock init` cannot run `podman network ls`, it now exits 1 with
+  the same diagnosis `ensure` gives — `cannot list Podman networks; the
+  subnet-overlap pre-check cannot run (fail closed): <podman output>` —
+  instead of the misleading `no free /24 …` (auto-pick) or
+  `overlaps an existing profile/network` (`--subnet`) message. It still
+  refuses to write a conf/allowlist pair, a real overlap still reports
+  the overlap, and a successful init is unchanged. No action.
+- **`all` is reserved as a profile name.** `egresslock init all` and
+  named commands with `all` now fail with exit 2 and a named `reserved`
+  error instead of creating an unreachable profile or resolving
+  `main.conf`; the config loader refuses a legacy `all.conf`, and
+  `teardown all` refuses (exit 2) while one exists instead of tearing
+  down `main`. `egresslock-setup --profile all` and an imported source
+  whose `profile` line names `all` refuse too. `main` and every other
+  valid name are unchanged; `teardown all` keeps its main.conf-only
+  meaning once no `all.conf` exists. Migrating a legacy `all` profile
+  is covered in
+  [Reserved profile name](docs/reference/policy-reference.md#reserved-profile-name).
+- **The gateway allowlist is always the profile's pair half.** The
+  parser accepts only `<profile>-allowlist` for the `gateway` line:
+  another profile's file, an absolute path, or a path component now
+  exits 2 at load (naming the conf line and the expected file).
+  `egresslock-setup import` likewise refuses a source whose gateway
+  line names anything else (rc 1, nothing written). A conforming pair
+  loads and imports byte-identically.
+- **Extra arguments are rejected by `verify`/`rules`/`list`/`teardown`.**
+  A stray token now fails with `Error: <command> takes no extra
+  arguments.` plus the usage line (rc 2) before any config is read,
+  instead of being silently ignored; `teardown all --runtime` in
+  particular no longer silently runs the main-conf teardown (the runtime
+  sweep stays `teardown --runtime`). Valid forms are unchanged; no
+  action required.
+- **Netns-probe failures and inherited working directories.** A
+  `sudo -u <account> egresslock …` run from a directory the account
+  cannot traverse no longer fails: the engine, `egresslock-verify`, and
+  the `build-gateway` / `build-egl-base` helpers run their
+  container-runtime commands from `/`, and relative paths
+  such as `proxy-env --out` still resolve against the directory you
+  ran the command from. Relative Podman settings (`CONTAINERS_CONF`,
+  the registries/storage configs, `TMPDIR`, `XDG_*`) keep that same
+  invocation-directory meaning too. Before this release, that failure
+  — and any other failed rootless-netns probe — led with a fixed
+  AppArmor diagnosis (an AppArmor label and the pasta profile, with
+  AppArmor fixes to try) even though AppArmor was often not the cause. A failed
+  probe now prints podman's actual error and routes on it: an
+  AppArmor-shaped error (`rc 126` / `permission denied`) leads with
+  `sudo egresslock-setup apparmor check` (apply the amendment only
+  when the check says it is required); any other error points at the
+  netns-inspection page. No rc or policy behavior change; no action
+  required.
+
+### Internal
+
+- **`bash tests/run.sh` takes a per-harness timeout override** —
+  `EGRESSLOCK_HARNESS_TIMEOUT=<seconds>` (positive integer, default 600)
+  lets a slow or loaded host finish the engine battery; CI keeps 600.
+- **The engine battery's `egl139` section runs faster** — setup-only
+  legs now restore a green fixture snapshot instead of re-running
+  `ensure`, and the shared mocks fork fewer helper processes; its 142
+  passing assertions are unchanged.
+- **The `egl139` conntrack fixtures are fidelity-checked** — the mock
+  keeps the old awk's numeric port comparison (so a leading-zero
+  `:0443` still matches `dport=443`), snapshot/restore preserves the
+  real `$STATE/opslog` and `callorder.log`, and a failed snapshot or
+  copy fails the section by name instead of being masked by cleanup.
+  Eleven new `egl362` assertions cover those paths, including an
+  end-to-end `:0443` revocation and a survivor that must fail closed.
+
 ## 0.9.0 - 2026-10-23
 
 > **Operator-important changes:**

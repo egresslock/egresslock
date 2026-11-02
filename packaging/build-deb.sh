@@ -63,10 +63,12 @@ keep_stage="${EGRESSLOCK_DEB_KEEP_STAGE:-}"
 # ownership in the archive without fakeroot (R-022-2 follow-up: the
 # install-kit-style root gate was over-conservative for a pure build).
 
-# Version (ARC-22-D2, EGL-27-D1, EGL-72-D1/D2): <VERSION_BASE>+git<YYYYMMDDHHMMSS>.<short12>
-# (VERSION_BASE is the one release base at the repo root — bump it once
-# per release, never hard-code it here). All characters are legal in a
-# Debian Version (alnum . + - ~).
+# Version (ARC-22-D2, EGL-27-D1, EGL-72-D1/D2, EGL-342-D1):
+# <VERSION_BASE>+git<YYYYMMDDHHMMSS>.<short12>
+# (VERSION_BASE is the one release base at the repo root — between H and
+# T9 it carries the cycle marker `<X.Y.Z>-dev`; T9 drops the marker.
+# Never hard-code the base here). All characters are legal in a Debian
+# Version (alnum . + - ~).
 # EGL-27: the UTC second-resolution timestamp is the dpkg ORDERING key
 # (the old date-only prefix collided within a day, and hex commit hashes
 # do not sort monotonically — a later rebuild could compare as a
@@ -178,16 +180,37 @@ chmod 0644 "$libdir/VERSION"
 install -m 0644 "$kit/examples/main.conf"       "$share/examples/main.conf"
 install -m 0644 "$kit/examples/main-allowlist"  "$share/examples/main-allowlist"
 install -d -m 0755 "$share/examples/recipes"
-for f in "$kit"/examples/recipes/*; do
-    [[ -f "$f" ]] || continue
-    # Site-name screen (see the doc loop below/above): a recipe that
-    # carries fleet facts stays repo-only.
-    if grep -q 'home\.arpa' "$f" 2>/dev/null; then
-        echo "build-deb: skipping recipe with site names: $(basename "$f")" >&2
-        continue
+# EGL-420: only regular recipe files ship, and the recipe input must be
+# real paths. [[ -f ]] follows a symlink and install(1) dereferences it,
+# so a linked entry OR a linked examples/ or examples/recipes directory
+# (whose glob children then look like regular files) could copy private
+# bytes from outside the kit into the package. Skip the whole recipes
+# input when it is linked, naming the link and never dereferencing it.
+recipes_dir="$kit/examples/recipes"
+recipes_linked=0
+for d in "$kit/examples" "$recipes_dir"; do
+    if [[ -L "$d" ]]; then
+        echo "build-deb: skipping recipe symlink: ${d#"$kit"/}" >&2
+        recipes_linked=1
     fi
-    install -m 0644 "$f" "$share/examples/recipes/$(basename "$f")"
 done
+if [[ "$recipes_linked" == 0 ]]; then
+    for f in "$recipes_dir"/*; do
+        # A linked entry is never read (see the input guard above).
+        if [[ -L "$f" ]]; then
+            echo "build-deb: skipping recipe symlink: ${f#"$kit"/}" >&2
+            continue
+        fi
+        [[ -f "$f" ]] || continue
+        # Site-name screen (see the doc loop below/above): a recipe that
+        # carries fleet facts stays repo-only.
+        if grep -q 'home\.arpa' "$f" 2>/dev/null; then
+            echo "build-deb: skipping recipe with site names: $(basename "$f")" >&2
+            continue
+        fi
+        install -m 0644 "$f" "$share/examples/recipes/$(basename "$f")"
+    done
+fi
 chmod -R go-w "$share/examples/recipes"
 # EGL-232: the shared example base image (egl-base) — staged as its own
 # directory (the recipes loop above is file-only and would skip it).
@@ -196,14 +219,17 @@ install -m 0644 "$kit/examples/egl-base/Containerfile" "$share/examples/egl-base
 install -m 0644 "$kit/examples/egl-base/README.md"     "$share/examples/egl-base/README.md"
 install -m 0755 "$kit/examples/egl-base/build-egl-base" "$share/examples/egl-base/build-egl-base"
 chmod -R go-w "$share/examples/egl-base"
-# EGL-28: the docs/ tree ships structure-preserving (quickstart/setup/
-# reference/troubleshooting tiers + the index); process files (tickets/,
-# BOARD.md) and site-named docs never ship. README.md sits beside the
-# tree at doc/README.md.
+# EGL-28 / EGL-364: the docs/ tree ships structure-preserving
+# (quickstart/setup/reference/troubleshooting tiers + the index);
+# site-named docs never ship. README.md sits beside the tree at
+# doc/README.md. The ticket flow and board live under internal_docs/
+# now; this package keeps its own process-file guard for the old paths
+# (the BOARD.md skip and the tickets/ find filter below) because it is
+# the deb's only guard if that layout reappears — no tripwire covers
+# this stage.
 while IFS= read -r f; do
-    # BOARD.md is generated ticket-process navigation (EGL-1 flatten:
-    # the manuals share docs/ with docs/tickets/ + BOARD.md) — process
-    # files never ship in the package.
+    # BOARD.md is generated ticket-process navigation (see the guard
+    # note above) — process files never ship in the package.
     [[ "$(basename "$f")" == "BOARD.md" ]] && continue
     # ARC-22 verification: no site names in the package. A doc that
     # carries fleet facts is skipped (named on stderr) rather than
@@ -239,7 +265,7 @@ Architecture: all
 Depends: bash, podman, netavark, nftables, conntrack
 Recommends: apparmor
 Maintainer: egresslock maintainers <onyxcoyote@users.noreply.github.com>
-Description: restricted egress for agent accounts (rootless podman + nftables + squid)
+Description: restricted egress for untrusted workloads (rootless podman + nftables + squid)
  Per-profile bridge networks with a fail-closed nftables policy in the
  shared rootless netns, a squid gateway, and a periodic drift-check
  timer. Thin packaging convenience; the checkout + install-kit.sh
