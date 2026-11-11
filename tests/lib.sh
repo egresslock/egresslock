@@ -18,6 +18,17 @@
 
 set -u
 
+# EGL-451: sharded-window selection. run.sh exports
+# EGRESSLOCK_TEST_SHARDED=1 plus a space-delimited EGRESSLOCK_TEST_SECTIONS
+# list; each engine window is wrapped in shard_section_run. A sharded run
+# with an empty list is refused here, before any window can execute: empty
+# must never mean "run every section" (that would duplicate every section
+# across shards if the planner ever produced an empty bin).
+if [[ -n "${EGRESSLOCK_TEST_SHARDED:-}" && -z "${EGRESSLOCK_TEST_SECTIONS:-}" ]]; then
+    echo "FAIL: EGRESSLOCK_TEST_SHARDED is set but EGRESSLOCK_TEST_SECTIONS is empty — refusing to run every section (EGL-451 fail-closed)" >&2
+    exit 2
+fi
+
 TESTROOT="$(mktemp -d /tmp/egresslock-test.XXXXXX)"
 # EGL-246 launcher note: deliberately NO battery-wide `egresslock` PATH
 # launcher. Both harnesses put the tree root on PATH at their top
@@ -360,6 +371,23 @@ case "$cmd" in
                         : > "$D/confdir-unwritable-seen"
                     fi
                 fi
+                # EGL-397 F5 test seam: witness the actual post-delete,
+                # pre-restore conf. Marker = two lines (<conf> then
+                # <witness>); same one-shot second-read timing as
+                # confdir-unwritable. A test that never observes this
+                # state cannot prove the delete/restore window ran.
+                if [[ -f "$D/conf-witness-after-delete" ]]; then
+                    if [[ -f "$D/conf-witness-after-delete-seen" ]]; then
+                        _cwconf=""; _cwdest=""
+                        { IFS= read -r _cwconf; IFS= read -r _cwdest; } < "$D/conf-witness-after-delete"
+                        if [[ -n "$_cwconf" && -n "$_cwdest" ]]; then
+                            cp -- "$_cwconf" "$_cwdest" 2>/dev/null || true
+                        fi
+                        rm -f "$D/conf-witness-after-delete" "$D/conf-witness-after-delete-seen"
+                    else
+                        : > "$D/conf-witness-after-delete-seen"
+                    fi
+                fi
                 # EGL-307 test seam: the Nth POST-(-f) chain read fails
                 # once with a netlink-style error. The counter
                 # ($D/f-list-reads, reset on every -f) increments per
@@ -450,6 +478,15 @@ case "$cmd" in
                 printf '%s\n' "${RENDERED[@]}"
                 ;;
             table)
+                # EGL-481 test seam: the chain-set read fails once
+                # (one-shot), modelling an nft/netns read fault after the
+                # content compares already passed. Must surface as the
+                # named not-drift read-failure line, never as drift.
+                if [[ -f "$D/fail-list-table" ]]; then
+                    rm -f "$D/fail-list-table"
+                    echo "Error: mock nft: netlink read of table '$2' failed once (fail-list-table)" >&2
+                    exit 1
+                fi
                 # Keyed on the TABLE name ($2), not the family: a table
                 # exists iff it has chain state files.
                 found=0
@@ -459,7 +496,37 @@ case "$cmd" in
                 done
                 [[ "$found" == 1 ]] || { echo "Error: No such file or directory" >&2; exit 1; }
                 ;;
+            tables)
+                # EGL-438-D5: bare `nft list tables` — one brace-less
+                # declaration line per fixture table (the <table>.<chain>
+                # state files), like real nft's table-only listing. This
+                # is the teardown oracle: rule/set/comment bytes never
+                # appear, so foreign content cannot fake a declaration.
+                declare -A tseen_t=()
+                for f in "$D"/*; do
+                    [[ -f "$f" ]] || continue
+                    tbase="${f##*/}"
+                    [[ "$tbase" == last-transaction.nft ]] && continue
+                    [[ "$tbase" == *.* ]] || continue
+                    ttable="${tbase%%.*}"
+                    [[ -z "${tseen_t[$ttable]:-}" ]] || continue
+                    tseen_t[$ttable]=1
+                    echo "table inet $ttable"
+                done
+                # EGL-438-D5 test seam: extra declaration lines (wrong
+                # family, lookalike, or a duplicate exact line) come from
+                # this file, so a foreign shape needs no fixture chain.
+                [[ -f "$D/list-tables-extra" ]] && cat "$D/list-tables-extra"
+                exit 0
+                ;;
             ruleset)
+                # EGL-438-D5 test seam: the boundedness leg models the
+                # ER's constrained-resource full-ruleset read failing
+                # while `list tables` and deletes still work.
+                if [[ -f "$D/list-ruleset-fails" ]]; then
+                    echo "Error: Memory allocation failure" >&2
+                    exit 1
+                fi
                 # ARC-52: every table's chains grouped under a table
                 # header, like real `nft list ruleset` (family inet is
                 # assumed in this mock). Scratch files are skipped:
@@ -676,8 +743,11 @@ mock_cfg_init() { # <name> — first boot / replace: bootstrap cfgdir + identity
     local name="$1"
     rm -rf "$D/containers-$name.cfg" "$D/containers-$name.candidate" \
            "$D/containers-$name.pending-mv" "$D/containers-$name.started" \
-           "$D/containers-$name.id" "$D/containers-$name.live"
+           "$D/containers-$name.id" "$D/containers-$name.live" \
+           "$D/containers-$name.live-token"
     mkdir -p "$D/containers-$name.cfg"
+    # EGL-394: a booted Squid has its cache.log open from the start.
+    : > "$D/containers-$name.cache.log"
     : > "$D/containers-$name.cfg/allowlist.conf"
     # A replacement container gets a NEW ID (the .gen counter survives the
     # rm); restarts keep it. EGL-395's witness binds that instance ID.
@@ -689,23 +759,46 @@ mock_cfg_init() { # <name> — first boot / replace: bootstrap cfgdir + identity
     printf 'mockid%s%sg%s\n' "$(printf '%s' "$name" | sha256sum | cut -c1-56)" "$gen" "$gen" \
         > "$D/containers-$name.id"
     printf '2026-01-01T00:00:00.000000000Z#1\n' > "$D/containers-$name.started"
+    # EGL-394: a fresh container boots the entrypoint's bootstrap config.
+    printf '/etc/squid/squid.conf\n' > "$D/containers-$name.argv"
     if [[ -f "${ARCMOCK_TREE_ROOT:-}/gateway/squid.conf" ]]; then
         cp "${ARCMOCK_TREE_ROOT}/gateway/squid.conf" "$D/containers-$name.live"
     else
         : > "$D/containers-$name.live"
     fi
 }
+mock_cfg_argv_set() { # <name> — the argv the running Squid was started with
+    local name="$1"
+    if [[ -f "$D/containers-$name.cfg/squid.conf" ]]; then
+        printf '%s\n' "$(mock_cfg_abs "$name")/squid.conf" > "$D/containers-$name.argv"
+    else
+        printf '/etc/squid/squid.conf\n' > "$D/containers-$name.argv"
+    fi
+}
 mock_cfg_load_live() { # <name> — a start/restart loads the deployed config (or bootstrap)
-    local name="$1" src
+    local name="$1" src token
+    [[ -f "$D/containers-$name.cache.log" ]] || : > "$D/containers-$name.cache.log"
+    mock_cfg_argv_set "$name"
     if [[ -f "$D/containers-$name.cfg/squid.conf" ]]; then
         src="$D/containers-$name.cfg/squid.conf"
     elif [[ -f "${ARCMOCK_TREE_ROOT:-}/gateway/squid.conf" ]]; then
         src="${ARCMOCK_TREE_ROOT}/gateway/squid.conf"
     else
         : > "$D/containers-$name.live"
+        rm -f "$D/containers-$name.live-token"
         return 0
     fi
     cp "$src" "$D/containers-$name.live"
+    # EGL-393-D5: the live token is the one embedded in the config that
+    # was LOADED (the deny_info URL), exactly what Squid would answer
+    # with — never a recompute from the current group files. Bootstrap /
+    # no block -> no token (the probe then has no redirect to return).
+    token="$(sed -n "s|^deny_info 302:http://egresslock-probe\\.invalid/live/\\([0-9a-f]\\{64\\}\\) egl393_probe_dst\$|\\1|p" "$src" | head -n1)"
+    if [[ -n "$token" ]]; then
+        printf '%s\n' "$token" > "$D/containers-$name.live-token"
+    else
+        rm -f "$D/containers-$name.live-token"
+    fi
 }
 mock_bump_started() { # <name> — a restart changes StartedAt; Id stays
     local name="$1" n
@@ -713,6 +806,485 @@ mock_bump_started() { # <name> — a restart changes StartedAt; Id stays
     [[ -n "$n" ]] || n=0
     printf '2026-01-01T00:00:00.000000000Z#%s\n' "$((n + 1))" > "$D/containers-$name.started"
 }
+# EGL-394 F1: model a deployed config swapped out after the running
+# instance loaded it and restored to the SAME bytes. A byte-identical
+# copy has the same generation but a new device/inode and ctime, so only
+# the stat-identity chain can tell the load did not come from the file
+# being claimed.
+mock_cfg_restored_after_load() { # <name> — identical deployed squid.conf, new inode/ctime
+    local name="$1" f
+    f="$D/containers-$name.cfg/squid.conf"
+    [[ -f "$f" ]] || return 0
+    cp -p "$f" "$f.egl394-restore" || return 0
+    mv -f "$f.egl394-restore" "$f"
+    return 0
+}
+# EGL-515: batched read-only probes (`bash -c <script> egl515-batch ...`).
+# Each record models one in-container probe; the knobs keep the
+# fail-closed seams reachable per key and per batch.
+mock_batch_test() { # <name> <op> <path> -> rc
+    local name="$1" topt="$2" tpath="$3" lpath="" tstate=1
+    case "$topt" in
+        -e|-f|-L) ;;
+        *) return 2 ;;
+    esac
+    if [[ "$topt" == "-e" && ( -f "$D/batch-test-e-fails-$name" || -f "$D/batch-test-e-fails" ) ]] \
+        || [[ "$topt" == "-L" && ( -f "$D/batch-test-L-fails-$name" || -f "$D/batch-test-L-fails" ) ]] \
+        || [[ "$topt" == "-f" && ( -f "$D/batch-test-f-fails-$name" || -f "$D/batch-test-f-fails" ) ]]; then
+        return 2
+    fi
+    if [[ "$topt" == "-e" && ( -f "$D/exec-test-e-fails-$name" || -f "$D/exec-test-e-fails" ) ]]; then
+        return 2
+    fi
+    if [[ "$topt" == "-L" && ( -f "$D/exec-test-L-fails-$name" || -f "$D/exec-test-L-fails" ) ]]; then
+        return 2
+    fi
+    if [[ "$topt" == "-L" && -f "$D/exec-test-L-fails-deployed" && "$tpath" == */squid.conf && "$tpath" != */.egresslock-stage.* ]]; then
+        return 2
+    fi
+    if [[ "$topt" == "-e" && -f "$D/exec-test-e-fails-stage" && "$tpath" == */.egresslock-stage.* ]]; then
+        return 2
+    fi
+    case "$tpath" in
+        /var/log/squid/access.log) lpath="$D/containers-$name.access.log" ;;
+        /var/log/squid/cache.log) lpath="$D/containers-$name.cache.log" ;;
+        *) lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath="" ;;
+    esac
+    [[ -n "$lpath" ]] || return 1
+    case "$topt" in
+        -e) [[ -e "$lpath" ]] && tstate=0 ;;
+        -f) [[ -f "$lpath" && ! -L "$lpath" ]] && tstate=0 ;;
+        -L) [[ -L "$lpath" ]] && tstate=0 ;;
+    esac
+    return "$tstate"
+}
+
+mock_batch_hash() { # <name> <path> -> payload; rc
+    local name="$1" tpath="$2" lpath=""
+    # EGL-395 publication-resolution seam: a lost rename result leaves
+    # the deployed-config read failing (never "absent").
+    if [[ -f "$D/read-fails-$name" && "$tpath" == */squid.conf \
+        && "$tpath" != *"/.egresslock-stage."* ]]; then
+        return 1
+    fi
+    case "$tpath" in
+        /var/log/squid/access.log) lpath="$D/containers-$name.access.log" ;;
+        /var/log/squid/cache.log) lpath="$D/containers-$name.cache.log" ;;
+        *) lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath="" ;;
+    esac
+    [[ -n "$lpath" && -f "$lpath" ]] || return 1
+    sha256sum "$lpath" | sed "s|  $lpath\$|  $tpath|"
+}
+
+mock_batch_stat_ident() { # <name> <path> -> payload; rc
+    local name="$1" tpath="$2" lpath=""
+    # EGL-394: a failed identity read after a confirmed publication dies
+    # committed+owned (the running gateway was not activated).
+    if [[ -f "$D/conf-ident-fails-$name" || -f "$D/conf-ident-fails" ]]; then
+        return 1
+    fi
+    case "$tpath" in
+        /var/log/squid/access.log) lpath="$D/containers-$name.access.log" ;;
+        /var/log/squid/cache.log) lpath="$D/containers-$name.cache.log" ;;
+        *) lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath="" ;;
+    esac
+    [[ -n "$lpath" && -f "$lpath" ]] || return 1
+    stat -c '%d:%i %s %z' "$lpath"
+}
+
+mock_batch_stat_stream() { # <name> <path> -> payload; rc
+    local name="$1" tpath="$2" lpath=""
+    case "$tpath" in
+        /var/log/squid/access.log) lpath="$D/containers-$name.access.log" ;;
+        /var/log/squid/cache.log) lpath="$D/containers-$name.cache.log" ;;
+        *) lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath="" ;;
+    esac
+    [[ -n "$lpath" && -f "$lpath" ]] || return 1
+    printf '%s %s\n' "$(stat -c %d:%i "$lpath")" "$(wc -c < "$lpath")"
+}
+
+mock_batch_mtime() { # <name> <path> -> payload; rc
+    local name="$1" tpath="$2" lpath=""
+    lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath=""
+    [[ -n "$lpath" && -e "$lpath" ]] || return 1
+    stat -c %Y "$lpath"
+}
+
+mock_batch_prefix() { # <name> <path> -> "dev:inode size prefix-hash"; rc
+    local name="$1" tpath="$2" lpath="" st size plen h
+    # EGL-515: the warm reload gate's pre-signal baseline (once the
+    # reload pre-read moved into the batch). Same failure knobs the old
+    # pre mode honored.
+    if [[ -f "$D/reload-stat-fails-$name" || -f "$D/reload-stat-fails" ]]; then
+        return 1
+    fi
+    case "$tpath" in
+        /var/log/squid/access.log) lpath="$D/containers-$name.access.log" ;;
+        /var/log/squid/cache.log) lpath="$D/containers-$name.cache.log" ;;
+        *) lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath="" ;;
+    esac
+    [[ -n "$lpath" && -f "$lpath" ]] || return 1
+    st="$(stat -c '%d:%i %s' "$lpath")"
+    size="${st##* }"
+    if (( size < 4096 )); then plen=$size; else plen=4096; fi
+    if (( plen > 0 )); then
+        if [[ -f "$D/reload-prefix-fails-$name" || -f "$D/reload-prefix-fails" ]] \
+            || [[ -f "$D/reload-prefix-head-fails-$name" || -f "$D/reload-prefix-head-fails" ]]; then
+            return 1
+        fi
+        h="$(head -c "$plen" "$lpath" | sha256sum)"
+        printf '%s %s\n' "$st" "${h%%[[:space:]]*}"
+    else
+        printf '%s \n' "$st"
+    fi
+}
+
+mock_caps_pair() { # <name> -> "CapEff NoNewPrivs"; rc 1 unreadable, 2 missing
+    local name="$1" knob_bad="" knob_nnp="" knob_unreadable=""
+    # EGL-206-D2b: healthy default (CapEff all-zero, NoNewPrivs 1), with
+    # the same per-container-then-global knobs the exec oracle models.
+    [[ -f "$D/caps-bad-$name" || -f "$D/caps-bad" ]] && knob_bad=1
+    [[ -f "$D/caps-nnp-$name" || -f "$D/caps-nnp" ]] && knob_nnp=1
+    [[ -f "$D/caps-unreadable-$name" || -f "$D/caps-unreadable" ]] && knob_unreadable=1
+    if [[ -n "$knob_unreadable" ]]; then
+        return 1
+    fi
+    local capseff="0000000000000000" nnp="1"
+    [[ -n "$knob_bad" ]] && capseff="00000000000001f7"
+    [[ -n "$knob_nnp" ]] && nnp="0"
+    printf '%s %s\n' "$capseff" "$nnp"
+}
+
+mock_batch_argv() { # <name> <cfgdir> -> rc 0 when PID 1 is squid -N -f <cfgdir>/squid.conf
+    local name="$1" cfgdir="$2" want
+    if [[ -f "$D/argv-bad-$name" || -f "$D/argv-bad" ]]; then
+        return 1
+    fi
+    if [[ -f "$D/containers-$name.argv" ]]; then
+        want="$(cat "$D/containers-$name.argv")"
+    elif [[ -f "$D/containers-$name.cfg/squid.conf" ]]; then
+        want="$(mock_cfg_abs "$name")/squid.conf"
+    else
+        want="/etc/squid/squid.conf"
+    fi
+    [[ "$want" == "$cfgdir/squid.conf" ]]
+}
+
+# EGL-515: model the one-shot deployed-vs-live HTTP GET (EGL-393) once,
+# shared by the single-exec shape and the batch `G` op. Prints the raw
+# response; returns 1 when the listener never answers (probe-fails).
+# EGL-515: model the container-side `mv -T <src> <dst>` rename used by
+# the publish script (extracted from the exec mv branch so both the
+# single-call shape and the batch-era script share one model).
+mock_mv_T() { # <name> <src> <dst>
+    local name="$1" msrc="$2" mdst="$3" lsrc="" ldst=""
+    lsrc="$(mock_cfg_local "$name" "$msrc" 2>/dev/null)" || lsrc=""
+    ldst="$(mock_cfg_local "$name" "$mdst" 2>/dev/null)" || ldst=""
+    if [[ -f "$D/mv-rc0-old" || -f "$D/mv-rc0-absent" || -f "$D/mv-rc0-other" ]]; then
+        # EGL-395: a zero rc reports a completed rename; a later
+        # read-back that is not the candidate is Unknown. Model an
+        # outside writer / lying primitive: report success without
+        # publishing.
+        if [[ -f "$D/mv-rc0-absent" ]]; then
+            [[ -n "$ldst" ]] && rm -f "$ldst"
+        elif [[ -f "$D/mv-rc0-other" && -n "$ldst" ]]; then
+            printf 'tampered\n' > "$ldst"
+        fi
+        return 0
+    fi
+    if [[ -f "$D/mv-check-fails" ]]; then
+        echo "mv: cannot move '$msrc': simulated swap failure" >&2
+        return 1
+    fi
+    if [[ -f "$D/mv-arm-read-fails" ]]; then
+        # EGL-395: the rename client result is lost and the container
+        # read path then fails. The resolution must classify the read
+        # error as Unknown, never as a proven pre-publication state.
+        : > "$D/read-fails-$name"
+        echo "Error: error moving file: simulated lost rename result" >&2
+        return 1
+    fi
+    if [[ -f "$D/mv-arm-probe-fails" ]]; then
+        # EGL-395 R-EGL-395-4 F1(a): the rename reports a failure and the
+        # deployed read-back then fails on both the hash and the -L
+        # probe. With a bootstrap (old generation absent) tree this must
+        # stay Unknown/S-P4: a failed probe is never `absent`, so it
+        # cannot prove pre-publication.
+        : > "$D/read-fails-$name"
+        : > "$D/exec-test-L-fails-deployed"
+        echo "Error: error moving file: simulated lost rename result" >&2
+        return 1
+    fi
+    if [[ -f "$D/mv-lost-result-landed" || -f "$D/mv-lost-result-not-landed" \
+        || -f "$D/mv-delayed-lands" || -f "$D/mv-unknown" ]]; then
+        if [[ -f "$D/mv-lost-result-landed" ]]; then
+            [[ -n "$lsrc" && -f "$lsrc" && -n "$ldst" ]] && mv -f "$lsrc" "$ldst"
+        elif [[ -f "$D/mv-delayed-lands" ]]; then
+            printf '%s\n%s\n' "$msrc" "$mdst" > "$D/containers-$name.pending-mv"
+        fi
+        echo "Error: error moving file: simulated lost rename result" >&2
+        return 1
+    fi
+    if [[ -z "$lsrc" || ! -f "$lsrc" ]]; then
+        echo "mv: cannot stat '$msrc': No such file or directory" >&2
+        return 1
+    fi
+    if [[ -z "$ldst" ]]; then
+        echo "mv: cannot move '$msrc' to '$mdst': No such file or directory" >&2
+        return 1
+    fi
+    if [[ -d "$ldst" && ! -L "$ldst" ]]; then
+        echo "mv: cannot overwrite directory '$mdst'" >&2
+        return 1
+    fi
+    mv -f "$lsrc" "$ldst"
+}
+
+# EGL-515: model the purpose-built publish script (`EGL-515 publish v1`):
+# witness removal, `mv -T`, and a success-only stage sweep in one exec.
+# The stage sweep is best-effort in the script, so its failure stays
+# silent and leaves the stage for the host's quiescence path.
+mock_publish() { # <name> <witness> <src> <dst> <stage>
+    local name="$1" witness="$2" src="$3" dst="$4" stage="$5" wl="" sdir="" rc=0
+    wl="$(mock_cfg_local "$name" "$witness" 2>/dev/null)" || wl=""
+    if [[ -n "$wl" ]]; then rm -f "$wl" 2>/dev/null || true; fi
+    mock_mv_T "$name" "$src" "$dst" || rc=$?
+    if (( rc == 0 )); then
+        sdir="$(mock_cfg_local "$name" "$stage" 2>/dev/null)" || sdir=""
+        if [[ -n "$sdir" && ! -f "$D/rm-stage-fails" ]]; then
+            rm -rf "$sdir"
+        fi
+    fi
+    return "$rc"
+}
+
+# EGL-515: model cleanup's one-exec window (`EGL-515 cleanup-read v2`):
+# witness removal, deployed-config read and the single type/mtime/name
+# listing. Two space-delimited base64 records (`cfg`, `find`) so one exec
+# still carries exact bytes; the script itself always exits 0.
+mock_cleanup() { # <name> <witness> <conf> <dir>
+    local name="$1" witness="$2" conf="$3" dir="$4" wl="" cl="" ldir="" f typ
+    local frc=0 fdata="" listing=""
+    local -a _found=() _lines=()
+    wl="$(mock_cfg_local "$name" "$witness" 2>/dev/null)" || wl=""
+    if [[ -n "$wl" ]]; then rm -f "$wl" 2>/dev/null || true; fi
+    cl="$(mock_cfg_local "$name" "$conf" 2>/dev/null)" || cl=""
+    if [[ -n "$cl" && -f "$cl" ]]; then
+        printf 'cfg 0 %s\n' "$(base64 -w0 < "$cl")"
+    else
+        printf 'cfg 1 \n'
+    fi
+    if [[ -f "$D/find-fails-$name" || -f "$D/find-fails" ]]; then
+        echo "find: ${dir:-}: Input/output error" >&2
+        frc=1
+    else
+        ldir="$(mock_cfg_local "$name" "${dir%/}" 2>/dev/null)" || ldir=""
+        if [[ -z "$ldir" ]]; then
+            echo "find: '${dir}': No such file or directory" >&2
+            frc=1
+        else
+            shopt -s dotglob nullglob
+            _found=("$ldir"/*)
+            shopt -u dotglob nullglob
+            for f in "${_found[@]}"; do
+                typ=o
+                [[ -L "$f" ]] && typ=l
+                [[ -f "$f" && ! -L "$f" ]] && typ=f
+                [[ -d "$f" && ! -L "$f" ]] && typ=d
+                _lines+=("$(printf '%s %s %s' "$typ" "$(stat -c %Y "$f")" "${f##*/}")")
+            done
+            if (( ${#_lines[@]} > 0 )); then
+                listing="$(printf '%s\n' "${_lines[@]}")"
+            fi
+            fdata="$(printf '%s' "$listing" | base64 -w0)"
+        fi
+    fi
+    printf 'find %s %s\n' "$frc" "$fdata"
+    return 0
+}
+
+mock_live_http() { # <name> -> raw HTTP; rc 1 no listener
+    local name="$1" _ltok=""
+    if [[ -f "$D/probe-fails-active-$name" || -f "$D/reload-probe-fails-active-$name" ]]; then
+        return 1
+    fi
+    _ltok="$(cat "$D/containers-$name.live-token" 2>/dev/null || true)"
+    if [[ -f "$D/live-probe-no-response-$name" || -f "$D/live-probe-no-response" ]]; then
+        return 0
+    fi
+    if [[ -f "$D/live-probe-403-$name" || -f "$D/live-probe-403" ]]; then
+        printf 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
+        return 0
+    fi
+    if [[ -f "$D/live-probe-malformed-location-$name" || -f "$D/live-probe-malformed-location" ]]; then
+        printf 'HTTP/1.1 302 Found\r\nLocation: http://egresslock-probe.invalid/live/not-a-token\r\nContent-Length: 0\r\n\r\n'
+        return 0
+    fi
+    if [[ -f "$D/live-probe-wrong-token-$name" || -f "$D/live-probe-wrong-token" ]]; then
+        printf 'HTTP/1.1 302 Found\r\nLocation: http://egresslock-probe.invalid/live/%064d\r\nContent-Length: 0\r\n\r\n' 0
+        return 0
+    fi
+    if [[ -f "$D/live-probe-no-location-$name" || -f "$D/live-probe-no-location" || -z "$_ltok" ]]; then
+        printf 'HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n'
+        return 0
+    fi
+    printf 'HTTP/1.1 302 Found\r\nLocation: http://egresslock-probe.invalid/live/%s\r\nContent-Length: 0\r\n\r\n' "$_ltok"
+}
+
+mock_batch() { # <name> <key op path>...
+    local name="$1"; shift
+    local key op path out rc i=0 gport grest gurl ghost ghttp
+    if [[ -f "$D/batch-exec-fails" ]]; then
+        echo "Error: can only create exec sessions on running containers: container state improper" >&2
+        exit 125
+    fi
+    while (( $# )); do
+        key="$1"; op="$2"; path="$3"; shift 3
+        i=$((i + 1))
+        out=""; rc=0
+        case "$op" in
+            e) mock_batch_test "$name" -e "$path" || rc=$? ;;
+            L) mock_batch_test "$name" -L "$path" || rc=$? ;;
+            f) mock_batch_test "$name" -f "$path" || rc=$? ;;
+            h) out="$(mock_batch_hash "$name" "$path" 2>/dev/null)" || rc=$?
+               out="${out%%[[:space:]]*}" ;;
+            i) out="$(mock_batch_stat_ident "$name" "$path" 2>/dev/null)" || rc=$? ;;
+            s) out="$(mock_batch_stat_stream "$name" "$path" 2>/dev/null)" || rc=$? ;;
+            m) out="$(mock_batch_mtime "$name" "$path" 2>/dev/null)" || rc=$? ;;
+            B) out="$(mock_batch_prefix "$name" "$path" 2>/dev/null)" || rc=$? ;;
+            P) # A stopped container cannot run the probe exec at all (real
+               # podman exec fails); the mock's generic exec gate accepts a
+               # registered container, so the liveness op owns the running
+               # oracle here — the batch must not bless a stopped instance.
+               if [[ ! -f "$D/running/$name" ]] \
+                   || [[ -f "$D/probe-fails-active-$name" || -f "$D/reload-probe-fails-active-$name" ]]; then
+                   rc=1
+               else
+                   rc=0
+               fi ;;
+            C) out="$(mock_caps_pair "$name" 2>/dev/null)" || rc=$? ;;
+            A) mock_batch_argv "$name" "$path" || rc=$? ;;
+            G) gport="${path%%|*}"; grest="${path#*|}"
+               gurl="${grest%%|*}"; ghost="${grest#*|}"
+               if [[ "$gport" =~ ^[0-9]+$ && -n "$gurl" && -n "$ghost" ]]; then
+                   if ghttp="$(mock_live_http "$name")"; then
+                       out="$(printf '%s' "$ghttp" | base64 -w0)" || rc=$?
+                   else
+                       rc=2
+                   fi
+               else
+                   rc=2
+               fi ;;
+            *) rc=2 ;;
+        esac
+        case "$rc" in 0|1) ;; *) rc=2 ;; esac
+        [[ -f "$D/batch-drop-key-$key" ]] && continue
+        if [[ -f "$D/batch-blank-$key" ]]; then
+            # F4: an internal blank line is a malformed record (D1); the
+            # parser must invalidate the whole batch, not skip it.
+            printf '\n%s\t%s\t%s\n' "$key" "$rc" "$out"
+        elif [[ -f "$D/batch-malformed-$key" ]]; then
+            printf 'malformed record\n'
+        elif [[ -f "$D/batch-dup-$key" ]]; then
+            printf '%s\t%s\t%s\n%s\t%s\t%s\n' "$key" "$rc" "$out" "$key" "$rc" "$out"
+        elif [[ -f "$D/batch-rc9-$key" ]]; then
+            printf '%s\t9\t%s\n' "$key" "$out"
+        else
+            printf '%s\t%s\t%s\n' "$key" "$rc" "$out"
+        fi
+        if [[ -f "$D/batch-partial-dies" && "$i" -ge 1 ]]; then
+            exit 1
+        fi
+    done
+}
+
+# EGL-515: model the purpose-built reload read script (`EGL-515
+# reload-read v1`). Emits the same TAB records the container-side script
+# would. Probe failures are rc 2; a tail that does not carry the witness
+# is rc 1 (the host maps that to its existing named error). Only the
+# post-signal mode is reachable — the pre-signal baseline is batch op `B`
+# (`mock_batch_prefix`), so there is no `pre` model here (F1).
+mock_reload_read() { # <name> <post> [<prev-ident> <before> <plen> <phash> <cfgdir>]
+    local name="$1"
+    shift 2
+    local f="$D/containers-$name.cache.log" st h new
+    local prev_ident="$1" before="$2" plen_arg="$3" cfgdir="$5"
+    _rl_post_stat() {
+        if [[ -f "$D/reload-stat-fails-$name" || -f "$D/reload-stat-fails" ]] \
+            || [[ ! -f "$f" ]]; then
+            return 1
+        fi
+        # EGL-394 F2: a later post-signal observation of the
+        # shrink-then-regrow seam sees the stream regrown past the
+        # original offset with a matching witness. The fixed engine
+        # treats the first shrink as terminal and never accepts it.
+        if [[ -f "$D/reload-log-shrink-regrow-pending-$name" ]]; then
+            local _n=0
+            [[ -f "$D/reload-log-shrink-regrow-pending-$name.n" ]] \
+                && read -r _n < "$D/reload-log-shrink-regrow-pending-$name.n"
+            _n=$((_n + 1))
+            printf '%s\n' "$_n" > "$D/reload-log-shrink-regrow-pending-$name.n"
+            if (( _n >= 2 )); then
+                rm -f "$D/reload-log-shrink-regrow-pending-$name" \
+                      "$D/reload-log-shrink-regrow-pending-$name.n"
+                : > "$f"
+                printf '%05000d' 0 >> "$f"
+                {
+                    printf 'Reconfiguring Squid Cache (version 6.13)...\n'
+                    printf 'Processing Configuration File: %s/squid.conf (depth 0)\n' "$(mock_cfg_abs "$name")"
+                } >> "$f"
+                mock_cfg_load_live "$name"
+            fi
+        fi
+        stat -c '%d:%i %s' "$f"
+    }
+    if ! st="$(_rl_post_stat)"; then
+        printf 's1\t2\t\np\t2\t\nt\t2\t\nw1\t2\t\nw2\t2\t\ns2\t2\t\n'
+        return 0
+    fi
+    printf 's1\t0\t%s\n' "$st"
+    if (( plen_arg > 0 )); then
+        if [[ -f "$D/reload-prefix-fails-$name" || -f "$D/reload-prefix-fails" ]] \
+            || [[ -f "$D/reload-prefix-head-fails-$name" || -f "$D/reload-prefix-head-fails" ]]; then
+            printf 'p\t2\t\n'
+        else
+            h="$(head -c "$plen_arg" "$f" | sha256sum)"
+            printf 'p\t0\t%s\n' "${h%%[[:space:]]*}"
+        fi
+    else
+        printf 'p\t1\t\n'
+    fi
+    new=""
+    if new="$(tail -c "+$((before + 1))" "$f" 2>/dev/null)"; then
+        printf 't\t0\t\n'
+        if [[ "$new" == *"Reconfiguring Squid Cache"* ]]; then
+            printf 'w1\t0\t\n'
+        else
+            printf 'w1\t1\t\n'
+        fi
+        if [[ "$new" == *"Processing Configuration File: $cfgdir/squid.conf (depth 0)"* ]]; then
+            printf 'w2\t0\t\n'
+        else
+            printf 'w2\t1\t\n'
+        fi
+        # EGL-394 H2: swap the stream AFTER the witness bytes are read;
+        # the re-stat inside the same script must see the new inode.
+        if [[ -f "$D/reload-log-replaced-at-tail-once-$name" ]]; then
+            rm -f "$D/reload-log-replaced-at-tail-once-$name"
+            cp "$f" "$f.at-tail"
+            mv -f "$f.at-tail" "$f"
+        fi
+    else
+        printf 't\t2\t\nw1\t2\t\nw2\t2\t\n'
+    fi
+    if st="$(_rl_post_stat)"; then
+        printf 's2\t0\t%s\n' "$st"
+    else
+        printf 's2\t2\t\n'
+    fi
+    return 0
+}
+
 mock_perform_pending_mv() { # <name> <in-container stage dir> — delayed rename lands before sweep
     local name="$1" stage="$2" src dst
     [[ -f "$D/containers-$name.pending-mv" ]] || return 0
@@ -927,6 +1499,13 @@ case "$cmd" in
         # EGL-395: a new container gets a fresh bootstrap config dir and
         # its own instance identity; the shipped image config is what
         # PID 1 starts on until the first apply publishes squid.conf.
+        # EGL-394 F1: real podman refuses a duplicate container name. A
+        # failed removal of a still-running pre-existing gateway leaves
+        # the name registered, so its replacement start fails here.
+        if [[ -f "$D/name-in-use-$name" ]]; then
+            echo "Error: creating container storage: the container name \"$name\" is already in use by another container" >&2
+            exit 125
+        fi
         mock_cfg_init "$name"
         if [[ -f "$D/run-sick-$name" || -f "$D/run-sick" ]]; then
             echo "$net" > "$D/containers/$name.net"
@@ -987,6 +1566,13 @@ case "$cmd" in
                 ;;
             '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}')
                 cat "$D/containers/$name.net" 2>/dev/null | head -1; echo ;;
+            '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}|{{$v.IPAddress}}|{{$v.MacAddress}}{{println}}{{end}}')
+                # EGL-515 D3: verify_gateway's combined attachment/IP/MAC
+                # read. One row for the container's class network.
+                printf '%s|%s|%s\n' \
+                    "$(head -1 "$D/containers/$name.net" 2>/dev/null)" \
+                    "$(cat "$D/containers/$name.ip" 2>/dev/null || true)" \
+                    "$(cat "$D/containers/$name.mac" 2>/dev/null || true)" ;;
             *'IPAddress}}'*)
                 # Static-ip containers report their stored IP.
                 if [[ -f "$D/containers/$name.ip" ]]; then
@@ -1016,6 +1602,12 @@ case "$cmd" in
             '{{.State.StartedAt}}')
                 # EGL-395: a real container always has an identity even
                 # when a test hand-seeded only the running/net markers.
+                # EGL-394 F2: a failed pre-signal StartedAt read must
+                # disclose the unexpected warm-path restart.
+                if [[ -f "$D/inspect-started-fails-$name" || -f "$D/inspect-started-fails" ]]; then
+                    echo "Error: simulated inspect failure for $name" >&2
+                    exit 1
+                fi
                 cat "$D/containers-$name.started" 2>/dev/null \
                     || echo '2026-01-01T00:00:00.000000000Z#1'
                 ;;
@@ -1030,7 +1622,28 @@ case "$cmd" in
         [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
         # ARC-32-D1: record exec argv — separate file, because runlog
         # line counts are how existing tests assert "no new podman run".
-        echo "exec $name $*" >> "$D/execlog"
+        # EGL-515: the batched-probe script is multi-line; log a compact
+        # one-line argv so execlog stays a per-exec log and the count
+        # oracle stays exact.
+        batch=0
+        reload=0
+        publish=0
+        cleanup=0
+        if [[ "${1:-}" == "bash" && "${2:-}" == "-c" && "${3:-}" == *"EGL-515 batch v1"* ]]; then
+            batch=1
+            echo "exec $name bash -c egl515-batch ${*:5}" >> "$D/execlog"
+        elif [[ "${1:-}" == "bash" && "${2:-}" == "-c" && "${3:-}" == *"EGL-515 reload-read v1"* ]]; then
+            reload=1
+            echo "exec $name bash -c egl515-reload ${*:5}" >> "$D/execlog"
+        elif [[ "${1:-}" == "bash" && "${2:-}" == "-c" && "${3:-}" == *"EGL-515 publish v1"* ]]; then
+            publish=1
+            echo "exec $name bash -c egl515-publish ${*:5}" >> "$D/execlog"
+        elif [[ "${1:-}" == "bash" && "${2:-}" == "-c" && "${3:-}" == *"EGL-515 cleanup-read v2"* ]]; then
+            cleanup=1
+            echo "exec $name bash -c egl515-cleanup ${*:5}" >> "$D/execlog"
+        else
+            echo "exec $name $*" >> "$D/execlog"
+        fi
         # EGL-283: model podman's own exec failure (container stopped or
         # mid-restart — e.g. a concurrent ensure) while the container
         # still lists as running, so the engine's earlier liveness check
@@ -1038,6 +1651,26 @@ case "$cmd" in
         if [[ -f "$D/exec-fails-$name" || -f "$D/exec-fails" ]]; then
             echo "Error: can only create exec sessions on running containers: container state improper" >&2
             exit 125
+        fi
+        if (( reload == 1 )); then
+            shift 4
+            mock_reload_read "$name" "$@"
+            exit $?
+        fi
+        if (( batch == 1 )); then
+            shift 4
+            mock_batch "$name" "$@"
+            exit $?
+        fi
+        if (( publish == 1 )); then
+            shift 4
+            mock_publish "$name" "$@"
+            exit $?
+        fi
+        if (( cleanup == 1 )); then
+            shift 4
+            mock_cleanup "$name" "$@"
+            exit $?
         fi
         case "$1" in
             test)
@@ -1089,6 +1722,19 @@ case "$cmd" in
                     echo "Error: can only create exec sessions on running containers: container state improper" >&2
                     exit 125
                 fi
+                # EGL-394: log-path existence (the cap's reopen proof).
+                if [[ "${2:-}" =~ ^-(e|f)$ && ( "${3:-}" == /var/log/squid/access.log || "${3:-}" == /var/log/squid/cache.log ) ]]; then
+                    case "${3:-}" in
+                        /var/log/squid/access.log) f="$D/containers-$name.access.log" ;;
+                        /var/log/squid/cache.log)  f="$D/containers-$name.cache.log" ;;
+                    esac
+                    if [[ "${2:-}" == "-e" ]]; then
+                        [[ -e "$f" ]] && exit 0
+                        exit 1
+                    fi
+                    [[ -f "$f" && ! -L "$f" ]] && exit 0
+                    exit 1
+                fi
                 tstate=1
                 case "$topt" in
                     -e|-f|-L)
@@ -1106,19 +1752,12 @@ case "$cmd" in
                 exit "$tstate"
                 ;;
             squid)
-                # ARC-32-D1: `squid -k rotate` reopens the stdio logs;
-                # model that by recreating fresh (empty) log files. The
-                # rotate-fails marker exercises the engine's restore
-                # path (fail open for the log, never for policy).
-                if [[ "$*" == *"-k rotate"* ]]; then
-                    if [[ -f "$D/rotate-fails" ]]; then
-                        echo "mock squid: rotate failed" >&2
-                        exit 1
-                    fi
-                    : > "$D/containers-$name.access.log" 2>/dev/null || true
-                    : > "$D/containers-$name.cache.log" 2>/dev/null || true
-                    exit 0
-                fi
+                # EGL-394: the engine signals the daemon by pid
+                # (`bash -c 'kill -HUP 1'`), not `squid -k` — see the
+                # bash case below. A `squid -k` client would need the
+                # daemon's pidfile, which the shipped entrypoint's
+                # daemonizing `squid -z` can delete after `-N` wrote it
+                # (live finding R-EGL-394-2 F2).
                 # Reject if the candidate config is marked bad.
                 if [[ -f "$D/allowlist-invalid" ]]; then
                     echo "mock squid: config invalid" >&2
@@ -1144,6 +1783,30 @@ case "$cmd" in
                     echo "mock squid: deployed config invalid" >&2
                     exit 1
                 fi
+                # EGL-394 F3: a same-name replacement or a deployed-config
+                # drift at the final verification. Both leave the deployed
+                # file parseable; only argv/hash binding catches them.
+                if [[ "$*" == *"/squid.conf"* && "$*" != *"/.egresslock-stage."* ]]; then
+                    if [[ -f "$D/deployed-replaced-at-verify-$name" ]]; then
+                        rm -f "$D/deployed-replaced-at-verify-$name"
+                        mock_bump_started "$name"
+                        printf '/etc/squid/squid.conf\n' > "$D/containers-$name.argv"
+                        printf 'bootstrap-old-acl\n' > "$D/containers-$name.live"
+                    fi
+                    if [[ -f "$D/deployed-config-drifts-at-verify-$name" ]]; then
+                        rm -f "$D/deployed-config-drifts-at-verify-$name"
+                        _df="$(mock_cfg_local "$name" "${!#}" 2>/dev/null)" || _df=""
+                        [[ -n "$_df" && -f "$_df" ]] && printf '\n# concurrent drift\n' >> "$_df"
+                    fi
+                    # EGL-394 F1: the deployed config is swapped for an
+                    # identical copy after the apply loaded it but before
+                    # the final verification. The generation (bytes) is
+                    # unchanged; only the stat identity shows the swap.
+                    if [[ -f "$D/deployed-conf-restored-at-verify-$name" ]]; then
+                        rm -f "$D/deployed-conf-restored-at-verify-$name"
+                        mock_cfg_restored_after_load "$name"
+                    fi
+                fi
                 exit 0
                 ;;
             stat)
@@ -1152,6 +1815,26 @@ case "$cmd" in
                     lpath="$(mock_cfg_local "$name" "${4:-}" 2>/dev/null)" || lpath=""
                     if [[ -n "$lpath" && -e "$lpath" ]]; then
                         stat -c %Y "$lpath"
+                        exit 0
+                    fi
+                    echo "stat: cannot stat '${4:-}': No such file or directory" >&2
+                    exit 1
+                fi
+                # EGL-394 F1: the deployed config's stat identity
+                # (device/inode, size, ctime). The mock's mounted tree is
+                # a host directory, so the host file's identity models
+                # the container view exactly.
+                if [[ "${2:-}" == "-c" && "${3:-}" == "%d:%i %s %z" ]]; then
+                    # EGL-394: a failed identity read after a confirmed
+                    # publication dies committed+owned (the running
+                    # gateway was not activated).
+                    if [[ -f "$D/conf-ident-fails-$name" || -f "$D/conf-ident-fails" ]]; then
+                        echo "stat: cannot stat '${4:-}': simulated failure" >&2
+                        exit 1
+                    fi
+                    lpath="$(mock_cfg_local "$name" "${4:-}" 2>/dev/null)" || lpath=""
+                    if [[ -n "$lpath" && -f "$lpath" ]]; then
+                        stat -c '%d:%i %s %z' "$lpath"
                         exit 0
                     fi
                     echo "stat: cannot stat '${4:-}': No such file or directory" >&2
@@ -1173,15 +1856,81 @@ case "$cmd" in
                     echo "stat: cannot stat '${4:-}': No such file or directory" >&2
                     exit 1
                 fi
+                # EGL-394: reload proof binds the cache log stream to its
+                # device:inode and size; log cap binds the reopen to a
+                # changed inode.
+                case "$4" in
+                    /var/log/squid/access.log) f="$D/containers-$name.access.log" ;;
+                    /var/log/squid/cache.log)  f="$D/containers-$name.cache.log" ;;
+                    *) f="" ;;
+                esac
+                if [[ "${2:-}" == "-c" && "${3:-}" == "%d:%i" && -n "$f" && -f "$f" ]]; then
+                    stat -c %d:%i "$f"
+                    exit 0
+                fi
+                if [[ "${2:-}" == "-c" && "${3:-}" == "%d:%i %s" && -n "$f" && -f "$f" ]]; then
+                    # EGL-394 F2: a failed pre-signal cache-log stat must
+                    # disclose the unexpected warm-path restart.
+                    if [[ -f "$D/reload-stat-fails-$name" || -f "$D/reload-stat-fails" ]]; then
+                        echo "stat: cannot stat '$4': simulated failure" >&2
+                        exit 1
+                    fi
+                    # EGL-394 F2: second post-signal observation of the
+                    # shrink-then-regrow seam: the stream regrows past the
+                    # original offset with a matching witness.
+                    if [[ "$f" == "$D/containers-$name.cache.log" \
+                          && -f "$D/reload-log-shrink-regrow-pending-$name" ]]; then
+                        _sr_n=0
+                        [[ -f "$D/reload-log-shrink-regrow-pending-$name.n" ]] \
+                            && read -r _sr_n < "$D/reload-log-shrink-regrow-pending-$name.n"
+                        _sr_n=$(( _sr_n + 1 ))
+                        printf '%s\n' "$_sr_n" > "$D/reload-log-shrink-regrow-pending-$name.n"
+                        if (( _sr_n >= 2 )); then
+                            rm -f "$D/reload-log-shrink-regrow-pending-$name" \
+                                  "$D/reload-log-shrink-regrow-pending-$name.n"
+                            : > "$f"
+                            printf '%05000d' 0 >> "$f"
+                            {
+                                printf 'Reconfiguring Squid Cache (version 6.13)...\n'
+                                printf 'Processing Configuration File: %s/squid.conf (depth 0)\n' "$(mock_cfg_abs "$name")"
+                            } >> "$f"
+                            mock_cfg_load_live "$name"
+                        fi
+                    fi
+                    printf '%s %s\n' "$(stat -c %d:%i "$f")" "$(wc -c < "$f")"
+                    exit 0
+                fi
                 echo "mock podman: unsupported stat $*" >&2
                 exit 2
                 ;;
             tail)
                 # EGL-252: cmd_denied tail-reads the newest log bytes
                 # when access.log exceeds the read cap (tail -c <N>).
+                # EGL-394: the reload witness scan reads cache.log from
+                # a recorded offset (tail -c +<N>).
                 if [[ "${2:-}" == "-c" && "${4:-}" == /var/log/squid/access.log ]]; then
                     f="$D/containers-$name.access.log"
                     if [[ -f "$f" ]]; then tail -c "$3" "$f"; exit 0; fi
+                    echo "tail: cannot open '$4' for reading: No such file or directory" >&2
+                    exit 1
+                fi
+                if [[ "${2:-}" == "-c" && "${4:-}" == /var/log/squid/cache.log \
+                      && "${3:-}" == +* ]]; then
+                    f="$D/containers-$name.cache.log"
+                    if [[ -f "$f" ]]; then
+                        tail -c "$3" "$f"
+                        # EGL-394 H2: swap the stream AFTER the witness
+                        # bytes are read. The post-tail stat must see the
+                        # new inode and reject the poll; without that
+                        # re-assertion the witness would be accepted.
+                        if [[ -f "$D/reload-log-replaced-at-tail-once-$name" ]]; then
+                            rm -f "$D/reload-log-replaced-at-tail-once-$name"
+                            _tp="$f.at-tail"
+                            cp "$f" "$_tp"
+                            mv -f "$_tp" "$f"
+                        fi
+                        exit 0
+                    fi
                     echo "tail: cannot open '$4' for reading: No such file or directory" >&2
                     exit 1
                 fi
@@ -1196,6 +1945,25 @@ case "$cmd" in
                 # moves); $D/mv-check-fails exercises the swap die.
                 if [[ "${2:-}" == /var/log/squid/* && "${3:-}" == /var/log/squid/* ]]; then
                     s="$D/containers-$name.${2##*/}"; d="$D/containers-$name.${3##*/}"
+                    # R-EGL-394-16 F1 mutation control: the pre-fix
+                    # restore was a clobbering `mv`. Model the same
+                    # reopen-at-restore race here so a reintroduced
+                    # check-then-mv loses the fresh record, not just the
+                    # primitive-shape assertion in the fixed legs.
+                    case "${3##*/}" in
+                        access.log)
+                            if [[ -f "$D/rotate-reopen-before-restore-access-$name" ]]; then
+                                rm -f "$D/rotate-reopen-before-restore-access-$name"
+                                printf 'fresh-access-record\n' > "$d"
+                            fi
+                            ;;
+                        cache.log)
+                            if [[ -f "$D/rotate-reopen-before-restore-cache-$name" ]]; then
+                                rm -f "$D/rotate-reopen-before-restore-cache-$name"
+                                printf 'fresh-cache-record\n' > "$d"
+                            fi
+                            ;;
+                    esac
                     if [[ -f "$s" ]]; then
                         mv "$s" "$d"
                         exit 0
@@ -1204,75 +1972,8 @@ case "$cmd" in
                     exit 1
                 fi
                 if [[ "${2:-}" == "-T" && "${3:-}" == /etc/squid/* && "${4:-}" == /etc/squid/* ]]; then
-                    # `mv -T <src> <dst>`: argv is mv, -T, src, dst.
-                    if [[ "${2:-}" != "-T" ]]; then
-                        echo "mock podman: unsupported mv $*" >&2
-                        exit 2
-                    fi
-                    msrc="${3:-}"; mdst="${4:-}"
-                    lsrc="$(mock_cfg_local "$name" "$msrc" 2>/dev/null)" || lsrc=""
-                    ldst="$(mock_cfg_local "$name" "$mdst" 2>/dev/null)" || ldst=""
-                    if [[ -f "$D/mv-rc0-old" || -f "$D/mv-rc0-absent" || -f "$D/mv-rc0-other" ]]; then
-                        # EGL-395: a zero rc reports a completed rename; a
-                        # later read-back that is not the candidate is
-                        # Unknown. Model an outside writer / lying
-                        # primitive: report success without publishing.
-                        if [[ -f "$D/mv-rc0-absent" ]]; then
-                            [[ -n "$ldst" ]] && rm -f "$ldst"
-                        elif [[ -f "$D/mv-rc0-other" && -n "$ldst" ]]; then
-                            printf 'tampered\n' > "$ldst"
-                        fi
-                        exit 0
-                    fi
-                    if [[ -f "$D/mv-check-fails" ]]; then
-                        echo "mv: cannot move '$msrc': simulated swap failure" >&2
-                        exit 1
-                    fi
-                    if [[ -f "$D/mv-arm-read-fails" ]]; then
-                        # EGL-395: the rename client result is lost and the
-                        # container read path then fails. The resolution
-                        # must classify the read error as Unknown, never
-                        # as a proven pre-publication state.
-                        : > "$D/read-fails-$name"
-                        echo "Error: error moving file: simulated lost rename result" >&2
-                        exit 1
-                    fi
-                    if [[ -f "$D/mv-arm-probe-fails" ]]; then
-                        # EGL-395 R-EGL-395-4 F1(a): the rename reports a
-                        # failure and the deployed read-back then fails on
-                        # both the hash and the -L probe. With a bootstrap
-                        # (old generation absent) tree this must stay
-                        # Unknown/S-P4: a failed probe is never `absent`,
-                        # so it cannot prove pre-publication.
-                        : > "$D/read-fails-$name"
-                        : > "$D/exec-test-L-fails-deployed"
-                        echo "Error: error moving file: simulated lost rename result" >&2
-                        exit 1
-                    fi
-                    if [[ -f "$D/mv-lost-result-landed" || -f "$D/mv-lost-result-not-landed" \
-                        || -f "$D/mv-delayed-lands" || -f "$D/mv-unknown" ]]; then
-                        if [[ -f "$D/mv-lost-result-landed" ]]; then
-                            [[ -n "$lsrc" && -f "$lsrc" && -n "$ldst" ]] && mv -f "$lsrc" "$ldst"
-                        elif [[ -f "$D/mv-delayed-lands" ]]; then
-                            printf '%s\n%s\n' "$msrc" "$mdst" > "$D/containers-$name.pending-mv"
-                        fi
-                        echo "Error: error moving file: simulated lost rename result" >&2
-                        exit 1
-                    fi
-                    if [[ -z "$lsrc" || ! -f "$lsrc" ]]; then
-                        echo "mv: cannot stat '$msrc': No such file or directory" >&2
-                        exit 1
-                    fi
-                    if [[ -z "$ldst" ]]; then
-                        echo "mv: cannot move '$msrc' to '$mdst': No such file or directory" >&2
-                        exit 1
-                    fi
-                    if [[ -d "$ldst" && ! -L "$ldst" ]]; then
-                        echo "mv: cannot overwrite directory '$mdst'" >&2
-                        exit 1
-                    fi
-                    mv -f "$lsrc" "$ldst"
-                    exit 0
+                    mock_mv_T "$name" "${3:-}" "${4:-}"
+                    exit $?
                 fi
                 exit 0
                 ;;
@@ -1284,33 +1985,36 @@ case "$cmd" in
                     rm -f "$D/containers-$name.${3##*/}"
                 fi
                 if [[ "${2:-}" == -f || "${2:-}" == -rf ]]; then
-                    rpath="${3:-}"
-                    if [[ "$rpath" == /etc/squid/agent/* || "$rpath" == /etc/squid/egresslock/* ]]; then
-                        if [[ "$rpath" == *"/.egresslock-stage."* ]]; then
-                            if [[ -f "$D/rm-stage-fails" ]]; then
-                                echo "Error: simulated stage sweep failure" >&2
+                    shift 2
+                    [[ "${1:-}" == "--" ]] && shift
+                    for rpath in "$@"; do
+                        if [[ "$rpath" == /etc/squid/agent/* || "$rpath" == /etc/squid/egresslock/* ]]; then
+                            if [[ "$rpath" == *"/.egresslock-stage."* ]]; then
+                                if [[ -f "$D/rm-stage-fails" ]]; then
+                                    echo "Error: simulated stage sweep failure" >&2
+                                    exit 1
+                                fi
+                                mock_perform_pending_mv "$name" "$rpath"
+                            elif [[ -f "$D/rm-config-fails-${rpath##*/}" ]]; then
+                                echo "rm: cannot remove '$rpath': simulated config removal failure" >&2
+                                exit 1
+                            elif [[ -f "$D/cleanup-rm-enospc" ]]; then
+                                echo "rm: cannot remove '$rpath': No space left on device" >&2
+                                exit 1
+                            elif [[ -f "$D/cleanup-rm-fails" ]]; then
+                                echo "rm: cannot remove '$rpath': simulated cleanup failure" >&2
                                 exit 1
                             fi
-                            mock_perform_pending_mv "$name" "$rpath"
-                        elif [[ -f "$D/rm-config-fails-${rpath##*/}" ]]; then
-                            echo "rm: cannot remove '$rpath': simulated config removal failure" >&2
-                            exit 1
-                        elif [[ -f "$D/cleanup-rm-enospc" ]]; then
-                            echo "rm: cannot remove '$rpath': No space left on device" >&2
-                            exit 1
-                        elif [[ -f "$D/cleanup-rm-fails" ]]; then
-                            echo "rm: cannot remove '$rpath': simulated cleanup failure" >&2
-                            exit 1
-                        fi
-                        lpath="$(mock_cfg_local "$name" "$rpath" 2>/dev/null)" || lpath=""
-                        if [[ -n "$lpath" ]]; then
-                            if [[ -d "$lpath" && ! -L "$lpath" ]]; then
-                                rm -rf "$lpath"
-                            else
-                                rm -f "$lpath"
+                            lpath="$(mock_cfg_local "$name" "$rpath" 2>/dev/null)" || lpath=""
+                            if [[ -n "$lpath" ]]; then
+                                if [[ -d "$lpath" && ! -L "$lpath" ]]; then
+                                    rm -rf "$lpath"
+                                else
+                                    rm -f "$lpath"
+                                fi
                             fi
                         fi
-                    fi
+                    done
                 fi
                 exit 0
                 ;;
@@ -1323,6 +2027,8 @@ case "$cmd" in
                 if [[ "${2:-}" == /proc/1/cmdline ]]; then
                     if [[ -f "$D/argv-bad-$name" || -f "$D/argv-bad" ]]; then
                         printf 'squid\0-N\0-f\0/etc/squid/squid.conf\0-d\00\0'
+                    elif [[ -f "$D/containers-$name.argv" ]]; then
+                        printf 'squid\0-N\0-f\0%s\0-d\00\0' "$(cat "$D/containers-$name.argv")"
                     elif [[ -f "$D/containers-$name.cfg/squid.conf" ]]; then
                         printf 'squid\0-N\0-f\0%s/squid.conf\0-d\00\0' "$(mock_cfg_abs "$name")"
                     else
@@ -1339,17 +2045,11 @@ case "$cmd" in
                 # (NoNewPrivs 0), caps-unreadable (exec fails — the
                 # fail-closed path). Per-container form: caps-<knob>-<name>.
                 if [[ "${2:-}" == /proc/1/status ]]; then
-                    knob_bad=""; knob_nnp=""; knob_unreadable=""
-                    [[ -f "$D/caps-bad-$name" || -f "$D/caps-bad" ]] && knob_bad=1
-                    [[ -f "$D/caps-nnp-$name" || -f "$D/caps-nnp" ]] && knob_nnp=1
-                    [[ -f "$D/caps-unreadable-$name" || -f "$D/caps-unreadable" ]] && knob_unreadable=1
-                    if [[ -n "$knob_unreadable" ]]; then
+                    if ! pair="$(mock_caps_pair "$name")"; then
                         echo "cat: /proc/1/status: No such file or directory" >&2
                         exit 1
                     fi
-                    capseff="0000000000000000"; nnp="1"
-                    [[ -n "$knob_bad" ]] && capseff="00000000000001f7"
-                    [[ -n "$knob_nnp" ]] && nnp="0"
+                    read -r capseff nnp <<<"$pair" || true
                     printf 'CapEff:\t%s\n' "$capseff"
                     printf 'NoNewPrivs:\t%s\n' "$nnp"
                     exit 0
@@ -1368,6 +2068,14 @@ case "$cmd" in
                 # path resolves through the symlink on a new image, while
                 # an old image has no new path.
                 if [[ "${2:-}" == /etc/squid/agent/* || "${2:-}" == /etc/squid/egresslock/* ]]; then
+                    # EGL-515: cleanup reads the deployed config once and
+                    # hashes it on the host; this seam makes that read
+                    # fail (the old cleanup-sha-fails seam).
+                    if [[ -f "$D/cleanup-sha-fails" && "${2:-}" == */squid.conf \
+                        && "${2:-}" != *"/.egresslock-stage."* ]]; then
+                        echo "cat: ${2}: Input/output error" >&2
+                        exit 1
+                    fi
                     f="$(mock_cfg_local "$name" "$2" 2>/dev/null)" || f=""
                     if [[ -n "$f" && -f "$f" ]]; then
                         cat "$f"
@@ -1408,6 +2116,38 @@ case "$cmd" in
                     echo "mock podman: unsupported ln $*" >&2
                     exit 2
                 fi
+                # R-EGL-394-16 F1: the cap restores a moved stdio log
+                # with an atomic no-clobber link. Model Squid's async
+                # rotation reopening the live path at the instant of the
+                # link: the seam creates that path (with a fresh record)
+                # immediately before the link attempt, so a clobbering
+                # restore would lose the record while `ln -T` fails EEXIST
+                # and leaves the moved generation.
+                if [[ "${3:-}" == /var/log/squid/* && "${4:-}" == /var/log/squid/* ]]; then
+                    lsrc="$D/containers-$name.${3##*/}"
+                    ldst="$D/containers-$name.${4##*/}"
+                    case "${4##*/}" in
+                        access.log)
+                            if [[ -f "$D/rotate-reopen-before-restore-access-$name" ]]; then
+                                rm -f "$D/rotate-reopen-before-restore-access-$name"
+                                printf 'fresh-access-record\n' > "$ldst"
+                            fi
+                            ;;
+                        cache.log)
+                            if [[ -f "$D/rotate-reopen-before-restore-cache-$name" ]]; then
+                                rm -f "$D/rotate-reopen-before-restore-cache-$name"
+                                printf 'fresh-cache-record\n' > "$ldst"
+                            fi
+                            ;;
+                    esac
+                    if [[ -e "$ldst" || -L "$ldst" ]]; then
+                        echo "ln: failed to create hard link '${4}': File exists" >&2
+                        exit 1
+                    fi
+                    [[ -f "$lsrc" ]] || { echo "ln: failed to access '${3}': No such file or directory" >&2; exit 1; }
+                    ln -T -- "$lsrc" "$ldst" || { echo "ln: failed to create hard link '${4}'" >&2; exit 1; }
+                    exit 0
+                fi
                 lsrc="$(mock_cfg_local "$name" "$3" 2>/dev/null)" || lsrc=""
                 ldst="$(mock_cfg_local "$name" "$4" 2>/dev/null)" || ldst=""
                 [[ -n "$ldst" ]] || { echo "ln: failed to create hard link '${4}': No such file or directory" >&2; exit 1; }
@@ -1447,8 +2187,16 @@ case "$cmd" in
             find)
                 # EGL-395 cleanup enumeration: find <cfgdir> -maxdepth 1
                 # -mindepth 1 -type f|d|l -printf '%f\n'.
+                # EGL-394: find-fails models an unreadable config
+                # directory during cleanup (the apply itself never runs
+                # find, so this only exercises the cleanup skip).
+                if [[ -f "$D/find-fails-$name" || -f "$D/find-fails" ]]; then
+                    echo "find: ${2:-}: Input/output error" >&2
+                    exit 1
+                fi
                 if [[ "${2:-}" == /etc/squid/agent* || "${2:-}" == /etc/squid/egresslock* ]] \
-                    && [[ "$*" == *"-maxdepth 1"* && "$*" == *"-mindepth 1"* && "$*" == *"-printf %f\\n"* ]]; then
+                    && [[ "$*" == *"-maxdepth 1"* && "$*" == *"-mindepth 1"* ]] \
+                    && [[ "$*" == *"-printf %f\\n"* || "$*" == *"-printf %y %T@ %f\\n"* ]]; then
                     ldir="$(mock_cfg_local "$name" "${2%/}" 2>/dev/null)" || ldir=""
                     if [[ -z "$ldir" ]]; then
                         echo "find: '${2}': No such file or directory" >&2
@@ -1460,6 +2208,17 @@ case "$cmd" in
                     shopt -s dotglob nullglob
                     _found=("$ldir"/*)
                     shopt -u dotglob nullglob
+                    # EGL-515: one listing for type + mtime + name.
+                    if [[ "$*" == *"-printf %y %T@ %f\\n"* ]]; then
+                        for f in "${_found[@]}"; do
+                            _typ=o
+                            [[ -L "$f" ]] && _typ=l
+                            [[ -f "$f" && ! -L "$f" ]] && _typ=f
+                            [[ -d "$f" && ! -L "$f" ]] && _typ=d
+                            printf '%s %s %s\n' "$_typ" "$(stat -c %Y "$f")" "${f##*/}"
+                        done
+                        exit 0
+                    fi
                     if [[ "$*" == *"-type f"* ]]; then
                         for f in "${_found[@]}"; do [[ -f "$f" && ! -L "$f" ]] && echo "${f##*/}"; done
                         exit 0
@@ -1481,11 +2240,232 @@ case "$cmd" in
                 if [[ "${2:-}" == "-c" && "${3:-}" == *"/proc/1/cmdline"* ]]; then
                     if [[ -f "$D/argv-bad-$name" || -f "$D/argv-bad" ]]; then
                         printf 'squid\n-N\n-f\n/etc/squid/squid.conf\n-d\n0\n'
+                    elif [[ -f "$D/containers-$name.argv" ]]; then
+                        printf 'squid\n-N\n-f\n%s\n-d\n0\n' "$(cat "$D/containers-$name.argv")"
                     elif [[ -f "$D/containers-$name.cfg/squid.conf" ]]; then
                         printf 'squid\n-N\n-f\n%s/squid.conf\n-d\n0\n' "$(mock_cfg_abs "$name")"
                     else
                         printf 'squid\n-N\n-f\n/etc/squid/squid.conf\n-d\n0\n'
                     fi
+                    exit 0
+                fi
+                # EGL-394: the reload proof hashes a fixed prefix of the
+                # cache log to bind later polls to the same stream.
+                # R-EGL-394-13 F1: the engine runs the pipeline under
+                # `set -o pipefail`, so a failing `head` fails the exec
+                # even though `sha256sum` still writes a digest of its
+                # (empty/partial) input. The mock models that result: the
+                # `reload-prefix-head-fails` seam emits the empty-input
+                # digest and exits 1 when pipefail is present; without
+                # pipefail (pre-fix engine) the same pipeline exits 0,
+                # which is exactly the false proof the pin must catch.
+                if [[ "${2:-}" == "-c" && "${3:-}" =~ ^(set\ -o\ pipefail\;\ )?head\ -c\ \'([0-9]+)\'\ \'/var/log/squid/cache\.log\'\ \|\ sha256sum$ ]]; then
+                    f="$D/containers-$name.cache.log"
+                    if [[ -f "$f" ]]; then
+                        # EGL-394 F2: a failed pre-signal prefix read must
+                        # disclose the unexpected warm-path restart.
+                        if [[ -f "$D/reload-prefix-fails-$name" || -f "$D/reload-prefix-fails" ]]; then
+                            echo "head: cannot open /var/log/squid/cache.log (simulated failure)" >&2
+                            exit 1
+                        fi
+                        # R-EGL-394-13 F1: only `head` fails; sha256sum
+                        # still writes the empty-input digest.
+                        if [[ -f "$D/reload-prefix-head-fails-$name" || -f "$D/reload-prefix-head-fails" ]]; then
+                            printf '%s  -\n' "$(printf '' | sha256sum | cut -d' ' -f1)"
+                            if [[ "${3:-}" == *"set -o pipefail"* ]]; then
+                                exit 1
+                            fi
+                            exit 0
+                        fi
+                        head -c "${BASH_REMATCH[2]}" "$f" | sha256sum
+                        exit 0
+                    fi
+                    echo "head: cannot open /var/log/squid/cache.log" >&2
+                    exit 1
+                fi
+                # EGL-394: gw_log_cap drops every numbered generation
+                # after a confirmed reopen (both stdio logs).
+                if [[ "${2:-}" == "-c" && "${3:-}" == 'rm -f /var/log/squid/access.log.[0-9]* /var/log/squid/cache.log.[0-9]*' ]]; then
+                    rm -f "$D/containers-$name.access.log".[0-9]* \
+                          "$D/containers-$name.cache.log".[0-9]* 2>/dev/null || true
+                    exit 0
+                fi
+                # EGL-394: the engine's activation signal. The gateway
+                # daemon is PID 1, so the engine runs
+                # `bash -c 'kill -HUP 1'` (reload) / `kill -USR1 1`
+                # (rotate). A real SIGHUP re-reads the daemon's startup
+                # ConfigFile and writes its witness to cache.log.
+                # Knobs: reload-signal-fails (rc 1), reload-silent
+                # (rc 0, no witness), reload-fatal (the container exits,
+                # as a fatal parse does), reload-probe-fails (the
+                # listener never reopens until a restart), rotate-fails.
+                if [[ "${2:-}" == "-c" && "${3:-}" == "kill -USR1 1" ]]; then
+                    # ARC-32-D1: a rotate reopens the stdio logs. EGL-394
+                    # models Squid 6.13 `logfile_rotate 10` and the real
+                    # rename order: shift `.0`..`.9` up by one, move the
+                    # live file to `.0`, then create a fresh live file —
+                    # for BOTH access.log and cache.log. The rotate-fails
+                    # marker exercises the engine's restore path (fail
+                    # open for the log, never for policy).
+                    if [[ -f "$D/rotate-fails" ]]; then
+                        echo "mock squid: rotate failed" >&2
+                        exit 1
+                    fi
+                    # EGL-394 F3: the signal fails after one stdio log
+                    # already reopened. The engine's restore must be
+                    # gated on the live path being absent, or it would
+                    # move the retained `.1` generation over the
+                    # daemon's new fd.
+                    if [[ -f "$D/rotate-fails-after-reopen-$name" ]]; then
+                        rm -f "$D/rotate-fails-after-reopen-$name"
+                        : > "$D/containers-$name.access.log"
+                        echo "mock squid: rotate failed after reopening access.log" >&2
+                        exit 1
+                    fi
+                    # R-EGL-394-13 F2: the signal is delivered but the
+                    # daemon reopens only access.log (the sibling rename
+                    # sequence stalls). The timeout branch must restore
+                    # only the path that is PROVEN absent.
+                    if [[ -f "$D/rotate-partial-reopen-$name" ]]; then
+                        rm -f "$D/rotate-partial-reopen-$name"
+                        : > "$D/containers-$name.access.log"
+                        exit 0
+                    fi
+                    # R-EGL-394-13 F2: signal delivered, no stdio log
+                    # reopened at all (the daemon is wedged in rotation).
+                    if [[ -f "$D/rotate-no-reopen-$name" ]]; then
+                        rm -f "$D/rotate-no-reopen-$name"
+                        exit 0
+                    fi
+                    _rot() {
+                        local _b="$D/containers-$name.$1.log" _i
+                        for ((_i = 9; _i >= 0; _i--)); do
+                            [[ -e "$_b.$_i" ]] && mv -f "$_b.$_i" "$_b.$((_i + 1))"
+                        done
+                        [[ -e "$_b" ]] && mv -f "$_b" "$_b.0"
+                        : > "$_b"
+                    }
+                    if [[ -f "$D/rotate-stagger" ]]; then
+                        # Squid may rotate one stdio log after the other;
+                        # the exec returns after access.log and cache.log
+                        # follows asynchronously. The cap must wait for
+                        # both reopens before deleting generations (F4).
+                        _rot access
+                        ( sleep 0.4; _rot cache ) &
+                        exit 0
+                    fi
+                    for _l in access cache; do
+                        _rot "$_l"
+                    done
+                    exit 0
+                fi
+                if [[ "${2:-}" == "-c" && "${3:-}" == "kill -HUP 1" ]]; then
+                    if [[ -f "$D/reload-signal-fails-$name" || -f "$D/reload-signal-fails" ]]; then
+                        echo "mock squid: reconfigure signal failed" >&2
+                        exit 1
+                    fi
+                    if [[ -f "$D/reload-fatal-$name" || -f "$D/reload-fatal" ]]; then
+                        rm -f "$D/running/$name"
+                        echo "mock squid: fatal parse error" >&2
+                        exit 1
+                    fi
+                    if [[ -f "$D/reload-silent-$name" || -f "$D/reload-silent" ]]; then
+                        exit 0
+                    fi
+                    # EGL-394 F2: a log that shrinks during the reload is
+                    # terminal for the attempt (never a later regrown
+                    # stream). `shrink` leaves the live path short;
+                    # `regrow` truncates and rewrites it in place so the
+                    # original offset is valid again but the stream is
+                    # different; `replaced` swaps in a new inode whose
+                    # bytes contain a matching witness (the old size-only
+                    # proof would bless it).
+                    if [[ -f "$D/reload-log-shrink-once-$name" ]]; then
+                        rm -f "$D/reload-log-shrink-once-$name"
+                        : > "$D/containers-$name.cache.log"
+                        printf 'x' >> "$D/containers-$name.cache.log"
+                        mock_cfg_load_live "$name"
+                        exit 0
+                    fi
+                    # EGL-394 F2 mutation seam: the first post-signal stat
+                    # sees the shrink; a LATER poll sees the stream regrown
+                    # past the original offset with a matching witness. The
+                    # shrink must be terminal, so the later stream is never
+                    # accepted as this apply's reload.
+                    if [[ -f "$D/reload-log-shrink-regrow-once-$name" ]]; then
+                        rm -f "$D/reload-log-shrink-regrow-once-$name"
+                        : > "$D/containers-$name.cache.log"
+                        printf 'x' >> "$D/containers-$name.cache.log"
+                        rm -f "$D/reload-log-shrink-regrow-pending-$name".n
+                        : > "$D/reload-log-shrink-regrow-pending-$name"
+                        mock_cfg_load_live "$name"
+                        exit 0
+                    fi
+                    if [[ -f "$D/reload-log-regrow-once-$name" ]]; then
+                        rm -f "$D/reload-log-regrow-once-$name"
+                        : > "$D/containers-$name.cache.log"
+                        printf '%05000d' 0 >> "$D/containers-$name.cache.log"
+                        {
+                            printf 'Reconfiguring Squid Cache (version 6.13)...\n'
+                            printf 'Processing Configuration File: %s/squid.conf (depth 0)\n' "$(mock_cfg_abs "$name")"
+                        } >> "$D/containers-$name.cache.log"
+                        mock_cfg_load_live "$name"
+                        exit 0
+                    fi
+                    if [[ -f "$D/reload-log-replaced-once-$name" ]]; then
+                        rm -f "$D/reload-log-replaced-once-$name"
+                        # Allocate the replacement BEFORE unlinking the
+                        # old file, so the new stream cannot reuse the
+                        # old inode (the identity binding must be real).
+                        _rp="$D/containers-$name.cache.log.new"
+                        printf '%05000d' 0 > "$_rp"
+                        {
+                            printf 'Reconfiguring Squid Cache (version 6.13)...\n'
+                            printf 'Processing Configuration File: %s/squid.conf (depth 0)\n' "$(mock_cfg_abs "$name")"
+                        } >> "$_rp"
+                        mv -f "$_rp" "$D/containers-$name.cache.log"
+                        mock_cfg_load_live "$name"
+                        exit 0
+                    fi
+                    # EGL-394 F3: the same-name instance is replaced at
+                    # the signal boundary by a healthy bootstrap-argv
+                    # gateway; the deployed candidate stays parseable.
+                    # The engine must not call that activation.
+                    if [[ -f "$D/reload-replaced-during-$name" ]]; then
+                        rm -f "$D/reload-replaced-during-$name"
+                        mock_bump_started "$name"
+                        printf '/etc/squid/squid.conf\n' > "$D/containers-$name.argv"
+                        printf 'bootstrap-old-acl\n' > "$D/containers-$name.live"
+                        exit 0
+                    fi
+                    cfgabs="$(mock_cfg_abs "$name")"
+                    {
+                        printf 'Reconfiguring Squid Cache (version 6.13)...\n'
+                        printf 'Processing Configuration File: %s/squid.conf (depth 0)\n' "$cfgabs"
+                    } >> "$D/containers-$name.cache.log"
+                    mock_cfg_load_live "$name"
+                    # EGL-394 F1: the deployed config is swapped for an
+                    # identical copy after Squid loaded it. The reload
+                    # witness is real; only the stat-identity chain can
+                    # refuse the claim that these bytes came from the
+                    # published file.
+                    if [[ -f "$D/conf-restored-after-reload-$name" ]]; then
+                        rm -f "$D/conf-restored-after-reload-$name"
+                        mock_cfg_restored_after_load "$name"
+                    fi
+                    if [[ -f "$D/reload-probe-fails-$name" || -f "$D/reload-probe-fails" ]]; then
+                        : > "$D/reload-probe-fails-active-$name"
+                    fi
+                    exit 0
+                fi
+                # EGL-393: the deployed-vs-live HTTP check. The engine
+                # sends one GET for the reserved probe name over bash
+                # /dev/tcp; the mock answers with raw HTTP built from the
+                # token embedded in the config that was loaded. This stays
+                # distinct from gw_probe's TCP-connect success (which
+                # falls through to exit 0 with no body).
+                if [[ "${2:-}" == "-c" && "${3:-}" == *"GET http://egresslock-probe.invalid/"* ]]; then
+                    mock_live_http "$name" || exit 1
                     exit 0
                 fi
                 # gw_probe /dev/tcp check. EGL-217: the probe-fails knob
@@ -1495,7 +2475,7 @@ case "$cmd" in
                 # $D/probe-fails-active-<name>): the crash begins at
                 # start or at config activation, never on a pre-existing
                 # healthy gateway mid-ensure.
-                if [[ -f "$D/probe-fails-active-$name" ]]; then
+                if [[ -f "$D/probe-fails-active-$name" || -f "$D/reload-probe-fails-active-$name" ]]; then
                     exit 1
                 fi
                 exit 0 ;;
@@ -1503,26 +2483,37 @@ case "$cmd" in
         esac
         ;;
     cp)
-        # cp <src> <dst>: host -> container (private stage copy / EGL-389
-        # rollback restore) or container -> host (pre-staging snapshot).
+        # cp <src> <dst>: host -> container (private stage copy /
+        # EGL-389 rollback restore) or container -> host (pre-staging
+        # snapshot). Podman 5.4 accepts exactly one source and one
+        # destination (a third path is a CLI error), so the mock rejects
+        # a multi-source call with podman's rc 125 instead of silently
+        # modeling more than the runtime supports.
         # EGL-395: the deployed tree is a real directory model; a stage
         # path is a real subdirectory, so a staged candidate is never
         # aliased onto the deployed squid.conf. EGL-369-D7: the
         # destination parent must exist in the container's modeled
         # layout — copying the new path into an old-layout gateway fails
         # as podman cp would.
-        src="$1"; dst="$2"
+        ndst=$#
+        if (( ndst > 2 )); then
+            echo "Error: accepts 2 arg(s), received $ndst" >&2
+            exit 125
+        fi
+        dst="${!#}"
         if [[ "$dst" == *:* ]]; then
             name="${dst%%:*}"; path="${dst#*:}"
             [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
             layout="$(mock_layout "$name")"
-            base="${path##*/}"
-            [[ -z "$base" || "$path" == */ ]] && base="${src##*/}"
             lpath="$(mock_cfg_local "$name" "$path" 2>/dev/null)" || lpath=""
             if [[ -z "$lpath" ]]; then
                 echo "Error: copying to '$path': no such directory in container $name (layout $layout)" >&2
                 exit 1
             fi
+            # A trailing slash or an existing modeled directory means
+            # each source lands under its own basename.
+            isdir=0
+            [[ "$path" == */ || -d "$lpath" ]] && isdir=1
             # EGL-395 R-EGL-395-4 F1(b): the container stops after the
             # apply has begun. The registration and its config remain, so
             # the failure disclosure must select the proven not-running
@@ -1555,46 +2546,111 @@ case "$cmd" in
                 rm -f "$D/proxy-source-restore-fails-cp"
                 chmod 0555 "$_cdir" 2>/dev/null || true
             fi
-            if [[ "$src" == */prev/* ]]; then
-                if [[ -f "$D/cp-restore-fails-$base" ]]; then
-                    echo "Error: simulated restore copy failure for $base" >&2
+            # EGL-515: a directory source copies its contents
+            # (`podman cp <dir>/. <container>:<dir>/`); the group set is
+            # staged this way. Apply the per-file failure knobs to every
+            # member, as the old one-source-per-group copies did.
+            if (( ndst == 2 )) && [[ "${1:-}" == */. ]]; then
+                srcdir="${1%/.}"
+                [[ -d "$srcdir" ]] || {
+                    echo "Error: copying to '$path': no such directory: $srcdir" >&2
+                    exit 1
+                }
+                for srcf in "$srcdir"/*; do
+                    [[ -e "$srcf" || -L "$srcf" ]] || continue
+                    base="${srcf##*/}"
+                    if [[ "$srcf" == */prev/* ]]; then
+                        if [[ -f "$D/cp-restore-fails-$base" ]]; then
+                            echo "Error: simulated restore copy failure for $base" >&2
+                            exit 1
+                        fi
+                    elif [[ -f "$D/cp-stage-fails-$base" ]]; then
+                        echo "Error: simulated staging copy failure for $base" >&2
+                        exit 1
+                    fi
+                    if [[ ! -d "${lpath%/*}" ]]; then
+                        echo "Error: copying to '$path': no such directory in container $name (layout $layout)" >&2
+                        exit 1
+                    fi
+                    cp "$srcf" "$lpath/"
+                    cp "$srcf" "$D/allowlist-staged"
+                    # Test observation only: the exact candidate bytes copied
+                    # into a private stage (the deployed squid.conf changes
+                    # only at the publication rename).
+                    if [[ "$base" == squid.conf && "$path" == *"/.egresslock-stage."* ]]; then
+                        cp "$srcf" "$D/containers-$name.candidate"
+                    fi
+                done
+                exit 0
+            fi
+            for ((ci = 1; ci < ndst; ci++)); do
+                src="${!ci}"
+                base="${path##*/}"
+                [[ -z "$base" || "$isdir" == 1 ]] && base="${src##*/}"
+                if [[ "$src" == */prev/* ]]; then
+                    if [[ -f "$D/cp-restore-fails-$base" ]]; then
+                        echo "Error: simulated restore copy failure for $base" >&2
+                        exit 1
+                    fi
+                elif [[ -f "$D/cp-stage-fails-$base" ]]; then
+                    echo "Error: simulated staging copy failure for $base" >&2
                     exit 1
                 fi
-            elif [[ -f "$D/cp-stage-fails-$base" ]]; then
-                echo "Error: simulated staging copy failure for $base" >&2
-                exit 1
-            fi
-            if [[ ! -d "${lpath%/*}" ]]; then
-                echo "Error: copying to '$path': no such directory in container $name (layout $layout)" >&2
-                exit 1
-            fi
-            cp "$src" "$lpath"
-            cp "$src" "$D/allowlist-staged"
-            # Test observation only: the exact candidate bytes copied into
-            # a private stage (the deployed squid.conf changes only at the
-            # publication rename).
-            if [[ "$base" == squid.conf && "$path" == *"/.egresslock-stage."* ]]; then
-                cp "$src" "$D/containers-$name.candidate"
-            fi
+                if [[ ! -d "${lpath%/*}" ]]; then
+                    echo "Error: copying to '$path': no such directory in container $name (layout $layout)" >&2
+                    exit 1
+                fi
+                cp "$src" "$lpath"
+                cp "$src" "$D/allowlist-staged"
+                # Test observation only: the exact candidate bytes copied
+                # into a private stage (the deployed squid.conf changes
+                # only at the publication rename).
+                if [[ "$base" == squid.conf && "$path" == *"/.egresslock-stage."* ]]; then
+                    cp "$src" "$D/containers-$name.candidate"
+                fi
+            done
             exit 0
         fi
-        if [[ "$src" == *:* ]]; then
-            name="${src%%:*}"; path="${src#*:}"
-            [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
-            layout="$(mock_layout "$name")"
-            base="${path##*/}"
-            if [[ -f "$D/cp-snapshot-fails-$base" ]]; then
-                echo "Error: simulated snapshot copy failure for $base" >&2
-                exit 1
+        if [[ "$ndst" -ge 2 && "${1:-}" == *:* ]]; then
+            # EGL-515: a directory source copies its contents to the host
+            # (`podman cp <container>:<dir>/. <host-dir>/`); the deployed
+            # config tree is snapshotted this way.
+            if [[ "${1:-}" == */. ]]; then
+                src="${1%/.}"
+                name="${src%%:*}"; path="${src#*:}"
+                [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
+                fdir="$(mock_cfg_local "$name" "$path" 2>/dev/null)" || fdir=""
+                [[ -n "$fdir" && -d "$fdir" ]] \
+                    || { echo "Error: no such file in container $name: $path" >&2; exit 1; }
+                for f in "$fdir"/*; do
+                    [[ -e "$f" || -L "$f" ]] || continue
+                    base="${f##*/}"
+                    if [[ -f "$D/cp-snapshot-fails-$base" ]]; then
+                        echo "Error: simulated snapshot copy failure for $base" >&2
+                        exit 1
+                    fi
+                    cp -a "$f" "$dst/"
+                done
+                exit 0
             fi
-            f="$(mock_cfg_local "$name" "$path" 2>/dev/null)" || f=""
-            [[ -n "$f" && ( -f "$f" || -d "$f" ) ]] \
-                || { echo "Error: no such file in container $name: $path" >&2; exit 1; }
-            if [[ -d "$f" && ! -L "$f" ]]; then
-                cp -a "$f" "$dst"
-            else
-                cp "$f" "$dst"
-            fi
+            for ((ci = 1; ci < ndst; ci++)); do
+                src="${!ci}"
+                name="${src%%:*}"; path="${src#*:}"
+                [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
+                base="${path##*/}"
+                if [[ -f "$D/cp-snapshot-fails-$base" ]]; then
+                    echo "Error: simulated snapshot copy failure for $base" >&2
+                    exit 1
+                fi
+                f="$(mock_cfg_local "$name" "$path" 2>/dev/null)" || f=""
+                [[ -n "$f" && ( -f "$f" || -d "$f" ) ]] \
+                    || { echo "Error: no such file in container $name: $path" >&2; exit 1; }
+                if [[ -d "$f" && ! -L "$f" ]]; then
+                    cp -a "$f" "$dst"
+                else
+                    cp "$f" "$dst"
+                fi
+            done
             exit 0
         fi
         echo "mock podman: unsupported cp (neither side names a container)" >&2
@@ -1622,6 +2678,16 @@ case "$cmd" in
             exit 125
         fi
         if [[ -f "$D/rm-container-fails" ]]; then
+            # EGL-394 F1 seam: the failed removal and the trap's source
+            # restore are one failure window — the conf dir becomes
+            # unwritable at the failed gateway removal (after the pin
+            # record was written), so a still-running pre-existing
+            # gateway is left owned and the restore also fails.
+            if [[ -f "$D/proxy-source-restore-fails-rmf-$name" ]]; then
+                _cdir="$(cat "$D/proxy-source-restore-fails-rmf-$name")"
+                rm -f "$D/proxy-source-restore-fails-rmf-$name"
+                chmod 0555 "$_cdir" 2>/dev/null || true
+            fi
             echo "Error: unable to remove container $name: device or resource busy" >&2
             exit 1
         fi
@@ -1689,10 +2755,25 @@ case "$cmd" in
             exit 1
         fi
         [[ -f "$D/running/$name" ]] || { echo "no such container" >&2; exit 1; }
+        # EGL-394: a restart is a new container start. A one-shot
+        # bootstrap-argv seam models the instance being restarted, not
+        # every later start, so consume it here (the entrypoint starts
+        # Squid on the deployed config whenever it exists — D5).
+        rm -f "$D/argv-bad-$name"
         # EGL-395: a restart is a new gateway instance start — StartedAt
         # changes and the current deployed bytes become the live config.
+        # EGL-394: a restart also reopens the listener modeled as failed
+        # by a reload.
         mock_bump_started "$name"
         mock_cfg_load_live "$name"
+        # EGL-394 F1: the deployed config is swapped for an identical
+        # copy after the (re)started instance loaded it. The start cannot
+        # be claimed as activation of the published file.
+        if [[ -f "$D/conf-restored-after-start-$name" ]]; then
+            rm -f "$D/conf-restored-after-start-$name"
+            mock_cfg_restored_after_load "$name"
+        fi
+        rm -f "$D/reload-probe-fails-active-$name"
         # EGL-217: a RESTART while the probe-fails knob is armed puts the
         # swapped config live — from here the proxy never answers
         # (crash-loop), so the apply health wait fails.
@@ -2458,10 +3539,116 @@ slow_section_run() { # slow_section_run <name> — 0 = run the window, 1 = skip 
     return 1
 }
 
+# EGL-451: whole-window shard gate. Unsharded (direct harness run, flag
+# unset/empty) runs every window; sharded matches NAME as a whole
+# space-delimited word in EGRESSLOCK_TEST_SECTIONS (never a substring).
+shard_section_run() { # shard_section_run <name> — 0 = run this window
+    local name="${1:-}"
+    if [[ -z "${EGRESSLOCK_TEST_SHARDED:-}" ]]; then
+        return 0
+    fi
+    case " ${EGRESSLOCK_TEST_SECTIONS:-} " in
+        *" $name "*) return 0 ;;
+    esac
+    return 1
+}
+
+# EGL-465: converged-state snapshot for section resets that would otherwise
+# pay a teardown+ensure per leg (the egl389/egl392 state-pristine pattern).
+# `state_restore_or_seed <dir> <seed-cmd...>` restores the frozen mock state
+# when it exists, else runs the seed command once and freezes the result.
+# The cumulative logs ($STATE/opslog, $STATE/callorder.log) are append-only
+# evidence: they are excluded from the snapshot and callorder is carried
+# across a restore (opslog is truncated as the per-leg reset contract).
+# Every failure is named and returned; callers turn it into their section
+# assert so a partial copy can never look like a successful reset.
+state_snapshot() { # state_snapshot <pristine-dir> — freeze the converged $STATE
+    local dest="${1:-}"
+    if [[ -z "$dest" ]]; then
+        echo "FAIL: state_snapshot: usage: state_snapshot <pristine-dir>" >&2
+        return 2
+    fi
+    if ! rm -rf "$dest" || ! mkdir -p "$dest"; then
+        echo "FAIL: state_snapshot: cannot create $dest" >&2
+        return 1
+    fi
+    if ! cp -a "$STATE/." "$dest/"; then
+        echo "FAIL: state_snapshot: cannot copy $STATE to $dest" >&2
+        return 1
+    fi
+    if ! rm -f "$dest/opslog" "$dest/callorder.log"; then
+        echo "FAIL: state_snapshot: cannot exclude the cumulative logs in $dest" >&2
+        return 1
+    fi
+    return 0
+}
+state_restore_or_seed() { # state_restore_or_seed <pristine-dir> <seed-cmd...>
+    local dest="${1:-}" saved had_callorder=0
+    if [[ -z "$dest" ]]; then
+        echo "FAIL: state_restore_or_seed: usage: state_restore_or_seed <pristine-dir> <seed-cmd...>" >&2
+        return 2
+    fi
+    shift
+    if [[ -d "$dest" ]]; then
+        saved="$TESTROOT/.state-restore-callorder.$$"
+        if [[ -f "$STATE/callorder.log" ]]; then
+            had_callorder=1
+            if ! cp -a "$STATE/callorder.log" "$saved"; then
+                echo "FAIL: state_restore_or_seed: cannot preserve $STATE/callorder.log" >&2
+                rm -f "$saved"; return 1
+            fi
+        fi
+        if ! rm -rf "$STATE" || ! cp -a "$dest" "$STATE"; then
+            echo "FAIL: state_restore_or_seed: cannot restore $STATE from $dest" >&2
+            rm -f "$saved"; return 1
+        fi
+        if (( had_callorder )) && ! cp -a "$saved" "$STATE/callorder.log"; then
+            echo "FAIL: state_restore_or_seed: cannot restore $STATE/callorder.log" >&2
+            rm -f "$saved"; return 1
+        fi
+        rm -f "$saved"
+        if ! : > "$STATE/opslog"; then
+            echo "FAIL: state_restore_or_seed: cannot reset $STATE/opslog" >&2
+            return 1
+        fi
+        return 0
+    fi
+    if (( $# == 0 )); then
+        echo "FAIL: state_restore_or_seed: no snapshot at $dest and no seed command" >&2
+        return 1
+    fi
+    if ! "$@"; then
+        echo "FAIL: state_restore_or_seed: seed command failed for $dest" >&2
+        return 1
+    fi
+    state_snapshot "$dest"
+}
+
 # EGL-270 (P1): per-section runtime stamps. section_end emits one
 # `TIMING: <name> <n.n>s`; a slow-skipped section emits none. RESULTS text
 # stays byte-identical (EGL-99).
 declare -A _sect_snap=()   # name -> "mode|label|pass|fail" (ended only)
+declare -A _sect_emitted=()  # name -> 1 when results_emit printed its line (EGL-451-F3)
+
+# EGL-481-D5: per-section mock-nft isolation. Engine windows share the ONE
+# mock netns state ($STATE/nft) inside a harness process, so a chain a
+# previous section installed used to be visible to this section — harmless
+# while verify compared only the two known chains, but EGL-481-D2 fails any
+# chain the section's own confdir does not define. Reset the mock firewall
+# at every engine window entry so each section starts from no chains (its
+# own seeds/ensures rebuild what it needs); never weaken the check itself.
+# Gated on the engine harness opt-in so the kit/docs harnesses (same
+# lib.sh) keep their state across sections. The cumulative logs live
+# outside $STATE/nft and are untouched.
+_section_reset_nft_state() {
+    [[ -n "${EGRESSLOCK_TEST_NFT_ISOLATION:-}" ]] || return 0
+    [[ -n "${STATE:-}" && -d "$STATE/nft" ]] || return 0
+    if ! rm -rf "$STATE/nft" || ! mkdir -p "$STATE/nft"; then
+        echo "FAIL: section_begin: cannot reset the mock nft state in $STATE/nft (EGL-481 isolation, fail-closed)"
+        exit 1
+    fi
+}
+
 section_begin() { # section_begin <name> "<label>" [counted|excluded|excluded-silent]
     local name="${1:-}" label="${2:-}" mode="${3:-counted}"
     if [[ -z "$name" || -z "$label" ]]; then
@@ -2480,6 +3667,13 @@ section_begin() { # section_begin <name> "<label>" [counted|excluded|excluded-si
         echo "FAIL: section_begin: '$name' already ended (re-begin; EGL-184 fail-closed)"
         exit 1
     fi
+    # EGL-451-D6: the parent names the section a timed-out shard wedged in.
+    # Subsections (EGL-184 controls in command substitutions) must not
+    # overwrite the top-level progress marker.
+    if [[ -n "${EGRESSLOCK_TEST_SHARD_PROGRESS:-}" && "${BASH_SUBSHELL:-0}" == "0" ]]; then
+        printf '%s\n' "$name" > "$EGRESSLOCK_TEST_SHARD_PROGRESS" 2>/dev/null || true
+    fi
+    _section_reset_nft_state
     _sect_open_cur="$name"; _sect_open_label="$label"; _sect_open_mode="$mode"
     pass=0; fail=0
     _sect_t0="${EPOCHREALTIME:-}"
@@ -2503,6 +3697,14 @@ section_end() { # section_end <name> — snapshot only; does NOT emit RESULTS (E
 }
 results_emit() { # results_emit <name> — prints the pinned RESULTS line from the snapshot
     local name="${1:-}"
+    # EGL-451-D5: in a shard, a section outside this shard's selection was
+    # never begun and must no-op. Restrict the no-op to the top-level shell:
+    # the EGL-184 controls call results_emit inside a command substitution
+    # and must still refuse a never-begun/never-ended section.
+    if [[ -n "${EGRESSLOCK_TEST_SHARDED:-}" && "${BASH_SUBSHELL:-0}" == "0" ]] \
+       && ! shard_section_run "$name"; then
+        return 0
+    fi
     # EGL-270/G4: a section skipped on the fast track has no snapshot and
     # emits no RESULTS line — its named SKIP: line is the record; TOTAL
     # counts it via skip_summary.
@@ -2517,6 +3719,7 @@ results_emit() { # results_emit <name> — prints the pinned RESULTS line from t
     local rest="${snap#*|}"
     local label="${rest%%|*}" counts="${rest#*|}"
     echo "RESULTS ($label): ${counts%%|*} passed, ${counts#*|} failed"
+    _sect_emitted["$name"]=1
 }
 results_total() { # results_total [ext_pass] [ext_fail] — declared raw-counter externals (engine arc14)
     local ext_pass="${1:-0}" ext_fail="${2:-0}"
@@ -2536,6 +3739,27 @@ results_total() { # results_total [ext_pass] [ext_fail] — declared raw-counter
         echo "FAIL: results_total: grand accumulator ($_sect_grand_pass passed, $_sect_grand_fail failed) disagrees with booked snapshots ($_sect_booked_pass passed, $_sect_booked_fail failed) — an increment ran outside every ended section (EGL-184 fail-closed) — TOTAL refused"
         exit 1
     fi
+    # EGL-451-F3: a shard must prove every section in its selection produced
+    # its pinned RESULTS line. Without this a misspelled/missing
+    # `results_emit <name>` is a silent evidence omission: the section's
+    # counters still enter TOTAL from the ended snapshot while no RESULTS
+    # line names them. The unsharded path needs no check — its RESULTS set
+    # is the whole file. Slow-skipped sections are the one legitimate
+    # no-emit case (their named SKIP line is the record).
+    if [[ -n "${EGRESSLOCK_TEST_SHARDED:-}" && "${BASH_SUBSHELL:-0}" == "0" ]]; then
+        local _want
+        for _want in ${EGRESSLOCK_TEST_SECTIONS:-}; do
+            [[ -n "${_slow_skipped[$_want]:-}" ]] && continue
+            if [[ -z "${_sect_snap[$_want]:-}" ]]; then
+                echo "FAIL: results_total: selected section '$_want' never began (EGL-451 fail-closed) — TOTAL refused"
+                exit 1
+            fi
+            if [[ -z "${_sect_emitted[$_want]:-}" ]]; then
+                echo "FAIL: results_total: selected section '$_want' produced no RESULTS line (misspelled or missing results_emit; EGL-451 fail-closed) — TOTAL refused"
+                exit 1
+            fi
+        done
+    fi
     local counted_pass=0 counted_fail=0 name snap rest mode counts
     for name in "${!_sect_snap[@]}"; do
         snap="${_sect_snap[$name]}"
@@ -2547,5 +3771,35 @@ results_total() { # results_total [ext_pass] [ext_fail] — declared raw-counter
     done
     total_pass=$((counted_pass + ext_pass))
     total_fail=$((counted_fail + ext_fail))
+    # EGL-451-D5: in a multi-shard run each harness writes its counters and
+    # skip causes to a private file; the parent replays the logs in shard
+    # order, sums them, and prints the single pinned TOTAL line. A single
+    # debug shard (--shard N/M) leaves this unset and prints its own
+    # partial TOTAL. Write-then-rename keeps a killed shard from leaving a
+    # half result the parent could mistake for a complete one.
+    if [[ -n "${EGRESSLOCK_TEST_SHARD_RESULT:-}" ]]; then
+        local _rf="$EGRESSLOCK_TEST_SHARD_RESULT"
+        local _rtmp="$EGRESSLOCK_TEST_SHARD_RESULT.tmp.$$"
+        local _cause
+        if ! {
+            printf 'pass\t%s\n' "$counted_pass"
+            printf 'fail\t%s\n' "$counted_fail"
+            printf 'ext_pass\t%s\n' "$ext_pass"
+            printf 'ext_fail\t%s\n' "$ext_fail"
+            printf 'skips\t%s\n' "$skip_count"
+            for _cause in "${!skip_causes[@]}"; do
+                printf 'skip_cause\t%s\t%s\n' "$_cause" "${skip_causes[$_cause]}"
+            done
+            printf 'tree\t%s\n' "$(tree_shape_tag)"
+        } > "$_rtmp"; then
+            echo "FAIL: results_total: cannot write shard result '$_rtmp' (EGL-451 fail-closed)"
+            exit 1
+        fi
+        if ! mv -f -- "$_rtmp" "$_rf"; then
+            echo "FAIL: results_total: cannot publish shard result '$_rf' (EGL-451 fail-closed)"
+            exit 1
+        fi
+        return 0
+    fi
     echo "RESULTS TOTAL: $total_pass passed, $total_fail failed$(skip_summary) ($(tree_shape_tag))"
 }

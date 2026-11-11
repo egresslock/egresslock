@@ -2,10 +2,10 @@
 
 Goal: a turn-key opencode agent inside a **custom image** on a
 restricted profile — egress to exactly `openrouter.ai` (LLM API,
-through the gateway) and `github.com` (VCS, git-over-SSH direct rule),
-everything else denied. The container is ephemeral; the **workspace
-folder persists** on the host, and the API key is never baked into the
-image.
+through the gateway) and `github.com` (VCS, git-over-SSH direct rule —
+see the rotation caveat in step 1), everything else denied. The
+container is ephemeral; the **workspace folder persists** on the host,
+and the API key is never baked into the image.
 
 Uses the starter `main` profile (from `egresslock-setup --init-conf`);
 adapt the profile name if you run on a different one.
@@ -40,6 +40,19 @@ egresslock ensure main
 egresslock allow main openrouter.ai:443
 egresslock allow main github.com:22 --direct   # git-over-SSH
 ```
+
+> [!NOTE]
+> **the direct `github.com:22` pin churns by design**
+>
+> GitHub's SSH name serves a rotating address pool, so a direct pin of
+> the name can never be stable: each `ensure`/`verify` re-pins one
+> current member, and `verify` reports `drift:` lines whenever DNS
+> serves a different member ([Rotating
+> names](../../docs/reference/rotating-names.md)). The rule keeps
+> working only while the pinned member stays in the pool. If you want
+> a pin that does not churn, use the stable paths in the
+> [GitHub recipe](github.md) — `github.com` through the gateway for
+> HTTPS, or the `ssh.github.com:443` name tunnel for SSH.
 
 ## 2. Build the image
 
@@ -105,5 +118,6 @@ config is gone when the container exits. After a host reboot, re-run
   (e.g. `raw.githubusercontent.com` behind a github.com redirect) — add
   the redirect target to the allowlist.
 - A local LLM (e.g. Ollama on the host/LAN) is not reachable through
-  the gateway — that needs a direct/host route (the engine is
-  hostnames-only today, no CIDR allow yet).
+  the gateway — that needs a direct rule with an IPv4 literal
+  (`allow … --direct`; no CIDR ranges yet) — see the
+  [local LLM recipe](local-llm.md).

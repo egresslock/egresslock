@@ -35,6 +35,7 @@ The two failures differ. A missing `flock` fails every command that takes the lo
 
 ## Links
 
+- Back to the [symptom index](../troubleshooting.md).
 - [scripts-and-environment](../reference/scripts-and-environment.md) — `EGRESSLOCK_LOCK_WAIT`
 - [policy-reference](../reference/policy-reference.md) — concurrent-command rules
 - [verify-timer-signals](verify-timer-signals.md) — raced verify messages

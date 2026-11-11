@@ -217,16 +217,16 @@ chmod -R go-w "$share/examples/recipes"
 install -d -m 0755 "$share/examples/egl-base"
 install -m 0644 "$kit/examples/egl-base/Containerfile" "$share/examples/egl-base/Containerfile"
 install -m 0644 "$kit/examples/egl-base/README.md"     "$share/examples/egl-base/README.md"
+install -m 0644 "$kit/examples/egl-base/security-floor" "$share/examples/egl-base/security-floor"
 install -m 0755 "$kit/examples/egl-base/build-egl-base" "$share/examples/egl-base/build-egl-base"
 chmod -R go-w "$share/examples/egl-base"
 # EGL-28 / EGL-364: the docs/ tree ships structure-preserving
 # (quickstart/setup/reference/troubleshooting tiers + the index);
 # site-named docs never ship. README.md sits beside the tree at
-# doc/README.md. The ticket flow and board live under internal_docs/
-# now; this package keeps its own process-file guard for the old paths
-# (the BOARD.md skip and the tickets/ find filter below) because it is
-# the deb's only guard if that layout reappears — no tripwire covers
-# this stage.
+# doc/README.md. This package keeps its own process-file guard for the
+# old ticket/board paths (the BOARD.md skip and the tickets/ find filter
+# below) because it is the deb's only guard if that layout reappears — no
+# tripwire covers this stage.
 while IFS= read -r f; do
     # BOARD.md is generated ticket-process navigation (see the guard
     # note above) — process files never ship in the package.
@@ -408,21 +408,108 @@ if grep -RIl 'home\.arpa' "$root/usr" "$root/DEBIAN" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Guard (EGL-47-D3): the maintainer-internal internal_docs/ (repo
-# root) must never reach the package. The docs loop below/above is
-# deliberately scoped to `find "$kit/docs"` — do NOT widen it to
-# `$kit`; this tripwire catches a widened copy if one ever appears.
-if find "$root" -name 'internal_docs' | grep -q .; then
-    echo "build-deb: FAIL - internal_docs leaked into the staged tree:" >&2
-    find "$root" -name 'internal_docs' >&2 || true
-    exit 1
-fi
-
 if [[ -n "$keep_stage" ]]; then
-    rm -rf "$keep_stage"
-    mkdir -p "$(dirname "$keep_stage")"
-    cp -R "$root" "$keep_stage"
-    echo "build-deb: staged tree copied to $keep_stage (not built)"
+    # EGL-433-D4/D7: classify the LEXICAL destination, not the literal
+    # spelling. A literal `missing/../protected` is false for -e until
+    # `mkdir -p` creates `missing`; classifying the lexical path first
+    # closes that alias. Only an already-empty, real directory may be
+    # replaced (with rmdir — never a recursive delete), and only a leaf
+    # this run creates may receive the copy. A symlink at the literal
+    # path or at the lexical destination is refused; the literal spelling
+    # is never operated on. Every emitted path is shell-quoted.
+    _keep_stage_refuse_not_empty() { # <q:path> [<q:lexical>]
+        local qpath="$1" qlex="${2:-}"
+        echo "build-deb: refusing: EGRESSLOCK_DEB_KEEP_STAGE must be absent or an empty real directory: $qpath" >&2
+        if [[ -n "$qlex" ]]; then
+            echo "  the value resolves to $qlex; move that path aside or name an empty directory, then re-run; nothing was written to $qpath:" >&2
+        else
+            echo "  move that path aside or name an empty directory, then re-run; nothing was written to $qpath:" >&2
+        fi
+        echo "    EGRESSLOCK_DEB_KEEP_STAGE=<new-empty-dir> packaging/build-deb.sh" >&2
+        exit 2
+    }
+    # EGL-433-D8/F1: capture one complete NUL path record from a producer
+    # that exited 0. Command substitution strips trailing newlines (naming a
+    # sibling) and `<(…)` hides the producer's status; run to a private file,
+    # keep the real `$?`, and refuse a complete record from a failed producer.
+    # The file is removed on every path.
+    _egl433_capture_path() { # <var> <command...> — 1 = unresolvable
+        local _out="$1" _tmp _rc=0 _val="" _n _sz
+        shift
+        _tmp="$(mktemp "${TMPDIR:-/tmp}/egl433-path.XXXXXX")" || return 1
+        "$@" >"$_tmp" 2>/dev/null || _rc=$?
+        if (( _rc == 0 )) && IFS= read -r -d '' _val <"$_tmp"; then
+            _n="$(printf '%s' "$_val" | wc -c)"
+            _sz="$(wc -c <"$_tmp")"
+            rm -f -- "$_tmp"
+            if (( _sz == _n + 1 )); then
+                printf -v "$_out" '%s' "$_val"
+                return 0
+            fi
+            return 1
+        fi
+        rm -f -- "$_tmp"
+        return 1
+    }
+    keep_path="$keep_stage"
+    [[ "$keep_path" == */ ]] && keep_path="${keep_path%/}"
+    printf -v keep_q '%q' "$keep_path"
+    if [[ -L "$keep_path" ]]; then
+        echo "build-deb: refusing: EGRESSLOCK_DEB_KEEP_STAGE is a symbolic link: $keep_q" >&2
+        keep_resolved=""
+        if [[ -d "$keep_path" ]]; then
+            _egl433_capture_path keep_resolved \
+                readlink -z -f -- "$keep_path" || keep_resolved=""
+        fi
+        if [[ -n "$keep_resolved" ]]; then
+            printf -v keep_qres '%q' "$keep_resolved"
+            echo "  the link points to $keep_qres; nothing was written to $keep_q." >&2
+        fi
+        echo "  name an empty real directory instead, for example:" >&2
+        echo "    EGRESSLOCK_DEB_KEEP_STAGE=<empty-dir> packaging/build-deb.sh" >&2
+        exit 2
+    fi
+    # EGL-433-D8: capture the lexical path byte-for-byte (GNU -z plus an
+    # IFS= NUL read). Command substitution strips a trailing newline, so
+    # `stage<newline>` would classify (and be written) as the sibling
+    # `stage`; the same applies to the parent below. A failed producer or an
+    # incomplete record is unresolvable: refuse without writing.
+    keep_lexical=""
+    _egl433_capture_path keep_lexical \
+        realpath -z -s -m -- "$keep_path" || keep_lexical=""
+    [[ -n "$keep_lexical" ]] \
+        || _keep_stage_refuse_not_empty "$keep_q" ""
+    keep_parent=""
+    _egl433_capture_path keep_parent \
+        dirname -z -- "$keep_lexical" || keep_parent=""
+    [[ -n "$keep_parent" ]] \
+        || _keep_stage_refuse_not_empty "$keep_q" ""
+    keep_qlex=""
+    [[ "$keep_lexical" != "$keep_path" ]] && printf -v keep_qlex '%q' "$keep_lexical"
+    [[ ! -L "$keep_lexical" ]] \
+        || _keep_stage_refuse_not_empty "$keep_q" "$keep_qlex"
+    if [[ -e "$keep_lexical" ]]; then
+        [[ -d "$keep_lexical" ]] \
+            || _keep_stage_refuse_not_empty "$keep_q" "$keep_qlex"
+        [[ -z "$(find "$keep_lexical" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] \
+            || _keep_stage_refuse_not_empty "$keep_q" "$keep_qlex"
+        rmdir -- "$keep_lexical" \
+            || _keep_stage_refuse_not_empty "$keep_q" "$keep_qlex"
+    fi
+    mkdir -p -- "$keep_parent" || {
+        echo "build-deb: FAIL - could not create the staging parent for $keep_q" >&2
+        echo "  inspect the path and re-run; nothing was written to $keep_q." >&2
+        exit 2
+    }
+    # A no-clobber leaf mkdir: EEXIST means a writer appeared after the
+    # classification (including a fresh non-empty directory).
+    mkdir -- "$keep_lexical" \
+        || _keep_stage_refuse_not_empty "$keep_q" "$keep_qlex"
+    cp -R -- "$root"/. "$keep_lexical"
+    # EGL-433-F5: report the lexical destination this run populated, never
+    # the input spelling (`link/../stage` can traverse elsewhere).
+    printf -v keep_qdest '%q' "$keep_lexical"
+    echo "build-deb: staged tree copied to $keep_qdest (not built)"
     exit 0
 fi
 

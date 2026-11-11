@@ -18,7 +18,8 @@ any other destination that uses a rotating list of IPs, see
 > 1. an account set up with a name of your choosing — the examples
 >    use `egl-runner`; enter its shell with `sudo -iu egl-runner`
 >    (see [who-runs-what](../reference/who-runs-what.md) for the
->    three worlds)
+>    three worlds). Nothing installed yet? Start at
+>    [install](../setup/install.md).
 > 2. the profile is up — `egresslock ensure main` (the examples use
 >    profile `main`; full health check:
 >    [check-everything](../reference/check-everything.md))
@@ -29,9 +30,12 @@ any other destination that uses a rotating list of IPs, see
 ## The loop — worked example: git over SSH
 
 1. **Start the container** — on the host, as the account, on the
-   profile network. Image: `localhost/egl-base:latest`:
+   profile network. Image: `localhost/egl-base:latest`. Two terminal
+   windows are involved in this guide: the one you run this in becomes
+   **the container session** when the container starts; the allow
+   commands later run in a **second host terminal** you open then:
    ```sh
-   # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
+   # the host, account shell: sudo -iu egl-runner
    # prompt: egl-runner@host:~$
 
    podman run --rm -it --name ssh-probe \
@@ -55,10 +59,10 @@ any other destination that uses a rotating list of IPs, see
    </details>
 
 2. **(Optional) Try it from the workload** — you are inside the
-   container now; this is TERMINAL 1 (the container shell runs as
-   in-container root — not the host account):
+   container now — this is the container session (the container shell
+   runs as in-container root — not the host account):
    ```sh
-   # TERMINAL 1 — the workload container
+   # the container session
    # prompt: root@9badc0ffee67:/#
 
    ssh -o ConnectTimeout=5 -T git@self-hosted-git.example
@@ -77,15 +81,16 @@ any other destination that uses a rotating list of IPs, see
    it.
    </details>
 
-3. **Allow it.** In a second terminal — TERMINAL 2, the host — as the
-   account. Grammar: `allow <profile> <host:port> --direct` — a
+3. **Allow it.** Open the second host terminal (the first one is now
+   the container session) and, as the account: Grammar:
+   `allow <profile> <host:port> --direct` — a
    hostname or an IPv4 literal, and the port is required. The direct
    path installs a firewall rule; it does not change client proxy
    settings. (`allow-direct <profile> <host:port>` is the same command
    as a shortcut.) CIDR ranges are not yet supported. Why egress has
    two paths: [paths-and-signatures](../reference/paths-and-signatures.md).
    ```sh
-   # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
+   # the second host terminal, account shell: sudo -iu egl-runner
    # prompt: egl-runner@host:~$
 
    egresslock allow main self-hosted-git.example:22 --direct
@@ -98,16 +103,17 @@ any other destination that uses a rotating list of IPs, see
    egl-runner@host:~$ egresslock allow main self-hosted-git.example:22 --direct
    using config /home/egl-runner/.config/egresslock/main.conf
    path: direct — firewall rule in /home/egl-runner/.config/egresslock/main.conf (does not change client proxy settings)
-   added: rule allow-host self-hosted-git.example:22 -> /home/egl-runner/.config/egresslock/main.conf
+   added: rule allow-host self-hosted-git.example:22 to /home/egl-runner/.config/egresslock/main.conf
    re-ensuring profile 'main' ...
-   gateway 'egresslock-gateway-main' ready (already converged, not restarted)
+   gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
    profile 'main' ready (network egresslock-main, policy verified)
    </pre>
    </details>
 
-4. **Confirm.** Back in TERMINAL 1 — the container is still running:
+4. **Confirm.** Back in the container session — the container is still
+   running:
    ```sh
-   # TERMINAL 1 — the workload container
+   # the container session
    # prompt: root@9badc0ffee67:/#
 
    ssh -o ConnectTimeout=5 -T git@self-hosted-git.example
@@ -149,10 +155,11 @@ any other destination that uses a rotating list of IPs, see
 
 5. **Prove the proxy path still fails closed** — a not-allowed DOMAIN
    gets the fast 403 from Squid; opening the direct pin opened
-   nothing else (fresh one-shot container, TERMINAL 2):
+   nothing else (fresh one-shot container, in the second host
+   terminal):
 
    ```sh
-   # TERMINAL 2 — the host, account shell: sudo -iu egl-runner
+   # the second host terminal, account shell: sudo -iu egl-runner
    # prompt: egl-runner@host:~$
 
    podman run --rm \
@@ -183,13 +190,13 @@ any other destination that uses a rotating list of IPs, see
    </details>
 
 6. **Observe the direct path on a not-allowed IP — expect a timeout**
-   Back in TERMINAL 1 — the ssh-probe is still
+   Back in the container session — the ssh-probe is still
    running. `--noproxy '*'` takes the direct path a
    proxy-ignoring tool would take (plain curl would 403 through the
    proxy — that is the previous check):
 
    ```sh
-   # TERMINAL 1 — the workload container
+   # the container session
    # prompt: root@9badc0ffee67:/#
 
    curl --noproxy '*' -sS -o /dev/null --max-time 5 http://203.0.113.1:8000
@@ -229,7 +236,7 @@ Back on the host — exit the probe first (`exit`; it was `--rm`, it
 goes away):
 
 ```sh
-# TERMINAL 2 — the host, account shell: sudo -iu egl-runner
+# the second host terminal, account shell: sudo -iu egl-runner
 # prompt: egl-runner@host:~$
 
 egresslock disallow main self-hosted-git.example:22 --direct
@@ -246,9 +253,9 @@ egl-runner@host:~$ egresslock disallow main self-hosted-git.example:22 --direct
 using config /home/egl-runner/.config/egresslock/main.conf
 path: direct — firewall rule in /home/egl-runner/.config/egresslock/main.conf (does not change client proxy settings)
 re-ensuring profile 'main' ...
-gateway 'egresslock-gateway-main' ready (already converged, not restarted)
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
-removed: rule allow-host self-hosted-git.example:22 -> /home/egl-runner/.config/egresslock/main.conf
+removed: rule allow-host self-hosted-git.example:22 from /home/egl-runner/.config/egresslock/main.conf
 </pre>
 
 Troubleshooting: rule not present? It fails closed — exit 1, nothing

@@ -1,0 +1,9 @@
+# Security rebuild floor for the kit-built gateway image.
+#
+# Images created before this date may predate the package refresh
+# recorded here; the doctor prints a rebuild warning and a plain
+# build-gateway refresh uses --no-cache below this floor. Bump this
+# date in the same change that issues a gateway rebuild note.
+#
+# 2026-11-04: squid security update (DSA-6606-1, CVE-2026-61642).
+2026-11-04

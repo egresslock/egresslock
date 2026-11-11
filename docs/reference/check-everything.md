@@ -20,7 +20,12 @@ sudo -iu <account>
 ```
 
 `<account>` = your account name; `<name>` = a profile name (the per-profile
-commands below use `main` as the example).
+commands below use `main` as the example). The catalog calls the engine
+bare (`egresslock`): on a `.deb` install it lives at
+`/usr/bin/egresslock`, on a prefix install at `$PREFIX/egresslock` —
+both installs put `egresslock` on your PATH via a wrapper
+([files installed](files-installed.md)); use the full path only if you
+skipped the wrappers.
 
 ### 1. Account-wide (no profile name needed)
 
@@ -40,9 +45,9 @@ podman unshare --rootless-netns /usr/sbin/nft list tables | grep egresslock
 # or scan everything:
 #podman unshare --rootless-netns /usr/sbin/nft list ruleset | grep '^table'
 # Verify, for every profile with a live anchor
-/opt/egresslock/egresslock verify --ensured
+egresslock verify --ensured
 # All profiles: name, network, subnet
-/opt/egresslock/egresslock list
+egresslock list
 ```
 
 Want a one-off from your own shell? Prefix them with
@@ -53,17 +58,17 @@ in the reference for why the tilde must stay unexpanded).
 
 ```sh
 # Build + verify the policy (fail closed; re-resolves direct pins, heals DNS drift)
-/opt/egresslock/egresslock ensure main
+egresslock ensure main
 # Read-only drift check — a `drift:` line means "re-run ensure", not an error
-/opt/egresslock/egresslock verify main
+egresslock verify main
 # The nftables rules the engine installs
-/opt/egresslock/egresslock rules main
+egresslock rules main
 # What the proxy lane allows (configured entries; file comments are not shown)
-/opt/egresslock/egresslock allowlist main
+egresslock allowlist main
 # What the direct path is configured to allow (profile conf; read-only, no DNS)
-/opt/egresslock/egresslock allowlist main --direct
+egresslock allowlist main --direct
 # Hosts the gateway blocked (feed for `allow`; last 14 days by default — --days 0 for the full log)
-/opt/egresslock/egresslock denied main
+egresslock denied main
 # Every request, one line each (last 5)
 podman exec egresslock-gateway-main cat /var/log/squid/access.log | tail -5
 # Startup / DNS errors (last 5)
@@ -77,7 +82,8 @@ podman logs egresslock-gateway-main --tail 5
 ```sh
 # The 15-minute verify timer
 systemctl list-timers 'egresslock-verify@*' --no-pager
-# Last verify run (exit 0 + 'verified (ensured)' = healthy; FAILED = drift, heal with ensure)
+# Last verify run (exit 0 + 'verified (ensured)' = healthy; FAILED = the policy is
+# no longer as installed — a `drift:` line alone never fails the run — heal with ensure)
 systemctl status egresslock-verify@<account>.service --no-pager -n 10
 # Recent verify log lines (the system journal — this one needs root)
 sudo journalctl -u egresslock-verify@<account>.service --no-pager -n 10
@@ -87,8 +93,8 @@ sudo journalctl -u egresslock-verify@<account>.service --no-pager -n 10
 
 - `ensure` / `verify` exit 0 and print `profile 'main' policy and
   gateway verified`.
-- `list` shows your profiles; one anchor (and one gateway per gateway
-  profile) per ensured profile.
+- `list` shows your profiles; one anchor and one gateway per ensured
+  profile (every profile has a gateway — the directive is required).
 - The timer is `active (waiting)` with a recent `last run`; the service
   journal shows `verified (ensured)` lines. A `verify: ... FAILED` line
   means policy drift or a half-dead profile — heal with `ensure

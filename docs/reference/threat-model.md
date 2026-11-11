@@ -23,7 +23,7 @@ one bypass — the source-address-keyed gateway exemption — closed on
 [accepted risks](#non-goals--accepted-risks). Neither exercise was a
 pentest.
 
-Last reviewed: 2026-09-28. The claims below are scoped to the dogfood
+Last reviewed: 2026-11-10. The claims below are scoped to the dogfood
 hosts in the [version matrix](#version-matrix), not to "any rootless
 Podman" install.
 
@@ -140,7 +140,7 @@ what that does and does not mean).
 | A1 | a process inside a workload container | may be container root, typically with no capabilities when launched by a cap-dropping launcher |
 | A2 | another container on the same profile network | same L2, same subnet, kit policy applies to it identically |
 | A3 | another account on the same host | separate rootless store/netns; unprivileged |
-| A4 | a destination the operator allowlisted (a malicious or compromised SaaS/CDN), or its DNS | inside the policy, not outside it |
+| A4 | a destination the operator allowlisted (a malicious or compromised SaaS/CDN), or its DNS — including a co-tenant vhost behind an allowlisted shared IP | inside the policy, not outside it; the name layer authorizes the CONNECT host, the tunnel bytes choose the SNI/Host the origin sees (T17) |
 | A5 | a local unprivileged user holding the kit binaries | uninteresting: if they already own the account, the kit adds nothing for them |
 
 A1 is the primary attacker. A2 matters because the profile network is
@@ -258,7 +258,7 @@ attacks table or an explicit non-goal.
 
 | ID | Invariant | If broken |
 |---|---|---|
-| I1 | Default drop for the profile subnet, except established/related flows, DNS to the bridge gateway `:53`, explicit `allow-host` pins, the gateway's own port, and the gateway's own egress — keyed on the gateway's source address **and** its pinned MAC since 2026-09-21 (the address alone no longer satisfies it). DNS has two paths by design: (a) workload DNS to the bridge gateway `:53`; (b) the **gateway process's own DNS**, which pasta forwards to `169.254.1.1` — i.e. the **host resolver, for any name** | direct internet or LAN reach from the workload. (b) is not a workload bypass — the gateway's connects are still Squid-allowlisted — but its DNS egress is host-resolver-wide by design |
+| I1 | Default drop for the profile subnet, except established/related flows, DNS to the bridge gateway `:53`, explicit `allow-host` pins, the gateway's own port, and the gateway's own egress — keyed on the gateway's source address **and** its pinned MAC since 2026-09-21 (the address alone no longer satisfies it). The gateway exemption is unscoped by destination, port, and protocol (live-confirmed 2026-11-06): the gateway's own direct TCP and UDP:53 match it — a min-privilege acceptance, not a workload path (see the gateway-egress bullet below). DNS has two paths by design: (a) workload DNS to the bridge gateway `:53`; (b) the **gateway process's own DNS**, which pasta forwards to `169.254.1.1` — i.e. the **host resolver, for any name** | direct internet or LAN reach from the workload. (b) is not a workload bypass — Squid still allowlists the proxy requests it handles — but its DNS egress is host-resolver-wide by design |
 | I2 | The proxy env is not the boundary: nftables is | an operator believes unsetting the proxy stops egress, or setting it grants egress |
 | I3 | On a gateway-only profile the gateway being down means no direct internet (nothing else is accepted) | fail-open when Squid dies |
 | I4 | Forwarded IPv6 is dropped (`p_v6deny`, before Netavark) | IPv6 bypass of an IPv4-only policy |
@@ -370,7 +370,21 @@ attacks table or an explicit non-goal.
   queried from the gateway's position (while resolving allowlisted
   dstdomains, for instance) also leave unimpeded, without a profile
   chain in between. Not a workload bypass: Squid still allowlists the
-  gateway's connects; the queries themselves are not gated.
+  proxy requests it handles; the queries themselves are not gated.
+- **Gateway egress is unscoped by design (min-privilege acceptance):**
+  the gateway's exemption from the profile chain matches its source
+  address and pinned MAC on the profile bridge, with no destination,
+  port, or protocol predicate — so the rule itself does not restrict
+  the gateway's own traffic. Direct gateway-originated TCP and UDP:53
+  matched it on 2026-11-06 (live-confirmed to a local listener); how
+  far that traffic actually gets still depends on routing, pasta, and
+  the host's own firewall. This is defense-in-depth, not a workload
+  path: the gateway is the trusted enforcement position. Squid
+  allowlists the proxy requests it handles; traffic the gateway
+  originates outside Squid is not subject to that allowlist. Narrowing
+  the exemption to the proxy's needs was considered and deferred: a
+  too-narrow exemption fails the proxy lane closed, and per-ensure
+  destination sets churn while the chain is hot.
 - **Two paths, one destination, different verdicts (T18 neighbor):**
   on a gateway profile an `allow-host` IP is an nft-direct rule, but a
   proxied HTTP(S) request to that same literal IP never reaches it —
@@ -378,6 +392,29 @@ attacks table or an explicit non-goal.
   dstdomain allowlist denies it — unless `no-proxy` (conf) or the
   client's `NO_PROXY` steers the request off the proxy. This is the
   documented two-path behavior, not a bypass.
+
+- **Non-IP channels are outside the profile chain (CVE-2026-123876
+  class):** the enforcement chain is IP-scoped; socket families that
+  are not IP traffic — `AF_VSOCK` (VM sockets, not
+  network-namespace-scoped) and `NETLINK_AUDIT` (kernel audit) — never
+  traverse it. Their only layer is the container runtime's seccomp
+  profile: the kit sets no `--security-opt seccomp` in any launch path
+  and ships no workload launcher, so on a workload that profile is
+  whatever the operator's launcher requests — `no-new-privileges` does
+  not cover this layer. On the tested Debian lane, the stock profile
+  (containers-common 0.62.2) has no `AF_VSOCK` deny rule: plain and
+  high-bits `socket(2)` calls both succeed, so seccomp does not block
+  vsock there. Its `NETLINK_AUDIT` deny was not bypassed by the
+  high-bits argument in lane verification — plain and high-bits calls
+  were rejected identically. Newer profiles (forky's 0.67.1) add an
+  `AF_VSOCK` deny for container-escape prevention, outside this model
+  (see [Scope](#scope)); on the same lane that rule rejected the
+  high-bits call exactly as the plain one, so the CVE-2026-123876
+  bypass did not manifest in lane verification. Upstream fixed the
+  family comparison in containers-common 0.70.0.
+  Accepted: the kit's promise is the workload's **IP egress** surface;
+  where you rely on the seccomp layer, prefer a fixed containers-common
+  / Podman (or your distribution's backport).
 
 ## Attacks table
 
@@ -403,7 +440,7 @@ CONNECT deny may show as curl `000` with 403 in the error line.
 | T14 | `rule public-only` (drop-set narrower than all special-use ranges) | **retired** as of 0.6.0: the mode is gone, so the risk no longer exists to accept | n/a — see CHANGELOG | retired |
 | T15 | Another account's `podman network ls` | cannot see this account's nets | empty / other store | design-intent |
 | T16 | Engine run as root | refuse | error; root's store unused | design-intent |
-| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach: cloud metadata (`169.254.169.254`) is **not delivered** on this pasta (in-lab mitigation: connection times out); hosts-file rebind is **not injectable** from the gateway (non-root gateway; Squid resolves via internal DNS, not the hosts file); LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, nft-direct, not the name-rebind path. The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. The same name-at-request-time semantics cover **gateway-tunneled non-HTTP** (e.g. SSH via a client `ProxyCommand` CONNECT — optional recipe, docs only): the SSH host-key check remains the mitigation for SSH, and `denied` does see **denied** CONNECT-tunneled traffic (an allowed tunnel shows in the gateway access.log as `TCP_TUNNEL/200`). | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
+| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach: cloud metadata (`169.254.169.254`) is **not delivered** on this pasta (in-lab mitigation: connection times out); hosts-file rebind is **not injectable** from the gateway (non-root gateway; Squid resolves via internal DNS, not the hosts file); LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, nft-direct, not the name-rebind path. The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. **Shared-IP co-tenancy (live-confirmed 2026-11-06):** a CONNECT to an allowlisted name on a shared IP completes TLS with a co-tenant SNI, and an HTTP request with a mismatched Host is carried through the same tunnel — Squid's blind CONNECT authorizes the CONNECT name only, so the tunnel bytes choose what the origin sees (the same accepted class as the opaque-body risk, not a way past the name layer). Which vhost the origin serves for that SNI/Host is the origin's choice: the live observation covers the tunnel carrying the co-tenant SNI and mismatched Host, not a distinct tenant-vhost response. The same name-at-request-time semantics cover **gateway-tunneled non-HTTP** (e.g. SSH via a client `ProxyCommand` CONNECT — optional recipe, docs only): the SSH host-key check remains the mitigation for SSH, and `denied` does see **denied** CONNECT-tunneled traffic (an allowed tunnel shows in the gateway access.log as `TCP_TUNNEL/200`). | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
 | T18 | Literal `http://127.0.0.1` (or other IPv4 URL) via proxy | Squid 403 (dstdomain is names). `allow` of an IPv4 literal is rejected. Use `allow <profile> <ip>:<port> --direct` for addresses. | 403; `allow` exit 2 | lab-verified (unlisted literals); grammar: literals rejected. Since 0.5.0: 403 holds **including when the IP's PTR equals an allowlisted name** (generated dstdomain ACLs carry `-n`) |
 
 Rows read as "what should happen", not a pentest report:

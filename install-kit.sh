@@ -36,20 +36,36 @@
 #   -h, --help        print this help
 #
 # Environment (test hooks; the mock harness runs non-root):
-#   EGRESSLOCK_KIT_ALLOW_NON_ROOT=1   allow non-root runs (tests only)
+#   EGRESSLOCK_KIT_ALLOW_NON_ROOT=1   allow non-root runs (tests only);
+#                                test mode is off by default — only
+#                                exactly 1 turns it on, and any other
+#                                value (e.g. true) warns and leaves
+#                                test mode off
 #   EGRESSLOCK_APPARMOR_PROFILES=<f>  kernel profiles listing to probe
 #                                for the podman AppArmor label advisory
 #                                (default:
 #                                /sys/kernel/security/apparmor/profiles;
 #                                requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1;
 #                                same hook/ERE as egresslock-setup)
-#   EGRESSLOCK_UNIT_DIR=<dir>         install unit templates here
-#                                (default: /etc/systemd/system)
-#   EGRESSLOCK_PATH_BINDIR=<dir>     PATH wrapper dir for the engine
-#                                (default: /usr/local/bin)
+#   EGRESSLOCK_UNIT_DIR=<dir>         install unit templates here in test mode
+#                                (default: /etc/systemd/system; requires
+#                                EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+#   EGRESSLOCK_UNIT_SRC=<dir>         unit template source in test mode
+#                                (default: the kit's systemd/; requires
+#                                EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+#   EGRESSLOCK_UB_BIN=<path>          deb-shape guard probe in test mode
+#                                (default: /usr/bin/egresslock; requires
+#                                EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+#   EGRESSLOCK_DEB_LIBDIR=<dir>       deb-libdir guard probe in test mode
+#                                (default: /usr/lib/egresslock; requires
+#                                EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+#   EGRESSLOCK_PATH_BINDIR=<dir>     PATH wrapper dir for the engine in test mode
+#                                (default: /usr/local/bin; requires
+#                                EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
 #   EGRESSLOCK_PATH_SBINDIR=<dir>    PATH wrapper dir for
-#                                egresslock-setup (default:
-#                                /usr/local/sbin)
+#                                egresslock-setup in test mode (default:
+#                                /usr/local/sbin; requires
+#                                EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
 #
 # Defaults that are not parameter-changeable:
 #   - deployed kit file set: egresslock, egresslock-start,
@@ -63,6 +79,34 @@
 # Exit codes: 0 ok, 1 preflight failure, 2 usage error.
 
 set -euo pipefail
+
+# Testability hook: the mock harness runs non-root. This flag gates the
+# harness hook reads that follow; without it each gated site uses its
+# production default.
+kit_test_mode() { [[ "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]]; }
+
+# EGL-491-D1/D2: a test-harness hook that is set without the test flag is
+# discarded; say so once per name per invocation, on stderr only. The value
+# is never echoed and rc/stdout stay unchanged.
+egl491_warned_hooks=""
+egl491_warn_ignored_hook() { # egl491_warn_ignored_hook <name> [value]
+    local _name="$1" _value="${2:-}"
+    if [[ -z "$_value" ]] || kit_test_mode; then
+        return 0
+    fi
+    case " $egl491_warned_hooks " in
+        *" $_name "*) return 0 ;;
+    esac
+    egl491_warned_hooks+=" $_name"
+    echo "install-kit: WARNING - $_name is set but ignored: it is a test-harness override and requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1; the production default applies." >&2
+}
+# EGL-491-D4: the test flag's gate is the exact `== 1` predicate. Any other
+# set value (including empty) leaves test mode off, so the hooks set
+# alongside it are inert — warn once, presence-based, never echo the value.
+if [[ -n "${EGRESSLOCK_KIT_ALLOW_NON_ROOT+x}" \
+      && "${EGRESSLOCK_KIT_ALLOW_NON_ROOT-}" != 1 ]]; then
+    echo "install-kit: WARNING - EGRESSLOCK_KIT_ALLOW_NON_ROOT is set but is not the exact value 1, so test mode is off; test-harness overrides are ignored." >&2
+fi
 
 prefix="/opt/egresslock"
 src="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
@@ -119,6 +163,69 @@ _check_kit_path_shape "$prefix"
     exit 1
 }
 
+# EGL-433-D3/D7: never operate through a symlinked --prefix. The guard below
+# (and every copy after it) would otherwise read, delete, and deploy inside
+# the referent; a stray `<link>/VERSION` would even pass the marker fence.
+# Probe both spellings (the argument as passed and its one-trailing-slash
+# form, whose -L is false) before the marker read and any copy. Do not
+# rewrite --prefix: the PATH-wrapper marker embeds the argument as passed.
+_kit_prefix_shape_ok() { # <path> — the parser's rule, without exiting
+    local p="$1"
+    [[ "$p" == /* && "$p" != "/" ]] || return 1
+    [[ "$p" != *[[:space:]]* ]] || return 1
+    LC_ALL=C grep -qE '^/[A-Za-z0-9._/-]+$' <<<"$p" || return 1
+    [[ "$p" != *"//"* && "$p" != *"/./"* && "$p" != *"/../"* \
+       && "$p" != *"/." && "$p" != *"/.." ]] || return 1
+    return 0
+}
+# EGL-433-D8/F1: capture `readlink -z -f` without losing pathname bytes and
+# without trusting a failed producer. Command substitution strips a trailing
+# newline (naming a sibling); `<(…)` exposes only the read's status, not the
+# producer's. Run the producer to a private file, keep its real exit status,
+# and accept only rc 0 plus exactly one complete NUL record. Remove the file
+# on every path; anything else is unresolvable (no retry is offered).
+_kit_resolved() { # <var> <path> — returns 1 when unresolvable
+    local _out="$1" _src="$2" _tmp _rc=0 _val="" _n _sz
+    _tmp="$(mktemp "${TMPDIR:-/tmp}/egl433-readlink.XXXXXX")" || return 1
+    readlink -z -f -- "$_src" >"$_tmp" 2>/dev/null || _rc=$?
+    if (( _rc == 0 )) && IFS= read -r -d '' _val <"$_tmp"; then
+        _n="$(printf '%s' "$_val" | wc -c)"
+        _sz="$(wc -c <"$_tmp")"
+        rm -f -- "$_tmp"
+        if (( _sz == _n + 1 )); then
+            printf -v "$_out" '%s' "$_val"
+            return 0
+        fi
+        return 1
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+prefix_probe="$prefix"
+[[ "$prefix_probe" == */ ]] && prefix_probe="${prefix_probe%/}"
+if [[ -L "$prefix_probe" ]]; then
+    printf -v q_prefix '%q' "$prefix"
+    echo "install-kit: refusing: --prefix is a symbolic link: $q_prefix" >&2
+    prefix_resolved=""
+    if [[ -d "$prefix_probe" ]]; then
+        _kit_resolved prefix_resolved "$prefix_probe" || prefix_resolved=""
+    fi
+    if [[ -z "$prefix_resolved" ]]; then
+        echo "  the link does not resolve to a directory; pass the real kit prefix. nothing was written or removed." >&2
+    elif _kit_prefix_shape_ok "$prefix_resolved"; then
+        printf -v q_resolved '%q' "$prefix_resolved"
+        echo "  pass the real directory the link points to (the installer does not follow the link); nothing was written or removed:" >&2
+        echo "    sudo ./install-kit.sh --prefix $q_resolved" >&2
+    else
+        # D7: a retry command is offered only when its argument would pass
+        # this tool's own --prefix rule; name the target, offer no command.
+        printf -v q_resolved '%q' "$prefix_resolved"
+        echo "  the link points to $q_resolved, which --prefix cannot name (only letters, digits, '.', '_', '-', and '/' are allowed); nothing was written or removed." >&2
+    fi
+    exit 2
+fi
+unset prefix_probe prefix_resolved q_prefix q_resolved
+
 # EGL-68-D1 / EGL-90-D3: never rm -rf through a mistyped --prefix. The
 # install replaces gateway/, apparmor/, examples/recipes/ and
 # examples/egl-base/. Deleting one is allowed only when it is absent
@@ -163,29 +270,35 @@ base="$(tr -d ' \t\n' < "$src/VERSION_BASE")"
 _kit_missing=""
 # EGL-102-D6-F3: cover the WHOLE unconditional copy list (binaries,
 # gateway/, apparmor/, examples incl. recipes/, unit templates). Keep
-# this list in lockstep with the copy list: the EGL-47-D3 tripwire
-# below guards the shipped set, this guards the copied set.
+# this list in lockstep with the copy list below: this gate guards the
+# copied set.
 for _src in egresslock egresslock-start egresslock-verify egresslock-setup \
             gateway/Containerfile gateway/entrypoint.sh gateway/squid.conf \
+            gateway/security-floor \
             apparmor/usr.bin.pasta.local apparmor/README.md \
             examples/main.conf examples/main-allowlist examples/recipes \
-            examples/egl-base/Containerfile examples/egl-base/build-egl-base; do
+            examples/egl-base/Containerfile examples/egl-base/README.md \
+            examples/egl-base/build-egl-base examples/egl-base/security-floor; do
     [[ -e "$src/$_src" ]] || _kit_missing+="$_src "
 done
-if [[ -n "${EGRESSLOCK_UNIT_SRC:-}" ]]; then
-    _unit_src_chk="$EGRESSLOCK_UNIT_SRC"
+# EGL-456-D4: EGRESSLOCK_UNIT_SRC is a test-only hook. Resolve it once
+# here (gated) and use the same value for the completeness check and the
+# deploy; without the flag the kit's own systemd/ applies.
+unit_src="$src/systemd"
+if kit_test_mode && [[ -n "${EGRESSLOCK_UNIT_SRC:-}" ]]; then
+    unit_src="$EGRESSLOCK_UNIT_SRC"
 else
-    _unit_src_chk="$src/systemd"
+    egl491_warn_ignored_hook EGRESSLOCK_UNIT_SRC "${EGRESSLOCK_UNIT_SRC:-}"
 fi
 for _ut in egresslock-verify@.service egresslock-verify@.timer; do
-    [[ -f "$_unit_src_chk/$_ut" ]] || _kit_missing+="systemd/$_ut "
+    [[ -f "$unit_src/$_ut" ]] || _kit_missing+="systemd/$_ut "
 done
 if [[ -n "$_kit_missing" ]]; then
     echo "install-kit: FAIL - incomplete kit tree at $src (missing: ${_kit_missing% })" >&2
     echo "  restore the full checkout or re-extract the release tarball, then re-run; nothing was written." >&2
     exit 1
 fi
-unset _kit_missing _src _unit_src_chk _ut
+unset _kit_missing _src _ut
 
 # EGL-72-D3: the version line. A tarball install carries KIT_VERSION
 # (written by build-tarball.sh) so the deployed stamp is the BUILD
@@ -247,14 +360,6 @@ rm -rf "$prefix/examples/egl-base"
 mv "$prefix/examples/egl-base.tmp" "$prefix/examples/egl-base"
 chmod -R go-w "$prefix/examples/egl-base"
 
-# EGL-47-D3: the deployed file set is the explicit copy list above —
-# repo-internal material (internal_docs/, maintainer notes) is NOT in
-# it and must never be added. Tripwire: fail closed if a widened copy
-# rule ever sweeps it in.
-if [[ -e "$prefix/internal_docs" ]]; then
-    echo "install-kit: FAIL - internal_docs leaked into the prefix" >&2
-    exit 1
-fi
 commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
 if [[ -z "$commit" ]]; then
     echo "install-kit: WARNING - cannot determine deployed commit" \
@@ -284,9 +389,26 @@ chmod 0644 "$prefix/VERSION"
 #     with the .deb (ARC-22-D1) and never clobber a foreign dest.
 #     EGL-80-L2: the deb-shape guard honours EGRESSLOCK_UB_BIN (default
 #     /usr/bin/egresslock), so it is testable on hosts with the .deb.
-path_bindir="${EGRESSLOCK_PATH_BINDIR:-/usr/local/bin}"
-path_sbindir="${EGRESSLOCK_PATH_SBINDIR:-/usr/local/sbin}"
-ub_bin="${EGRESSLOCK_UB_BIN:-/usr/bin/egresslock}"
+# EGL-434-D1/D3: the PATH dirs are test-only hooks. Without the flag an
+# inherited value is ignored and the production default is used, exactly
+# as if the variable were unset.
+path_bindir="/usr/local/bin"
+path_sbindir="/usr/local/sbin"
+if kit_test_mode; then
+    if [[ -n "${EGRESSLOCK_PATH_BINDIR:-}" ]]; then path_bindir="$EGRESSLOCK_PATH_BINDIR"; fi
+    if [[ -n "${EGRESSLOCK_PATH_SBINDIR:-}" ]]; then path_sbindir="$EGRESSLOCK_PATH_SBINDIR"; fi
+else
+    egl491_warn_ignored_hook EGRESSLOCK_PATH_BINDIR "${EGRESSLOCK_PATH_BINDIR:-}"
+    egl491_warn_ignored_hook EGRESSLOCK_PATH_SBINDIR "${EGRESSLOCK_PATH_SBINDIR:-}"
+fi
+ub_bin="/usr/bin/egresslock"
+# EGL-456-D4: the host-leftover guard fixtures are test-only hooks. Without
+# the flag an inherited value is ignored and the production probe applies.
+if kit_test_mode; then
+    if [[ -n "${EGRESSLOCK_UB_BIN:-}" ]]; then ub_bin="$EGRESSLOCK_UB_BIN"; fi
+else
+    egl491_warn_ignored_hook EGRESSLOCK_UB_BIN "${EGRESSLOCK_UB_BIN:-}"
+fi
 deb_status="$(dpkg-query -W -f='${Status}' egresslock 2>/dev/null || true)"
 if [[ "$deb_status" == *'installed'* ]]; then
     echo "install-kit: the egresslock .deb is installed on this host ($deb_status);" >&2
@@ -297,7 +419,12 @@ fi
 # foreign host) while the deb's libdir kit is still present. Refuse on
 # the deb libdir's VERSION marker too (hookable for tests); never
 # auto-remove the deb (same never-co-install policy as above).
-deb_libdir="${EGRESSLOCK_DEB_LIBDIR:-/usr/lib/egresslock}"
+deb_libdir="/usr/lib/egresslock"
+if kit_test_mode; then
+    if [[ -n "${EGRESSLOCK_DEB_LIBDIR:-}" ]]; then deb_libdir="$EGRESSLOCK_DEB_LIBDIR"; fi
+else
+    egl491_warn_ignored_hook EGRESSLOCK_DEB_LIBDIR "${EGRESSLOCK_DEB_LIBDIR:-}"
+fi
 if [[ -e "$deb_libdir/VERSION" ]]; then
     echo "install-kit: FAIL - an egresslock .deb kit exists at $deb_libdir" >&2
     echo "  (dpkg-query did not report an installed egresslock, but the libdir kit" >&2
@@ -341,7 +468,7 @@ for _wl in "$path_bindir/egresslock:$prefix/egresslock" \
     if printf '#!/bin/sh\n# egresslock-path-wrapper prefix=%s\nexec "%s" "$@"\n' \
             "$prefix" "$_wtarget" > "$_wdest" 2>/dev/null \
             && chmod 0755 "$_wdest" 2>/dev/null; then
-        echo "PATH wrapper installed: $_wdest -> $_wtarget"
+        echo "PATH wrapper installed: $_wdest to $_wtarget"
     else
         # Unwritable PATH dir (read-only /usr, unusual setups): warn and
         # continue — the wrappers are a convenience, the prefix kit is
@@ -352,20 +479,22 @@ for _wl in "$path_bindir/egresslock:$prefix/egresslock" \
 done
 
 # 2. Instanced unit templates (instance = account, ARC-16-D1/D8).
-#    Destination overridable for the mock harness (non-root tests).
+#    Destination overridable for the mock harness (non-root tests) only;
+#    EGL-434-D1/D3 gates the hook so a root run always uses /etc.
 #    R-017-1 F1: the ExecStart prefix placeholder is substituted HERE so
 #    a non-default --prefix yields a working timer; the repo template
 #    keeps the __EGRESSLOCK_PREFIX__ placeholder.
-unit_dest="${EGRESSLOCK_UNIT_DIR:-/etc/systemd/system}"
+unit_dest="/etc/systemd/system"
+if kit_test_mode && [[ -n "${EGRESSLOCK_UNIT_DIR:-}" ]]; then
+    unit_dest="$EGRESSLOCK_UNIT_DIR"
+else
+    egl491_warn_ignored_hook EGRESSLOCK_UNIT_DIR "${EGRESSLOCK_UNIT_DIR:-}"
+fi
 # ARC-22, tightened for the repo split (ARC-74-D5): the unit templates
 # are kit assets inside the egresslock tree, so a self-contained kit tree
-# deploys with no shared-repo layout. Only EGRESSLOCK_UNIT_SRC (override)
-# or $src/systemd are consulted; there is no fallback outside the tree.
-if [[ -n "${EGRESSLOCK_UNIT_SRC:-}" ]]; then
-    unit_src="${EGRESSLOCK_UNIT_SRC}"
-else
-    unit_src="$src/systemd"
-fi
+# deploys with no shared-repo layout. EGL-456-D4: unit_src was resolved
+# once, gated, before the completeness check; this deploy uses that same
+# value (no second raw hook read).
 [[ -f "$unit_src/egresslock-verify@.service" && -f "$unit_src/egresslock-verify@.timer" ]] || {
     echo "install-kit: unit templates missing under $unit_src" >&2
     exit 1
@@ -376,7 +505,23 @@ sed "s|__EGRESSLOCK_PREFIX__|$prefix|g" "$unit_src/egresslock-verify@.service" \
 chmod 0644 "$unit_dest/egresslock-verify@.service"
 install -m 0644 "$unit_src/egresslock-verify@.timer" "$unit_dest/"
 
-systemctl daemon-reload
+# EGL-121: the reload only loads the verify timer templates; the kit is
+# already deployed. On a host without systemd (no systemctl, or a binary
+# with no reachable PID 1) a bare reload failed *after* the install and
+# `set -e` skipped the success/advisory lines. Warn and continue (rc 0),
+# same policy as packaging/build-deb.sh; the attempt itself is the check
+# (a PATH pre-check would pass on a container/chroot/WSL host).
+# Confirmed only on rc 0 with no captured output: systemd v257 logs
+# `Running in chroot, ignoring command 'daemon-reload'` and exits 0 in a
+# real chroot (or with SYSTEMD_OFFLINE=1), so an rc-only guard would hide
+# that no-op; a noisy rc-0 reload is unconfirmed too. The captured text is
+# not echoed — the named warning is the operator contract.
+_reload_rc=0
+_reload_out="$(systemctl daemon-reload 2>&1)" || _reload_rc=$?
+if (( _reload_rc != 0 )) || [[ -n "$_reload_out" ]]; then
+    echo "install-kit: WARNING - systemd did not confirm the unit-file reload; the verify timer templates are installed but may not be loaded." >&2
+    echo "  An already-enabled verify timer may still run the previous unit definition; when systemd is available, run: systemctl daemon-reload" >&2
+fi
 
 echo
 echo "successfully installed! kit is at: $prefix"
@@ -396,6 +541,8 @@ echo
 _aa_profiles="/sys/kernel/security/apparmor/profiles"
 if [[ "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]]; then
     _aa_profiles="${EGRESSLOCK_APPARMOR_PROFILES:-$_aa_profiles}"
+else
+    egl491_warn_ignored_hook EGRESSLOCK_APPARMOR_PROFILES "${EGRESSLOCK_APPARMOR_PROFILES:-}"
 fi
 if [[ -r "$_aa_profiles" ]]; then
     # grep rc: 0 = match (labeled), 1 = no match (unlabeled), 2 = read

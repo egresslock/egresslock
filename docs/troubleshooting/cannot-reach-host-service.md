@@ -38,7 +38,7 @@ egresslock allow main host.containers.internal:8000
 egl-runner@host:~$ egresslock allow main host.containers.internal:8000
 using config /home/egl-runner/.config/egresslock/main.conf
 path: proxy — gateway allowlist /home/egl-runner/.config/egresslock/main-allowlist
-added: host.containers.internal:8000 -> /home/egl-runner/.config/egresslock/main-allowlist
+added: host.containers.internal:8000 to /home/egl-runner/.config/egresslock/main-allowlist
 note: port 8000 is not the usual HTTP(S) port. If host.containers.internal:8000 is a non-HTTP service, add a direct rule as well (this does not remove the allowlist entry):
   egresslock allow main host.containers.internal:8000 --direct
 re-ensuring profile 'main' ...
@@ -87,10 +87,10 @@ egresslock allow main 169.254.1.2:8000 --direct
 egl-runner@host:~$ egresslock allow main 169.254.1.2:8000 --direct
 using config /home/egl-runner/.config/egresslock/main.conf
 path: direct — firewall rule in /home/egl-runner/.config/egresslock/main.conf (does not change client proxy settings)
-added: rule allow-host 169.254.1.2:8000 -> /home/egl-runner/.config/egresslock/main.conf
+added: rule allow-host 169.254.1.2:8000 to /home/egl-runner/.config/egresslock/main.conf
 note: IPv4 direct pins are included in proxy-env NO_PROXY; recreate running workloads to pick up the new env.
 re-ensuring profile 'main' ...
-gateway 'egresslock-gateway-main' ready (already converged, not restarted)
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
 </pre>
 

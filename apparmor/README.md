@@ -97,8 +97,9 @@ Diagnose the amendment state (read-only, no root needed) with
 enforced|NOT enforced|unknown|n/a` on two lines, then the podman
 label tri-state and the amendment verdict (`podman label:
 labeled|unlabeled|unknown` — any mode counts as labeled, the label
-not the mode is the discriminator — and `pasta amendment: needed|
-not needed on this host (...)|condition unknown (verify: podman
+not the mode is the discriminator — and `pasta amendment: required
+on this host|not required on this host (pasta not enforced|podman
+unlabeled)|condition unknown (verify: podman
 unshare --rootless-netns true as the account)`; an UNKNOWN listing
 never produces a "not needed" claim), then `pasta profile: found`,
 `pasta local extension: present (stock) / present (egresslock) /

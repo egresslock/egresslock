@@ -130,7 +130,7 @@ egresslock-setup: building the gateway image — first run downloads the base im
 5) gateway image … OK
 enabling verify timer for egl-runner (egresslock-verify@egl-runner.timer)
 6) timer … OK
-egresslock-setup: unit.env written for egl-runner -> /home/egl-runner/.config/egresslock/unit.env
+egresslock-setup: unit.env written for egl-runner to /home/egl-runner/.config/egresslock/unit.env
 egresslock-setup: the scheduled check will verify every profile
 egresslock-setup: account 'egl-runner' is ready — it can ensure profiles now
 next steps (as the account):
@@ -144,8 +144,8 @@ started anchor egresslock-anchor-main
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
 $ sudo -iu egl-runner -- /usr/share/egresslock/examples/egl-base/build-egl-base
->> Building localhost/egl-base:latest FROM 62bd423aeee9
->> Done: localhost/egl-base:latest
+Building localhost/egl-base:latest FROM a72b4433de1c
+Done: localhost/egl-base:latest
 </pre>
 </details>
 
@@ -186,7 +186,7 @@ the container's shell prompt — you are inside the locked network:
 
 <pre>
 $ sudo -iu egl-runner -- sh -c 'egresslock ensure main && podman run … sh'
-gateway 'egresslock-gateway-main' ready (already converged, not restarted)
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
 root@9badc0ffee67:/#
 </pre>
@@ -307,10 +307,13 @@ error.
 
 - The test battery is `bash tests/run.sh`, run from the repository
   root; it runs every `tests/test-*.sh` suite with no root, Podman, or
-  nftables required. For a quicker iteration loop, `bash tests/run.sh
-  --track fast` skips the registered slow sections (named `SKIP:` lines
-  keep the `RESULTS TOTAL` exact; `bash tests/run.sh` — the default —
-  still runs everything).
+  nftables required. The engine harness shards across a few processes
+  by default (weights in `tests/shard-weights.tsv`) and still prints one
+  `RESULTS TOTAL`; `--serial` restores the one-process path and
+  `--shard N/M` runs a single shard for debugging. For a quicker
+  iteration loop, `bash tests/run.sh --track fast` skips the registered
+  slow sections (named `SKIP:` lines keep the `RESULTS TOTAL` exact;
+  `bash tests/run.sh` — the default — still runs everything).
 - Found a vulnerability or a bypass? Report it privately — see
   [SECURITY.md](SECURITY.md). Do not open a public issue for it.
 - Other bug reports and changes go through public issues and pull

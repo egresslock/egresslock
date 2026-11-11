@@ -7,6 +7,11 @@
 # runs a container, never calls egresslock ensure/verify, and takes no
 # profile. Not on PATH; invoke by full path or ./ from this directory.
 #
+# The helper also rebuilds when the image predates the kit's recorded
+# security rebuild floor (beside this script) even if the base pin did
+# not move; that refresh uses podman --no-cache. Age alone is a doctor
+# warning only — it does not trigger a build here.
+#
 # Options:
 #   -h, --help   print this help
 #   --force      rebuild even when the image matches the deployed pin
@@ -84,17 +89,51 @@ podman_in_root() { # podman_in_root cmd [arg...] — run one podman command from
     )
 }
 
+# EGL-487: security rebuild floor — one ISO date in a file beside the
+# Containerfile, `#` comments allowed. Missing, unreadable or
+# unparseable data yields no floor (never a guess).
+security_floor_date() { # security_floor_date <floor-file> -> YYYY-MM-DD or empty
+    local f="$1" line="" d=""
+    [[ -f "$f" && -r "$f" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+            && [[ "$(date -u -d "$line" '+%Y-%m-%d' 2>/dev/null || true)" == "$line" ]]; then
+            d="$line"
+        fi
+        break
+    done < "$f"
+    printf '%s\n' "$d"
+}
+
 state=missing
 base=""
+created=""
 if podman_in_root podman image exists "$IMAGE" 2>/dev/null; then
     state=present
-    base="$(podman_in_root podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}}' "$IMAGE" 2>/dev/null || true)"
-    # Go template index of a missing key prints "<no value>".
-    [[ "$base" == "<no value>" ]] && base=""
+    ins=""
+    if ins="$(podman_in_root podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}} {{.Created}}' "$IMAGE" 2>/dev/null)"; then
+        # Go template index of a missing key prints "<no value>" (with a
+        # space inside); strip it before the split so the pre-label
+        # branch fires (EGL-254, same predicate as the engine's probe).
+        [[ "$ins" == "<no value>"* ]] && ins="${ins#"<no value>"}"
+        if [[ "$ins" == *\ * ]]; then
+            base="${ins%% *}"
+            created="${ins#* }"
+        else
+            base="$ins"
+        fi
+    fi
 fi
 
 build=0
 reason=""
+below_floor=0
+floor=""
+built="${created:0:10}"
 if [[ "$state" != present ]]; then
     build=1
     reason="missing"
@@ -106,10 +145,36 @@ elif [[ -z "$base" || -z "$pin" || "$base" != "$pin" ]]; then
         reason="stale"
     fi
 fi
+# EGL-487-D4: below the recorded security floor is a real refresh even
+# when the base pin matches — --no-cache is what makes apt re-fetch the
+# unpinned packages. R-EGL-487-2 F2: only an image whose build date is
+# at or after the floor proves the floor is satisfied. A missing image,
+# a pre-label image (no base label), a missing/unparseable .Created, or
+# a below-floor date all get --no-cache — otherwise a surviving
+# pre-floor apt layer would be reused and the rebuilt image would look
+# fresh to the doctor. A moved pin needs no flag (the FROM digest
+# invalidated the layers). Age stays doctor-only.
+floor="$(security_floor_date "$dir/security-floor")"
+if [[ -n "$floor" ]]; then
+    if [[ "$state" != present || -z "$base" || -z "$pin" ]]; then
+        build=1
+        below_floor=1
+    elif [[ "$base" == "$pin" ]] \
+         && { [[ ! "$built" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+              || [[ "$built" < "$floor" ]]; }; then
+        build=1
+        below_floor=1
+    fi
+fi
 
 if (( ! build && ! force )); then
     echo "already built from deployed pin ${pin_short} — use --force to rebuild"
     exit 0
+fi
+
+if (( below_floor && ! force )) && [[ "$built" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+    && [[ "$built" < "$floor" ]]; then
+    echo "egl-base image: built ${built} predates the recorded rebuild floor ${floor} — rebuilding with --no-cache"
 fi
 
 if (( ! force )); then
@@ -123,9 +188,9 @@ if (( ! force )); then
     fi
 fi
 
-echo ">> Building $IMAGE FROM ${pin_short}"
+echo "Building $IMAGE FROM ${pin_short}"
 extra=()
-if (( force )); then
+if (( force || below_floor )); then
     extra+=(--no-cache)
 fi
 if ! podman_in_root podman build -t "$IMAGE" "${extra[@]}" -f "$dir/Containerfile" "$dir"; then
@@ -136,4 +201,4 @@ if ! podman_in_root podman build -t "$IMAGE" "${extra[@]}" -f "$dir/Containerfil
     echo "Error: egl-base image build failed for $IMAGE (build output above); fix the cause and re-run: $retry" >&2
     exit 1
 fi
-echo ">> Done: $IMAGE"
+echo "Done: $IMAGE"

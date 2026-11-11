@@ -8,7 +8,8 @@ domain → confirm.
 > 1. an account set up with a name of your choosing — the examples
 >    use `egl-runner`; enter its shell with `sudo -iu egl-runner`
 >    (see [who-runs-what](../reference/who-runs-what.md) for the
->    three worlds)
+>    three worlds). Nothing installed yet? Start at
+>    [install](../setup/install.md).
 > 2. the profile is up — `egresslock ensure main` (the examples use
 >    profile `main`; full health check:
 >    [check-everything](../reference/check-everything.md))
@@ -42,7 +43,9 @@ podman run --rm \
 
 <details>
 <summary>Expected output (denied):</summary>
-after up to 10 second delay…
+fast — the 403 comes back quickly; the 10 s figure is only the
+`--max-time` ceiling of the probe command, not how long the denial
+takes:
 
 <pre>
 egl-runner@host:~$ podman run --rm \
@@ -101,9 +104,14 @@ egresslock allow main example.com:443
 ```
 
 > [!WARNING]
-> Allowing or disallowing a domain restarts the gateway to pick it
-> up, so connections going through the gateway drop briefly —
-> including those of other containers on the same profile network.
+> Allowlist changes and re-running `ensure` reload the gateway in
+> place when the reload can be confirmed, so established proxied
+> sessions keep running — a new connection can briefly fail while the
+> gateway reopens its listener. When the engine cannot confirm the
+> reload it warns and restarts the gateway instead, which drops proxied
+> connections. Disallowing a domain always restarts the gateway, so
+> proxied connections drop — including those of other containers on the
+> same profile network.
 
 <details>
 <summary>Expected output:</summary>
@@ -112,7 +120,7 @@ egresslock allow main example.com:443
 egl-runner@host:~$ egresslock allow main example.com:443
 using config /home/egl-runner/.config/egresslock/main.conf
 path: proxy — gateway allowlist /home/egl-runner/.config/egresslock/main-allowlist
-added: example.com:443 -> /home/egl-runner/.config/egresslock/main-allowlist
+added: example.com:443 to /home/egl-runner/.config/egresslock/main-allowlist
 re-ensuring profile 'main' ...
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
@@ -149,7 +157,7 @@ egresslock allow main dev.example.com:8080
 egl-runner@host:~$ egresslock allow main dev.example.com:8080
 using config /home/egl-runner/.config/egresslock/main.conf
 path: proxy — gateway allowlist /home/egl-runner/.config/egresslock/main-allowlist
-added: dev.example.com:8080 -> /home/egl-runner/.config/egresslock/main-allowlist
+added: dev.example.com:8080 to /home/egl-runner/.config/egresslock/main-allowlist
 note: port 8080 is not the usual HTTP(S) port. If dev.example.com:8080 is a non-HTTP service, add a direct rule as well (this does not remove the allowlist entry):
   egresslock allow main dev.example.com:8080 --direct
 re-ensuring profile 'main' ...
@@ -214,12 +222,15 @@ path: proxy — gateway allowlist /home/egl-runner/.config/egresslock/main-allow
 re-ensuring profile 'main' ...
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
-removed: example.com:443 -> /home/egl-runner/.config/egresslock/main-allowlist
+removed: example.com:443 from /home/egl-runner/.config/egresslock/main-allowlist
 </pre>
 
-Removes the exact line and applies the change. Re-run the probe —
-denied again. Entry not present? It fails closed — exit 1, nothing
-changed:
+Removes the exact line and applies the change — by a full gateway
+restart, not a reload (revocation must sever established tunnels).
+Every proxied session on the profile drops, not only sessions to the
+removed destination. Re-run the
+probe — denied again. Entry not present? It fails closed — exit 1,
+nothing changed:
 
 <pre>
 egl-runner@host:~$ egresslock disallow main example.com:443

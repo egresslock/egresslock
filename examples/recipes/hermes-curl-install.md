@@ -51,9 +51,11 @@ egresslock allow main \
     github.com pypi.org files.pythonhosted.org
 ```
 
-Bare hostnames are enough — the gateway resolves them and matches any
-port. Why each host (the install chain, not the agent, drives most of
-them):
+Bare hostnames are enough here because every destination below is
+used over HTTPS — a bare name enters the **port-443 group** (the
+gateway resolves it per request); for any other port, add an explicit
+`:port` entry. Why each host (the install chain, not the agent, drives
+most of them):
 
 - `hermes-agent.nousresearch.com` — the agent's own host: the
   `install.sh` script and the agent's API endpoint.

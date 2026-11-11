@@ -45,10 +45,14 @@ Ports matter here:
   redirects to HTTPS. The no-port allowlist group only matches port
   443, so the plain-HTTP fetch 403s without an explicit `:80` entry.
 - Bare hostnames (`registry.npmjs.org`, `github.com`,
-  `openrouter.ai`) are enough — the gateway resolves them and matches
-  any port. (In the absorbed debian-github-openrouter walkthrough the
-  bare `github.com` allowed apt to reach it; opencode uses it for VCS
-  clone/fetch.)
+  `openrouter.ai`) are enough here because every one of them is used
+  over HTTPS — a bare name enters the **port-443 group** (the gateway
+  resolves it per request); for any other port, add an explicit
+  `:port` entry like the `deb.debian.org:80` one. (The absorbed
+  debian-github-openrouter walkthrough relied on the bare `github.com`
+  the same way; opencode uses it for VCS clone/fetch — if your
+  workflow uses git-over-SSH instead, pin `github.com:22 --direct`
+  like the [agentic-tool recipe](agentic-tool-opencode.md) does.)
 
 ## 2. Run the container (proxy env as one file)
 

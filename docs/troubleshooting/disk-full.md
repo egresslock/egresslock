@@ -115,6 +115,7 @@ It exits 1, the conf is byte-identical, and no `added:`, `removed:`,
 
 ## Links
 
+- Back to the [symptom index](../troubleshooting.md).
 - [concurrent-commands](concurrent-commands.md) — the lock and `holder: unknown`.
 - [verify-timer-signals](verify-timer-signals.md) — the same lines as timer signals.
 - [file-locations](../reference/file-locations.md) — lock, confdir, pin record, `/tmp`.

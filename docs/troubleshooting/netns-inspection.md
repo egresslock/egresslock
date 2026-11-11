@@ -5,7 +5,9 @@
 The engine (`egresslock`) applies its nftables policy inside the
 user's **shared rootless netns**. Podman gives each user exactly ONE
 shared rootless netns, held open by a helper process (`pasta` on
-podman >= 4.6, `slirp4netns` on older). All of the user's podman
+podman >= 5.0 — the rootless default since 5.0, per the [podman 5.0
+release notes](https://github.com/containers/podman/blob/v5.0.0/RELEASE_NOTES.md) —
+`slirp4netns` on older). All of the user's podman
 networks live inside it; the nftables chains apply to every network
 in it at once — that is the single enforcement point.
 
@@ -28,7 +30,11 @@ ls -la /run/user/$(id -u)/netns/
 podman unshare --rootless-netns nft list ruleset
 
 # Enter it as root (nsenter needs a PID, not the netns filename):
-pid="$(pgrep -f 'netns-type=path' | head -1)"
+pid="$(pgrep -x pasta | head -1)"
+[ -n "$pid" ] || pid="$(pgrep -x slirp4netns | head -1)"
+# Confirm you got the account's holder — a per-container pasta
+# instance can also match:
+ps -p "$pid" -o user=,cmd=
 sudo nsenter -t "$pid" -n ip addr        # view interfaces inside the netns
 sudo nsenter -t "$pid" -n nft list ruleset 2>/dev/null   # the live policy
 ```
@@ -58,6 +64,16 @@ sudo -iu <account>
 
 ## Related
 
+- [paths-and-signatures](../reference/paths-and-signatures.md) —
+  reading the live counters and rules you just listed.
+- [pasta-apparmor](pasta-apparmor.md) — when the probe itself fails
+  with `kill network process: permission denied`.
+- [who-runs-what](../reference/who-runs-what.md) — the three levels
+  and why root must never run the engine.
+
+## Links
+
+- Back to the [symptom index](../troubleshooting.md).
 - [paths-and-signatures](../reference/paths-and-signatures.md) —
   reading the live counters and rules you just listed.
 - [pasta-apparmor](pasta-apparmor.md) — when the probe itself fails

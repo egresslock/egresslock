@@ -136,10 +136,15 @@ deployed kit files; accounts are not touched:
 
 <pre>
 $ sudo ./install-kit.sh --prefix "$PREFIX"
-install-kit: deployed kit to /opt/egresslock
-install-kit: unit templates -> /etc/systemd/system
-install-kit: PATH wrappers -> /usr/local/bin/egresslock, /usr/local/sbin/egresslock-setup
+PATH wrapper installed: /usr/local/bin/egresslock to /opt/egresslock/egresslock
+PATH wrapper installed: /usr/local/sbin/egresslock-setup to /opt/egresslock/egresslock-setup
+
+successfully installed! kit is at: /opt/egresslock
+  0.11.0+git20261108123456.a1b2c3d4e5f6
 </pre>
+
+(The same AppArmor advisory and next-step block as a first install
+follows; accounts are not touched.)
 </details>
 
 ### 5. Rebuild the images if the base moved
@@ -170,27 +175,41 @@ $ sudo -iu <account>
 # account — you are in the account shell
 # prompt: <account>@host:~$
 
-egresslock doctor | grep -E 'gateway image|stale:'    # does the installed kit expect a different base?
+egresslock doctor | grep -E 'gateway image|stale:|rebuild:|egl-base image'    # does the installed kit expect a different base or a security rebuild?
 ```
 
 <details><summary>Expected output:</summary>
 a current image — nothing to rebuild:
 
 <pre>
-<account>@host:~$ egresslock doctor | grep -E 'gateway image|stale:'
-gateway image: present (localhost/egresslock-gateway:latest) — base <pin>, built 2026-10-09
+<account>@host:~$ egresslock doctor | grep -E 'gateway image|stale:|rebuild:|egl-base image'
+gateway image: present (localhost/egresslock-gateway:latest) — base <pin>, built 2026-11-05
+egl-base image: present (localhost/egl-base:latest) — base <pin>, built 2026-11-05
 </pre>
 
-a `stale:` line — rebuild (below):
+(The `egl-base image:` row appears only when that optional example
+image exists.)
+
+a `stale:` line — the base pin moved; rebuild (below):
 
 <pre>
-<account>@host:~$ egresslock doctor | grep -E 'gateway image|stale:'
+<account>@host:~$ egresslock doctor | grep -E 'gateway image|stale:|rebuild:|egl-base image'
 gateway image: present (localhost/egresslock-gateway:latest) — base <old-pin>, built 2026-09-01
   stale: base pin moved (image base <old-pin> != deployed pin <pin>) — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see "The gateway image" reference page)
 </pre>
+
+a `rebuild:` line — the image predates the kit's security rebuild
+floor or is more than 30 days old; rebuild (below). The age form says
+`more than 30 days old` instead:
+
+<pre>
+<account>@host:~$ egresslock doctor | grep -E 'gateway image|stale:|rebuild:|egl-base image'
+gateway image: present (localhost/egresslock-gateway:latest) — base <pin>, built 2026-10-25
+  rebuild: gateway image built 2026-10-25 is older than the kit's security rebuild floor 2026-11-04 — rebuild in the account shell: egresslock build-gateway --force && egresslock ensure --replace-gateway <profile> per affected profile (see "The gateway image" reference page)
+</pre>
 </details>
 
-**If the check said `stale:` (or `missing`) — rebuild both images:**
+**If the check said `stale:`, `rebuild:`, or `missing` — rebuild both images:**
 
 ```sh
 # account — you are in the account shell
@@ -202,21 +221,36 @@ egresslock build-gateway
 
 <details><summary>Expected output:</summary>
 each command rebuilds and streams its podman build log (STEP lines,
-apt output, layer commits) between the `>> Building …` line and the
+apt output, layer commits) between the `Building …` line and the
 end; `build-gateway` prints no separate success line, `build-egl-base`
-ends with `>> Done: …`. A re-run on an already-current image prints
+ends with `Done: …`. A re-run on an already-current image prints
 `already built from deployed pin <pin> — use --force to rebuild`
 instead.
 
 <pre>
 <account>@host:~$ egresslock build-gateway
->> Building localhost/egresslock-gateway:latest FROM <pin>
+Building localhost/egresslock-gateway:latest FROM <pin>
 ...
 <account>@host:~$ /usr/share/egresslock/examples/egl-base/build-egl-base
 egl-base image: stale: base pin moved (image <old-pin> != deployed pin <pin>)
->> Building localhost/egl-base:latest FROM <pin>
+Building localhost/egl-base:latest FROM <pin>
 ...
->> Done: localhost/egl-base:latest
+Done: localhost/egl-base:latest
+</pre>
+
+A moved base and a floor `rebuild:` line are refreshed by these plain
+builds (below the floor, both helpers pass `--no-cache`). If the only
+line was the **age** `rebuild:` (more than 30 days old), age does not
+trigger either helper — run the same two commands with `--force`:
+
+<pre>
+<account>@host:~$ egresslock build-gateway --force
+Building localhost/egresslock-gateway:latest FROM <pin>
+...
+<account>@host:~$ /usr/share/egresslock/examples/egl-base/build-egl-base --force
+Building localhost/egl-base:latest FROM <pin>
+...
+Done: localhost/egl-base:latest
 </pre>
 </details>
 
@@ -250,9 +284,9 @@ Background: [The gateway image](../reference/gateway-image.md).
 
 ### 6. Re-ensure each profile
 
-Profiles replaced in step 5 are already converged; for every profile
-these commands are a no-op unless the profile's policy or allowlist
-changed:
+Profiles replaced in step 5 are already running the new image; for every
+profile these commands make no policy change unless the profile's policy
+or allowlist changed:
 
 ```sh
 # account — you are in the account shell
@@ -263,13 +297,15 @@ egresslock verify main
 ```
 
 <details><summary>Expected output:</summary>
-an unchanged profile re-ensures as a no-op — no disruption; when the
-profile's allowlist changed, this run applies it and restarts the
-gateway to pick it up:
+an unchanged profile re-ensures without a restart when the in-place
+reload is confirmed — established proxied sessions then stay; if the
+reload cannot be confirmed the engine prints one warning and restarts
+the gateway, which drops established proxied sessions. When the
+profile's allowlist changed, this run applies it the same way:
 
 <pre>
 <account>@host:~$ egresslock ensure main
-gateway 'egresslock-gateway-main' ready (already converged, not restarted)
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
 <account>@host:~$ egresslock verify main
 profile 'main' policy and gateway verified
@@ -279,21 +315,6 @@ Troubleshooting:
 - full per-layer health checks:
   [check-everything](../reference/check-everything.md).
 </details>
-
-The first `ensure` after this upgrade (and after any reboot or crash)
-restarts each gateway once even when the allowlist text is unchanged:
-the engine records a durable activation witness that binds the deployed
-configuration to the current gateway container and its start time, and
-does not trust a missing or stale witness. Subsequent redundant ensures
-are non-disruptive again. Old unreferenced content-addressed
-`allowlist.*` group files are kept for a grace window (default 3600 s)
-and removed by a later ensure; letting them age is normal and does not
-require operator action. A failed apply that cannot prove whether the
-new configuration was published tells you to run `egresslock ensure`
-and does not promise that the old policy is still live. That includes a
-rename that reported success but did not leave the expected config
-bytes, and a missing config is treated as absent only when the
-container probes explicitly report not found.
 
 ## Next
 

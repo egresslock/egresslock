@@ -35,10 +35,9 @@ The kit is deployed ROOT-owned to `--prefix` (default
 | `apparmor/` | pasta AppArmor snippet + profiles shipped root-owned with the prefix (distribution only — applying stays the explicit `egresslock-setup apparmor add`; see `apparmor/README.md`) |
 | `examples/` | starter conf + empty allowlist for `egresslock-setup --init-conf`; `recipes/` deployed so accounts build from the prefix; `egl-base/` so accounts build the shared example image from the prefix (includes the `build-egl-base` helper) |
 | `VERSION` | `commit:` SHA + `deployed:` UTC date (+ `-dirty` marker) of what is installed |
-| `PATH wrappers` | `egresslock` at `/usr/local/bin/egresslock` and `egresslock-setup` at `/usr/local/sbin/egresslock-setup` — small sh wrappers that exec the prefix copies (the `.deb` ships `/usr/bin` / `/usr/sbin` instead). Directories overridable with `EGRESSLOCK_PATH_BINDIR` / `EGRESSLOCK_PATH_SBINDIR` |
+| `PATH wrappers` | `egresslock` at `/usr/local/bin/egresslock` and `egresslock-setup` at `/usr/local/sbin/egresslock-setup` — small sh wrappers that exec the prefix copies (the `.deb` ships `/usr/bin` / `/usr/sbin` instead) |
 
-Unit templates installed to `/etc/systemd/system/` (overridable via
-`EGRESSLOCK_UNIT_DIR`):
+Unit templates installed to `/etc/systemd/system/`:
 
 | Unit | What it is |
 |---|---|
@@ -65,7 +64,6 @@ repository root:
 | `egresslock-verify` | Entry point for the verify timer: named profile or `--ensured` mode |
 | `gateway/` | Build context for the Squid gateway image (`Containerfile`, `squid.conf`, entrypoint) |
 | `examples/` | Starter conf + empty allowlist shipped by `install-kit.sh` for `egresslock-setup --init-conf`; recipes under `recipes/`; `egl-base/` (shared example image) (includes `build-egl-base`) |
-| `build-gateway` | Build the gateway image into the current user's store (checkout use) |
 | `tests/` | Mock battery: `bash tests/run.sh` runs every `tests/test-*.sh` harness (`test-engine.sh`, `test-kit.sh`, `test-docs.sh`, …; no root/Podman needed; `--track fast` skips the registered slow sections — `bash tests/run.sh` still runs everything) |
 | `packaging/` | `build-deb.sh` (FHS `.deb`, thin `dpkg-deb` build) and `build-tarball.sh` (self-contained manual-install tar.gz incl. `uninstall-kit.sh`); `README.md` (the packaging guide). Builds stage in `/tmp/egresslock-deb.XXXXXX` / `/tmp/egresslock-tarball.XXXXXX` and clean the stage on exit |
 | `docs/` | the shipped docs tree (quickstart / setup / reference / troubleshooting; see the [docs map](../README.md)) |

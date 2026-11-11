@@ -8,7 +8,7 @@
 # Scope (EGL-163-D2, first cut): exactly the markdown the public snapshot
 # stages — README.md, SECURITY.md, CHANGELOG.md, packaging/README.md,
 # apparmor/README.md, docs/** and examples/**. The ticket flow and board
-# live under internal_docs/ (not staged, not link-checked), and
+# live outside the shipped set (not staged, not link-checked), and
 # docs/lp-*.txt / docs/debian-*.txt are not markdown (do not widen).
 # A link is an inline `](target)` or reference definition `]: target`
 # whose target is RELATIVE — no scheme, leading `/`, or bare `#anchor`;
@@ -227,6 +227,48 @@ done < <(
 )
 docs_sweep ${docs_files[@]+"${docs_files[@]}"}
 docs_require_nonempty || true
+
+# EGL-433-D9: the public refused-run claim must stay scoped to the
+# implemented guarantees. A stale broad claim, or an unconditional
+# "deny-all" description of the allowlist a failed --init-conf retains,
+# is a ship-gate FAIL. The changelog is shipped; the operator map is not
+# present in an extracted kit, so it is checked only when it exists.
+d9_files=( "$docs_root/CHANGELOG.md" )
+# The operator map is private maintainer material, absent from an extracted
+# kit; locate it by basename so the check runs when the map exists and stays
+# inert otherwise (no private path is named here).
+while IFS= read -r d9f; do
+    d9_files+=( "$d9f" )
+done < <(find "$docs_root" -type f -name 'OPERATOR_STATE_MAP.md' \
+    -not -path '*/.git/*' 2>/dev/null | sort)
+d9_bad=0
+for d9f in "${d9_files[@]}"; do
+    [[ -f "$d9f" ]] || continue
+    if grep -qF 'a refused run changes nothing' "$d9f"; then
+        echo "FAIL: ${d9f#"$docs_root"/}: stale broad claim 'a refused run changes nothing'"
+        d9_bad=$(( d9_bad + 1 ))
+    fi
+    if grep -qF 'leaves the deny-all allowlist in place' "$d9f" \
+       || grep -qF 'it is the deny-all allowlist, reused on re-run' "$d9f"; then
+        echo "FAIL: ${d9f#"$docs_root"/}: retained allowlist unconditionally called deny-all"
+        d9_bad=$(( d9_bad + 1 ))
+    fi
+done
+if (( d9_bad )); then
+    docs_fail=$(( docs_fail + d9_bad ))
+else
+    docs_pass=$(( docs_pass + 1 ))
+fi
+# The shipped one-sentence D9 claim (line wrapping collapsed).
+if [[ -f "$docs_root/CHANGELOG.md" ]]; then
+    d9_flat="$(tr '\n' ' ' < "$docs_root/CHANGELOG.md" | tr -s ' ')"
+    if [[ "$d9_flat" == *'Normal use is unchanged. A refused run never deletes or overwrites your files — except that a refused build can leave an empty keep-stage directory absent, and a failed `--init-conf` leaves the allowlist in place; inspect it before reuse.'* ]]; then
+        docs_pass=$(( docs_pass + 1 ))
+    else
+        docs_fail=$(( docs_fail + 1 ))
+        echo "FAIL: CHANGELOG.md: scoped D9 refused-run claim is missing"
+    fi
+fi
 
 echo "RESULTS (docs link resolution): $docs_pass passed, $docs_fail failed"
 echo "RESULTS TOTAL: $docs_pass passed, $docs_fail failed$(skip_summary) ($(tree_shape_tag))"

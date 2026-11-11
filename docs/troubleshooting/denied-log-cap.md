@@ -39,6 +39,7 @@ run since the log grew (or the cap was lowered below the log size).
 
 ## Links
 
+- Back to the [symptom index](../troubleshooting.md).
 - [scripts and environment](../reference/scripts-and-environment.md)
   (both cap variables).
 - [gateway logs](gateway-logs.md) — how to read `access.log`.

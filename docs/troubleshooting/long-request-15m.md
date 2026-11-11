@@ -21,10 +21,12 @@ why short requests and streamed calls never show this signature.
 
 Two things this is NOT:
 
-- Not an `ensure`-time break: a gateway replacement severs proxied
-  sessions at the moment you run `ensure`, not at a request's
-  15-minute mark (and since the converged-ensure gate, a redundant
-  `ensure` of a healthy, unchanged profile does not restart anything).
+- Not an `ensure`-time break: a plain or changed-allowlist `ensure`
+  reloads the gateway in place and severs no established session; only
+  a fallback restart (an unconfirmable reload), a bootstrap or
+  older-config-path apply, `ensure --replace-gateway`, or a `disallow`
+  sever sessions — and even then at the moment you run the command,
+  not at a request's 15-minute mark.
 - Not the verify timer: `verify` is read-only and never restarts
   containers.
 
@@ -65,3 +67,13 @@ egresslock ensure <profile>
   none of them matches this hazard.
 - Streaming the request also avoids the idle window, but the profile
   knob is the supported fix.
+
+## Links
+
+- Back to the [symptom index](../troubleshooting.md).
+- [gateway-logs](gateway-logs.md) — reading the access.log where the
+  15-minute cut-off shows.
+- [verify-timer-signals](verify-timer-signals.md) — the timer's own
+  lines and what is healthy.
+- [proxied-or-direct](proxied-or-direct.md) — hangs that are NOT this
+  signature (direct path, no proxy env).

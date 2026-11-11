@@ -42,6 +42,13 @@ that same port**, so it shows only still-blocked destinations; `denied
 look at the last **14 days** by default —
 `denied <profile> --days 0` is the full log.
 
+The engine's own live-config check sends one request for the reserved
+`egresslock-probe.invalid` name through the gateway. Its deny is logged
+like any other 403, but `denied` omits that exact host (and only that
+host) — a subdomain or a similarly spelled name still prints. Seeing
+`egresslock-probe.invalid` in the raw access log is normal: it is not
+workload traffic and needs no allowlist entry.
+
 The read itself is byte-capped (`EGRESSLOCK_DENIED_MAX_BYTES`, default
 32 MiB): when the log exceeds the cap, only the **newest** bytes are
 read (a stderr note names the cap and the remedy; set
@@ -78,3 +85,10 @@ nftables drop instead of failing fast at the gateway. See
 The `cache.log` `pinger| FATAL: Unable to open any ICMP sockets` noise
 at boot is benign — the gateway container runs with `--cap-drop=all`
 (no ICMP), so Squid's pinger can never start; Squid serves fine.
+
+## Links
+
+- Back to the [symptom index](../troubleshooting.md).
+- [proxied-or-direct](proxied-or-direct.md) — when the log is empty
+  and clients still fail.
+- [denied-log-cap](denied-log-cap.md) — the `denied` twin of this page.

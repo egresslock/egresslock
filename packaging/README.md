@@ -38,7 +38,7 @@ fleet-fact docs/recipes out of the package.
 Install + first run on the target host:
 
 ```sh
-sudo dpkg -i ./egresslock_<VERSION>_all.deb
+sudo dpkg -i ./packaging/egresslock_<VERSION>_all.deb
 sudo egresslock-setup init --account <acct> --init-conf --enable
 sudo egresslock-setup apparmor check   # confirm pasta AppArmor compatibility on this host
 ```
@@ -121,7 +121,7 @@ account, while the engine still exists.)
 | Variable | Purpose |
 |---|---|
 | `EGRESSLOCK_DEB_OUT` / `EGRESSLOCK_TARBALL_OUT` | redirect the artifact path |
-| `EGRESSLOCK_DEB_KEEP_STAGE=<dir>` | keep the staged .deb tree instead of building (file-set asserts without dpkg) |
+| `EGRESSLOCK_DEB_KEEP_STAGE=<dir>` | keep the staged .deb tree instead of building (file-set asserts without dpkg); the value is classified at its lexical path (`.`/`..` resolved without following symlinks) and must be absent or an empty real directory — a symlink, a non-empty directory, a regular file, or any other shape is refused rc 2 before anything is written; a failed `readlink`/`realpath`/`dirname` is refused rather than trusted (even if it printed a complete record); only an empty real directory is replaced (with `rmdir`, never a recursive delete), a leaf this run creates is copied into, and the success line names that lexical destination (shell-quoted), not the input spelling |
 | `EGRESSLOCK_UNIT_SRC=<dir>` | unit-template source override |
 
 (The root-gated kit scripts are `install-kit.sh`/`uninstall-kit.sh`
@@ -130,6 +130,5 @@ user.)
 
 Both scripts are exercised by the kit harness
 (`tests/test-kit.sh`; run all egresslock
-tests with `tests/run.sh` — the default full battery; `--track fast`
-(EGL-270) is the per-push CI/iteration track and skips the registered
-slow sections).
+tests with `tests/run.sh` — the default full battery; `--track fast` is
+the per-push CI/iteration track and skips the registered slow sections).

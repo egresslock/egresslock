@@ -19,8 +19,10 @@ own store; the sweep touches only the invoking account's). First
 stop any automation that launches the workloads, then stop and remove
 every workload launched through the kit — they run
 on the profile's `egresslock-<name>` network, and the sweep removes
-only kit-named objects: a still-running workload would survive while
-its enforcement boundary is gone.
+only kit-named objects. A still-running workload keeps its network
+and the kit firewall table (the sweep prints `kept network` and
+`kept nft table`), so it stays policed but the network and table stay
+behind; remove the workload, then re-run the sweep.
 
 ```sh
 # account (one-off) — from your own shell: sudo -iu <account> -- <cmd>
@@ -31,8 +33,12 @@ sudo -iu <account> -- egresslock teardown --runtime
 ```
 
 <details><summary>Expected output:</summary>
-the swept objects, named; "no kit runtime" when the account had
-none (fine — still run it, for every account):
+the swept objects, named. "no kit runtime" means every listing
+succeeded and nothing was removed (fine — still run it, for every
+account); a failed removal or a kept network still exits 0 with its
+own note. A kept network also keeps the firewall table, so an
+attached workload stays policed; remove the workload and re-run the
+sweep to delete the table.
 
 <pre>
 $ sudo -iu <account> -- egresslock teardown --runtime
@@ -44,9 +50,14 @@ removed nft table inet egresslock
 
 Troubleshooting:
 - `kept network <name> (in use)` — a workload is still attached;
-  stop/remove it, re-run the sweep.
-- `note: could not delete nft table inet …` — the netns is gone but
-  a table lingered; the removal command is in the message.
+  stop/remove it, re-run the sweep. While the network is kept, the
+  kit firewall table is kept too (the sweep prints `kept nft table
+  …`), so that workload stays policed.
+- `note: could not delete nft table inet …` — the sweep found the
+  table but could not remove it; the removal command is in the message.
+- `incomplete sweep` — the sweep could not list part of the runtime
+  and exits 1; the note above it names what to check and remove by
+  hand, then re-run to confirm.
 </details>
 
 <details><summary>Applied the AppArmor pasta amendment? Unapply it</summary>
@@ -178,8 +189,10 @@ had runtime):
    may remain on a kit network without enforcement.
 4. **nft tables** (account): `podman unshare --rootless-netns nft
    list tables` shows no `inet egresslock` — or fails because the
-   netns is gone (also fine). If teardown was skipped: delete
-   manually with the command in step 1's troubleshooting.
+   netns is gone (also fine). If a workload still uses a kit network,
+   teardown keeps the table until that workload is removed and the
+   sweep re-run. If teardown was skipped: delete manually with the
+   command in step 1's troubleshooting.
 5. **Account data** (expected residue, not a leak):
    `~/.config/egresslock` remains unless you purged it.
 6. **AppArmor** (root): the amendment is gone from the local include
@@ -211,8 +224,7 @@ Untagged: localhost/egl-base:latest
 Deleted: <layer-id>
 </pre>
 
-(`EGRESSLOCK_GW_IMAGE` overriders: your tag instead. Lifecycle:
-[The gateway image](../reference/gateway-image.md).)
+(Lifecycle: [The gateway image](../reference/gateway-image.md).)
 </details>
 </details>
 

@@ -21,8 +21,9 @@
 # EGRESSLOCK_HARNESS_TIMEOUT=<seconds> (positive integer; unset/empty
 # keeps 600) so a slow or loaded host can finish the engine battery.
 # Anything else — including 0, which `timeout 0` would turn into no
-# bound — is refused with rc 2 before any harness starts; CI sets no
-# env, so its 600s default is unchanged.
+# bound — is refused with rc 2 before any harness starts; CI sets it
+# to 2000 on its two battery jobs (EGL-432), while local and handoff
+# runs keep the 600s default.
 #
 # EGL-79-D2: `--help/-h` prints usage and exits 0; `--harness
 # engine|kit|docs|all` selects a subset (default `all` = the `test-*.sh`
@@ -37,9 +38,28 @@
 # opts in at `.forgejo/workflows/ci.yml`; the full battery stays the
 # handoff/pre-release gate.
 #
+# EGL-451: the engine harness shards by default. `bash tests/run.sh`
+# splits the engine windows into M weight-balanced processes (M =
+# min(3, detected CPUs); cgroup v2 cpu.max quota, else nproc) using the
+# shipped tests/shard-weights.tsv, runs them concurrently, replays their
+# logs in shard order, and prints one parent-rendered RESULTS TOTAL.
+# `--serial` restores the one-process path; `--shard M` picks the count;
+# `--shard N/M` runs one shard for debugging. kit/docs stay serial. The
+# weights table and `test-engine.sh --list-sections` must agree exactly
+# or run.sh exits 2 before any shard starts.
+#
 # EGL-86-D1/D2: the battery is non-root — refused, not skipped, under uid
 # 0 (exit 2 after flag parsing, before harness selection). `--help` wins
 # over the root gate.
+#
+# EGL-464: `--section <name>[,<name>…]` is the documented, engine-only
+# subset run. It is a thin wrapper over EGL-451's shard selection
+# (`EGRESSLOCK_TEST_SHARDED=1` + `EGRESSLOCK_TEST_SECTIONS`), not a new
+# selector: one process, only the named windows, and the harness's own
+# partial RESULTS TOTAL. Names come from `test-engine.sh --list-sections`;
+# an empty, duplicate, or unknown name is refused (rc 2) before any test.
+# It refuses `--track fast` (a chosen slow section would be skipped),
+# `--shard`/`--serial` (not a shard pack), and `--harness kit|docs|all`.
 #
 # EGL-86-D3: each harness's output is teed to a temp log; at suite end
 # `^SKIP:` lines are counted, bucketed by reason, and summarized as one
@@ -47,6 +67,8 @@
 #
 # Run:  bash tests/run.sh [--help] [--harness engine|kit|docs|all]
 #                                      [--track fast|full] [--no-foreground]
+#                                      [--section <name>[,<name>…]]
+#                                      [--serial | --shard M | --shard N/M]
 #
 # Exit codes: 0 all green; 1 one or more harnesses failed (also a harness
 # timeout); 2 usage error (bad flags, no harnesses, timeout(1) missing, or
@@ -70,6 +92,22 @@ Usage: bash tests/run.sh [options]
                           Default stays the full battery (EGL-79-D2);
                           `--track fast` is CI's per-push battery and
                           the local iteration shortcut.
+  --serial                Run the engine harness in one process (the
+                          pre-EGL-451 path). Default is sharded.
+  --shard M               Run the engine in M concurrent shards (M >= 1;
+                          M=1 is the serial path). An explicit M is
+                          honored even above the detected CPU count.
+  --shard N/M             Run only shard N of M (debugging); that shard
+                          prints its own partial RESULTS TOTAL.
+  --section <name>[,<name>...]
+                          Engine-only subset run: execute only the named
+                          sections (names from
+                          `bash tests/test-engine.sh --list-sections`).
+                          Empty, duplicate, or unknown names exit 2 before
+                          any test; the RESULTS TOTAL is a partial total
+                          over the selected sections, not the battery
+                          total. Refused with --track fast, --shard,
+                          --serial, or --harness kit|docs|all (EGL-464).
   --no-foreground         Classic timeout isolation: on expiry the whole
                           harness process group is TERMed instead of the
                           direct child only. Default is foreground mode
@@ -108,7 +146,12 @@ EOF
 
 # --- EGL-79-D2: flag parsing (before any timeout/harness work) ----------
 harness_sel="all"
+harness_given=0
 track_sel="full"   # EGL-270 (D1-B): default = full battery; unset/empty = full for harnesses too
+shard_sel=""       # EGL-451: empty = default policy; M or N/M otherwise
+serial_sel=0       # EGL-451: --serial forces the one-process engine path
+section_sel=""     # EGL-464: comma-separated engine section names
+section_mode=0     # EGL-464: --section selects the one-process subset path
 # EGL-80 signal/timeout policy: default is `timeout --foreground -k 15`.
 #   --foreground keeps the harness in the caller's group so Ctrl+C cancels
 #                the battery; without it timeout ignores tty SIGINT and
@@ -132,6 +175,7 @@ while (( $# )); do
             ;;
         --harness=*)
             harness_sel="${1#*=}"
+            harness_given=1
             ;;
         --harness)
             if (( $# < 2 )); then
@@ -139,6 +183,20 @@ while (( $# )); do
                 exit 2
             fi
             harness_sel="$2"
+            harness_given=1
+            shift
+            ;;
+        --section=*)
+            section_sel="${1#*=}"
+            section_mode=1
+            ;;
+        --section)
+            if (( $# < 2 )); then
+                echo "run.sh: --section requires a comma-separated list of engine section names" >&2
+                exit 2
+            fi
+            section_sel="$2"
+            section_mode=1
             shift
             ;;
         --track=*)
@@ -152,6 +210,20 @@ while (( $# )); do
             track_sel="$2"
             shift
             ;;
+        --serial)
+            serial_sel=1
+            ;;
+        --shard=*)
+            shard_sel="${1#*=}"
+            ;;
+        --shard)
+            if (( $# < 2 )); then
+                echo "run.sh: --shard requires a value (M or N/M)" >&2
+                exit 2
+            fi
+            shard_sel="$2"
+            shift
+            ;;
         *)
             echo "run.sh: unknown option: $1" >&2
             usage >&2
@@ -161,14 +233,66 @@ while (( $# )); do
     shift
 done
 
+# EGL-464: --section shape conflicts are usage errors before any test runs.
+if (( section_mode )); then
+    if [[ -n "$shard_sel" ]]; then
+        echo "run.sh: --section and --shard are mutually exclusive (--section runs one process over a subset)" >&2
+        exit 2
+    fi
+    if (( serial_sel )); then
+        echo "run.sh: --section and --serial are mutually exclusive (--section is already the one-process subset path)" >&2
+        exit 2
+    fi
+    if [[ "$track_sel" == "fast" ]]; then
+        echo "run.sh: --section refuses --track fast (a chosen slow section would otherwise be skipped)" >&2
+        exit 2
+    fi
+    if (( harness_given )) && [[ "$harness_sel" != "engine" ]]; then
+        echo "run.sh: --section applies to the engine harness only (got --harness $harness_sel)" >&2
+        exit 2
+    fi
+fi
+
 # EGL-86-D1/D2: root preflight — refuse, never skip. Under uid 0 the
 # mocked root-guard and non-root-hook cases fail structurally; a skip
 # would falsely report "all applicable tests passed" and could mask a
 # real regression. Same exit class as usage (0/1/2); --help exited above.
-if [[ "$(id -u)" == "0" ]]; then
+#
+# EGL-434 (R-EGL-434-6, R-EGL-434-8): the effective UID is read from the
+# kernel's /proc/self/status `Uid:` line. Neither `id -u` nor bash's EUID
+# is caller-safe: PATH lets an `id` shim hide a uid-0 run (R-EGL-434-6),
+# and bash imports a pre-set EUID from the environment at startup, so
+# `env EUID=<nonzero>` hides one too (R-EGL-434-8). /proc/self/status is
+# generated by the kernel for this process and cannot be forged. Fail
+# closed if it is unreadable or the effective UID is not numeric instead
+# of running with unknown privilege.
+egl434_euid=""
+if [[ -r /proc/self/status ]]; then
+    while IFS=$' \t' read -r egl434_key egl434_real egl434_eff egl434_saved egl434_fs; do
+        if [[ "$egl434_key" == "Uid:" ]]; then
+            egl434_euid="$egl434_eff"
+            break
+        fi
+    done < /proc/self/status
+fi
+if [[ ! "${egl434_euid:-}" =~ ^[0-9]+$ ]]; then
+    echo "run.sh: FAIL cannot determine the effective UID (kernel Uid='${egl434_euid:-}') — refusing to run the battery with unknown privilege, because its mocked root-guard and non-root-hook cases are structurally invalid under uid 0 (EGL-434 F1)" >&2
+    exit 2
+fi
+if (( egl434_euid == 0 )); then
     echo "run.sh: FAIL run tests as an unprivileged account — the battery's mocked root-guard and non-root-hook cases are structurally invalid under uid 0, so root execution is refused, not skipped (EGL-86-D2)" >&2
     echo "run.sh: in a root-only container, run mapped: setpriv --reuid=nobody --regid=nogroup --clear-groups env HOME=/tmp bash tests/run.sh" >&2
     exit 2
+fi
+
+# EGL-434 F1 probe seam: the root-guard pin runs this file with
+# EGL434_ROOT_GUARD_PROBE=1 and a throwaway HOME, then checks which side
+# of the guard the child reached. Exit here — before harness selection or
+# any harness side effect — so a non-refused probe is bounded. Normal
+# runs never set it.
+if [[ -n "${EGL434_ROOT_GUARD_PROBE:-}" ]]; then
+    printf 'run.sh guard-pass euid=%s\n' "$egl434_euid"
+    exit 0
 fi
 
 shopt -s nullglob
@@ -191,6 +315,11 @@ case "$harness_sel" in
         ;;
 esac
 shopt -u nullglob
+
+# EGL-464: --section is engine-only; omitted --harness already means engine.
+if (( section_mode )); then
+    harnesses=( "$tests_dir/test-engine.sh" )
+fi
 
 # EGL-270: validate the track and export the channel (direct runs stay full).
 case "$track_sel" in
@@ -236,17 +365,305 @@ if [[ -n "${EGRESSLOCK_HARNESS_TIMEOUT:-}" ]]; then
     echo "run.sh: harness bound ${HARNESS_TIMEOUT}s (EGRESSLOCK_HARNESS_TIMEOUT)"
 fi
 
+# --- EGL-464: --section selection (fail closed before any test) ----------
+# Names are the `test-engine.sh --list-sections` output. Parse the
+# comma-separated list (trim each item), refuse an empty selection, a
+# duplicate, or an unknown name here — before any harness starts. The
+# selection is handed to the harness through EGL-451's existing
+# EGRESSLOCK_TEST_SHARDED/EGRESSLOCK_TEST_SECTIONS seam, whose own
+# fail-closed checks (a selected section never began / emitted no
+# RESULTS line) then apply inside the run.
+engine_harness="$tests_dir/test-engine.sh"
+section_names=""   # space-delimited, the harness seam's shape
+if (( section_mode )); then
+    declare -A section_known=() section_picked=()
+    declare -a section_listed=()
+    if [[ ! -f "$engine_harness" ]]; then
+        echo "run.sh: FAIL engine harness not found: $engine_harness (--section; EGL-464)" >&2
+        exit 2
+    fi
+    mapfile -t section_listed < <(bash "$engine_harness" --list-sections)
+    if (( ${#section_listed[@]} == 0 )); then
+        echo "run.sh: FAIL engine harness printed no sections (--list-sections; EGL-464)" >&2
+        exit 2
+    fi
+    for s in "${section_listed[@]}"; do
+        section_known[$s]=1
+    done
+    _section_rest="$section_sel"
+    while :; do
+        if [[ "$_section_rest" == *,* ]]; then
+            s="${_section_rest%%,*}"
+            _section_rest="${_section_rest#*,}"
+            _section_more=1
+        else
+            s="$_section_rest"
+            _section_more=0
+        fi
+        # Trim leading/trailing whitespace without external tools.
+        s="${s#"${s%%[![:space:]]*}"}"
+        s="${s%"${s##*[![:space:]]}"}"
+        if [[ -z "$s" ]]; then
+            echo "run.sh: --section has an empty name (expected name[,name...]; EGL-464)" >&2
+            exit 2
+        fi
+        if [[ -z "${section_known[$s]:-}" ]]; then
+            echo "run.sh: --section unknown section '$s' (see: bash tests/test-engine.sh --list-sections; EGL-464)" >&2
+            exit 2
+        fi
+        if [[ -n "${section_picked[$s]:-}" ]]; then
+            echo "run.sh: --section duplicate section '$s' (EGL-464)" >&2
+            exit 2
+        fi
+        section_picked[$s]=1
+        section_names+="${section_names:+ }$s"
+        (( _section_more )) || break
+    done
+    if [[ -z "$section_names" ]]; then
+        echo "run.sh: --section requires at least one section name (EGL-464)" >&2
+        exit 2
+    fi
+fi
+
+# --- EGL-451: shard planning ---------------------------------------------
+# Detected CPUs: ceil(cgroup v2 quota/period) when the quota is numeric,
+# else nproc. The local container reports nproc=8 but cpu.max=300000/100000
+# = 3; CI's job container is --cpus=2.
+detect_cpus() {
+    local quota period cpus=""
+    if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+        read -r quota period < /sys/fs/cgroup/cpu.max || true
+        if [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] && (( period > 0 )); then
+            cpus=$(( (quota + period - 1) / period ))
+        fi
+    fi
+    if [[ -z "$cpus" ]]; then
+        cpus="$(nproc 2>/dev/null || true)"
+    fi
+    if [[ ! "$cpus" =~ ^[0-9]+$ ]] || (( cpus < 1 )); then
+        cpus=1
+    fi
+    printf '%s\n' "$cpus"
+}
+
+if (( serial_sel )) && [[ -n "$shard_sel" ]]; then
+    echo "run.sh: --serial and --shard are mutually exclusive" >&2
+    exit 2
+fi
+if [[ -n "$shard_sel" && "$harness_sel" != "engine" && "$harness_sel" != "all" ]]; then
+    echo "run.sh: --shard applies to the engine harness only (got --harness $harness_sel)" >&2
+    exit 2
+fi
+
+engine_harness="$tests_dir/test-engine.sh"
+shard_mode="serial"   # serial | all | single
+shard_total=0
+shard_index=0
+if [[ -n "$shard_sel" ]]; then
+    if [[ "$shard_sel" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+        shard_index=$((10#${BASH_REMATCH[1]}))
+        shard_total=$((10#${BASH_REMATCH[2]}))
+        if (( shard_index < 1 || shard_total < 1 || shard_index > shard_total )); then
+            echo "run.sh: bad --shard value: '$shard_sel' (expected N/M with 1 <= N <= M)" >&2
+            exit 2
+        fi
+        if (( shard_total == 1 )); then
+            shard_mode="serial"
+        else
+            shard_mode="single"
+        fi
+    elif [[ "$shard_sel" =~ ^[0-9]+$ ]]; then
+        shard_total=$((10#$shard_sel))
+        if (( shard_total < 1 )); then
+            echo "run.sh: bad --shard value: '$shard_sel' (expected a positive integer)" >&2
+            exit 2
+        fi
+        if (( shard_total == 1 )); then
+            shard_mode="serial"
+        else
+            shard_mode="all"
+        fi
+    else
+        echo "run.sh: bad --shard value: '$shard_sel' (expected M or N/M)" >&2
+        exit 2
+    fi
+elif (( serial_sel )); then
+    shard_mode="serial"
+elif (( ! section_mode )) && [[ "$harness_sel" == "engine" || "$harness_sel" == "all" ]]; then
+    _cpus="$(detect_cpus)"
+    shard_total=$(( _cpus < 3 ? _cpus : 3 ))
+    (( shard_total < 1 )) && shard_total=1
+    if (( shard_total > 1 )); then
+        shard_mode="all"
+    fi
+fi
+
+declare -a sections=()
+declare -a bin_names=()
+declare -a bin_load=()
+if [[ "$shard_mode" != "serial" ]]; then
+    if [[ ! -f "$engine_harness" ]]; then
+        echo "run.sh: FAIL engine harness not found: $engine_harness" >&2
+        exit 2
+    fi
+    mapfile -t sections < <(bash "$engine_harness" --list-sections)
+    if (( ${#sections[@]} == 0 )); then
+        echo "run.sh: FAIL engine harness printed no sections (--list-sections; EGL-451)" >&2
+        exit 2
+    fi
+    declare -A section_seen=()
+    for s in "${sections[@]}"; do
+        if [[ -n "${section_seen[$s]:-}" ]]; then
+            echo "run.sh: FAIL duplicate section '$s' in the harness --list-sections (EGL-451 fail-closed)" >&2
+            exit 2
+        fi
+        section_seen[$s]=1
+    done
+    weights_file="$tests_dir/shard-weights.tsv"
+    if [[ ! -f "$weights_file" ]]; then
+        echo "run.sh: FAIL shard weights not found: $weights_file (EGL-451)" >&2
+        exit 2
+    fi
+    declare -A weight=()
+    declare -A weight_seen=()
+    while IFS=$'\t' read -r wname wms wextra; do
+        [[ "$wname" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$wname" =~ ^[[:space:]]*# ]] && continue
+        if [[ -n "$wextra" || ! "$wms" =~ ^[0-9]+$ ]]; then
+            echo "run.sh: bad shard weight row: '$wname' (expected name<TAB>positive-milliseconds)" >&2
+            exit 2
+        fi
+        wms=$((10#$wms))
+        if (( wms < 1 )); then
+            echo "run.sh: bad shard weight for '$wname': '$wms' (expected a positive integer of milliseconds)" >&2
+            exit 2
+        fi
+        if [[ -n "${weight_seen[$wname]:-}" ]]; then
+            echo "run.sh: duplicate shard weight for '$wname' (EGL-451 fail-closed)" >&2
+            exit 2
+        fi
+        weight_seen[$wname]=1
+        weight[$wname]=$wms
+    done < "$weights_file"
+
+    declare -A in_list=()
+    declare -a missing=() extra=()
+    for s in "${sections[@]}"; do
+        in_list[$s]=1
+        [[ -n "${weight[$s]:-}" ]] || missing+=( "$s" )
+    done
+    for w in "${!weight[@]}"; do
+        [[ -n "${in_list[$w]:-}" ]] || extra+=( "$w" )
+    done
+    if (( ${#missing[@]} > 0 || ${#extra[@]} > 0 )); then
+        echo "run.sh: FAIL shard weights disagree with the harness section list (EGL-451 fail-closed)" >&2
+        (( ${#missing[@]} > 0 )) && echo "run.sh: missing weight(s): ${missing[*]}" >&2
+        (( ${#extra[@]} > 0 )) && echo "run.sh: unknown section(s): ${extra[*]}" >&2
+        exit 2
+    fi
+
+    # EGL-451-F5: `--list-sections` proves a section exists; it does not
+    # prove the sharder can select it. A removed (or duplicated) window
+    # guard would run that body in every shard or in none while the pinned
+    # TOTAL/section evidence stayed green. Verify each listed section has
+    # exactly one `if shard_section_run <name>; then` window gate in the
+    # harness source (a slow-section wrapper may sit between the gate and
+    # `section_begin`); a gate for an unknown name is also refused. The two
+    # tail alias gates (arc14 on arc12, egl140 on egl139) wrap manual
+    # RESULTS echoes, not windows, and do not count here.
+    declare -A gate_windows=()
+    while IFS=$'\t' read -r _kind _gname _gmode _gline; do
+        [[ "$_kind" == "GATE" ]] || continue
+        if [[ -z "${section_seen[$_gname]:-}" ]]; then
+            echo "run.sh: FAIL shard gate for unknown section '$_gname' at $engine_harness:$_gline (EGL-451 fail-closed)" >&2
+            exit 2
+        fi
+        if [[ "$_gmode" == "invalid" ]]; then
+            echo "run.sh: FAIL shard gate for '$_gname' at $engine_harness:$_gline does not wrap a section window or a manual RESULTS alias (EGL-451 fail-closed)" >&2
+            exit 2
+        fi
+        if [[ "$_gmode" == "window" ]]; then
+            gate_windows[$_gname]=$(( ${gate_windows[$_gname]:-0} + 1 ))
+        fi
+    done < <(awk '
+        /^if shard_section_run [A-Za-z0-9_]+; then$/ {
+            name = $3
+            sub(/;$/, "", name)
+            start = NR
+            mode = "invalid"
+            while ((getline line) > 0) {
+                if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) continue
+                if (line == "if slow_section_run " name "; then") continue
+                if (line ~ ("^section_begin[[:space:]]+" name "([[:space:]]|$)")) mode = "window"
+                else if (line ~ /^[[:space:]]*echo "RESULTS \(/) mode = "alias"
+                break
+            }
+            print "GATE\t" name "\t" mode "\t" start
+        }
+    ' "$engine_harness")
+    declare -a gate_missing=()
+    for s in "${sections[@]}"; do
+        if (( ${gate_windows[$s]:-0} != 1 )); then
+            gate_missing+=( "$s (${gate_windows[$s]:-0} window gate(s))" )
+        fi
+    done
+    if (( ${#gate_missing[@]} > 0 )); then
+        echo "run.sh: FAIL shard window gates do not match the harness section list — expected exactly one \`if shard_section_run <name>; then\` per section (EGL-451 fail-closed)" >&2
+        echo "run.sh: section(s): ${gate_missing[*]}" >&2
+        exit 2
+    fi
+
+    # Longest-processing-time packing: weight descending, source order as
+    # the tie-break; each section goes to the least-loaded bin (lowest bin
+    # index on a tie). M <= sections is enforced by the empty-bin check.
+    for ((i=0; i<shard_total; i++)); do
+        bin_names[i]=""
+        bin_load[i]=0
+    done
+    while IFS=$'\t' read -r _idx _w _name; do
+        _best=0
+        for ((b=1; b<shard_total; b++)); do
+            if (( bin_load[b] < bin_load[_best] )); then _best=$b; fi
+        done
+        bin_names[_best]+="${bin_names[_best]:+ }$_name"
+        bin_load[_best]=$(( bin_load[_best] + _w ))
+    done < <(
+        for ((i=0; i<${#sections[@]}; i++)); do
+            s="${sections[i]}"
+            printf '%d\t%d\t%s\n' "$i" "${weight[$s]}" "$s"
+        done | sort -t $'\t' -k2,2nr -k1,1n
+    )
+    for ((i=0; i<shard_total; i++)); do
+        if [[ -z "${bin_names[i]}" ]]; then
+            echo "run.sh: FAIL shard $((i+1))/$shard_total has no sections (EGL-451; M exceeds the section count)" >&2
+            exit 2
+        fi
+    done
+fi
+
 # EGL-86-D3: per-harness tee logs for the end-of-suite skip summary.
 skip_logs=()
 rc=0
-for h in "${harnesses[@]}"; do
+
+run_harness() { # run_harness <path> [keep-section-env] — the pre-EGL-451 single-process path
+    local h="$1" keep_section="${2:-}"
     if [[ ! -x "$h" ]]; then
         echo "run.sh: FAIL harness not executable: $h" >&2
         rc=1
-        continue
+        return
+    fi
+    # EGL-451-F1: the shard variables are run.sh-internal. A stale exported
+    # copy in the caller's environment must never turn this one-process path
+    # into a filtered partial run (a non-empty non-matching section list
+    # would skip every engine window and still print a green 0/0/0 TOTAL).
+    # EGL-464: `--section` deliberately sets the same seam for its subset
+    # run, so only that caller keeps it.
+    if [[ "$keep_section" != "keep-section-env" ]]; then
+        unset EGRESSLOCK_TEST_SHARDED EGRESSLOCK_TEST_SECTIONS \
+            EGRESSLOCK_TEST_SHARD_PROGRESS EGRESSLOCK_TEST_SHARD_RESULT
     fi
     echo "== egresslock tests: $h =="
-    hrc=0
+    local hrc=0 h_t0 h_log
     h_t0="$(date +%s)"   # EGL-270 (P1): per-harness runtime stamp
     h_log="$(mktemp /tmp/egl86-run-log.XXXXXX)"
     skip_logs+=( "$h_log" )
@@ -277,8 +694,327 @@ for h in "${harnesses[@]}"; do
     fi
     # EGL-270 (P1): per-harness runtime line — bookkeeping, not RESULTS (EGL-99).
     echo "run.sh: harness $(basename "$h") $(( $(date +%s) - h_t0 ))s"
-done
+}
 
+shard_work=""
+declare -a shard_pids=()
+shards_running=0
+_cleanup_done=0
+# EGL-451-F6: each shard command runs in its own session (setsid) so
+# cancellation can signal the whole process group, including descendants
+# that a shard's direct parent no longer owns. Without setsid, fall back
+# to a recursive (ppid) tree walk.
+_shard_setsid=0
+if command -v setsid >/dev/null 2>&1; then
+    _shard_setsid=1
+fi
+_own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+_shard_group_signal() { # <pgid> <TERM|KILL> — signal a shard's own session group
+    local pg="$1" sig="$2"
+    [[ "$pg" =~ ^[0-9]+$ ]] || return 0
+    (( pg > 1 )) || return 0
+    [[ "$pg" != "$$" ]] || return 0
+    # Never signal our own process group if setsid did not detach.
+    [[ -n "$_own_pgid" && "$pg" == "$_own_pgid" ]] && return 0
+    kill -"$sig" -- "-$pg" 2>/dev/null || true
+}
+_shard_group_alive() { # <pgid> — true while any process remains in the group
+    local pg="$1"
+    [[ "$pg" =~ ^[0-9]+$ ]] || return 1
+    (( pg > 1 )) || return 1
+    [[ "$pg" != "$$" ]] || return 1
+    [[ -n "$_own_pgid" && "$pg" == "$_own_pgid" ]] && return 1
+    kill -0 -- "-$pg" 2>/dev/null
+}
+_shard_kill_tree() { # <pid> [TERM|KILL] — signal this pid's descendants leaf-first, then it
+    local p="$1" sig="${2:-TERM}" c
+    [[ -n "$p" ]] || return 0
+    while read -r c; do
+        [[ -n "$c" ]] && _shard_kill_tree "$c" "$sig"
+    done < <(ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$p" '$2 == parent { print $1 }')
+    kill -"$sig" "$p" 2>/dev/null || true
+}
+cleanup_shards() {
+    # EGL-451-F6: a cancelled battery must not orphan the shard processes.
+    # Each shard command was started in its own session; signal that whole
+    # process group TERM (covers children that were already reparented,
+    # e.g. a mock's background rotation) and walk the remaining ppid tree
+    # leaf-first. Bash defers its own TERM while waiting on a foreground
+    # child, so descendants must be signalled before their parents. After a
+    # bounded grace, KILL the groups and any survivors: a SIGSTOPped or
+    # TERM-ignoring descendant must not keep mutating mock state (or block
+    # `wait`) after the parent exits. Idempotent (the EXIT trap runs again
+    # after a signal trap).
+    (( _cleanup_done )) && return 0
+    _cleanup_done=1
+    local p c pg
+    local -a groups=()
+    if (( shards_running )); then
+        if (( _shard_setsid )) && [[ -n "$shard_work" ]]; then
+            for c in "$shard_work"/shard-*.cmdpid; do
+                [[ -f "$c" ]] || continue
+                read -r p < "$c" || p=""
+                [[ "$p" =~ ^[0-9]+$ ]] && groups+=( "$p" )
+            done
+        fi
+        for pg in "${groups[@]:-}"; do
+            _shard_group_signal "$pg" TERM
+        done
+        for p in "${shard_pids[@]:-}"; do
+            _shard_kill_tree "$p" TERM
+        done
+        # Bounded grace for normal TERM handling; poll at 100 ms.
+        local i any
+        for i in {1..50}; do
+            any=0
+            for pg in "${groups[@]:-}"; do
+                if _shard_group_alive "$pg"; then any=1; break; fi
+            done
+            if (( any == 0 )); then
+                for p in "${shard_pids[@]:-}"; do
+                    if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then any=1; break; fi
+                done
+            fi
+            (( any )) || break
+            sleep 0.1
+        done
+        # A stopped or TERM-defying descendant must not survive the parent.
+        for pg in "${groups[@]:-}"; do
+            _shard_group_signal "$pg" KILL
+        done
+        for p in "${shard_pids[@]:-}"; do
+            _shard_kill_tree "$p" KILL
+        done
+        for p in "${shard_pids[@]:-}"; do
+            [[ -n "$p" ]] && wait "$p" 2>/dev/null || true
+        done
+    fi
+    [[ -n "$shard_work" ]] && rm -rf "$shard_work"
+    return 0
+}
+trap cleanup_shards EXIT
+trap 'cleanup_shards; exit 143' TERM
+trap 'cleanup_shards; exit 130' INT
+
+run_shard_bg() { # <i> <M> <sections> <log> <result> <progress> <rcfile> <timefile> <cmdpidfile>
+    local i="$1" m="$2" secs="$3" log="$4" result="$5" progress="$6" rcfile="$7" timefile="$8" cmdpidfile="$9"
+    local t0 jrc=0 cpid
+    t0="$(date +%s)"
+    : > "$progress"
+    export EGRESSLOCK_TEST_SHARDED=1
+    export EGRESSLOCK_TEST_SECTIONS="$secs"
+    export EGRESSLOCK_TEST_SHARD_PROGRESS="$progress"
+    if [[ -n "$result" ]]; then
+        export EGRESSLOCK_TEST_SHARD_RESULT="$result"
+    else
+        unset EGRESSLOCK_TEST_SHARD_RESULT
+    fi
+    # EGL-451-F6: run the bounded command as a background child and record
+    # its pid so the parent's signal trap can terminate it directly (and
+    # through it the harness). `wait` below still captures the exact rc.
+    # The command gets its own session/process group (setsid) so cleanup
+    # can signal every descendant, including already-reparented helpers,
+    # and KILL a stopped survivor after the TERM grace. The child writes
+    # its own pid (the session leader/pgid) before exec.
+    local -a shard_cmd=()
+    if command -v stdbuf >/dev/null 2>&1; then
+        shard_cmd=( timeout "${tf_args[@]}" "$HARNESS_TIMEOUT" stdbuf -oL -eL bash "$engine_harness" )
+    else
+        shard_cmd=( timeout "${tf_args[@]}" "$HARNESS_TIMEOUT" bash "$engine_harness" )
+    fi
+    if (( _shard_setsid )); then
+        setsid -w bash -c 'printf "%s\n" "$$" > "$1" || exit 1; shift; exec "$@"' \
+            _ "$cmdpidfile" "${shard_cmd[@]}" </dev/null >"$log" 2>&1 &
+    else
+        "${shard_cmd[@]}" </dev/null >"$log" 2>&1 &
+        cpid=$!
+        printf '%s\n' "$cpid" > "$cmdpidfile" 2>/dev/null || true
+    fi
+    cpid=$!
+    # Do not race cleanup: make sure the pid file exists before waiting.
+    local i
+    for i in {1..100}; do
+        [[ -s "$cmdpidfile" ]] && break
+        sleep 0.01
+    done
+    wait "$cpid"
+    jrc=$?
+    printf '%s\n' "$jrc" > "$rcfile"
+    printf '%s\n' "$(( $(date +%s) - t0 ))" > "$timefile"
+}
+
+report_shard() { # <i> <M> <log> <rcfile> <timefile> <progress>
+    local i="$1" m="$2" log="$3" rcfile="$4" timefile="$5" progress="$6"
+    local jrc sect
+    jrc="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    # Not the `== egresslock tests: <path> ==` evidence boundary shape:
+    # a shard log is not a complete harness, and ci-status.sh requires
+    # exactly one boundary + one RESULTS TOTAL per harness. The parent
+    # prints the canonical engine boundary before the merged TOTAL.
+    echo "== egresslock tests [shard $i/$m]: $engine_harness =="
+    cat "$log"
+    skip_logs+=( "$log" )
+    if (( jrc == 124 || jrc == 137 )); then
+        sect=""
+        [[ -s "$progress" ]] && sect="$(head -1 "$progress")"
+        echo "run.sh: FAIL shard $i/$m timed out on ${sect:-(no section begun)} after ${HARNESS_TIMEOUT}s (set EGRESSLOCK_HARNESS_TIMEOUT=<seconds> to change the bound)" >&2
+        rc=1
+    elif (( jrc != 0 )); then
+        echo "run.sh: FAIL shard $i/$m (rc=$jrc)" >&2
+        rc=1
+    fi
+    echo "run.sh: harness $(basename "$engine_harness") shard $i/$m $(cat "$timefile" 2>/dev/null || echo '?')s"
+}
+
+merge_shard_results() { # <M> <result-prefix> — one parent-rendered TOTAL
+    local m="$1" prefix="$2" i key val extra
+    local pass=0 fail=0 ext_pass=0 ext_fail=0 skips=0
+    local tree="" tree_prev="" tree_seen=0
+    declare -A causes=()
+    for ((i=1; i<=m; i++)); do
+        local rf="$prefix$i.result"
+        if [[ ! -f "$rf" ]]; then
+            echo "run.sh: FAIL shard $i/$m produced no result file — no merged RESULTS TOTAL (incomplete; EGL-451)" >&2
+            return 1
+        fi
+        local have_pass=0 have_fail=0 have_ep=0 have_ef=0 have_sk=0 have_tree=0
+        while IFS=$'\t' read -r key val extra; do
+            case "$key" in
+                pass|fail|ext_pass|ext_fail|skips)
+                    if [[ ! "$val" =~ ^[0-9]+$ ]]; then
+                        echo "run.sh: FAIL shard $i/$m result: '$key' is not numeric ('$val'; EGL-451)" >&2
+                        return 1
+                    fi
+                    case "$key" in
+                        pass) pass=$(( pass + 10#$val )); have_pass=1 ;;
+                        fail) fail=$(( fail + 10#$val )); have_fail=1 ;;
+                        ext_pass) ext_pass=$(( ext_pass + 10#$val )); have_ep=1 ;;
+                        ext_fail) ext_fail=$(( ext_fail + 10#$val )); have_ef=1 ;;
+                        skips) skips=$(( skips + 10#$val )); have_sk=1 ;;
+                    esac
+                    ;;
+                skip_cause)
+                    if [[ -z "$val" || ! "$extra" =~ ^[0-9]+$ ]]; then
+                        echo "run.sh: FAIL shard $i/$m result: malformed skip_cause row (EGL-451)" >&2
+                        return 1
+                    fi
+                    causes["$val"]=$(( ${causes["$val"]:-0} + 10#$extra ))
+                    ;;
+                tree)
+                    tree="$val"; have_tree=1
+                    ;;
+                *)
+                    echo "run.sh: FAIL shard $i/$m result: unknown key '$key' (EGL-451)" >&2
+                    return 1
+                    ;;
+            esac
+        done < "$rf"
+        if (( !have_pass || !have_fail || !have_ep || !have_ef || !have_sk || !have_tree )); then
+            echo "run.sh: FAIL shard $i/$m result is incomplete — no merged RESULTS TOTAL (EGL-451)" >&2
+            return 1
+        fi
+        if (( tree_seen )) && [[ "$tree" != "$tree_prev" ]]; then
+            echo "run.sh: FAIL shard tree tags disagree ('$tree_prev' vs '$tree') — no merged RESULTS TOTAL (EGL-451)" >&2
+            return 2
+        fi
+        tree_prev="$tree"; tree_seen=1
+    done
+    local total_pass=$(( pass + ext_pass )) total_fail=$(( fail + ext_fail ))
+    local detail="" cause
+    for cause in "${!causes[@]}"; do
+        if (( causes["$cause"] == 1 )); then
+            detail+="${detail:+, }$cause"
+        else
+            detail+="${detail:+, }$cause: ${causes["$cause"]}"
+        fi
+    done
+    if (( skips == 0 )); then
+        echo "RESULTS TOTAL: $total_pass passed, $total_fail failed, 0 skipped ($tree)"
+    else
+        echo "RESULTS TOTAL: $total_pass passed, $total_fail failed, $skips skipped ($detail) ($tree)"
+    fi
+    return 0
+}
+
+run_engine_shards() {
+    local i
+    shard_work="$(mktemp -d /tmp/egl451-shard.XXXXXX)" || {
+        echo "run.sh: FAIL cannot create the shard work directory (EGL-451)" >&2
+        exit 2
+    }
+    if [[ "$shard_mode" == "single" ]]; then
+        local idx=$(( shard_index - 1 ))
+        echo "run.sh: shard $shard_index/$shard_total (${bin_load[$idx]}ms, $(wc -w <<<"${bin_names[$idx]}") sections)"
+        shards_running=1
+        run_shard_bg "$shard_index" "$shard_total" "${bin_names[$idx]}" \
+            "$shard_work/shard-$shard_index.log" "" \
+            "$shard_work/shard-$shard_index.progress" \
+            "$shard_work/shard-$shard_index.rc" "$shard_work/shard-$shard_index.time" \
+            "$shard_work/shard-$shard_index.cmdpid" &
+        shard_pids+=($!)
+        wait "${shard_pids[-1]}"
+        shards_running=0
+        report_shard "$shard_index" "$shard_total" \
+            "$shard_work/shard-$shard_index.log" "$shard_work/shard-$shard_index.rc" \
+            "$shard_work/shard-$shard_index.time" "$shard_work/shard-$shard_index.progress"
+        return
+    fi
+    echo "run.sh: sharding engine: $shard_total shards, ${#sections[@]} sections (weights tests/shard-weights.tsv)"
+    # The one canonical harness boundary for tier-0 evidence tooling; it
+    # opens the section that the parent-rendered merged TOTAL closes.
+    echo "== egresslock tests: $engine_harness =="
+    local -a pids=()
+    shards_running=1
+    for ((i=1; i<=shard_total; i++)); do
+        local idx=$(( i - 1 ))
+        run_shard_bg "$i" "$shard_total" "${bin_names[$idx]}" \
+            "$shard_work/shard-$i.log" "$shard_work/shard-$i.result" \
+            "$shard_work/shard-$i.progress" "$shard_work/shard-$i.rc" \
+            "$shard_work/shard-$i.time" "$shard_work/shard-$i.cmdpid" &
+        pids[i]=$!
+        shard_pids+=("$!")
+    done
+    for ((i=1; i<=shard_total; i++)); do
+        wait "${pids[i]}" || true
+    done
+    shards_running=0
+    for ((i=1; i<=shard_total; i++)); do
+        report_shard "$i" "$shard_total" "$shard_work/shard-$i.log" \
+            "$shard_work/shard-$i.rc" "$shard_work/shard-$i.time" \
+            "$shard_work/shard-$i.progress"
+    done
+    merge_shard_results "$shard_total" "$shard_work/shard-"
+    local mrc=$?
+    if (( mrc == 2 )); then
+        rc=2
+    elif (( mrc != 0 )); then
+        rc=1
+    fi
+}
+
+# EGL-464: hand the validated subset to the engine harness through
+# EGL-451's existing fail-closed seam (one process, named windows only).
+if (( section_mode )); then
+    export EGRESSLOCK_TEST_SHARDED=1
+    export EGRESSLOCK_TEST_SECTIONS="$section_names"
+fi
+
+for h in "${harnesses[@]}"; do
+    if [[ "$h" == "$engine_harness" && "$shard_mode" != "serial" ]]; then
+        run_engine_shards
+        continue
+    fi
+    if (( section_mode )); then
+        run_harness "$h" keep-section-env
+    else
+        run_harness "$h"
+    fi
+done
+if (( section_mode )); then
+    # The harness's RESULTS TOTAL covers only these windows; never let it
+    # read as the battery total.
+    echo "run.sh: --section partial TOTAL over: $section_names (not the battery total; EGL-464)"
+fi
 # EGL-86-D3: "N passed, 0 failed" must be distinguishable from "all
 # applicable tests ran". Count `^SKIP:` lines across the teed logs, bucket
 # by reason, and state the public tree's remaining coverage. Skips never
@@ -306,6 +1042,9 @@ fi
 if [[ "$track_sel" == "fast" ]]; then
     # EGL-270 (G5): the full trailer would over-claim on a fast run.
     echo "run.sh: --track fast — registered slow sections were skipped (named above); run bash tests/run.sh for the full battery; remaining skips are the private-fixture / host-shape checks"
+elif (( section_mode )); then
+    # EGL-464: a subset run must not read as a full-battery coverage claim.
+    echo "run.sh: --section subset — the rest of the battery was not run; use bash tests/run.sh for the full battery"
 else
     echo "run.sh: public-tree coverage still includes .deb staging asserts, tarball staging, and prefix guards; skipped items above are the private-fixture / host-shape checks that need a tree with those fixtures present"
 fi

@@ -7,10 +7,8 @@
 # apparmor, install-kit.sh, uninstall-kit.sh, README) plus the systemd/
 # unit templates, so the extracted tree is
 # SELF-CONTAINED: install-kit.sh prefers the in-kit systemd/ templates
-# (ARC-22 implementation decision — see
-# internal_docs/tickets/completed/ARC-22.md), which
-# also means the kit can move to its own repository without layout
-# changes.
+# (ARC-22 implementation decision), which also means the kit can move to
+# its own repository without layout changes.
 #
 #   tar -xzf egresslock_<version>.tar.gz
 #   sudo ./egresslock/install-kit.sh --prefix /opt/egresslock
@@ -82,25 +80,15 @@ mkdir -p "$stage/egresslock/systemd"
 (
     cd "$kit"
     # Copy everything at the kit root (the repo root since the EGL-1
-    # flatten) except the packaging build outputs, the repo-only
-    # process files (git dir, CI workflows, AGENTS.md, .gitignore) and
-    # the maintainer-internal internal_docs/ (EGL-47-D2, now also
-    # holding the ticket flow and board) — the shipped tarball carries
-    # kit payload only, exactly the file set the pre-flatten egresslock/
-    # tree carried.
+    # flatten) except the packaging build outputs and the repo-only
+    # process files (git dir, CI workflows, AGENTS.md, .gitignore) — the
+    # shipped tarball carries kit payload only, exactly the file set the
+    # pre-flatten egresslock/ tree carried.
     tar -cf - --exclude=./packaging --exclude=./.git \
         --exclude=./.forgejo \
         --exclude=./AGENTS.md --exclude=./.gitignore \
-        --exclude=./internal_docs \
         --exclude=./docs/lp-*.txt --exclude=./docs/debian-*.txt . | tar -xf - -C "$stage/egresslock"
 )
-# EGL-47-D2: tripwire — the maintainer-internal internal_docs/ must
-# never reach the tarball; a widened copy rule would leak it. `-e || -L`
-# (here and in the tripwires below) treats a dangling symlink as present.
-if [[ -e "$stage/egresslock/internal_docs" || -L "$stage/egresslock/internal_docs" ]]; then
-    echo "build-tarball: FAIL - internal_docs leaked into the tarball stage" >&2
-    exit 1
-fi
 # EGL-364: with the old ticket/board excludes gone, a re-introduced old
 # layout must fail closed here too — including a dangling symlink.
 if [[ -e "$stage/egresslock/docs/tickets" || -L "$stage/egresslock/docs/tickets" \

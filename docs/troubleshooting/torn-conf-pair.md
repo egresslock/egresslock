@@ -58,6 +58,7 @@ untouched):
 
 ## Links
 
+- Back to the [symptom index](../troubleshooting.md).
 - [first-run-checks](../quickstart/first-run-checks.md) — the checks
   right after initial setup, including the first `ensure`.
 - [scripts-and-environment](../reference/scripts-and-environment.md) —

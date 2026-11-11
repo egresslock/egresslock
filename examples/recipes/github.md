@@ -46,6 +46,7 @@ names](../../docs/reference/rotating-names.md) shows the replace flow.
 # prompt: egl-runner@host:~$
 
 egresslock ensure main \
+ && egresslock verify main \
  && podman run --rm -it \
     --network="$(egresslock network main)" \
     --env-file="$(egresslock proxy-env main --out)" \
@@ -111,6 +112,7 @@ egresslock allow main ssh.github.com
 # prompt: egl-runner@host:~$
 
 egresslock ensure main \
+ && egresslock verify main \
  && podman run --rm -it \
     --network="$(egresslock network main)" \
     --env-file="$(egresslock proxy-env main --out)" \
@@ -196,6 +198,7 @@ A plain container — no proxy env needed:
 # prompt: egl-runner@host:~$
 
 egresslock ensure main \
+ && egresslock verify main \
  && podman run --rm -it \
     --network="$(egresslock network main)" \
     --cap-drop=all --security-opt=no-new-privileges \

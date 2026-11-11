@@ -157,8 +157,9 @@ address is permitted to reach its upstream destinations.
 gateway, installs the policy, and verifies the result. The
 shipped daemon launcher (`egresslock-start`) refuses to start the daemon
 unless `ensure` succeeds. `verify` compares the live nftables chain with the
-expected policy;
-the timer repeats that check for drift.
+expected policy and sends one probe request through the gateway to
+confirm the running Squid serves the deployed configuration;
+the timer repeats both checks for drift.
 
 ## Fail-open vs fail-closed
 

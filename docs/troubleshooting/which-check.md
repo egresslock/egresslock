@@ -35,8 +35,11 @@ Pick the row that matches the question you actually have:
 | Profile runtime | Is this account's policy live? | `egresslock ensure` / `verify` | rc 1 (fail-closed) |
 
 `egresslock doctor` also carries labeled account-side advisory
-lines (network backend, rootless netns, gateway image base);
-advisories never change its exit code.
+lines (network backend, rootless netns, gateway image base and age,
+egl-base image); advisories never change its exit code. The gateway
+`rebuild:` advisory — the image predates the kit's security rebuild
+floor or is more than 30 days old — and its remedy are covered in
+[The gateway image](../reference/gateway-image.md).
 
 All four exit nonzero when something is missing, so "rc 0" is the
 shared green signal. For the runtime layer, `verify <profile>` is the

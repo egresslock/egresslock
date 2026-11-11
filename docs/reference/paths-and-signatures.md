@@ -56,9 +56,10 @@ Same-host services therefore use one of:
   that name into every container's `/etc/hosts` (it maps to pasta's
   host-loopback address); Squid's dstdomain matches it, and the
   GATEWAY container resolves it and reaches the host through pasta.
-  The gateway's egress exemption (`ip saddr <GW_IP> ether saddr
-  <GW_MAC> accept`, the MAC kit-derived and pinned) covers the
-  upstream leg. The standard `denied`/`allow` loop applies.
+  The gateway's egress exemption (`ip saddr <GW_IP> iifname
+  "<bridge>" ether saddr <GW_MAC> accept`, the MAC kit-derived and
+  pinned) covers the upstream leg. The standard `denied`/`allow` loop
+  applies.
 - **Non-HTTP, direct by IP literal**:
   `allow <profile> 169.254.1.2:<port> --direct` — `169.254.1.2` is
   podman's pasta map-guest-addr address; traffic to it is translated

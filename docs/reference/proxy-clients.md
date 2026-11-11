@@ -43,9 +43,9 @@ of the same pair:
 
 - `HTTP_PROXY` / `HTTPS_PROXY` (uppercase) and `http_proxy` /
   `https_proxy` (lowercase) — the same gateway address. curl reads
-  the uppercase forms for most URLs, but apt, wget, git, and pip
-  honor ONLY the lowercase ones; tools that
-  read either case get a consistent answer.
+  lowercase `http_proxy` for plain-HTTP URLs and either case of
+  `HTTPS_PROXY`; apt, wget, git, and pip honor ONLY the lowercase
+  spellings; tools that read either case get a consistent answer.
 - `NO_PROXY` / `no_proxy` — destinations that must bypass the proxy
   and connect direct: `localhost,127.0.0.1`, the conf's `no-proxy`
   entries, and every direct-path IPv4 pin. NO_PROXY matching

@@ -34,3 +34,12 @@ nothing but clients 403: check the engine actually running is recent
 enough to union direct IPv4 pins (`egresslock --version`; older
 engines silently omitted IPv4
 from `denied`), and see [gateway-logs](gateway-logs.md).
+
+## Links
+
+- Back to the [symptom index](../troubleshooting.md).
+- [cannot-reach-host-service](cannot-reach-host-service.md) — the
+  same-host-service special case.
+- [gateway-logs](gateway-logs.md) — the proxy side's own evidence.
+- [proxy-clients](../reference/proxy-clients.md) — which tools honor
+  the injected proxy env.

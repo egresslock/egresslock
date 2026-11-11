@@ -7,20 +7,23 @@ The conf grammar itself is the
 
 ## Engine environment overrides
 
-See `egresslock help env` for the full list:
+Operator overrides (see `egresslock help env`; the test-harness hooks
+are not operator options and live in the hidden test topics — see the
+pointer after the table):
 
 | Variable | What it does |
 |---|---|
-| `NFT_BIN` | path to the `nft` binary (default `/usr/sbin/nft`, else `$PATH`) |
-| `CONNTRACK_BIN` | absolute path to conntrack (default `/usr/sbin/conntrack`, then `$PATH`) — required by `disallow --direct`'s revocation flush |
-| `EGRESSLOCK_ANCHOR_IMAGE` | anchor image (default: base image or alpine) |
-| `EGRESSLOCK_GW_IMAGE` | gateway image (default `localhost/egresslock-gateway:latest`) |
+| `NFT_BIN` | path to the `nft` binary; default resolution: `$PATH` first (`command -v nft`), then `/usr/sbin/nft` as a fallback for non-root PATHs that omit `/usr/sbin` |
+| `CONNTRACK_BIN` | path to conntrack; default resolution: `$PATH`, then `/usr/sbin/conntrack` — required by `disallow --direct`'s revocation flush |
 | `EGRESSLOCK_ALLOW_ROOT=1` | allow running as root (NOT recommended — root's Podman store/netns is not an account) |
-| `EGRESSLOCK_SKIP_NETNS_PROBE=1` | skip the podman rootless-netns preflight probe (test harness only) |
-| `EGRESSLOCK_USERNS_SYSCTL` | path to the sysctl file the `userns:` doctor row reads (default: the kernel's unprivileged-userns sysctl; test harness only — requires `EGRESSLOCK_KIT_ALLOW_NON_ROOT=1`) |
 | `EGRESSLOCK_GW_LOG_MAX_BYTES` | gateway log rotation cap in bytes (default 32 MiB; `0` = no cap) |
 | `EGRESSLOCK_DENIED_MAX_BYTES` | `denied` log-read cap in bytes — the newest N bytes are read, partial first line dropped (default 32 MiB, same as the rotation cap; `0` = the full log) |
 | `EGRESSLOCK_LOCK_WAIT` | seconds to wait for the account lock before a writer fails closed (default 30; `verify` waits 5 and then proceeds without it; `0` = don't wait) |
+| `EGRESSLOCK_GW_CLEANUP_GRACE` | seconds an unreferenced gateway config file or private stage directory is kept before a later apply removes it (default 3600; `0` = eligible immediately). Host-side `/tmp/egresslock-allowlist.*` staging directories are kept until they are 10 s older than this window. That margin is age-based, not a liveness check: applies that share the account lock are serialized, but a stage older than the margin remains eligible while another lock domain under the same uid may still be using it |
+
+The harness-only hooks (the engine and setup image overrides included)
+are listed in `egresslock help env test` and
+`egresslock-setup help env test`.
 
 ## Config resolution
 
@@ -201,8 +204,15 @@ after it executed).
 
 - `doctor` without `--account` checks the host slice (engine at the
   derived prefix, unit templates installed); with `--account` it adds
-  conf parse, `unit.env` match, timer, linger, and (for gateway confs)
-  the user manager and gateway image. AppArmor is pointed at
+  conf parse, policy file modes (`<profile>.conf`, `<profile>-allowlist`,
+  and `unit.env` must be `0600`; a confdir writable by other users is
+  reported), `unit.env` match, timer, linger, and (for gateway confs)
+  the user manager and gateway image. The mode check is read-only and
+  prints the `chmod` command to run as the account — `sudo -u`, no
+  login shell needed, so it also works for `nologin` service accounts;
+  it follows symlinks and never reports the engine's own records or
+  `gateway-build.log`.
+  AppArmor is pointed at
   `apparmor check`, not duplicated. This is distinct from the
   engine's `egresslock doctor` (the host environment probe: podman,
   netavark, nft, conntrack, unprivileged userns, plus labeled
@@ -260,16 +270,30 @@ passed through to the daemon unchanged; its header is the reference.
 
 A few environment variables are test-harness hooks, not operator
 knobs: `EGRESSLOCK_APPARMOR_D`, `EGRESSLOCK_SYSTEMCTL`,
-`EGRESSLOCK_USERNS_SYSCTL`, and `EGRESSLOCK_ACCOUNT_HOME` are honored
-only when `EGRESSLOCK_KIT_ALLOW_NON_ROOT=1` is set; without it each
-command uses its production default (`/etc/apparmor.d`, `systemctl` on
-`$PATH`, the kernel's unprivileged-userns sysctl, the passwd home).
-That flag is a harness-only bypass and is never meant to be set
-outside the test harness. It reaches a privileged run only by
-inheritance — `sudo -E`, or a unit that carries a test environment —
-and any environment carrying it makes these four hooks live,
-including as root. Keep it out of shells and units that run
-privileged commands.
+`EGRESSLOCK_USERNS_SYSCTL`, `EGRESSLOCK_ACCOUNT_HOME`,
+`EGRESSLOCK_UNIT_DIR`, `EGRESSLOCK_PATH_BINDIR`,
+`EGRESSLOCK_PATH_SBINDIR`, `EGRESSLOCK_ANCHOR_IMAGE`,
+`EGRESSLOCK_GW_IMAGE`, `EGRESSLOCK_DEFAULT_UNIT_DIR`,
+`EGRESSLOCK_DEB_UNIT_DIR`, `EGRESSLOCK_ETC_UNIT_DIR`,
+`EGRESSLOCK_UNIT_SRC`, `EGRESSLOCK_UB_BIN`, and
+`EGRESSLOCK_DEB_LIBDIR` are honored only when
+`EGRESSLOCK_KIT_ALLOW_NON_ROOT=1` is set; without it each command
+ignores them, with a warning, and uses its production default
+(`/etc/apparmor.d`, `systemctl` on `$PATH`, the kernel's
+unprivileged-userns sysctl, the passwd home,
+`/etc/systemd/system`, `/usr/local/bin`, `/usr/local/sbin`, the
+digest-pinned alpine anchor, `localhost/egresslock-gateway:latest`,
+`/etc/systemd/system` for both the default `/etc` probe and the
+doctor's `/etc` load-precedence path, `/usr/lib/systemd/system`, the
+kit's own `systemd/`, `/usr/bin/egresslock`, and
+`/usr/lib/egresslock`). That flag
+is a harness-only bypass and is never meant to be set outside the test
+harness. It is off by default: only the exact value `1` turns test
+mode on, and any other value (e.g. `true`) warns and leaves test mode
+off. It reaches a privileged run only by inheritance — `sudo -E`,
+or a unit that carries a test environment — and any environment
+carrying it makes these hooks live, including as root. Keep it out of
+shells and units that run privileged commands.
 `EGRESSLOCK_APPARMOR_PROFILES` follows a wider rule: a root run reads
 the kernel listing unless `EGRESSLOCK_KIT_ALLOW_NON_ROOT=1` is set,
 while a non-root run may point it at a copied listing (the kernel
@@ -277,3 +301,10 @@ listing is root-only on many kernels). The installer's advisory read is
 test-mode only.
 `EGRESSLOCK_DIR` selects the engine directory for the entry scripts;
 the default is `/opt/egresslock`, then the script's own directory.
+
+`EGRESSLOCK_SKIP_NETNS_PROBE=1` is a test-harness hook too, and unlike
+the list above it is **not** gated by `EGRESSLOCK_KIT_ALLOW_NON_ROOT`:
+the engine and the verify timer entry script honor it unconditionally,
+and it skips the rootless-network-namespace preflight that fails closed
+on a broken netns. Keep it out of timer, service, and shell
+environments.

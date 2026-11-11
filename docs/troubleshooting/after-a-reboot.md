@@ -40,7 +40,8 @@ egresslock ensure main
 or use the kit launcher `egresslock-start`, which always ensures first
 (fail-closed: if ensure fails, the daemon does not start). `ensure` is
 idempotent: it recreates the anchor, reinstalls the policy, and
-restarts the gateway in one non-disruptive pass.
+refreshes the gateway — reloading it in place when its running instance
+was started on the deployed config, and restarting it once otherwise.
 
 ## What the timer does (and does not) do
 
@@ -56,6 +57,7 @@ restarts the gateway in one non-disruptive pass.
 
 ## Links
 
+- Back to the [symptom index](../troubleshooting.md).
 - [network-not-found](network-not-found.md) — the complementary case:
   the network object is missing entirely.
 - [verify-timer-signals](verify-timer-signals.md) — every timer line,

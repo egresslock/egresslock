@@ -21,6 +21,59 @@ set -euo pipefail
 # production default.
 kit_test_mode() { [[ "${EGRESSLOCK_KIT_ALLOW_NON_ROOT:-0}" == 1 ]]; }
 
+# EGL-491-D1/D2: a test-harness hook that is set without the test flag is
+# discarded; say so once per name per invocation, on stderr only. The value
+# is never echoed and rc/stdout stay unchanged.
+egl491_warned_hooks=""
+egl491_warn_ignored_hook() { # egl491_warn_ignored_hook <name> [value]
+    local _name="$1" _value="${2:-}"
+    if [[ -z "$_value" ]] || kit_test_mode; then
+        return 0
+    fi
+    case " $egl491_warned_hooks " in
+        *" $_name "*) return 0 ;;
+    esac
+    egl491_warned_hooks+=" $_name"
+    echo "egresslock-setup: WARNING - $_name is set but ignored: it is a test-harness override and requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1; the production default applies." >&2
+}
+# EGL-491-D4: the test flag's gate is the exact `== 1` predicate. Any other
+# set value (including empty) leaves test mode off, so the hooks set
+# alongside it are inert — warn once, presence-based, never echo the value.
+if [[ -n "${EGRESSLOCK_KIT_ALLOW_NON_ROOT+x}" \
+      && "${EGRESSLOCK_KIT_ALLOW_NON_ROOT-}" != 1 ]]; then
+    echo "egresslock-setup: WARNING - EGRESSLOCK_KIT_ALLOW_NON_ROOT is set but is not the exact value 1, so test mode is off; test-harness overrides are ignored." >&2
+fi
+
+# EGL-434-D1/D3: EGRESSLOCK_UNIT_DIR is a test-only hook. Resolve it once
+# here, gated; every read below (prefix derivation and the doctor) uses
+# this value, so an ignored hook is indistinguishable from an unset one
+# and cannot suppress the deb fallback or the stale-prefix retry.
+unit_dir_override=""
+if kit_test_mode && [[ -n "${EGRESSLOCK_UNIT_DIR:-}" ]]; then
+    unit_dir_override="$EGRESSLOCK_UNIT_DIR"
+else
+    egl491_warn_ignored_hook EGRESSLOCK_UNIT_DIR "${EGRESSLOCK_UNIT_DIR:-}"
+fi
+
+# EGL-456-D3: the unit-dir DEFAULTS are test-only hooks too. Resolve each
+# once behind the gate so every read below (prefix derivation, the deb
+# fallback, the stale-prefix retry and the doctor) uses the production
+# default when the flag is off — an ignored hook is indistinguishable from
+# an unset one. The heuristics keep keying off the gated explicit
+# `unit_dir_override`, never off these defaults (EGL-434-D3 precedent).
+unit_dir_default="/etc/systemd/system"
+deb_unit_dir_default="/usr/lib/systemd/system"
+etc_unit_dir_default="/etc/systemd/system"
+if kit_test_mode; then
+    if [[ -n "${EGRESSLOCK_DEFAULT_UNIT_DIR:-}" ]]; then unit_dir_default="$EGRESSLOCK_DEFAULT_UNIT_DIR"; fi
+    if [[ -n "${EGRESSLOCK_DEB_UNIT_DIR:-}" ]]; then deb_unit_dir_default="$EGRESSLOCK_DEB_UNIT_DIR"; fi
+    if [[ -n "${EGRESSLOCK_ETC_UNIT_DIR:-}" ]]; then etc_unit_dir_default="$EGRESSLOCK_ETC_UNIT_DIR"; fi
+else
+    egl491_warn_ignored_hook EGRESSLOCK_DEFAULT_UNIT_DIR "${EGRESSLOCK_DEFAULT_UNIT_DIR:-}"
+    egl491_warn_ignored_hook EGRESSLOCK_DEB_UNIT_DIR "${EGRESSLOCK_DEB_UNIT_DIR:-}"
+    egl491_warn_ignored_hook EGRESSLOCK_ETC_UNIT_DIR "${EGRESSLOCK_ETC_UNIT_DIR:-}"
+fi
+
 prefix=""
 account=""
 conf=""
@@ -43,7 +96,15 @@ buildgw=0
     legacy_flag=""  # the conflicting legacy flag, named in the error
     legacy_form=""  # its verb form, named in the error
 prefix_explicit=0
-gw_img="${EGRESSLOCK_GW_IMAGE:-localhost/egresslock-gateway:latest}"
+gw_img="localhost/egresslock-gateway:latest"
+# EGL-456-D3: the gateway image override is a test-only hook. Gate it
+# before the parse-time flag-shape check so an ignored hook (including a
+# '-' value) behaves exactly like an unset one.
+if kit_test_mode && [[ -n "${EGRESSLOCK_GW_IMAGE:-}" ]]; then
+    gw_img="$EGRESSLOCK_GW_IMAGE"
+else
+    egl491_warn_ignored_hook EGRESSLOCK_GW_IMAGE "${EGRESSLOCK_GW_IMAGE:-}"
+fi
 # ARC-59-D1: a non-empty override that starts with '-' is a flag-shaped
 # token in the `podman build -t` / `podman image exists` positional args
 # below. Empty stays the default; a value is never optional flags.
@@ -243,8 +304,9 @@ EOF
 egresslock-setup doctor [--account <acct>] [--prefix <path>]
 
 Kit/account install state check with the command that fixes each
-missing item (read-only; rc nonzero when a required item is missing).
-Two questions, two binaries: the host environment probe
+missing item (read-only; rc nonzero when a required item is missing or
+a policy file is not owner-only). Two questions, two binaries: the host
+environment probe
 (podman/netavark/nft/unprivileged userns) is the ENGINE's
 `egresslock doctor`; kit/account install state is `doctor` HERE.
 
@@ -252,14 +314,19 @@ Host slice without --account: engine present at the derived prefix,
 unit templates installed, verify-unit health (shadowed /etc fragment,
 ExecStart target, failed instances, dangling timer wants — rc 1 on
 any; named skip without systemctl). With --account it adds: conf
-parses, unit.env matches, timer enabled, linger on, and (gateway
-confs) user@<uid>.service active + gateway image present. AppArmor is
-one pointer line at apparmor check (its strings stay there).
+parses, policy file modes (conf, allowlist, unit.env are 0600; a
+confdir writable by other users is reported), unit.env matches, timer
+enabled, linger on, and (gateway confs) user@<uid>.service active +
+gateway image present. AppArmor is
+one pointer line at apparmor check (its strings stay there). The
+optional egl-base example image gets its own rc-neutral row when it
+exists.
 
 Arguments and flags:
-  --account <name>  add the account slice (conf parse, unit.env,
-                    timer, linger, user manager, gateway image);
-                    needs root (sudo) to read the account state
+  --account <name>  add the account slice (conf parse, policy file
+                    modes, unit.env, timer, linger, user manager,
+                    gateway image, egl-base image); needs root (sudo)
+                    to read the account state
   --prefix <path>   deployed kit prefix (default: derived from the
                     installed unit template, else /opt/egresslock)
 
@@ -371,43 +438,18 @@ Kit data locations, environment overrides, and defaults for the
 setup tool.
 
 Kit data locations: examples and the apparmor snippet are
-resolved share-first — $EGRESSLOCK_SHARE when set, else
-/usr/share/egresslock (the .deb layout), else the directory holding
-this script (= the deployed prefix, or an egresslock/ checkout/tree).
-The ENGINE always comes from the deployed prefix.
+resolved share-first — /usr/share/egresslock (the .deb layout), else
+the directory holding this script (= the deployed prefix, or an
+egresslock/ checkout/tree). The ENGINE always comes from the deployed
+prefix.
 
 Environment:
-  EGRESSLOCK_GW_IMAGE            gateway image (default:
-                             localhost/egresslock-gateway:latest)
-  EGRESSLOCK_KIT_ALLOW_NON_ROOT=1   allow non-root runs (tests only)
-  EGRESSLOCK_UNIT_DIR=<dir>      unit template dir for prefix derivation
-                             (default: /etc/systemd/system; EXPLICIT
-                             hook — suppresses the deb fallback and
-                             the stale-prefix retry)
-  EGRESSLOCK_DEFAULT_UNIT_DIR=<dir>  harness-only override of the
-                             DEFAULT /etc probe path (heuristic-
-                             preserving: deb fallback + stale-prefix
-                             retry still run)
-  EGRESSLOCK_ETC_UNIT_DIR=<dir>  harness-only override of the /etc
-                             load-precedence path in the doctor
-                             shadow gate (default: /etc/systemd/system)
-  EGRESSLOCK_DEB_UNIT_DIR=<dir>  harness-only override of the deb
-                             unit dir in doctor shadow checks
-                             (default: /usr/lib/systemd/system)
-  EGRESSLOCK_APPARMOR_D=<dir>    AppArmor profile dir for tests
-                             (default: /etc/apparmor.d; requires
-                             EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
   EGRESSLOCK_APPARMOR_PROFILES=<f>  kernel profiles listing to probe
                              for AppArmor checks (default:
                              /sys/kernel/security/apparmor/profiles;
-                             a root run ignores it unless
-                             EGRESSLOCK_KIT_ALLOW_NON_ROOT=1; non-root
-                             runs may point it at a copied listing)
-  EGRESSLOCK_SYSTEMCTL=<path>    systemctl binary for tests
-                             (default: systemctl on the PATH;
-                             requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
-  EGRESSLOCK_ACCOUNT_HOME=<dir>  account home override in test mode
-                             (requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+                             a root run always reads the kernel
+                             listing; non-root runs may point it at a
+                             copied listing)
 
 Defaults that are not parameter-changeable:
   - unit.env path: ~/.config/egresslock/unit.env, mode 0600, with
@@ -416,12 +458,65 @@ Defaults that are not parameter-changeable:
   - --init-conf dest: ~/.config/egresslock/main.conf with sibling
     main-allowlist (empty starter), both copied as the account
   - account-side steps run as the account from its own home
+
+Test-harness overrides (not operator options) live in
+`egresslock-setup help env test`.
+EOF
+            ;;
+        "env test")
+            cat <<'EOF'
+Test-harness overrides (not operator options) for the setup tool:
+
+These are test harness only: no shipped workflow tells an operator to
+set them. Do not set them for a production install. Overrides below
+marked `requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1` are ignored without
+it: the production default applies, and the setup tool warns when it
+ignores a set override.
+
+  EGRESSLOCK_SHARE=<dir>         kit share directory override (default:
+                             /usr/share/egresslock, else the directory
+                             holding this script; tests only)
+  EGRESSLOCK_GW_IMAGE            gateway image (default:
+                             localhost/egresslock-gateway:latest;
+                             requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+  EGRESSLOCK_KIT_ALLOW_NON_ROOT=1   allow non-root runs (tests only);
+                             test mode is off by default — only
+                             exactly 1 turns it on, and any other
+                             value (e.g. true) warns and leaves
+                             test mode off
+  EGRESSLOCK_UNIT_DIR=<dir>      unit template dir for prefix derivation
+                             in test mode (default: /etc/systemd/system;
+                             requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1;
+                             EXPLICIT hook — suppresses the deb fallback
+                             and the stale-prefix retry, only when the
+                             flag is set)
+  EGRESSLOCK_DEFAULT_UNIT_DIR=<dir>  harness-only override of the
+                             DEFAULT /etc probe path (heuristic-
+                             preserving: deb fallback + stale-prefix
+                             retry still run; requires
+                             EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+  EGRESSLOCK_ETC_UNIT_DIR=<dir>  harness-only override of the /etc
+                             load-precedence path in the doctor
+                             shadow gate (default: /etc/systemd/system;
+                             requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+  EGRESSLOCK_DEB_UNIT_DIR=<dir>  harness-only override of the deb
+                             unit dir in doctor shadow checks
+                             (default: /usr/lib/systemd/system;
+                             requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+  EGRESSLOCK_APPARMOR_D=<dir>    AppArmor profile dir for tests
+                             (default: /etc/apparmor.d; requires
+                             EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+  EGRESSLOCK_SYSTEMCTL=<path>    systemctl binary for tests
+                             (default: systemctl on the PATH;
+                             requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
+  EGRESSLOCK_ACCOUNT_HOME=<dir>  account home override in test mode
+                             (requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
 EOF
             ;;
         *)
-            # Callers validate the topic against the five pages; this
-            # arm only bounds the function (fail closed if a new topic
-            # is added without a page).
+            # Callers validate the topic against the five pages (and the
+            # hidden `env test` pair); this arm only bounds the function
+            # (fail closed if a new topic is added without a page).
             echo "Error: unknown help topic '$1'." >&2
             usage >&2
             exit 2
@@ -464,6 +559,12 @@ for _v in "${SETUP_VERBS[@]}"; do
             ;;
         help)
             shift
+            # EGL-410: match the hidden `env test` pair before the
+            # one-topic check, so every other multi-token input keeps
+            # today's message.
+            if [[ $# -eq 2 && "$1" == "env" && "$2" == "test" ]]; then
+                help_topic "env test"; exit 0
+            fi
             if [[ $# -gt 1 ]]; then
                 echo "Error: egresslock-setup help takes at most one topic." >&2
                 usage >&2
@@ -513,20 +614,22 @@ done
 # never fatal: the engine-presence check reports the real problem.
 if [[ -z "$prefix" ]]; then
     # EGRESSLOCK_DEFAULT_UNIT_DIR overrides the DEFAULT /etc probe path
-    # without being an explicit user hook (harness only): the deb
-    # fallback and the D37-1 stale-/etc retry still run, unlike
-    # EGRESSLOCK_UNIT_DIR which suppresses both (documented "explicit
-    # hook beats heuristics" behavior).
-    unit_dir="${EGRESSLOCK_UNIT_DIR:-${EGRESSLOCK_DEFAULT_UNIT_DIR:-/etc/systemd/system}}"
+    # in test mode without being an explicit user hook: the deb fallback
+    # and the D37-1 stale-/etc retry still run, unlike the gated
+    # EGRESSLOCK_UNIT_DIR hook (test-mode only), which suppresses both
+    # (documented "explicit hook beats heuristics" behavior). Without the
+    # test flag the hook is ignored (production /etc).
+    unit_dir="${unit_dir_override:-$unit_dir_default}"
     prefix="$(sed -n "s|^ExecStart=\(.*\)/egresslock-verify$|\1|p" \
         "$unit_dir/egresslock-verify@.service" 2>/dev/null | head -1 || true)"
-    if [[ -z "$prefix" && -z "${EGRESSLOCK_UNIT_DIR:-}" ]]; then
+    if [[ -z "$prefix" && -z "$unit_dir_override" ]]; then
         # ARC-22 R-022-1 F1: the .deb installs the unit templates under
         # /usr/lib/systemd/system, so the /etc probe misses on a fresh
         # .deb-only host; derive the prefix from the deb template too.
-        # EGRESSLOCK_DEB_UNIT_DIR overrides for the mock harness;
-        # EGRESSLOCK_UNIT_DIR (explicit hook) suppresses this probe.
-        deb_unit_dir="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}"
+        # EGRESSLOCK_DEB_UNIT_DIR overrides for the mock harness in test
+        # mode only; the gated EGRESSLOCK_UNIT_DIR hook suppresses this
+        # probe.
+        deb_unit_dir="$deb_unit_dir_default"
         prefix="$(sed -n "s|^ExecStart=\(.*\)/egresslock-verify$|\1|p" \
             "$deb_unit_dir/egresslock-verify@.service" 2>/dev/null | head -1 || true)"
     fi
@@ -536,11 +639,11 @@ fi
 # points at a dead path while the live kit is the .deb. Retry the deb
 # unit dir when the derived engine is missing and the deb probe has not
 # run; only then fall back to /opt. A WORKING /etc prefix always wins.
-if (( prefix_explicit == 0 )) && [[ -n "$account" && -n "$prefix" && ! -f "$prefix/egresslock" && -z "${EGRESSLOCK_UNIT_DIR:-}" ]]; then
-    # D37-1 gate note: EGRESSLOCK_DEFAULT_UNIT_DIR (harness-only /etc
-    # override) does NOT suppress the retry — only the explicit
-    # EGRESSLOCK_UNIT_DIR hook does.
-    deb_unit_dir="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}"
+if (( prefix_explicit == 0 )) && [[ -n "$account" && -n "$prefix" && ! -f "$prefix/egresslock" && -z "$unit_dir_override" ]]; then
+    # D37-1 gate note: a test-mode EGRESSLOCK_DEFAULT_UNIT_DIR (harness
+    # /etc override) does NOT suppress the retry — only the gated
+    # explicit EGRESSLOCK_UNIT_DIR hook does.
+    deb_unit_dir="$deb_unit_dir_default"
     deb_prefix="$(sed -n "s|^ExecStart=\(.*\)/egresslock-verify$|\1|p" \
         "$deb_unit_dir/egresslock-verify@.service" 2>/dev/null | head -1 || true)"
     if [[ -n "$deb_prefix" && -f "$deb_prefix/egresslock" && "$deb_prefix" != "$prefix" ]]; then
@@ -669,6 +772,10 @@ fi
 home=""
 if [[ -n "$account" ]]; then
     if [[ "$(id -u)" == 0 ]] || ! kit_test_mode; then
+        # EGL-491: the override is honored only on the non-root test path;
+        # this passwd branch is where it is discarded (the helper is silent
+        # when the flag is on or the value is empty).
+        egl491_warn_ignored_hook EGRESSLOCK_ACCOUNT_HOME "${EGRESSLOCK_ACCOUNT_HOME:-}"
         id "$account" >/dev/null 2>&1 || { echo "egresslock-setup: no such account: $account" >&2; exit 1; }
         home="$(getent passwd "$account" | cut -d: -f6)"
     else
@@ -758,6 +865,12 @@ podman_labeled() {
     # match. rc: 0 labeled/unlabeled (state 0/1), 1 unknown (state 2;
     # grep rc 2 = EACCES, never "no").
     local profiles grc
+    # EGL-491: a root run without the flag discards the listing override
+    # (apparmor_profiles_path is always called in a subshell, so warn
+    # here in the caller's shell); a non-root run honors it.
+    if [[ "$(id -u)" == 0 ]]; then
+        egl491_warn_ignored_hook EGRESSLOCK_APPARMOR_PROFILES "${EGRESSLOCK_APPARMOR_PROFILES:-}"
+    fi
     profiles="$(apparmor_profiles_path)"
     podman_label_state=2
     if [[ ! -r "$profiles" ]]; then
@@ -789,6 +902,11 @@ podman_noop_note() {
 pasta_enforce_state=3
 pasta_enforced() {
     local profiles grc
+    # EGL-491: see podman_labeled — the override is discarded on a root,
+    # flag-off run; warn once in the caller's shell, not in the subshell.
+    if [[ "$(id -u)" == 0 ]]; then
+        egl491_warn_ignored_hook EGRESSLOCK_APPARMOR_PROFILES "${EGRESSLOCK_APPARMOR_PROFILES:-}"
+    fi
     profiles="$(apparmor_profiles_path)"
     pasta_enforce_state=3
     if [[ -r "$profiles" ]]; then
@@ -1038,7 +1156,11 @@ setup_apparmor() {
     local aa_d already installed_patch
     # Test hook (mock harness); honored only in test mode.
     aa_d="/etc/apparmor.d"
-    kit_test_mode && aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
+    if kit_test_mode; then
+        aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
+    else
+        egl491_warn_ignored_hook EGRESSLOCK_APPARMOR_D "${EGRESSLOCK_APPARMOR_D:-}"
+    fi
     # EGL-22-D2: apply skips ONLY on known not-enforced. Unknown
     # enforcement refuses (rc 1) — a host whose pasta profile we cannot
     # confirm is unenforced must not silently skip the amendment.
@@ -1153,7 +1275,11 @@ unapply_apparmor() {
     local -a targets=()
     # Test hook (mock harness); honored only in test mode.
     aa_d="/etc/apparmor.d"
-    kit_test_mode && aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
+    if kit_test_mode; then
+        aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
+    else
+        egl491_warn_ignored_hook EGRESSLOCK_APPARMOR_D "${EGRESSLOCK_APPARMOR_D:-}"
+    fi
     resolve_pasta_profile "$aa_d" >/dev/null 2>&1 || true
     [[ -n "$pasta_local_file" && -f "$pasta_local_file" ]] && targets+=("$pasta_local_file")
     if [[ -f "$aa_d/local/usr.bin.pasta" && "$aa_d/local/usr.bin.pasta" != "$pasta_local_file" ]]; then
@@ -1276,7 +1402,11 @@ doctor_apparmor() {
     local aa_d rc=0
     # Test hook (mock harness); honored only in test mode.
     aa_d="/etc/apparmor.d"
-    kit_test_mode && aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
+    if kit_test_mode; then
+        aa_d="${EGRESSLOCK_APPARMOR_D:-$aa_d}"
+    else
+        egl491_warn_ignored_hook EGRESSLOCK_APPARMOR_D "${EGRESSLOCK_APPARMOR_D:-}"
+    fi
     # R-EGL-22-1 Finding 1: the predicate returns rc 1 for states 2/3;
     # a bare call under set -euo pipefail aborts BEFORE any echo, so
     # --apparmor-check would print nothing on unknown/not-enabled. Use a
@@ -1552,22 +1682,71 @@ fi
 init_conf_script='
 set -euo pipefail
 dir="$(dirname "$A19_DST_CONF")"
-mkdir -p "$dir"
+mkdir -p -m 700 "$dir"
 tmp_conf="$dir/.main.conf.init.$$"
 tmp_al="$dir/.main-allowlist.init.$$"
-new_al=0
 trap "rm -f \"\$tmp_conf\" \"\$tmp_al\"" EXIT
+_egl433_refuse_dangling() { # <conf|allowlist> <path> — S4, no write
+    local what="$1" path="$2" q qbak
+    printf -v q "%q" "$path"
+    printf -v qbak "%q" "$path.bak"
+    echo "egresslock-setup: --init-conf: refusing: destination $what is a symbolic link to a missing file: $q" >&2
+    echo "  the starter is written only to a missing path; move the link aside (only the link moves) to a name that does not exist, then re-run:" >&2
+    echo "    mv -n -T -- $q $qbak" >&2
+    echo "  if that name already exists, nothing moves; pick another name. the conf pair was not changed." >&2
+    exit 3
+}
+_egl433_retained_allowlist() { # F4: name the possibly-changed allowlist
+    local qal qbak
+    printf -v qal "%q" "$dir/main-allowlist"
+    printf -v qbak "%q" "$dir/main-allowlist.bak"
+    echo "  the allowlist at $qal was left in place and may have been changed or replaced since this run started; inspect it before reusing it:" >&2
+    echo "    cat -- $qal" >&2
+    echo "  if it is not the starter you expect, move it aside to a name that does not exist, then re-run (only that allowlist moves):" >&2
+    echo "    mv -n -T -- $qal $qbak" >&2
+}
+_egl433_refuse_pair_owned() { # S5: a regular conf won; leave the allowlist
+    local q
+    printf -v q "%q" "$A19_DST_CONF"
+    echo "egresslock-setup: --init-conf: refusing: destination conf appeared while the starter pair was being written (another initializer may have completed it): $q" >&2
+    _egl433_retained_allowlist
+    echo "  if that name already exists, nothing moves; pick another name. re-run --init-conf to check the pair. this run did not write the conf." >&2
+    exit 3
+}
+_egl433_fail_conf_write() { # generic post-publish failure, then guidance
+    local qacct
+    printf -v qacct "%q" "$A19_ACCOUNT"
+    echo "egresslock-setup: --init-conf: could not write the starter pair as $qacct" >&2
+    _egl433_retained_allowlist
+    echo "  if that name already exists, nothing moves; pick another name. re-run --init-conf to check the pair." >&2
+    exit 3
+}
 ( umask 077; cp "$A19_EXAMPLES/main.conf" "$tmp_conf" )
+if [[ -L "$dir/main-allowlist" && ! -e "$dir/main-allowlist" ]]; then
+    _egl433_refuse_dangling allowlist "$dir/main-allowlist"
+fi
 if [[ ! -e "$dir/main-allowlist" ]]; then
     ( umask 077; cp "$A19_EXAMPLES/main-allowlist" "$tmp_al" )
-    mv "$tmp_al" "$dir/main-allowlist"
-    new_al=1
+    mv -T -- "$tmp_al" "$dir/main-allowlist"
 fi
-if ! mv "$tmp_conf" "$A19_DST_CONF"; then
-    # Do not leave a newly-created allowlist without its conf (torn
-    # pair). A pre-existing allowlist is never removed.
-    (( new_al )) && rm -f "$dir/main-allowlist"
-    exit 1
+# EGL-433-D5: after this run publishes main-allowlist, never unlink that
+# path. An inode-ownership test cannot keep "a path another writer
+# replaced is never unlinked" (ext4 delete+recreate reuses dev:ino), and
+# a leftover allowlist is reused on re-run. A regular conf means another
+# initializer may have completed the pair: S5, leave both. Any other conf
+# shape or a failed conf rename prints one cause line plus the
+# retained-allowlist guidance (F4) and exits 1; the allowlist stays.
+if [[ -f "$A19_DST_CONF" && ! -L "$A19_DST_CONF" ]]; then
+    _egl433_refuse_pair_owned
+fi
+if [[ -e "$A19_DST_CONF" || -L "$A19_DST_CONF" ]]; then
+    _egl433_fail_conf_write
+fi
+if ! mv -T -- "$tmp_conf" "$A19_DST_CONF"; then
+    if [[ -f "$A19_DST_CONF" && ! -L "$A19_DST_CONF" ]]; then
+        _egl433_refuse_pair_owned
+    fi
+    _egl433_fail_conf_write
 fi
 trap - EXIT
 '
@@ -1627,6 +1806,7 @@ run_as_account() { # $@ = command words
             A18_PREFIX="$prefix" A18_GW_IMG="$gw_img" \
             A18_GW_LOG="$confdir/gateway-build.log" \
             A19_EXAMPLES="$examples_dir" A19_DST_CONF="$confdir/main.conf" \
+            A19_ACCOUNT="$account" \
             "$@" )
     else
         # Harness-only test hook: the engine resolves the account's fixed
@@ -1643,6 +1823,7 @@ run_as_account() { # $@ = command words
             A18_PREFIX="$prefix" A18_GW_IMG="$gw_img" \
             A18_GW_LOG="$confdir/gateway-build.log" \
             A19_EXAMPLES="$examples_dir" A19_DST_CONF="$confdir/main.conf" \
+            A19_ACCOUNT="$account" \
             "$@"
     fi
 }
@@ -2080,7 +2261,7 @@ import_pair() { # import_pair [expected-profile]
 
     # Stage the pair under the account, mode 0600. Create the confdir if
     # this is the first write.
-    run_as_account mkdir -p "$confdir" || {
+    run_as_account mkdir -p -m 700 "$confdir" || {
         echo "egresslock-setup: import: cannot create $confdir as $account" >&2
         return 1
     }
@@ -2236,20 +2417,20 @@ kit_check_engine() {
 
 kit_check_unit_templates() {
     local rc=0
-    ud="${EGRESSLOCK_UNIT_DIR:-${EGRESSLOCK_DEFAULT_UNIT_DIR:-/etc/systemd/system}}"
+    ud="${unit_dir_override:-$unit_dir_default}"
     # EGL-102-D6-R3 (sibling symmetry + partial shapes): the template
     # check decomposes per name (service/timer) and per dir (/etc probe,
     # deb fallback). Each observable shape gets a row: both-in-one-dir,
     # mixed dirs, partial (one missing, rc 1), or missing (rc 1).
-    local e84_dsvc="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.service"
+    local e84_dsvc="$deb_unit_dir_default/egresslock-verify@.service"
     local e84_sdir="" e84_tdir=""
     [[ -f "$ud/egresslock-verify@.service" ]] && e84_sdir="$ud"
-    [[ -z "$e84_sdir" && -z "${EGRESSLOCK_UNIT_DIR:-}" && -f "$e84_dsvc" ]] \
+    [[ -z "$e84_sdir" && -z "$unit_dir_override" && -f "$e84_dsvc" ]] \
         && e84_sdir="${e84_dsvc%/*}"
     [[ -f "$ud/egresslock-verify@.timer" ]] && e84_tdir="$ud"
-    [[ -z "$e84_tdir" && -z "${EGRESSLOCK_UNIT_DIR:-}" \
-        && -f "${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.timer" ]] \
-        && e84_tdir="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}"
+    [[ -z "$e84_tdir" && -z "$unit_dir_override" \
+        && -f "$deb_unit_dir_default/egresslock-verify@.timer" ]] \
+        && e84_tdir="$deb_unit_dir_default"
     if [[ -n "$e84_sdir" && -n "$e84_tdir" ]]; then
         if [[ "$e84_sdir" == "$e84_tdir" ]]; then
             echo "OK: unit templates: installed ($e84_sdir) — the verify service+timer templates are installed"
@@ -2626,7 +2807,7 @@ kit_check_verify_service() {
     fi
     if [[ -n "$e84_frag" ]]; then
         e84_verify_execstart="$(sed -n 's/^ExecStart=//p' "$e84_frag" 2>/dev/null | head -1 | awk '{print $1}' || true)"
-        e84_deb="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.service"
+        e84_deb="$deb_unit_dir_default/egresslock-verify@.service"
         if [[ "$e84_frag" == "$e84_etc"/* && -f "$e84_deb" && ! "$e84_deb" -ef "$e84_frag" ]]; then
             echo "PROBLEM: verify unit: SHADOWED — systemd loads $e84_frag, not the deb's $e84_deb (/etc precedence; a leftover prefix-install template defeats the deb's unit)"
             # EGL-102-D6-R5 classification (mirrors the postinst guard):
@@ -2691,7 +2872,7 @@ kit_check_verify_timer_shadow() {
     #     a blind rm. Drop-ins (*.timer.d/) are not examined here.
     e84_tfrag="$("$systemctl_bin" show -p FragmentPath --value 'egresslock-verify@.timer' 2>/dev/null || true)"
     if [[ "$e84_tfrag" == "$e84_etc"/* && "$e84_tfrag" == *.timer ]]; then
-        e84_tdeb="${EGRESSLOCK_DEB_UNIT_DIR:-/usr/lib/systemd/system}/egresslock-verify@.timer"
+        e84_tdeb="$deb_unit_dir_default/egresslock-verify@.timer"
         if [[ -f "$e84_tdeb" && ! "$e84_tdeb" -ef "$e84_tfrag" ]] && ! cmp -s "$e84_tfrag" "$e84_tdeb"; then
             echo "PROBLEM: verify timer template: SHADOWED — systemd loads $e84_tfrag, not the deb's $e84_tdeb (/etc precedence)"
             echo "  fix: $e84_tfrag does not match this package's timer template and may be yours — inspect it before removing anything; if it is a leftover from another install, sudo rm $e84_tfrag && sudo systemctl daemon-reload. While it shadows the deb's timer, the package's schedule is not in effect."
@@ -2803,7 +2984,11 @@ kit_check_verify_units() {
     # honored only in test mode; unset = production systemctl); no
     # usable systemctl → named skip, rc-neutral (D5).
     systemctl_bin="systemctl"
-    kit_test_mode && systemctl_bin="${EGRESSLOCK_SYSTEMCTL:-$systemctl_bin}"
+    if kit_test_mode; then
+        systemctl_bin="${EGRESSLOCK_SYSTEMCTL:-$systemctl_bin}"
+    else
+        egl491_warn_ignored_hook EGRESSLOCK_SYSTEMCTL "${EGRESSLOCK_SYSTEMCTL:-}"
+    fi
     if ! command -v "$systemctl_bin" >/dev/null 2>&1; then
         echo "NOTE: verify units: skipped (systemctl not found)"
     else
@@ -2811,7 +2996,7 @@ kit_check_verify_units() {
         # load-precedence path in the shadow gates (mock battery; unset
         # = production /etc/systemd/system, same hook family as
         # EGRESSLOCK_DEB_UNIT_DIR).
-        local e84_etc="${EGRESSLOCK_ETC_UNIT_DIR:-/etc/systemd/system}"
+        local e84_etc="$etc_unit_dir_default"
         kit_check_verify_service || rc=1
         kit_check_verify_timer_shadow || rc=1
         kit_check_verify_failed || rc=1
@@ -2828,7 +3013,11 @@ kit_verify_accounts() {
     local e84_row e84_tok e84_acct
     local -a e84_accts=()
     local e84_sctl="systemctl"
-    kit_test_mode && e84_sctl="${EGRESSLOCK_SYSTEMCTL:-$e84_sctl}"
+    if kit_test_mode; then
+        e84_sctl="${EGRESSLOCK_SYSTEMCTL:-$e84_sctl}"
+    else
+        egl491_warn_ignored_hook EGRESSLOCK_SYSTEMCTL "${EGRESSLOCK_SYSTEMCTL:-}"
+    fi
     command -v "$e84_sctl" >/dev/null 2>&1 || return 1
     while IFS= read -r e84_row; do
         [[ "$e84_row" == *not-found* ]] && continue
@@ -2856,7 +3045,11 @@ kit_check_accounts() {
     local -A e84_fs=()
     local e84_a e84_row e84_tok e84_noun
     local e84_sctl="systemctl"
-    kit_test_mode && e84_sctl="${EGRESSLOCK_SYSTEMCTL:-$e84_sctl}"
+    if kit_test_mode; then
+        e84_sctl="${EGRESSLOCK_SYSTEMCTL:-$e84_sctl}"
+    else
+        egl491_warn_ignored_hook EGRESSLOCK_SYSTEMCTL "${EGRESSLOCK_SYSTEMCTL:-}"
+    fi
     local e84_n e84_f e84_join
     [[ -n "$account" ]] && return 0
     command -v "$e84_sctl" >/dev/null 2>&1 || return 0
@@ -2897,7 +3090,7 @@ kit_check_host_pointers() {
     # EGL-102-D6-R1: sibling-surface pointer (AppArmor-row idiom) — the
     # host slice names what it did NOT examine and where to get it.
     if [[ -z "$account" ]]; then
-        echo "NOTE: account wiring (conf, unit.env, timer, linger, gateway image): not examined (no --account) — run: sudo egresslock-setup doctor --account <acct>"
+        echo "NOTE: account wiring (conf, policy file modes, unit.env, timer, linger, gateway image, egl-base image): not examined (no --account) — run: sudo egresslock-setup doctor --account <acct>"
     fi
     echo "NOTE: AppArmor: see egresslock-setup apparmor check (pasta slice)"
     return 0
@@ -2962,6 +3155,69 @@ doctor_init_fix() { # pathless EGL-328 re-arm; --profile only for named mode
     else
         printf 'sudo egresslock-setup init --account %s --enable' "$account"
     fi
+}
+
+# EGL-409: read-only policy-file mode check (unix mode only, D9). One
+# PROBLEM row per policy file whose exact numeric mode is not 600 — the
+# same mode class the engine's `allow` gate refuses (egresslock:8513-
+# 8516) — plus the confdir when its other-write bit is set. Missing,
+# broken-symlink, and non-regular candidates add no row (conf parse /
+# unit.env own missing wiring); a symlink is followed to the mode that
+# actually applies. A stat failure on a present path is an rc-neutral
+# NOTE. rc 1 on any PROBLEM. Doctor never chmods; every fix is a printed
+# command for the account. Checked set (D2): each existing resolved
+# <profile>.conf plus its <profile>-allowlist sibling, and unit.env once.
+# Exempt by construction: <profile>.pins / <profile>.revoke-pending
+# (written 0600) and gateway-build.log (0644 by design).
+kit_check_policy_modes() {
+    local rc=0 checked=0 bad=0 unknown=0
+    local p mode cf
+    local -a pm_candidates=()
+    for cf in "${doctor_conf_files[@]}"; do
+        [[ -f "$cf" ]] || continue
+        pm_candidates+=("$cf" "${cf%.conf}-allowlist")
+    done
+    pm_candidates+=("$confdir/unit.env")
+    # EGL-511: both `fix:` chmod continuations below print `sudo -u`, not
+    # `sudo -iu` — chmod on an absolute path needs no login environment, so
+    # the printed fix also runs for a `nologin` service account. The `-iu`
+    # hints elsewhere are login-env-dependent engine runs; do not flip back.
+    for p in "${pm_candidates[@]}"; do
+        [[ -f "$p" ]] || continue
+        if ! mode="$(stat -L -c %a -- "$p" 2>/dev/null)"; then
+            echo "NOTE: policy file modes: unknown ($p) — the mode could not be read, so it was not checked"
+            unknown=1
+            continue
+        fi
+        checked=$((checked + 1))
+        if [[ "$mode" != "600" ]]; then
+            echo "PROBLEM: policy file modes: $p is $mode, not 0600 — the account's policy files are owner-only (0600), and proxy allow rewrites only a 0600 allowlist"
+            echo "  fix: sudo -u $account -- chmod 600 -- $p"
+            bad=1
+        fi
+    done
+    # D3: only the other-write bit reports. 0755/0775/0700 stay silent;
+    # mask (never string-compare) so four-digit modes (sticky 1777,
+    # setgid 2775) classify correctly.
+    if [[ -d "$confdir" ]]; then
+        if ! mode="$(stat -L -c %a -- "$confdir" 2>/dev/null)"; then
+            echo "NOTE: policy file modes: unknown ($confdir) — the mode could not be read, so it was not checked"
+            unknown=1
+        elif (( (8#$mode & 2) != 0 )); then
+            echo "PROBLEM: policy file modes: $confdir is $mode (writable by other users) — any local user can replace the policy files in it"
+            echo "  fix: sudo -u $account -- chmod o-w -- $confdir"
+            bad=1
+        fi
+    fi
+    if (( bad )); then
+        rc=1
+    fi
+    # OK only when the whole check is clean and at least one file was
+    # checked; an empty confdir adds no OK row (conf parse owns that).
+    if (( bad == 0 && unknown == 0 && checked > 0 )); then
+        echo "OK: policy file modes: 0600 ($checked files) — every checked policy file is owner-only"
+    fi
+    return $rc
 }
 
 kit_check_conf_parse() {
@@ -3126,6 +3382,56 @@ kit_check_linger() {
     return $rc
 }
 
+# EGL-487: security rebuild floor — one ISO date in a file beside the
+# image's Containerfile, `#` comments allowed. Missing, unreadable or
+# unparseable data yields no floor (never a guess).
+kit_security_floor_date() { # kit_security_floor_date <floor-file> -> YYYY-MM-DD or empty
+    local f="$1" line="" d=""
+    [[ -f "$f" && -r "$f" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+            && [[ "$(date -u -d "$line" '+%Y-%m-%d' 2>/dev/null || true)" == "$line" ]]; then
+            d="$line"
+        fi
+        break
+    done < "$f"
+    printf '%s\n' "$d"
+}
+
+# EGL-487: image-age backstop (UTC, date precision). rc 0 when the
+# image's creation date is strictly more than <days> days ago.
+kit_image_older_than_days() { # kit_image_older_than_days <YYYY-MM-DD> <days>
+    local d="$1" days="$2" built now
+    [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    built="$(date -u -d "$d" '+%s' 2>/dev/null)" || return 1
+    now="$(date -u '+%s' 2>/dev/null)" || return 1
+    (( now - built > days * 86400 ))
+}
+
+# EGL-487: rc-neutral rebuild advisory — at most one indented `rebuild:`
+# line; a recorded floor wins over the 30-day backstop. Called only when
+# the image base label matches the deployed pin.
+kit_image_rebuild_notice() { # kit_image_rebuild_notice <label> <created> <base> <pin> <floor-file> <remedy> <pointer>
+    local label="$1" created="$2" base="$3" pin="$4" floorf="$5" remedy="$6" pointer="$7"
+    local built="${created:0:10}" floor="" max_age=30
+    [[ -n "$base" && -n "$pin" && "$base" == "$pin" ]] || return 0
+    [[ "$built" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 0
+    floor="$(kit_security_floor_date "$floorf")"
+    if [[ -n "$floor" && "$built" < "$floor" ]]; then
+        printf '  rebuild: %s image built %s is older than the kit'\''s security rebuild floor %s — rebuild in the account shell: %s %s\n' \
+            "$label" "$built" "$floor" "$remedy" "$pointer"
+        return 0
+    fi
+    if kit_image_older_than_days "$built" "$max_age"; then
+        printf '  rebuild: %s image built %s is more than %d days old — refresh it in the account shell: %s, and check for a newer egresslock release %s\n' \
+            "$label" "$built" "$max_age" "$remedy" "$pointer"
+    fi
+}
+
 kit_check_gateway() {
     local rc=0
     if [[ "$doctor_has_gateway" == 1 ]]; then
@@ -3198,6 +3504,11 @@ kit_check_gateway() {
             fi
             if [[ -n "$gw_stale" ]]; then
                 echo "  $gw_stale — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"
+            elif [[ -n "$gw_base" ]]; then
+                kit_image_rebuild_notice gateway "$gw_created" "$gw_base" "$gw_pin" \
+                    "$prefix/gateway/security-floor" \
+                    'egresslock build-gateway --force && egresslock ensure --replace-gateway <profile> per affected profile' \
+                    '(see "The gateway image" reference page)'
             fi
         else
             echo "PROBLEM: gateway image: missing ($gw_img)"
@@ -3213,6 +3524,60 @@ kit_check_gateway() {
         echo "NOTE: gateway image: n/a (no gateway line in the account confdir)"
     fi
     return $rc
+}
+
+# EGL-487-D5: optional egl-base example image row. Skipped silently
+# when the example is not in the resolved share tree or the image is
+# absent; advisory and rc-neutral like the gateway image row. The pin
+# and the floor come from the same resolved directory.
+kit_check_egl_base() {
+    local egl_dir="$examples_dir/egl-base" egl_img="localhost/egl-base:latest"
+    [[ -f "$egl_dir/Containerfile" ]] || return 0
+    run_as_account podman image exists "$egl_img" 2>/dev/null || return 0
+
+    local egl_pin egl_ins egl_base egl_created egl_short egl_pin_short egl_built egl_stale
+    egl_pin="$(grep -oE 'sha256:[0-9a-f]{64}' "$egl_dir/Containerfile" | head -1 || true)"
+    egl_base=""; egl_created=""; egl_ins=""
+    if egl_ins="$(run_as_account podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}} {{.Created}}' "$egl_img" 2>/dev/null)"; then
+        # EGL-254: strip Podman's literal <no value> marker before the
+        # split so the pre-label branches fire.
+        [[ "$egl_ins" == "<no value>"* ]] && egl_ins="${egl_ins#"<no value>"}"
+        if [[ "$egl_ins" == *\ * ]]; then
+            egl_base="${egl_ins%% *}"
+            egl_created="${egl_ins#* }"
+        else
+            egl_base="$egl_ins"
+        fi
+    fi
+    egl_short="${egl_base#sha256:}"; egl_short="${egl_short:0:12}"
+    egl_pin_short="${egl_pin#sha256:}"; egl_pin_short="${egl_pin_short:0:12}"
+    egl_built=""
+    [[ -n "$egl_created" ]] && egl_built=", built ${egl_created:0:10}"
+    egl_stale=""
+    if [[ -n "$egl_base" ]]; then
+        if [[ -n "$egl_pin" && "$egl_base" != "$egl_pin" ]]; then
+            egl_stale="stale: base pin moved (image base $egl_short != deployed pin $egl_pin_short)"
+        fi
+    elif [[ -n "$egl_ins" ]]; then
+        egl_stale="stale: base unknown (pre-label image)"
+    fi
+
+    if [[ -n "$egl_base" ]]; then
+        echo "OK: egl-base image: present ($egl_img) — base $egl_short${egl_built} — the optional example image exists in the account's store"
+    elif [[ -n "$egl_ins" ]]; then
+        echo "OK: egl-base image: present ($egl_img) — base unknown (pre-label image)${egl_built} — the optional example image exists in the account's store"
+    else
+        echo "OK: egl-base image: present ($egl_img) — base unknown — the optional example image exists in the account's store"
+    fi
+    if [[ -n "$egl_stale" ]]; then
+        echo "  $egl_stale — rebuild in the account shell: $egl_dir/build-egl-base (see the egl-base README)"
+    elif [[ -n "$egl_base" ]]; then
+        kit_image_rebuild_notice egl-base "$egl_created" "$egl_base" "$egl_pin" \
+            "$egl_dir/security-floor" \
+            "$egl_dir/build-egl-base --force" \
+            '(see the egl-base README)'
+    fi
+    return 0
 }
 
 kit_check_profile_networks() {
@@ -3282,10 +3647,12 @@ doctor_kit() {
     fi
     doctor_resolve_account
     kit_check_conf_parse || rc=1
+    kit_check_policy_modes || rc=1
     kit_check_unit_env || rc=1
     kit_check_timer || rc=1
     kit_check_linger || rc=1
     kit_check_gateway || rc=1
+    kit_check_egl_base  # EGL-487-D5: rc-neutral; skipped when absent
     kit_check_profile_networks  # EGL-55-D1 rc-neutral; rc is never set
     return $rc
 }
@@ -3351,16 +3718,49 @@ fi
 main_conf="$confdir/main.conf"
 main_allowlist="$confdir/main-allowlist"
 if [[ "$init_conf" == 1 ]]; then
+    # EGL-433-D5: classify both halves with -L BEFORE the -e branch. A
+    # dangling symlink is false for -e, so the old code wrote the starter
+    # over the link (link loss) or suggested `touch` on its missing
+    # referent. Refuse every dangling half by name (conf then allowlist)
+    # before any write; a live link or a directory keeps the existing
+    # "exists / leave" branch below.
+    _init_conf_dangling() { # <conf|allowlist> <path> — S4, no write
+        local what="$1" path="$2" q qbak
+        printf -v q '%q' "$path"
+        printf -v qbak '%q' "$path.bak"
+        echo "egresslock-setup: --init-conf: refusing: destination $what is a symbolic link to a missing file: $q" >&2
+        echo "  the starter is written only to a missing path; move the link aside (only the link moves) to a name that does not exist, then re-run:" >&2
+        echo "    mv -n -T -- $q $qbak" >&2
+        echo "  if that name already exists, nothing moves; pick another name. the conf pair was not changed." >&2
+    }
+    init_conf_dangling=0
+    if [[ -L "$main_conf" && ! -e "$main_conf" ]]; then
+        _init_conf_dangling conf "$main_conf"
+        init_conf_dangling=1
+    fi
+    if [[ -L "$main_allowlist" && ! -e "$main_allowlist" ]]; then
+        _init_conf_dangling allowlist "$main_allowlist"
+        init_conf_dangling=1
+    fi
+    if (( init_conf_dangling )); then
+        exit 1
+    fi
+    unset init_conf_dangling
     if [[ -e "$main_conf" ]]; then
         echo "egresslock-setup: --init-conf: conf exists ($main_conf); leaving conf and allowlist untouched"
         if [[ ! -e "$main_allowlist" ]]; then
+            printf -v _q_conf '%q' "$main_conf"
+            printf -v _q_al '%q' "$main_allowlist"
+            printf -v _q_bak '%q' "$main_conf.bak"
+            printf -v _q_acct '%q' "$account"
             echo "egresslock-setup: torn conf pair; refusing (not repaired; the account cannot be used until the allowlist exists):" >&2
-            echo "  present: $main_conf" >&2
-            echo "  missing: $main_allowlist" >&2
+            echo "  present: $_q_conf" >&2
+            echo "  missing: $_q_al" >&2
             echo "  fix: create the allowlist as the account — an empty file is the valid deny-all starter:" >&2
-            echo "       sudo -u $account touch $main_allowlist" >&2
+            echo "       sudo -u $_q_acct touch -- $_q_al" >&2
             echo "  or start over: if this confdir holds nothing else, move the conf aside and re-run (only this conf moves):" >&2
-            echo "       sudo -u $account mv $main_conf $main_conf.bak" >&2
+            echo "       sudo -u $_q_acct mv -n -T -- $_q_conf $_q_bak" >&2
+            unset _q_conf _q_al _q_bak _q_acct
             exit 1
         fi
     else
@@ -3374,10 +3774,22 @@ if [[ "$init_conf" == 1 ]]; then
             echo "  the share tree is incomplete - .deb hosts: reinstall the package; prefix installs: re-run install-kit.sh" >&2
             exit 1
         }
-        run_as_account bash -c "$init_conf_script" || {
-            echo "egresslock-setup: --init-conf: could not write the starter pair as $account" >&2
+        _init_rc=0
+        run_as_account bash -c "$init_conf_script" || _init_rc=$?
+        if (( _init_rc != 0 )); then
+            # The account-side script prints its own cause line (and, after
+            # publish, the retained-allowlist guidance) and exits 3 for
+            # S4/S5 and every post-publish failure: never stack the generic
+            # wrapper over a named cause (D5). A pre-publish failure keeps
+            # the generic cause and writes no guidance (the allowlist was
+            # not published by this run).
+            if (( _init_rc != 3 )); then
+                printf -v _q_account '%q' "$account"
+                echo "egresslock-setup: --init-conf: could not write the starter pair as $_q_account" >&2
+                unset _q_account
+            fi
             exit 1
-        }
+        fi
         echo "egresslock-setup: --init-conf: wrote starter $main_conf (+ $main_allowlist)"
     fi
 fi
@@ -3443,10 +3855,8 @@ fi
 rm -f "$list_err"
 
 # A2: `network`/`list` do not open the allowlist. Probe it for every
-# profile whose conf declares a gateway, so a missing half fails here
-# rather than at the first ensure.
+# profile, so a missing half fails here rather than at the first ensure.
 for cf in "${conf_files[@]}"; do
-    grep -qE '^[[:space:]]*gateway[[:space:]]' "$cf" || continue
     cf_profile="$(basename "$cf" .conf)"
     cf_err="$(mktemp)"
     if ! run_as_account "$prefix/egresslock" allowlist "$cf_profile" >/dev/null 2>"$cf_err"; then
@@ -3491,7 +3901,7 @@ else
     step_line 3 "linger" SKIP
 fi
 
-# 4+5. User manager + gateway image (only profiles that declare one).
+# 4+5. User manager + gateway image.
 #    EGL-51-D1: a never-logged-in account has no systemd user manager
 #    (user@<uid>.service), so account-side podman falls back to cgroupfs
 #    and dies on the sd-bus create call. Start the user manager (start,
@@ -3499,49 +3909,36 @@ fi
 #    before the first account-side podman call. D38-7: these are numbered
 #    steps 4 and 5; the gateway image is never reached when the user
 #    manager FAILs.
-has_gateway=0
-for _cf in "${conf_files[@]}"; do
-    if grep -qE '^[[:space:]]*gateway[[:space:]]' "$_cf"; then
-        has_gateway=1
-        break
-    fi
-done
-if (( has_gateway )); then
-    if [[ "$(id -u)" == 0 ]]; then
-        uid="$(getent passwd "$account" 2>/dev/null | cut -d: -f3)"
-    else
-        uid="$(id -u)"   # hook mode: the invoking process IS the account
-    fi
-    if [[ -z "$uid" ]]; then
-        step_line 4 "user manager" FAIL
-        echo "egresslock-setup: cannot resolve the uid of '$account' (getent passwd failed); cannot start user@.service" >&2
-        exit 1
-    fi
-    if ! systemctl start "user@${uid}.service"; then
-        step_line 4 "user manager" FAIL
-        echo "egresslock-setup: systemctl start user@${uid}.service failed for '$account'" >&2
-        exit 1
-    fi
-    if ! systemctl is-active --quiet "user@${uid}.service"; then
-        step_line 4 "user manager" FAIL
-        echo "egresslock-setup: no systemd user manager for '$account' (user@${uid}.service inactive). As root: systemctl start user@${uid}.service" >&2
-        linger="$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)"
-        [[ "$linger" == "yes" ]] || \
-            echo "egresslock-setup: ... and: loginctl enable-linger ${account}  (or re-run setup with --enable)" >&2
-        exit 1
-    fi
-    step_line 4 "user manager" OK
-    if ! run_as_account bash -c "$build_gw"; then
-        step_line 5 "gateway image" FAIL
-        echo "egresslock-setup: gateway image build failed for '$account' (see the podman output above)" >&2
-        exit 1
-    fi
-    step_line 5 "gateway image" OK
+if [[ "$(id -u)" == 0 ]]; then
+    uid="$(getent passwd "$account" 2>/dev/null | cut -d: -f3)"
 else
-    echo "egresslock-setup: no gateway profiles; skipping image build"
-    step_line 4 "user manager" SKIP
-    step_line 5 "gateway image" SKIP
+    uid="$(id -u)"   # hook mode: the invoking process IS the account
 fi
+if [[ -z "$uid" ]]; then
+    step_line 4 "user manager" FAIL
+    echo "egresslock-setup: cannot resolve the uid of '$account' (getent passwd failed); cannot start user@.service" >&2
+    exit 1
+fi
+if ! systemctl start "user@${uid}.service"; then
+    step_line 4 "user manager" FAIL
+    echo "egresslock-setup: systemctl start user@${uid}.service failed for '$account'" >&2
+    exit 1
+fi
+if ! systemctl is-active --quiet "user@${uid}.service"; then
+    step_line 4 "user manager" FAIL
+    echo "egresslock-setup: no systemd user manager for '$account' (user@${uid}.service inactive). As root: systemctl start user@${uid}.service" >&2
+    linger="$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)"
+    [[ "$linger" == "yes" ]] || \
+        echo "egresslock-setup: ... and: loginctl enable-linger ${account}  (or re-run setup with --enable)" >&2
+    exit 1
+fi
+step_line 4 "user manager" OK
+if ! run_as_account bash -c "$build_gw"; then
+    step_line 5 "gateway image" FAIL
+    echo "egresslock-setup: gateway image build failed for '$account' (see the podman output above)" >&2
+    exit 1
+fi
+step_line 5 "gateway image" OK
 
 # 6. Optional timer enable. --enable arms the verify timer; the linger
 #    half of the old --enable block (ARC-28) moved above, before the
@@ -3567,7 +3964,7 @@ else
     echo "egresslock-setup: timer NOT enabled — this run did not arm drift checks. Arm it: sudo egresslock-setup init --account $account${profile_name:+ --profile $profile_name} --enable"
 fi
 
-echo "egresslock-setup: unit.env written for $account -> $home/.config/egresslock/unit.env"
+echo "egresslock-setup: unit.env written for $account to $home/.config/egresslock/unit.env"
 [[ -n "$profile_name" ]] \
     && echo "egresslock-setup: the scheduled check will verify only profile '$profile_name'" \
     || echo "egresslock-setup: the scheduled check will verify every profile"

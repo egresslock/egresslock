@@ -2,8 +2,10 @@
 
 Goal: build/compile untrusted (or supply-chain-attacked) code on a dev
 machine while constraining it to a tiny, reviewable egress — a
-malicious dependency can't phone home, and every denied attempt shows
-up in `denied`.
+malicious dependency can't phone home (HTTP(S) attempts that honor the
+proxy env show up in `denied`; direct attempts are dropped silently,
+and DNS to the bridge resolver is allowed and unaudited — see the
+[threat model](../../docs/reference/threat-model.md)).
 
 ## What you end up with
 
@@ -39,8 +41,14 @@ Everything else stays denied: no telemetry, no callbacks, no exfil.
 ```sh
 egresslock allow build registry.npmjs.org:443
 egresslock allow build pypi.org:443
+egresslock allow build files.pythonhosted.org:443
 egresslock allow build api.github.com:443
 ```
+
+(`files.pythonhosted.org` is easy to miss: pip resolves metadata on
+`pypi.org` but always downloads the wheels/sdists from PyPI's CDN —
+allowing only `pypi.org` leaves pip stuck; same pattern as the
+[hermes recipe](hermes-curl-install.md).)
 
 Then build the network + policy:
 
@@ -48,9 +56,10 @@ Then build the network + policy:
 egresslock ensure build
 ```
 
-`egresslock denied build` after a failed step tells you exactly which
-host the build tried to reach — the "learn what it needs, then pin"
-loop.
+`egresslock denied build` after a failed step tells you which host the
+build's proxy-honoring tooling tried to reach (direct attempts are
+dropped silently — see the goal paragraph) — the "learn what it needs,
+then pin" loop.
 
 ## 2. Deliver the code through the persistent folder
 

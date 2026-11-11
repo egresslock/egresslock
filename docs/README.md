@@ -79,6 +79,10 @@ docs/
     after-a-reboot.md            network looks fine after a reboot but
                                  workloads are unprotected (no policy)
     revocation-name-gone.md      revoking a rule whose name no longer resolves (manual recovery)
+    torn-conf-pair.md            the starter pair lost its allowlist half (torn conf pair)
+    long-request-15m.md          a long request dies at exactly 15m00 (squid read_timeout)
+    concurrent-commands.md       another egresslock command is running (account lock)
+    disk-full.md                 No space left on device / named write failures
 ```
 
 Component-local docs stay beside their component (`apparmor/README.md`,

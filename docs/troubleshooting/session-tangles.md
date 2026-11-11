@@ -35,3 +35,11 @@ the Go storage layer).
 benign desktop noise (DrKonqi, xdg-desktop-portal, snap units) — the
 only gate worth testing is the `podman unshare --rootless-netns true`
 probe (see [netns-inspection](netns-inspection.md)).
+
+## Links
+
+- Back to the [symptom index](../troubleshooting.md).
+- [netns-inspection](netns-inspection.md) — the netns probe this page
+  points at.
+- [concurrent-commands](concurrent-commands.md) — the other lock-style
+  interference.

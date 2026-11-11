@@ -1,0 +1,9 @@
+# Security rebuild floor for the optional kit-built egl-base image.
+#
+# Images created before this date may predate the package refresh
+# recorded here; the doctor prints a rebuild warning and a plain
+# build-egl-base refresh uses --no-cache below this floor. Bump this
+# date in the same change that issues an egl-base rebuild note.
+#
+# 2026-10-20: ca-certificates security update (DSA-6572-1).
+2026-10-20

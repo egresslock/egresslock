@@ -52,7 +52,7 @@ egresslock ensure main
 <pre>
 egl-runner@host:~$ egresslock ensure main
 using config /home/egl-runner/.config/egresslock/main.conf
-gateway 'egresslock-gateway-main' ready (already converged, not restarted)
+gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
 </pre>
 </details>
@@ -97,10 +97,13 @@ rc=0
 
 Troubleshooting: rc!=0 with `kill network process: permission
 denied`? The pasta/AppArmor blocker —
-[pasta-apparmor](../troubleshooting/pasta-apparmor.md). Check first:
-`egresslock-setup apparmor check`; apply
-`egresslock-setup apparmor add` only when the check reports
-`pasta amendment: required on this host`.
+[pasta-apparmor](../troubleshooting/pasta-apparmor.md). Check first
+(`egresslock-setup apparmor check` runs without root); apply the
+amendment only when the check reports
+`pasta amendment: required on this host` — as root, and with the full
+path on a prefix install:
+`sudo /opt/egresslock/egresslock-setup apparmor add`
+(`.deb hosts: sudo egresslock-setup apparmor add`).
 </details>
 
 ## 4. Are the anchor and gateway containers up?

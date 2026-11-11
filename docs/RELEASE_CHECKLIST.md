@@ -64,6 +64,12 @@ development history):
       revocation drift tripwire is green in the full battery. A new
       accept shape that joins only one walk can mis-flush an accepted
       address or miss a flow.
+- [ ] Gateway live-config truth: if the delta under review touches
+      `gw_generate_config`'s probe block/token, `gw_live_token` /
+      `gw_live_probe`, or `verify_gateway`'s deployed-vs-live
+      comparison, the delta carries the `egl393` battery result. A
+      deployed config the running Squid never loaded is invisible to a
+      parse-only verify.
 - [ ] Threat model matches the tree: no site launchers, accepted
       risks stated, no claim of sandbox or “any rootless Podman”.
 - [ ] README and setup docs match CLI names:
@@ -89,7 +95,7 @@ not open traffic); profile/allowlist parsing as hostile input
 (injection into shell/nft/Squid); privilege split (root distributes,
 account executes; no NOPASSWD); gateway cap-drop and CONNECT policy;
 DNS pin vs `verify` drift-warn; AppArmor pasta amendment (narrow,
-conditional, removable, `--apparmor-check`); both install channels;
+conditional, removable, `apparmor check`); both install channels;
 ShellCheck plus a manual pass on profile-fed commands; docs vs
 implementation; secrets/hygiene on the **snapshot file set**.
 

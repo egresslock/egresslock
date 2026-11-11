@@ -188,13 +188,30 @@ and skips them — call the full path (`$PREFIX/egresslock`) instead.
 <pre>
 $ PREFIX=/opt/egresslock
 $ sudo ./install-kit.sh --prefix "$PREFIX"
-install-kit: deployed kit to /opt/egresslock
-install-kit: unit templates -> /etc/systemd/system
-install-kit: PATH wrappers -> /usr/local/bin/egresslock, /usr/local/sbin/egresslock-setup
+PATH wrapper installed: /usr/local/bin/egresslock to /opt/egresslock/egresslock
+PATH wrapper installed: /usr/local/sbin/egresslock-setup to /opt/egresslock/egresslock-setup
+
+successfully installed! kit is at: /opt/egresslock
+  0.11.0+git20261108123456.a1b2c3d4e5f6
+
+AppArmor: podman labeled; confirm pasta compatibility: sudo /opt/egresslock/egresslock-setup apparmor check
 
 next step — per-account setup (from the installed kit):
   sudo /opt/egresslock/egresslock-setup init --account <acct> --init-conf --enable
+  (or --from <conf> to import a pair; import never overwrites a
+  differing/torn dest — use import --force deliberately; the starter
+  ships from examples/ only when the dest conf is missing)
+
+or try the engine directly:  /opt/egresslock/egresslock --help
 </pre>
+
+The AppArmor line depends on the host: an AppArmor-confined podman
+gets the `podman labeled; confirm pasta compatibility` advisory above;
+an unlabeled host gets a `not confined by AppArmor … no action needed`
+line; the script is silent only when the AppArmor listing is unreadable
+(UNKNOWN). If `/usr/local/…` is unwritable the install prints a WARNING
+and skips that wrapper — the kit itself is already deployed, call the
+full path.
 
 Set `PREFIX` to the chosen absolute path; `/opt/egresslock` above is
 the default. Keep that same path for upgrades and uninstall.
@@ -289,7 +306,7 @@ egresslock-setup: building the gateway image — first run downloads the base im
 5) gateway image … OK
 enabling verify timer for <account> (egresslock-verify@<account>.timer)
 6) timer … OK
-egresslock-setup: unit.env written for <account> -> /home/<account>/.config/egresslock/unit.env
+egresslock-setup: unit.env written for <account> to /home/<account>/.config/egresslock/unit.env
 egresslock-setup: the scheduled check will verify every profile
 egresslock-setup: account '<account>' is ready — it can ensure profiles now
 next steps (as the account):
@@ -449,8 +466,9 @@ egresslock ensure main                # or your profile name
 
 <details><summary>Expected output:</summary>
 the first `ensure` creates the network, starts the anchor and
-gateway, and installs the policy; re-runs are idempotent and report
-`already converged`.
+gateway, and installs the policy; re-runs are idempotent and report the
+same `allowlist applied, health verified` line while reloading a warm
+gateway in place.
 
 <pre>
 <account>@host:~$ egresslock ensure main
@@ -487,9 +505,9 @@ egresslock verify main                # read-only drift check
 NETWORK ID    NAME              DRIVER
 <id>          egresslock-main   bridge
 <account>@host:~$ podman ps -a
-CONTAINER ID  IMAGE                                STATUS        NAMES
-<id>          localhost/egresslock-anchor:latest   Up 2 minutes  egresslock-anchor-main
-<id>          localhost/egresslock-gateway:latest  Up 2 minutes  egresslock-gateway-main
+CONTAINER ID  IMAGE                                          STATUS        NAMES
+<id>          docker.io/library/alpine:3.22@sha256:<digest>  Up 2 minutes  egresslock-anchor-main
+<id>          localhost/egresslock-gateway:latest            Up 2 minutes  egresslock-gateway-main
 <account>@host:~$ egresslock list
 NAME           NETWORK                SUBNET
 main           egresslock-main        10.199.0.0/24
@@ -513,7 +531,7 @@ cat ~/.config/egresslock/unit.env     # EGRESSLOCK_PROFILE=... only in named mod
 <pre>
 <account>@host:~$ ls -la ~/.config/egresslock/
 total 20
-drwxr-xr-x 2 <account> <account> 4096 Oct  9 12:00 .
+drwx------ 2 <account> <account> 4096 Oct  9 12:00 .
 drwxr-xr-x 4 <account> <account> 4096 Oct  9 12:00 ..
 -rw-r--r-- 1 <account> <account> 1234 Oct  9 12:00 gateway-build.log
 -rw------- 1 <account> <account> 1065 Oct  9 12:00 main.conf

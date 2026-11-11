@@ -49,6 +49,7 @@ user, switch to the container-owner account instead
 
 ## Links
 
+- Back to the [symptom index](../troubleshooting.md).
 - [who-runs-what](../reference/who-runs-what.md) — who runs the
   engine and the workloads (root never does).
 - [first-run-checks](../quickstart/first-run-checks.md) — the checks

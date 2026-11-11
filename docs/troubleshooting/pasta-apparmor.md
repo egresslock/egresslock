@@ -139,7 +139,23 @@ is a no-op — applied anyway as future-proofing; `--apparmor-check`
 tells you which case you are in.
 
 Manual (no setup available) — keep enforce but allow the signal (**the
-fix**; profile stays enforced):
+fix**; profile stays enforced). First check the profile actually
+references a local fragment — an unreferenced local file loads
+nothing, yet `apparmor_parser -r` exits 0 ([LP
+#2165739](https://bugs.launchpad.net/bugs/2165739)); the kit's apply
+handles include-less profiles automatically, this manual path does
+not:
+
+```sh
+# Does the profile include a local fragment at all?
+grep -n '#include <local/' /etc/apparmor.d/usr.bin.pasta   # or .../pasta
+```
+
+No match? Then appending to the local file would be inert — either
+add the marked include `#include <local/usr.bin.pasta>` into the
+profile first (after backing the profile up), or use the kit's apply
+above. With a local include present, write the rule into the local
+fragment the profile names and reload:
 
 ```sh
 # Shipped snippet: apparmor/usr.bin.pasta.local
@@ -147,7 +163,7 @@ fix**; profile stays enforced):
 # THE PROFILE FILE that exists (often usr.bin.pasta; may be 'pasta'):
 sudo apparmor_parser -r /etc/apparmor.d/usr.bin.pasta   # or .../pasta
 
-# B. Alternate but less secure workaround — put pasta in complain mode
+# Alternate but less secure workaround — put pasta in complain mode
 #    (denials logged, not blocked):
 sudo aa-complain /usr/bin/pasta
 ```
