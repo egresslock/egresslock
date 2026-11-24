@@ -3,12 +3,14 @@
 # egresslock-start — daemon-start wrapper for network-profile accounts
 # (ARC-7-D5; ARC-16-D2/D4).
 #
-# Runs `egresslock ensure <profile>` BEFORE exec'ing the account's
-# daemon, so the profile network, anchor, gateway, and nftables policy
-# exist and are verified before any job container can start. The runner
-# account has no per-job hook to run `ensure`; the anchor container
-# keeps the rootless netns (and therefore the policy) alive across job
-# churn. If ensure fails, the daemon does not start — the designed
+# Runs `egresslock ensure <profile>` BEFORE exec'ing a site daemon, so
+# the profile network, anchor, gateway, and nftables policy exist and
+# are verified before the daemon can start a workload. It is for a
+# service that has no per-job hook to run `ensure` (a CI runner is one
+# example); the anchor container keeps the rootless netns (and
+# therefore the policy) alive across job churn. It is not a workload
+# launcher: it starts the daemon named by RUNNER_BIN, never a job
+# container. If ensure fails, the daemon does not start — the designed
 # fail-closed mode.
 #
 # Deployment: this wrapper is deployed ROOT-owned into the shared kit
@@ -23,12 +25,15 @@
 # so the wrapper cannot consume flags. This header is the reference.
 #
 # Environment (ARC-16-D2: explicit-only, no site defaults):
-#   EGRESSLOCK_DIR     dir holding egresslock. Resolution order
+#   EGRESSLOCK_DIR       dir holding egresslock. Resolution order
 #                         (ARC-16-D4): this var > /opt/egresslock >
 #                         this script's directory.
-#   EGRESSLOCK_PROFILE         profile name to ensure. REQUIRED.
-#   RUNNER_BIN            daemon binary to exec. REQUIRED (no site
+#   EGRESSLOCK_PROFILE   profile name to ensure. REQUIRED.
+#   RUNNER_BIN           daemon executable to exec. REQUIRED (no site
 #                         default — the unit or caller supplies it).
+#                         The name is kept for compatibility with
+#                         existing units; it is the daemon path, not
+#                         necessarily a CI runner.
 #
 # The profile's conf is not passed to the engine: it always lives at
 # <account-home>/.config/egresslock/<profile>.conf (EGL-325).
@@ -42,6 +47,7 @@
 #
 # systemd (system unit, User=<account>): ExecStart runs this wrapper,
 # which execs the daemon with its args, e.g.:
+#   Environment=EGRESSLOCK_PROFILE=<profile>
 #   Environment=RUNNER_BIN=/usr/local/bin/<daemon>
 #   ExecStart=/opt/egresslock/egresslock-start daemon -c <conf>
 

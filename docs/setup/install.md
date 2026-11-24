@@ -21,7 +21,7 @@ is **interactive only** — do **not** grant `install-kit.sh`,
 1. **A Linux host or VM** 
    * **systemd**
    * which permits unprivileged user, network, and mount namespace creation (the kit drives rootless Podman, but is not itself
-   supported running "incepted" inside a restricted container.)
+   supported running nested inside a restricted container.)
    * up-to-date with security patches
 
 2. **Debian packages** (install as root):
@@ -69,7 +69,7 @@ is **interactive only** — do **not** grant `install-kit.sh`,
    # root — via sudo from your own shell
    # prompt: $ (your own prompt)
 
-   sudo adduser --disabled-password --gecos "egresslock runner" <account>
+   sudo adduser --disabled-password --gecos "egresslock runner" ACCOUNT
    ```
 
    <details><summary>Expected output:</summary>
@@ -87,7 +87,7 @@ is **interactive only** — do **not** grant `install-kit.sh`,
    </details>
 
    - `--disabled-password` gives the account no password login —
-     it is a service account, reached with `sudo -iu <account>` or
+     it is a service account, reached with `sudo -iu ACCOUNT` or
      SSH keys.
    - Linger (required by the verify timer) is armed by
      `egresslock-setup --enable` in install step 4 — no manual
@@ -101,7 +101,7 @@ The `.deb` install is recommended. Alternative methods (the tarball
 prefix deploy) appear inline in collapsed blocks where they differ.
 To switch install methods later, uninstall the current one first
 ([Uninstall](uninstall.md)) — never install both: the `.deb` postinst
-warns if `/opt/egresslock/egresslock` exists.
+refuses the install (exit 1) if `/opt/egresslock/egresslock` exists.
 
 ### 1. Get the kit
 
@@ -119,7 +119,7 @@ build details):
 cd ~/egresslock
 git pull
 rm -f ./packaging/egresslock_*_all.deb
-./packaging/build-deb.sh        # → packaging/egresslock_<VERSION>_all.deb
+./packaging/build-deb.sh        # → packaging/egresslock_VERSION_all.deb
 ```
 
 <details><summary>Expected output:</summary>
@@ -157,7 +157,7 @@ $ tar -xzf packaging/egresslock_<VERSION>.tar.gz && cd egresslock
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-sudo dpkg -i ./packaging/egresslock_<VERSION>_all.deb
+sudo dpkg -i ./packaging/egresslock_VERSION_all.deb
 ```
 
 <details><summary>Expected output:</summary>
@@ -172,9 +172,9 @@ Setting up egresslock (<VERSION>) ...
 </pre>
 
 Troubleshooting:
-- a warning about an existing `/opt/egresslock/egresslock` means the
+- a `FAIL: a prefix kit is still installed` postinst error means the
   tarball install is present — uninstall it first (one install
-  method per host).
+  method per host), then finish with `sudo dpkg --configure egresslock`.
 </details>
 
 <details><summary>Alternative: tarball (manual prefix) install</summary>
@@ -197,7 +197,7 @@ successfully installed! kit is at: /opt/egresslock
 AppArmor: podman labeled; confirm pasta compatibility: sudo /opt/egresslock/egresslock-setup apparmor check
 
 next step — per-account setup (from the installed kit):
-  sudo /opt/egresslock/egresslock-setup init --account <acct> --init-conf --enable
+  sudo /opt/egresslock/egresslock-setup init <acct> --init-conf --enable
   (or --from <conf> to import a pair; import never overwrites a
   differing/torn dest — use import --force deliberately; the starter
   ships from examples/ only when the dest conf is missing)
@@ -245,8 +245,8 @@ Summary: CHECK OK (AppArmor patch not needed)
 </details>
 
 <details><summary>Expected output (needed):</summary>
-affected host — apply the amendment before step 4 (the first
-`ensure` fails without it):
+affected host — apply the amendment before the first `ensure`
+(step 7; it fails without it):
 
 <pre>
 $ sudo egresslock-setup apparmor check | grep Summary
@@ -270,7 +270,6 @@ AppArmor: pasta profile reloaded (/etc/apparmor.d/usr.bin.pasta). Confirm with: 
 
 - ships the starter conf (`profile main` + empty allowlist) when
   missing; on a fresh account it denies application connections,
-- writes the account's `unit.env`,
 - builds the gateway image,
 - arms the 15-minute verify timer and enables linger (`--enable`).
 
@@ -286,28 +285,26 @@ Every flag and the step-by-step run map: the
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-sudo egresslock-setup init --init-conf --enable --account <account>
+sudo egresslock-setup init ACCOUNT --init-conf --enable
 ```
 
 <details><summary>Expected output:</summary>
-the six-step run map — each step `OK`, then the next-step block (the
+the five-step run map — each step `OK`, then the next-step block (the
 gateway build stream goes to the account's
 `~/.config/egresslock/gateway-build.log`; details below):
 
 <pre>
-$ sudo egresslock-setup init --init-conf --enable --account <account>
+$ sudo egresslock-setup init <account> --init-conf --enable
 egresslock-setup: --init-conf: wrote starter /home/<account>/.config/egresslock/main.conf (+ /home/<account>/.config/egresslock/main-allowlist)
 1) validate conf … OK
-2) write unit.env … OK
 enabling linger for <account>
-3) linger … OK
-4) user manager … OK
+2) linger … OK
+3) user manager … OK
 egresslock-setup: building the gateway image — first run downloads the base image and packages; a few minutes. Build log: /home/<account>/.config/egresslock/gateway-build.log
-5) gateway image … OK
+4) gateway image … OK
 enabling verify timer for <account> (egresslock-verify@<account>.timer)
-6) timer … OK
-egresslock-setup: unit.env written for <account> to /home/<account>/.config/egresslock/unit.env
-egresslock-setup: the scheduled check will verify every profile
+5) timer … OK
+egresslock-setup: the scheduled check will verify every profile whose anchor is running
 egresslock-setup: account '<account>' is ready — it can ensure profiles now
 next steps (as the account):
   sudo -iu <account>
@@ -347,13 +344,13 @@ distributed by deploy tooling — same bundle, no starter shipped:
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-sudo egresslock-setup import --account <account> --from <pinned-conf>
-sudo egresslock-setup init --account <account> --profile <profile> --enable
+sudo egresslock-setup import ACCOUNT --from PINNED-CONF
+sudo egresslock-setup init ACCOUNT --enable
 ```
 
 `import` copies the conf+allowlist pair into the account's
 `~/.config/egresslock/` and stops; `init` then validates it as the
-account and prints the same six-step map. A destination pair that
+account and prints the same five-step map. A destination pair that
 differs from the source, or a torn one, is refused unless you pass
 `--force`, which replaces only a regular-file pair — a destination
 directory, symbolic link, or special file is refused (rc 1, nothing
@@ -436,7 +433,7 @@ you stay in it until you type `exit`):
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-sudo -iu <account>
+sudo -iu ACCOUNT
 ```
 
 <details><summary>Expected output:</summary>
@@ -476,6 +473,7 @@ created network egresslock-main (10.199.0.0/24)
 started anchor egresslock-anchor-main
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
+note: egresslock protects the policy, not the workload's launch settings — before starting a workload, review the operator obligations checklist: /usr/share/egresslock/docs/reference/operator-obligations.md
 </pre>
 
 Troubleshooting:
@@ -522,8 +520,7 @@ profile 'main' policy and gateway verified
 # account — you are still in the account shell
 # prompt: <account>@host:~$
 
-ls -la ~/.config/egresslock/          # main.conf, main-allowlist, unit.env, gateway-build.log
-cat ~/.config/egresslock/unit.env     # EGRESSLOCK_PROFILE=... only in named mode
+ls -la ~/.config/egresslock/          # main.conf, main-allowlist, gateway-build.log
 ```
 
 <details><summary>Expected output:</summary>
@@ -536,9 +533,6 @@ drwxr-xr-x 4 <account> <account> 4096 Oct  9 12:00 ..
 -rw-r--r-- 1 <account> <account> 1234 Oct  9 12:00 gateway-build.log
 -rw------- 1 <account> <account> 1065 Oct  9 12:00 main.conf
 -rw------- 1 <account> <account>  644 Oct  9 12:00 main-allowlist
--rw------- 1 <account> <account>    0 Oct  9 12:00 unit.env
-<account>@host:~$ cat ~/.config/egresslock/unit.env
-<account>@host:~$
 </pre>
 </details>
 

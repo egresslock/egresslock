@@ -107,9 +107,9 @@ sudo egresslock-setup apparmor check | grep Summary
 sudo egresslock-setup apparmor check | grep -q "CHECK FAILED" && sudo egresslock-setup apparmor add
 
 # --- set up the account: starter conf + drift timer + linger (root) ------
-# the run is quiet: the six-step map is what matters; the gateway image
+# the run is quiet: the five-step map is what matters; the gateway image
 # build stream goes to the account's ~/.config/egresslock/gateway-build.log
-sudo egresslock-setup init --init-conf --enable --account "$ACCOUNT"
+sudo egresslock-setup init "$ACCOUNT" --init-conf --enable
 
 # --- build the policy and the shared example image (as the account) -----
 sudo -iu "$ACCOUNT" -- egresslock ensure main
@@ -119,19 +119,17 @@ sudo -iu "$ACCOUNT" -- /usr/share/egresslock/examples/egl-base/build-egl-base
 <details><summary>Expected output (the lines that matter):</summary>
 
 <pre>
-$ sudo egresslock-setup init --init-conf --enable --account egl-runner
+$ sudo egresslock-setup init egl-runner --init-conf --enable
 egresslock-setup: --init-conf: wrote starter /home/egl-runner/.config/egresslock/main.conf (+ /home/egl-runner/.config/egresslock/main-allowlist)
 1) validate conf … OK
-2) write unit.env … OK
 enabling linger for egl-runner
-3) linger … OK
-4) user manager … OK
+2) linger … OK
+3) user manager … OK
 egresslock-setup: building the gateway image — first run downloads the base image and packages; a few minutes. Build log: /home/egl-runner/.config/egresslock/gateway-build.log
-5) gateway image … OK
+4) gateway image … OK
 enabling verify timer for egl-runner (egresslock-verify@egl-runner.timer)
-6) timer … OK
-egresslock-setup: unit.env written for egl-runner to /home/egl-runner/.config/egresslock/unit.env
-egresslock-setup: the scheduled check will verify every profile
+5) timer … OK
+egresslock-setup: the scheduled check will verify every profile whose anchor is running
 egresslock-setup: account 'egl-runner' is ready — it can ensure profiles now
 next steps (as the account):
   sudo -iu egl-runner
@@ -143,6 +141,7 @@ created network egresslock-main (10.199.0.0/24)
 started anchor egresslock-anchor-main
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
+note: egresslock protects the policy, not the workload's launch settings — before starting a workload, review the operator obligations checklist: /usr/share/egresslock/docs/reference/operator-obligations.md
 $ sudo -iu egl-runner -- /usr/share/egresslock/examples/egl-base/build-egl-base
 Building localhost/egl-base:latest FROM a72b4433de1c
 Done: localhost/egl-base:latest
@@ -188,6 +187,7 @@ the container's shell prompt — you are inside the locked network:
 $ sudo -iu egl-runner -- sh -c 'egresslock ensure main && podman run … sh'
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
+note: egresslock protects the policy, not the workload's launch settings — before starting a workload, review the operator obligations checklist: /usr/share/egresslock/docs/reference/operator-obligations.md
 root@9badc0ffee67:/#
 </pre>
 
@@ -199,6 +199,11 @@ returns to the account's one-off shell.
 Next: [Allow a
 domain](docs/quickstart/allow-a-domain.md) — probe the deny-all,
 then allow one destination.
+
+The kit enforces the policy; the [operator obligations
+checklist](docs/reference/operator-obligations.md) is the one-screen
+list of the steps that keep it effective (hardening, `ensure`/`verify`,
+and what to avoid).
 
 ## Quick start guides
 
@@ -264,6 +269,11 @@ exceptions stated, never silent):
   cap-drop/no-new-privileges, keep-id + passwd-entry on bind-mount
   recipes, read-only where the rootfs is disposable, and the stated
   exceptions.
+- **[Operator obligations checklist](docs/reference/operator-obligations.md)**
+  — the one-screen do / do-not list for keeping workload traffic
+  protected: the hardening baseline, `ensure`/`verify` before
+  workloads (including after a reboot), host patching, and the launch
+  modes, mounts, and resolver-input writes to avoid.
 - **[The gateway image](docs/reference/gateway-image.md)** — when to
   rebuild the kit-built gateway, what the doctor's `stale:` means, and
   the rebuild/replace steps.
@@ -286,13 +296,11 @@ exceptions stated, never silent):
   the pin never stabilizes, how to find the pool's addresses, and the
   ways out (`allow` by name, literals, or a tunnel).
 - **[Engine, scripts, and environment](docs/reference/scripts-and-environment.md)**
-  — engine env overrides, config resolution, `unit.env`, and script
-  defaults.
+  — engine env overrides, config resolution, and script defaults.
 - **[File locations](docs/reference/file-locations.md)** — where
   egresslock keeps the account's files: profile confs and allowlists,
-  `unit.env`, `<profile>.pins`, the engine lock, the proxy env file,
-  and the temp files a killed run can leave behind (mode, lifecycle,
-  backup/cleanup).
+  `<profile>.pins`, the engine lock, the proxy env file, and the temp
+  files a killed run can leave behind (mode, lifecycle, backup/cleanup).
 
 ### Troubleshooting
 
@@ -310,10 +318,17 @@ error.
   nftables required. The engine harness shards across a few processes
   by default (weights in `tests/shard-weights.tsv`) and still prints one
   `RESULTS TOTAL`; `--serial` restores the one-process path and
-  `--shard N/M` runs a single shard for debugging. For a quicker
-  iteration loop, `bash tests/run.sh --track fast` skips the registered
-  slow sections (named `SKIP:` lines keep the `RESULTS TOTAL` exact;
-  `bash tests/run.sh` — the default — still runs everything).
+  `--shard N/M` runs a single shard for debugging. A whole-set run ends
+  with one `BATTERY TOTAL` line — the sum of the per-harness
+  `RESULTS TOTAL` lines, with a `run.sh: subtotal — <harness>: …` row
+  above it for each harness — so the battery's failed count is the last
+  numeric line. For a quicker iteration loop, `bash tests/run.sh
+  --track fast` skips the registered slow sections (named `SKIP:` lines
+  keep the `RESULTS TOTAL` exact; `bash tests/run.sh` — the default —
+  still runs everything). Per-push CI uses `--track lite` (the core
+  engine sections plus kit and docs; the merged `RESULTS TOTAL` names
+  the deferred sections), while the full battery stays the handoff,
+  nightly, and release gate.
 - Found a vulnerability or a bypass? Report it privately — see
   [SECURITY.md](SECURITY.md). Do not open a public issue for it.
 - Other bug reports and changes go through public issues and pull

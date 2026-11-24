@@ -13,7 +13,7 @@ constraints; it does not add a feature.
 
 ## Before you start
 
-- **One pair, matching hosts.** The account name is a command flag, not
+- **One pair, matching hosts.** The account name is a command operand, not
   part of the files, so one pair fits every host that uses the same
   `profile` name, profile subnet, and gateway IP. Hosts that need
   different values need different pairs — that is a config-management
@@ -35,7 +35,7 @@ constraints; it does not add a feature.
   its sibling allowlist. Stage the pair at an absolute path the service
   account can read on each host.
 - **No passwordless sudo.** `egresslock-setup` takes free-form
-  arguments (`--account`, `--from`, `--prefix`), so a `NOPASSWD` rule
+  arguments (the account operand, `--from`, `--prefix`), so a `NOPASSWD` rule
   without an exact-argv restriction is equivalent to full root. The kit
   ships no sudoers snippet; run these commands through your existing
   root channel instead. See
@@ -51,7 +51,6 @@ constraints; it does not add a feature.
 # on each host after the root step
 /home/svc/.config/egresslock/svc.conf
 /home/svc/.config/egresslock/svc-allowlist
-/home/svc/.config/egresslock/unit.env        (written by init)
 ```
 
 ## 1. Stage the pair
@@ -62,7 +61,6 @@ then distribute those two files to `/srv/egress/` on every host:
 ```sh
 # /srv/egress/svc.conf — one profile, one gateway
 profile svc 10.199.8.0/24
-    rule gateway-only
     gateway 10.199.8.2 3128 svc-allowlist
 
 # /srv/egress/svc-allowlist — the file the gateway line must name
@@ -77,7 +75,7 @@ name exactly that file; another basename or an absolute path is
 refused (with the line to fix, nothing written), so fix the source pair
 before importing.
 
-`import` takes the account from `--account`; it is never in the files.
+`import` takes the account as its positional operand; it is never in the files.
 Check the exact flags on the host with `egresslock-setup help import`.
 
 ## 2. First deploy on each host
@@ -86,13 +84,13 @@ As root on the host (via `sudo` from your own shell, or your
 config-management tool's root channel):
 
 ```sh
-sudo egresslock-setup init --account svc \
+sudo egresslock-setup init svc \
     --from /srv/egress/svc.conf --enable
 ```
 
-This imports the pair, validates it as the account, writes `unit.env`,
-builds the gateway image if missing, and enables linger plus the verify
-timer. It stops at wiring — the runtime policy is applied by the
+This imports the pair, validates it as the account, builds the gateway
+image if missing, and enables linger plus the verify timer. It stops at
+wiring — the runtime policy is applied by the
 account step below.
 
 ```sh
@@ -107,19 +105,20 @@ shipped `main.conf` when your pair is also `main`) must be inspected
 first, then replaced with the re-pin form in step 3. `init` has no
 pair force — `--force` is an `import` flag only.
 
-Pathless `init` validates every `*.conf` in the account's config
-directory and writes an empty `unit.env`, so the timer verifies all
-profiles. That is the right form for a dedicated single-profile
-account. If the account holds several profiles and you want the timer
-to verify just this one, add `--profile svc` to `init` (the conf name
-still comes from the pair's `profile` line).
+`init` validates every `*.conf` in the account's config directory and
+the verify timer checks every profile with a running anchor — there is
+no named mode. That is the right form for a dedicated single-profile
+account; an account with several profiles gets every one with a running
+anchor checked. For a one-off single-profile runtime check, run
+`egresslock verify svc` as the account; to inspect one conf,
+`egresslock-setup doctor svc --profile svc`.
 
 If you prefer copy and wiring as separate steps, split it — same
 result, still no `--force`:
 
 ```sh
-sudo egresslock-setup import --account svc --from /srv/egress/svc.conf
-sudo egresslock-setup init --account svc --enable
+sudo egresslock-setup import svc --from /srv/egress/svc.conf
+sudo egresslock-setup init svc --enable
 ```
 
 ## 3. Re-pin every host
@@ -128,9 +127,9 @@ When the staged pair changes — an allowlist entry most often, the conf
 rarely — replace it on each host and re-apply:
 
 ```sh
-sudo egresslock-setup import --account svc \
+sudo egresslock-setup import svc \
     --from /srv/egress/svc.conf --force
-sudo egresslock-setup init --account svc --enable
+sudo egresslock-setup init svc --enable
 sudo -iu svc -- egresslock ensure svc
 sudo -iu svc -- egresslock verify svc
 ```
@@ -159,8 +158,8 @@ status=0
 while IFS= read -r host; do
     [ -n "$host" ] || continue
     if ssh "root@$host" 'set -e
-        egresslock-setup import --account svc --from /srv/egress/svc.conf --force
-        egresslock-setup init --account svc --enable
+        egresslock-setup import svc --from /srv/egress/svc.conf --force
+        egresslock-setup init svc --enable
         sudo -iu svc -- egresslock ensure svc
         sudo -iu svc -- egresslock verify svc
     '; then
@@ -187,7 +186,7 @@ to both `egresslock-setup` commands.
 |---|---|---|
 | 0 | Imported and wired (an identical pair also returns 0) | Run the account `ensure` / `verify`; check `egresslock denied svc` after a workload. |
 | 1 | Refused or validation failed; the destination was not touched | Read the named cause — source not readable by the account, subnet collision, differing pair without `--force`, failed staged validation — fix it, then re-run that host. |
-| 2 | Usage error (missing or unknown flag, `--profile` mismatch) | Fix the command or loop; the host was not changed. |
+| 2 | Usage error (missing or unknown flag, `--profile` on `init`) | Fix the command or loop; the host was not changed. |
 
 `import` is atomic: the pair is staged and validated as the account
 before anything is committed, a refusal or failed validation leaves the

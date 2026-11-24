@@ -82,7 +82,7 @@ podman_in_root() { # podman_in_root cmd [arg...] — run one podman command from
             export "${v?}"
         done
         cd / || {
-            echo "Error: cannot change directory to / before running the container runtime; no runtime command was run" >&2
+            echo "Error: cannot change directory to / before running the container runtime; no runtime command was run; check that / is accessible as this account: ls /; if that fails the host root is broken — repair it, then re-run (this is not a kit reinstall)" >&2
             exit 1
         }
         "$@"

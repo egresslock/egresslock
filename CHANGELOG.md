@@ -4,6 +4,548 @@ All notable changes between egresslock releases. The public repository
 ships without history (each release is a fresh snapshot tree), so this
 file is the record of what changed since the previous release.
 
+## 0.12.0 - 2026-11-23
+
+> **Action required:**
+>
+> 1. **Run `egresslock ensure all` in every account — verify fails
+>    until you do.** From your own shell, as each account:
+>
+>    ```sh
+>    sudo -iu ACCOUNT -- egresslock ensure all
+>    ```
+>
+>    * Before the re-ensure, every verify — `verify --ensured`,
+>      `verify all`, and the verify timer — fails with `verify: policy
+>      chain p_PROFILE does not match the expected ruleset (…)` until
+>      you re-ensure. The failure is expected on this upgrade: the
+>      expected ruleset now includes the direct-path denial record
+>      behind `denied PROFILE --direct` (New features, below), and a
+>      chain ensured by the previous release does not. It does not
+>      affect running workloads and is not a sign of tampering or a
+>      security problem; fail-closed enforcement is unchanged — the
+>      live chain still drops everything the previous release dropped.
+>      The chain change is one added record rule, `ip saddr CIDR
+>      ip protocol tcp update @d_PROFILE { ip daddr . tcp dport }
+>      counter`, inserted immediately before the existing `ip saddr
+>      CIDR counter drop` (the `@d_PROFILE` set it records into is
+>      declared outside the chain, so the diff shows only the rule).
+>      Example of that failure message, as it prints before the
+>      re-ensure (the `7d6` hunk header varies with the profile's rule
+>      count):
+>
+>      > verify: policy chain p_PROFILE does not match the expected ruleset (the live chain is not what this engine would install now — often after an upgrade or a conf change) — run as ACCOUNT: egresslock ensure PROFILE\
+>      > details: ruleset diff — "<" is the expected ruleset, ">" is the live one\
+>      > 7d6\
+>      > < ip saddr CIDR ip protocol tcp update @d_PROFILE { ip daddr . tcp dport } counter
+> 2. **Likely no action is needed. Only if you checkpoint workloads in
+>    your own rootful Podman: launch them with `--cap-drop=all
+>    --security-opt=no-new-privileges` before checkpointing, and
+>    recreate a container that is already running unhardened.** A
+>    restored checkpoint keeps the capabilities and `NoNewPrivs` it
+>    recorded: the pair on `podman run` with a checkpoint image — or on
+>    `podman container restore` — is silently discarded (CVE-2026-94603
+>    class).
+>    Details:
+>    [container hardening baseline](docs/reference/container-hardening.md),
+>    [threat model](docs/reference/threat-model.md).
+> 3. **If you scripted against the emitted help or error text, update
+>    the placeholder words.** Only text parsers are affected: help
+>    pages, `usage:`, `Error:`, `note:`, and `fix:` lines now spell
+>    placeholders as uppercase words (`PROFILE`, `HOST:PORT`, `CIDR`,
+>    …) and join alternates with `or` (`teardown PROFILE, all
+>    [--yes], or --orphans`); commands, flags, exit codes, and the
+>    argument grammar are unchanged.
+> 4. **Likely no action is needed. Only if your runner account is
+>    named `all`: rename the OS account before running setup again.**
+>    `all` is now reserved as an account name in setup commands, so
+>    `init`, `import`, and `doctor` refuse it with exit 2 before reading
+>    the account or writing anything; the engine still runs with the
+>    account, and only setup refuses it. The safe order — stop the old
+>    timer and linger first, rename the user and its primary group, then
+>    re-run setup and re-ensure the profiles — is in [The account name
+>    'all' is
+>    reserved](docs/reference/scripts-and-environment.md#the-account-name-all-is-reserved).
+> 5. **Likely no action is needed. Only if you hand-added a `no-proxy`
+>    line to a conf: delete it.** The tool never wrote the line; a
+>    leftover line is rejected at load (exit 2, naming the line and the
+>    fix), and `proxy-env` supplies the value from the direct pins.
+>
+> **Important but no action required:**
+>
+> 1. **CLI change: `teardown --runtime` was replaced by `teardown all`
+>    then `teardown --orphans`.** `teardown all` takes down every
+>    profile's containers and network, then `teardown --orphans`
+>    sweeps what no conf owns; the old flag exits 2 naming its
+>    successors.
+>
+>    > egresslock teardown all\
+>    > egresslock teardown --orphans
+>
+> 2. **CLI change: setup verbs now take the account positionally.**
+>    Existing scripts keep working — `--account` remains a hidden
+>    legacy alias — but the alias may be removed in a future release,
+>    so write new scripts positionally (`init ACCOUNT`, `import
+>    ACCOUNT`, `doctor [ACCOUNT]`).
+>
+>    > #still works:\
+>    > egresslock-setup init --account ACCOUNT
+>
+>    > #new:\
+>    > egresslock-setup init ACCOUNT
+>
+> 3. **CLI change: `egresslock-setup init` no longer accepts `--conf`.**
+>    The flag was a one-release silent alias of `--from`. A script that
+>    passes `--conf` exits 2 before any account write and names the
+>    replacements; a conf path was never required for init (the
+>    [install docs](docs/setup/install.md) carry the modes).
+
+### New features
+
+- **New `egresslock ensure all` and `egresslock verify all` — each
+  covers every profile in the account.**
+  `egresslock ensure all [--yes]` ensures every profile named by a
+  `<profile>.conf` in the account confdir, in conf-file order, and
+  stops at the first failure (there is no rollback; a retry converges
+  the rest). More than one profile requires `--yes` (after `all`) or a
+  terminal confirmation, and a non-terminal run without `--yes`
+  refuses with exit 1 and changes nothing; a single profile runs
+  without a prompt.
+  `egresslock verify all` checks every profile, continues after
+  per-profile failures, and ends in one tally; a profile that was
+  never ensured is a named failure, not a skip. `verify --ensured` is
+  unchanged — it verifies the profiles whose anchor is running — and
+  the timer is unchanged.
+
+  > egresslock ensure all\
+  > egresslock verify all
+
+- **New `egresslock denied PROFILE --direct` view — lists recent
+  direct-path TCP denials.** The direct lane previously left no
+  operator-readable
+  record; the profile's terminal IPv4 forward drop now records each
+  `IP:port` destination into a bounded in-kernel set (16384 entries,
+  24h idle expiry), and `denied --direct` prints the members sorted,
+  one `IP:PORT` per line:
+
+  > egresslock denied PROFILE --direct
+
+  Both `denied` views now
+  print the same one-line caveat on **stderr before** the entries (the
+  view covers one lane; a short or empty list is not proof), and a full
+  direct record warns that later denials were dropped but are not
+  listed. `egresslock help denied` and the docs carry the bulleted
+  per-lane limitations, including that other protocols are not
+  permitted for workload egress (DNS `:53` to the bridge gateway
+  excepted), so UDP/ICMP are dropped rather than merely unlisted, and
+  that IPv4 literals need a direct pin or `NO_PROXY`. An
+  empty record prints the shared caveat and the empty-list sentence on
+  **stderr** with empty stdout (so a paste loop cannot feed prose to
+  `allow`); a missing record names `egresslock ensure PROFILE`, and a
+  failed read names the rootless netns read. The list is destinations
+  only — not hostnames or container identities — and covers terminal
+  TCP drops only, so a short or empty list is not proof that nothing
+  else was denied. Gateway `denied` entries, `--all`/`--days` (proxy
+  log only), and fail-closed enforcement are otherwise unchanged.
+- **`ensure` now points at the operator-obligations checklist.** After
+  a successful explicit `ensure`, one `note:` line on stderr names the
+  operator obligations checklist with its installed path and says that
+  egresslock protects the policy, not the workload's launch settings.
+  It is a
+  standing pointer, not a launch-time check: `verify`,
+  `allow`/`disallow`'s internal re-ensures, and the 15-minute timer
+  stay silent; `egresslock-start` inherits the line because it invokes
+  `ensure`.
+- **`doctor` now reports three advisory groups.** A `podman_cve:` line
+  follows the existing `podman:` row for each known-vulnerable
+  advisory that matches a parseable Podman version — one line per
+  matching advisory, now CVE-2026-94603 and CVE-2026-111361.
+  Prefer Podman 5.8.10 / 6.2.0 (or a distro backport) for digest-pinned
+  pulls — the threat model's Podman floor.
+  A `workloads:` section, printed only with `egresslock doctor
+  --workloads`, lists running non-kit containers in the
+  invoking account that are attached to a profile network, the host
+  network, or another container's network namespace and reports the
+  launch obligations it can see (network mode, dual-homing, exposure
+  binds, capabilities, no-new-privileges). An unreadable list, inspect,
+  or status read prints
+  `UNKNOWN` rather than a clean or skipped result. No section prints
+  at zero candidates on the flagged path, the section is advisory only
+  (not a check of your next launch), and bare doctor prints a
+  `workloads:` pointer line instead of scanning running containers.
+  A `conf:` row appears for each leftover retired `rule gateway-only`
+  line in the account's conf files: the directive is ignored at load
+  and has no effect, and the row names the file and the line — ignore
+  it or delete it; no `ensure` is needed. No advisory changes the exit
+  code.
+- **`doctor` now reports a running gateway on a different image.**
+  After the `gateway image:` block, a `running gateway:` line names
+  each profile whose running gateway container image ID differs from
+  the tagged image's ID, with a replace-only remedy (or rebuild first
+  when the image row printed `stale:`/`rebuild:`). It is silent when
+  no gateway runs, every ID matches, or the tagged image is absent,
+  and prints `running gateway: UNKNOWN — …` when the comparison
+  cannot be read. Advisory only: the read-only row never changes the
+  exit code and never builds, replaces, or starts anything.
+
+### Changed
+
+- **Setup verbs now take the account positionally: `init ACCOUNT`,
+  `import ACCOUNT`, and `doctor [ACCOUNT]`.** The account is the verb's
+  main operand, so help, emitted fix/check lines, packaging next steps,
+  and the docs now spell it positionally; the operand may appear before
+  or after the flags (`init ACCOUNT --enable` and `init --enable
+  ACCOUNT` both work). `--account` remains a hidden legacy alias:
+  existing scripts keep working, the same value in both forms is
+  accepted, and two different values (or a second positional) exit 2
+  before any account is read. Bare `doctor` is still the host slice;
+  an account operand adds the account slice. `all` is reserved as an
+  account name on every setup path and refused with exit 2 at the same
+  point; the check is case-sensitive, so `ALL` is unaffected, and the
+  engine still runs with an account named `all` (action item 4). No
+  action is required for the new spelling.
+
+- **Stopping the per-account verify timer now also stops a verify run
+  that is already in progress.** `systemctl disable --now
+  egresslock-verify@<account>.timer` propagates the stop to that
+  account's verify oneshot, and the uninstall steps stop the timer
+  before the teardown step, so a verify no longer runs while the
+  runtime is being removed. No action is required for an existing
+  install.
+
+- **Teardown now has one profile-scope grammar: `all` means every
+  profile, named teardown works without its conf, and `--runtime` is
+  replaced by `--orphans`.** `egresslock teardown all` selects every
+  `<profile>.conf` in the account confdir (by file name only — the
+  contents are never read, so a malformed conf cannot block an urgent
+  stop), prints `teardown all: N profiles: …`, and, when more than one
+  profile resolves, requires `--yes` or a terminal `y`; a non-terminal
+  run without `--yes` refuses with exit 1 and removes nothing, while a
+  single profile runs without a prompt. Zero configs is exit 2 with a
+  pointer at `--orphans`; a legacy `all.conf` still refuses.
+  `egresslock teardown <profile>` derives its object names from the
+  token and no longer needs the conf, so a profile can be torn down
+  after its files are archived; a well-formed unknown name is an
+  idempotent exit-0 no-op. `egresslock teardown --orphans` replaces
+  `--runtime`: it removes kit-named containers, networks, and
+  `p_<profile>` chains that no remaining `<profile>.conf` owns, keeps
+  live profiles silent (a legacy `all.conf` or an unreadable conf is
+  kept and named, never swept), and deletes `inet egresslock` only
+  when no config remains and no kit network or chain is left. A failed
+  or timed-out listing
+  prints `incomplete teardown` (named/`all`) or `incomplete sweep`
+  (`--orphans`) and exits 1 instead of claiming `not present` or
+  `no kit leftovers`. A config directory that exists but cannot be
+  listed is a named refusal (`teardown all` exit 2, `--orphans` exit
+  1) with nothing removed. `teardown --runtime` exits 2 for one release and
+  names its two successors; uninstall becomes `teardown all --yes`
+  then `teardown --orphans`. Kept objects and failed removals remain
+  exit-0 disclosures with their existing notes. The scripted
+  replacement is the first item under Important but no action required.
+- **`v6deny` is now a reserved profile name; only an install that
+  already has a profile named `v6deny` is affected.** Such a profile
+  `v6deny` derives the shared IPv6-deny chain `p_v6deny`, so it could
+  install into, verify against, or tear down the chain every profile
+  shares. `egresslock init v6deny`, the named commands, the config
+  loader, and `egresslock-setup doctor --profile v6deny` now exit 2
+  with a named `reserved` error before a conf is read or a file is
+  written; `egresslock-setup import` refuses such a source with exit
+  1; `teardown v6deny` exits 2. A pre-existing `v6deny.conf` fails to
+  load until renamed: rename the conf, allowlist, and `profile` line
+  to a valid name, then `ensure` it, and sweep any old
+  `egresslock-v6deny` runtime objects with `teardown --orphans` once
+  no conf owns them. `main` and every other
+  `[a-z0-9][a-z0-9-]*` name are unchanged. See
+  [Reserved profile name](docs/reference/policy-reference.md#reserved-profile-name).
+- **The engine and `egresslock-verify` now name the installed copy of
+  the docs page — the prefix's `docs/`, or
+  `/usr/share/egresslock/docs/` in the `.deb` — instead of a
+  repo-relative `docs/` path.** The engine and
+  `egresslock-verify` resolve one docs base on the host and print
+  `<page title>: <absolute path>` only when that page exists; with no
+  docs tree the line keeps the title and prints no path. A prefix
+  install now ships the docs tree (regular `.md` pages, no `tickets/`
+  or `BOARD.md`), so a pointer still resolves after the checkout or
+  tarball is removed, and the `.deb` exposes the same `docs/` path as a
+  relative symlink beside its documented `doc/docs/` tree. No action is
+  required; `dpkg -L` gains only the alias.
+- **Kit install/uninstall, `--init-conf`, and the deb builder now refuse
+  a directory swapped in after their checks instead of acting on it.**
+  `install-kit.sh`/`uninstall-kit.sh` exit 1 with `refusing: --prefix
+  changed while the kit checked it`; the deb builder exits 2 with
+  `refusing: EGRESSLOCK_DEB_KEEP_STAGE changed while the staged tree was
+  checked`. `egresslock-setup --init-conf` no longer replaces a starter
+  file that appeared while it ran: a regular allowlist is left in place,
+  and the success line says it was already present. No action is
+  required; a normal run is unchanged.
+- **The hand-edited `no-proxy` conf directive is removed; `NO_PROXY` is
+  derived from the installed direct pins.** `proxy-env` now emits
+  `localhost,127.0.0.1` plus every unique IPv4 direct pin, in conf
+  order; a hostname pin stays out, and HTTP(S) by name belongs on the
+  profile's Squid allowlist. The tool never wrote a `no-proxy` line into
+  a config — it could only ever have been added by hand — so if you did
+  not add it yourself, it cannot have arrived from an upgrade. A
+  leftover `no-proxy` line is rejected at load (exit 2, naming the line
+  and the fix): delete it; `proxy-env` supplies the value. For a conf
+  that never carried the line, the six assignments, the `noproxy`
+  token, `--out`, and the loopback-only value for a profile with no
+  direct pins are byte-identical. The deletion is action item 5; no
+  gateway or network is restarted.
+- **`install-kit.sh` now checks every shipped kit file before copying
+  and deploys the documented file modes.** A source tree missing any
+  shipped core, `gateway/`, `apparmor/`, or `examples/` file (including
+  every `examples/recipes/` and `examples/egl-base/` leaf) fails with
+  the existing incomplete-kit-tree message and nothing is written; a
+  complete checkout or release tarball is unchanged. Every leaf is now
+  installed with `install -m`, so the documented 0644/0755 modes hold
+  under a nonstandard umask (under the standard kit umask the deployed
+  modes are unchanged). No action is required.
+- **`rule gateway-only` is retired and no longer config-driven.**
+  Every profile now emits the workload→gateway proxy accept from its
+  required `gateway` line — the same accept the line used to request.
+  Compiled chains are byte-identical for the canonical shape (`init`
+  starters and the shipped examples: the line was first among the
+  rules). A conf that still carries `rule gateway-only` loads
+  unchanged and silently (the line is ignored and does not affect
+  behavior); `egresslock doctor` reports each leftover line with a
+  `conf:` row naming the file and the line — ignore it or delete it;
+  no `ensure` is needed. `init` / the shipped examples no longer
+  write it. **Action required: none** for a canonical conf — the line first
+  among the rules, as `init` writes it (deleting it only clears the
+  doctor row). A hand-edited conf (an `allow-host` line above the retired
+  line, or a duplicated line) or a conf written without the line
+  compiles differently, and `verify` names the expected-ruleset drift
+  until one `ensure` (action item 1). No gateway or network is
+  restarted by the conf change itself; the later `ensure` reloads the
+  gateway in place when the reload can be confirmed, and restarts it —
+  dropping that profile's proxied sessions — when it cannot.
+- **A `.deb` install now refuses (exit 1) when a prefix kit is still
+  installed at `/opt/egresslock`,** even when no `/etc` unit template
+  shadows the deb's — the last co-install shape that completed
+  warn-only. The remedy is `uninstall-kit.sh --prefix
+  /opt/egresslock`, then `dpkg --configure egresslock`.
+- **The engine now warns about unrecognized and retired `EGRESSLOCK_*`
+  environment variables.** Every invocation scans the process
+  environment before dispatch: a name the project does not read prints
+  one stderr warning, and a retired name prints the retired warning
+  (`EGRESSLOCK_CONF` since v0.10.0; `EGRESSLOCK_LEGACY_PREFIX`, removed
+  in 0.9.0). Commands keep their current output and exit codes, and
+  variable values are never read or echoed. **Action required: none** —
+  unset a reported name to silence the warning.
+- **`EGRESSLOCK_SHARE` is now a test-harness override like its
+  siblings.** `egresslock-setup` and the engine's doctor ignore it and
+  print the one warning naming `EGRESSLOCK_KIT_ALLOW_NON_ROOT=1`
+  unless that flag is set; both hidden help pages mark the
+  requirement.
+- **The doctor's two `chmod` fix lines now `%q`-quote the policy-file
+  path and the confdir,** so a path containing spaces stays one
+  argument when the printed `fix:` line is pasted.
+- **The `ensure` recovery hints this release reworked now name the
+  account before the command, e.g. `run as ACCOUNT: egresslock ensure
+  PROFILE`,** and the command ends its line, so a hint copied from a
+  journal, screenshot, or admin shell runs as printed instead of
+  dead-ending at the root refusal or failing with a bash syntax error.
+  A two-command remedy puts each command on its own line, scoped the
+  same way. No command, flag, exit code, fail-closed behavior, or
+  policy change; no action is required.
+- **Four refusal families now name the next action.** `proxy-env --out`
+  refuses an unusable target with one cause-specific next step (the
+  five texts that already named a move are unchanged); `ensure` and
+  `init` name `podman network ls` after a failed network list; the
+  engine (and the shipped `egl-base` example builder) names `ls /`
+  when `/` cannot be entered (and says it is not a kit reinstall); and
+  `egresslock-setup import` prints the staged sibling's `fix:` line for
+  an in-place conf, allowlist, or torn pair, naming the in-place path
+  and that nothing was changed. Exit codes, check order, and
+  fail-closed side effects are unchanged; no action is required.
+
+### Removed
+
+- **The named verify mode is gone, and the per-account
+  `~/.config/egresslock/unit.env` file is no longer created or read;
+  the verify timer now checks profiles with a running anchor.**
+  `egresslock-verify` always
+  runs `egresslock verify --ensured`, which verifies every profile with
+  a running anchor, using the `*.conf` files in the account's config
+  directory (the same aggregate the engine uses).
+  `egresslock-setup init` no longer writes `unit.env`
+  and no longer accepts `--profile` (rc 2 with a pointer to
+  `egresslock-setup doctor --profile`, the read-only inspection
+  narrowing that stays); `egresslock-setup doctor` no longer reports a
+  `unit.env` row. `egresslock-start` is unchanged and still requires
+  `EGRESSLOCK_PROFILE` to choose the profile it ensures. Existing
+  `unit.env` files are ignored by the timer and safe to delete. Named
+  mode was never a default: `init` wrote `EGRESSLOCK_PROFILE` only when
+  run with `--profile` — the default run kept the file in aggregate
+  mode — so an account is affected only if someone chose named mode
+  explicitly. An account that used named mode becomes aggregate on
+  upgrade (a fully torn-down profile, a deleted conf, or a torn state
+  no longer alarms the timer).
+- **`egresslock-setup init` no longer accepts `--conf`.** The one-release
+  silent alias of `--from` is retired: a leftover `init
+  --conf PATH` (including the legacy verb-less `--account A --conf C`
+  bundle) is refused with rc 2 before any account write and names both
+  replacements, `init ACCOUNT --from PATH` or `import ACCOUNT --from PATH`
+  (on a live host the account and engine checks still run first and can
+  exit 1 instead).
+  `init --conf ''` (an empty value) is refused too, instead of running
+  a silent pathless init. `init --from`, `import`,
+  and the `doctor --conf` display hint are unchanged; replace a
+  leftover `init --conf` with `init --from`.
+
+### Fixed
+
+- **`verify` now fails closed when the nft ruleset listing cannot be
+  trusted.** A rule or chain comment that contains text shaped like a
+  table header or chain declaration can no longer hide another table's
+  early forward hook, and a line break in a comment or table name can
+  no longer re-attribute that hook to this kit's table. When the
+  listing cannot be read, a table or chain header cannot be recognized,
+  or a hook priority cannot be read, `verify` prints a named failure
+  and exits 1 instead of passing silently. The existing foreign-hook
+  warning and its wording are unchanged, and a listing that
+  `nft list ruleset` renders normally still verifies green. No action
+  is required.
+- **`egresslock-verify`'s netns probe now has a real 5s bound when
+  the runtime ignores TERM.** The wrapper copies the engine's
+  `timeout -k 1 5` probe, so a TERM-immune
+  `podman unshare --rootless-netns` is KILLed after a 1s grace instead
+  of running until systemd's own start timeout — or forever on a
+  manual run. The named `netns probe timed out after 5s` line is printed
+  only when the probe reached the bound; the KILL outcome adds that the
+  probe ignored TERM and was killed after the grace (exit 1 either way).
+  A 124 or 137 that arrives before the bound is not a timeout — a probe's
+  own 124, or an external SIGKILL (OOM kill, stray `kill -9`, runtime
+  abort), keeps the generic broken-probe report with the real rc. The
+  `-h` text and the verify-timer page now define the sweep's silent
+  exit 0 as "no profile with a running anchor and nothing stale", not
+  "nothing ensured": a stopped anchor with its policy chain still
+  installed is skipped silently and is still enforcing. No action is
+  required.
+- **`verify --ensured` help, index, and usage now state the sweep's
+  real scope: profiles with a running anchor.** A profile whose anchor
+  is running is verified; one whose anchor is not running is skipped —
+  both with no network object and with its policy still installed — and
+  a network left without its policy is a named failure. The shipped
+  docs and comments that repeated "every profile" say the same scope.
+  No behavior, exit code, timer, or scan change.
+- **`--direct` now refuses a symlinked profile conf instead of replacing
+  the operator's link.** A symbolic link at `<profile>.conf` is named
+  and left untouched before any rewrite, so `allow … --direct` and
+  `disallow … --direct` no longer replace the link with a regular file
+  while the file it points to keeps its old contents. The refusal writes
+  no temporary file and no pending-revocation record; the automatic
+  restore path refuses a link without flattening it too. A duplicate
+  entry read through the link still prints `entry already present`, and
+  a regular conf is rewritten as before. Edit the file the link points
+  to by hand while no egresslock command is running, then
+  `ensure PROFILE`. No action is required unless a refusal names your
+  conf.
+- **A failed log-rotation restore now reports the leftover generation,
+  and the next rotation repairs it so the gateway log cap keeps
+  working.** When the gateway log restore links
+  `/var/log/squid/access.log.1` back and then cannot remove the extra
+  name, the two paths are one file and the next rotation's move used to
+  be refused forever — the log then grew past
+  `EGRESSLOCK_GW_LOG_MAX_BYTES` with no operator-actionable line. The
+  run now says the two paths are the same file; the next over-cap
+  rotation removes the proven duplicate (`repaired:`) and rotates
+  normally. A `.1` that is a different file is never removed, and no
+  clobbering move is ever used. No action is required unless a warning
+  asks for one.
+- **Uninstalling the kit now finds every enabled verify timer
+  instance.** `uninstall-kit.sh`'s timer sweep no longer trusts
+  `systemctl list-unit-files` alone: it also reads the manager's loaded
+  timers, the unit directory's instance files, and its
+  `timers.target.wants` enablement links. An instance that systemd 257
+  omits from the file listing is now stopped — and, if its stop fails,
+  named in the warning — instead of being left behind while the summary
+  says `timers stopped`. If any of those `systemctl` queries fails, the
+  closing summary keeps `timer stop not confirmed`. Summary text and
+  exit codes are unchanged; no action is required.
+- **`teardown <profile>` now removes that profile's firewall chain.**
+  After the profile's gateway, anchor, and network phase, teardown
+  flushes and deletes its `p_<profile>` chain from `inet egresslock`;
+  when it was the last profile and no kit network is in use, it
+  deletes the shared table too (including `p_v6deny`). A network
+  still in use, an unreadable network or nft listing, or a failed
+  removal keeps the firewall state, and the run names why and the
+  manual next step. Kept objects and failed removals are reported
+  without failing the run (exit 0); an unreadable or timed-out
+  listing is never treated as absence — teardown removes nothing it
+  could not see, prints `incomplete teardown`, and exits 1. The
+  account-wide grammar change is in `### Changed` above; `verify
+  --ensured` and the timer are unchanged.
+- **Emitted help and usage text is paste-inert.** The `--help` summary
+  index, the per-command help pages (`egresslock help COMMAND`,
+  `egresslock-setup help VERB`), every emitted `usage:`, `Error:`,
+  `note:`, or `fix:` line (argument errors, next-action lines, and config
+  errors), and runnable `docs/**` examples (`sh` fences and
+  command-shaped inline spans) now spell placeholders as uppercase words
+  (`PROFILE`, `HOST:PORT`, `CIDR`, `ACCOUNT`, `NAME`, `PATH`, `COMMAND`);
+  alternates use `or` (`teardown PROFILE, all [--yes], or
+  --orphans`). Pasting
+  a single-command example from this text no longer opens, creates, or
+  truncates a file: the placeholder reaches the command as plain
+  arguments and fails validation (engine exit 2, setup exit 1 or 2)
+  before any state change. A next-action line that intentionally chains
+  commands with `&&` still runs its first command when pasted — read
+  those lines before running them. Prose example identities
+  (`<account>`, `<profile>` in artifact
+  names) are unchanged. If you scripted against the old text, see
+  action item 3; commands, flags, exit codes, and the argument grammar
+  are unchanged.
+- **`teardown --orphans` keeps the kit firewall table when it cannot
+  list Podman networks:** a workload still attached to a kit network
+  may depend on it, so a blind network sweep now prints
+  `kept nft table …`, keeps the table, and exits 1 with
+  `incomplete sweep` — re-run it once the listing succeeds. A
+  complete sweep, and a sweep that kept a network in use, are
+  unchanged.
+- **Warning, purge, and repair-hint wording now matches what the
+  commands do.** The staging-cleanup warning says the private stage may
+  hold staged copies of the allowlist and that deleting it does not
+  change the live allowlist; `uninstall-kit.sh` names a removed symbolic
+  link instead of claiming it purged account data; the import refusal's
+  `mv` hint is a shell-quoted, non-clobbering `mv -n -T --` that says an
+  occupied name moves nothing; the hidden `help env test` page scopes
+  the ignored-override warning to commands that resolve the override;
+  and the bridge-unresolved policy-emit error gains a runnable next
+  action. No behavior, exit code, or policy change.
+- **A failed gateway allowlist apply leaves a pre-existing deployed
+  file alone.** The rollback previously treated a name it could not see
+  in its pre-publication snapshot as one this run had published: a
+  pre-existing dangling symlink at a staged name was removed, and a
+  pre-existing regular file or directory there was rewritten from the
+  snapshot. The rollback now removes only the `allowlist.*` names this
+  run created, so a failed apply cannot delete or replace an object it
+  did not create. The "nothing was replaced" refusals are unchanged and
+  now hold for every pre-existing object type. No command, flag, or
+  exit code changes.
+
+### Docs
+
+- **Simplified [uninstall.md](docs/setup/uninstall.md).**
+- **The netns-inspection troubleshooting page now reaches the live
+  policy.** The [troubleshooting
+  steps](docs/troubleshooting/netns-inspection.md) run entirely as
+  the account through `podman unshare --rootless-netns` — no root
+  step and no PID to find — and call `nft` by its absolute path
+  (`/usr/sbin/nft`), because a non-root `PATH` often omits
+  `/usr/sbin`. The rootless helper (pasta on podman 5.x) only holds
+  that netns open; `nsenter` into one of its PIDs shows the host
+  netns, not the policy. No action is required.
+- **New operator-obligations checklist.**
+  [docs/reference/operator-obligations.md](docs/reference/operator-obligations.md)
+  collects the do / do-not list for keeping workload traffic
+  protected — the launch hardening baseline, `ensure`/`verify` before
+  workloads (including after a reboot, and the note that the verify
+  timer signals a missing policy but never repairs it), host patching,
+  and the launch modes, mount bans, and resolver-input write access.
+  No behavior change.
+- **The threat model's dated v0.12 review is in** — no claim added,
+  dropped, or reversed; two descriptions were brought up to date.
+
 ## 0.11.0 - 2026-11-11
 
 > **Operator-important changes:**
@@ -164,8 +706,10 @@ file is the record of what changed since the previous release.
   applies to the next create or `ensure --replace-gateway`, not to an
   already-running gateway or anchor.
 - **A test-mode override set without the test flag now says so.**
-  The command prints one warning to stderr naming the variable and
-  saying it is ignored, while the production default still applies.
+  A command that resolves the override prints one warning to stderr
+  naming the variable and saying it is ignored, while the production
+  default still applies. Commands that never resolve it (for example
+  `list`, `verify --ensured`, or `doctor` without Podman) stay silent.
   `EGRESSLOCK_KIT_ALLOW_NON_ROOT` set to anything other than exactly
   `1` also warns once, because test mode stays off and the overrides
   stay inert. Exit codes, stdout, and behavior are unchanged, and the

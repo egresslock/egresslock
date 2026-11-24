@@ -23,24 +23,22 @@ working when the shared netns breaks.
 # The probe: does the shared netns work at all?
 podman unshare --rootless-netns true; echo "rc=$?"
 
-# The netns mount points (owned by the account; one shared netns):
+# These files are per-container netns on podman 5.x, not the shared
+# rootless netns (that lives elsewhere, e.g.
+# /tmp/storage-run-<uid>/containers/networks/rootless-netns/):
 ls -la /run/user/$(id -u)/netns/
 
-# Live counters and rules (see paths-and-signatures for reading them):
-podman unshare --rootless-netns nft list ruleset
-
-# Enter it as root (nsenter needs a PID, not the netns filename):
-pid="$(pgrep -x pasta | head -1)"
-[ -n "$pid" ] || pid="$(pgrep -x slirp4netns | head -1)"
-# Confirm you got the account's holder — a per-container pasta
-# instance can also match:
-ps -p "$pid" -o user=,cmd=
-sudo nsenter -t "$pid" -n ip addr        # view interfaces inside the netns
-sudo nsenter -t "$pid" -n nft list ruleset 2>/dev/null   # the live policy
+# Live counters and rules (see paths-and-signatures for reading them).
+# nft is /usr/sbin/nft — a non-root PATH often omits /usr/sbin:
+podman unshare --rootless-netns /usr/sbin/nft list ruleset
 ```
 
-Note: `nsenter --target` takes a **PID** (e.g. pasta's), not a netns
-filename. `cat` on a netns file just shows an empty bind-mount point.
+The unprivileged `podman unshare --rootless-netns` form enters the
+shared netns directly — no root step and no PID to find. `pasta` only
+holds that netns open (its `--netns` argument names the file); the
+pasta process itself stays in the host netns, so `nsenter` into one of
+its pids shows the host, not the policy — and `nsenter` takes a PID in
+any case, never the netns file.
 
 A bare `podman unshare` inherits the caller's working directory, so run
 it as the account from a directory the account can traverse; the engine
@@ -59,7 +57,7 @@ rootless store/netns. Running them as root builds it in ROOT's store —
 a separate world nothing else uses. Always:
 
 ```sh
-sudo -iu <account>
+sudo -iu ACCOUNT
 ```
 
 ## Related

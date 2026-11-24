@@ -18,7 +18,9 @@ egresslock` lists the real thing:
 - `/usr/lib/systemd/system/egresslock-verify@.{service,timer}` — the
   verify unit templates
 - `/usr/share/egresslock/` — shipped support files, incl. the docs
-  tree under `doc/`
+  tree under `doc/`; `/usr/share/egresslock/docs/` is a relative
+  symlink to `doc/docs`, so the docs path the installed messages print
+  is the same on this layout as on a prefix install
 
 ## Deployed kit (manual prefix install)
 
@@ -27,13 +29,14 @@ The kit is deployed ROOT-owned to `--prefix` (default
 
 | File / dir | What it is |
 |---|---|
-| `egresslock` | the engine CLI (`ensure`, `verify`, `list`, `network`, `rules`, `allowlist` (`--direct`), `denied`, `allow`/`disallow` (`--direct`), `drop-unauthorized`, `init`, `doctor`, `teardown`, ...) |
-| `egresslock-start` | daemon-start wrapper: `ensure` the profile, then exec the daemon |
-| `egresslock-verify` | entry point for the verify timer (named or `--ensured`) |
-| `egresslock-setup` | per-account bootstrap: import a pair or ship the starter conf, validate the fixed confdir, write `unit.env`, build gateway, enable timer |
+| `egresslock` | the engine CLI (`ensure` (`<profile>`, `all [--yes]`), `verify`, `list`, `network`, `rules`, `allowlist` (`--direct`), `denied`, `allow`/`disallow` (`--direct`), `drop-unauthorized`, `init`, `doctor`, `teardown` (`<profile>`, `all [--yes]`, `--orphans`), ...) |
+| `egresslock-start` | daemon-start wrapper: `ensure` the profile, then exec the daemon — not a workload launcher |
+| `egresslock-verify` | entry point for the verify timer (`verify --ensured`: profiles with a running anchor) |
+| `egresslock-setup` | per-account bootstrap: import a pair or ship the starter conf, validate the fixed confdir, build gateway, enable timer |
 | `gateway/` | build context for the Squid gateway image (`Containerfile`, `squid.conf`, entrypoint) |
 | `apparmor/` | pasta AppArmor snippet + profiles shipped root-owned with the prefix (distribution only — applying stays the explicit `egresslock-setup apparmor add`; see `apparmor/README.md`) |
 | `examples/` | starter conf + empty allowlist for `egresslock-setup --init-conf`; `recipes/` deployed so accounts build from the prefix; `egl-base/` so accounts build the shared example image from the prefix (includes the `build-egl-base` helper) |
+| `docs/` | the shipped docs pages (regular `.md` files, structure preserved; `tickets/` and the generated `BOARD.md` are not copied) — the installed copy the engine and verify messages point at, so a pointer still resolves after the checkout/tarball is gone |
 | `VERSION` | `commit:` SHA + `deployed:` UTC date (+ `-dirty` marker) of what is installed |
 | `PATH wrappers` | `egresslock` at `/usr/local/bin/egresslock` and `egresslock-setup` at `/usr/local/sbin/egresslock-setup` — small sh wrappers that exec the prefix copies (the `.deb` ships `/usr/bin` / `/usr/sbin` instead) |
 
@@ -56,12 +59,12 @@ repository root:
 
 | Path | What it is |
 |---|---|
-| `egresslock` | The engine CLI: `ensure`, `verify` (incl. `--ensured`), `list`, `network`, `proxy-env` (tokens: `proxyip`/`proxyport`/`noproxy`; `--out[=<path>]` — the bare `--out` (recommended) writes the env file mode 0600, default under the account's private runtime dir; `--out=<path>` is a backup for a specific location and is refused if its directory is group- or world-writable (use a directory only your account can write to, or pass them to `podman run` with `--env KEY=value`), `rules`, `allowlist` (bare = the configured proxy entries from the allowlist file; `--direct` lists the configured direct-path entries), `denied` (`--all`, `--days N`), `allow`/`disallow` (`--direct` selects the direct path), `drop-unauthorized`, `init`, `doctor`, `build-gateway` (incl. `--force`), `teardown` (incl. `--runtime`), `--version` |
+| `egresslock` | The engine CLI: `ensure` (`<profile>`, `all [--yes]`), `verify` (incl. `--ensured`), `list`, `network`, `proxy-env` (tokens: `proxyip`/`proxyport`/`noproxy`; `--out[=<path>]` — the bare `--out` (recommended) writes the env file mode 0600, default under the account's private runtime dir; `--out=<path>` is a backup for a specific location and is refused if its directory is group- or world-writable (use a directory only your account can write to, or pass them to `podman run` with `--env KEY=value`), `rules`, `allowlist` (bare = the configured proxy entries from the allowlist file; `--direct` lists the configured direct-path entries), `denied` (gateway log: `--all`, `--days N`; `--direct` reads the direct-path nft drop record), `allow`/`disallow` (`--direct` selects the direct path), `drop-unauthorized`, `init`, `doctor`, `build-gateway` (incl. `--force`), `teardown` (`<profile>`, `all [--yes]`, `--orphans`), `--version` |
 | `install-kit.sh` | (root) Deploy the kit to a prefix and install the instanced verify unit templates (no account changes) |
-| `egresslock-setup` | (root) One-command per-account setup: import a pair with `import --from` or ship the starter conf with `init --init-conf`, validate the fixed confdir, write `unit.env`, build the gateway image, optionally enable the timer |
+| `egresslock-setup` | (root) One-command per-account setup: import a pair with `import --from` or ship the starter conf with `init --init-conf`, validate the fixed confdir, build the gateway image, optionally enable the timer |
 | `uninstall-kit.sh` | (root) Remove the kit; account data is preserved unless `--purge-account-data` |
-| `egresslock-start` | Wrapper for daemon services: `ensure $EGRESSLOCK_PROFILE` (fail closed), then exec the daemon |
-| `egresslock-verify` | Entry point for the verify timer: named profile or `--ensured` mode |
+| `egresslock-start` | Wrapper for daemon services: `ensure $EGRESSLOCK_PROFILE` (fail closed), then exec the daemon; not a workload launcher |
+| `egresslock-verify` | Entry point for the verify timer: `verify --ensured` over profiles with a running anchor |
 | `gateway/` | Build context for the Squid gateway image (`Containerfile`, `squid.conf`, entrypoint) |
 | `examples/` | Starter conf + empty allowlist shipped by `install-kit.sh` for `egresslock-setup --init-conf`; recipes under `recipes/`; `egl-base/` (shared example image) (includes `build-egl-base`) |
 | `tests/` | Mock battery: `bash tests/run.sh` runs every `tests/test-*.sh` harness (`test-engine.sh`, `test-kit.sh`, `test-docs.sh`, …; no root/Podman needed; `--track fast` skips the registered slow sections — `bash tests/run.sh` still runs everything) |

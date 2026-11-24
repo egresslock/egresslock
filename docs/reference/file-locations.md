@@ -1,9 +1,9 @@
 # File locations — where egresslock keeps its files
 
 This page answers: **"where does X live?"** — the profile conf and
-allowlist, the pin record, `unit.env`, the engine lock, the proxy env
-file, the build log, and the temp files a killed run can leave
-behind. Everything here is owned by the container-owner account
+allowlist, the pin record, the engine lock, the proxy env file, the
+build log, and the temp files a killed run can leave behind. Everything
+here is owned by the container-owner account
 (`egl-runner` in the guides); run the listed commands as that
 account. The files the kit installs for the whole host (prefix,
 units, PATH wrappers) are on
@@ -16,30 +16,29 @@ logs](../troubleshooting/gateway-logs.md).
 The confdir is created `0700` on first write (`egresslock init`,
 `egresslock-setup --init-conf`, or `egresslock-setup import`); a
 missing `~/.config` is created under your umask, and an existing
-confdir keeps its mode. It holds one small file family per profile,
-plus the account's wiring. The policy files (`<profile>.conf`,
-`<profile>-allowlist`, `unit.env`) are produced `0600`; `gateway-build.log` is
-`0644` by design. `0600` is the policy: `egresslock-setup doctor
---account <acct>` reports any policy file that is not `0600` and any
-confdir writable by other users (the fix runs as the account). One
-deliberate exception: a proxy-path `disallow` rewrite preserves an
-existing regular file whose group class equals its other class (e.g.
+confdir keeps its mode. It holds one small file family per profile.
+The policy files (`<profile>.conf`, `<profile>-allowlist`) are produced
+`0600`; `gateway-build.log` is `0644` by design. `0600` is the policy:
+`egresslock-setup doctor ACCOUNT` reports any policy file that is not
+`0600` and any confdir writable by other users (the fix runs as the
+account). One deliberate exception: a proxy-path `disallow` rewrite
+preserves an existing regular file whose group class equals its other
+class (e.g.
 `0600`, `0444`, `0644`) rather than tightening it — see
 [How proxy disallow writes the allowlist](#how-proxy-disallow-writes-the-allowlist);
 such a file remains a doctor finding until you `chmod 600` it.
 
 | File | What it is | Mode | Written by | Removed by |
 |---|---|---|---|---|
-| `<profile>.conf` | the profile conf — profiles, subnets, rules, `allow-host` entries; the engine's input. The configured direct-path entries are listed by `egresslock allowlist <profile> --direct` | 0600 from `egresslock init`; `egresslock-setup import` stages the source as 0600; `--init-conf` stages the starter with umask 077 and renames it into place (0600) | `egresslock init`; `egresslock-setup import --from`; `egresslock-setup init --init-conf` (first create); `allow … --direct` / `disallow … --direct` (rewrite in place, keeping the mode); your editor | archiving it ([Delete a profile](policy-reference.md#delete-a-profile)); `uninstall-kit.sh --purge-account-data`; `rm` by hand |
+| `<profile>.conf` | the profile conf — profiles, subnets, rules, `allow-host` entries; the engine's input. The configured direct-path entries are listed by `egresslock allowlist PROFILE --direct` | 0600 from `egresslock init`; `egresslock-setup import` stages the source as 0600; `--init-conf` stages the starter with umask 077 and renames it into place (0600) | `egresslock init`; `egresslock-setup import --from`; `egresslock-setup init --init-conf` (first create); `allow … --direct` / `disallow … --direct` (atomic rewrite of a regular file, keeping the mode; a symbolic link is refused — edit the file it points to by hand while no egresslock command is running, then `ensure <profile>`); your editor | archiving it ([Delete a profile](policy-reference.md#delete-a-profile)); `uninstall-kit.sh --purge-account-data`; `rm` by hand |
 | `<profile>-allowlist` | the gateway allowlist — one `host[:port]` per line, matched by Squid's `dstdomain`; the profile's `gateway` line must name exactly this file | 0600 from `egresslock init`; `egresslock-setup import` stages the `<profile>-allowlist` half as 0600; `--init-conf` stages a missing starter sibling with umask 077 (0600; no entries, `EMPTY by design`) and leaves a pre-existing allowlist untouched, keeping its mode | `egresslock allow` (atomic replacement, only for a regular 0600 source; keeps 0600 and uid/gid) / `disallow` (atomic rewrite of a regular file whose group permissions equal its other permissions; keeps the exact mode and uid/gid); `egresslock init` (empty); `egresslock-setup import`; the kit starter | same as the conf |
-| `<profile>.pins` | the pin record — the addresses `ensure` installed for the profile's `allow-host` entries; `verify` compares the live chain against it and fails closed on divergence. It is the ensure-time witness, not the configured-entry list (`egresslock allowlist <profile> --direct`) | 0600 | `egresslock ensure <profile>` | `ensure` also removes it when the profile has no `allow-host` entries; remove it with the conf pair when archiving; `--purge-account-data`. To regenerate: re-run `ensure` |
-| `<profile>.revoke-pending` | the pending-revocation record — `host\|port <addresses>` entries for `disallow … --direct` runs that did not prove severance (interrupted mid-command, or a committed partial state). `ensure` finishes the recorded revocations and removes the record; `verify` fails closed with `unfinished revocation` (rc 1) while a committed entry is reported | 0600 | `egresslock disallow <profile> <host:port> --direct` (atomic write, before the conf line is removed) | the same `disallow` run after a clean confirmation; `egresslock ensure <profile>` (after the revocation is proven); `--purge-account-data`; archive it with the conf pair. It is not regenerable — the captured addresses may no longer be recomputable |
-| `unit.env` | the verify timer's wiring: `EGRESSLOCK_PROFILE=…` in named mode; empty for the `--ensured` sweep (no conf path — the confdir is fixed) | 0600 | `egresslock-setup` (rewritten wholesale on re-run) | `--purge-account-data`; `rm` by hand. To regenerate: re-run `egresslock-setup init` |
+| `<profile>.pins` | the pin record — the addresses `ensure` installed for the profile's `allow-host` entries; `verify` compares the live chain against it and fails closed on divergence. It is the ensure-time witness, not the configured-entry list (`egresslock allowlist PROFILE --direct`) | 0600 | `egresslock ensure PROFILE` | `ensure` also removes it when the profile has no `allow-host` entries; remove it with the conf pair when archiving; `--purge-account-data`. To regenerate: re-run `ensure` |
+| `<profile>.revoke-pending` | the pending-revocation record — `host\|port <addresses>` entries for `disallow … --direct` runs that did not prove severance (interrupted mid-command, or a committed partial state). `ensure` finishes the recorded revocations and removes the record; `verify` fails closed with `unfinished revocation` (rc 1) while a committed entry is reported | 0600 | `egresslock disallow PROFILE HOST:PORT --direct` (atomic write, before the conf line is removed) | the same `disallow` run after a clean confirmation; `egresslock ensure PROFILE` (after the revocation is proven); `--purge-account-data`; archive it with the conf pair. It is not regenerable — the captured addresses may no longer be recomputable |
 | `gateway-build.log` | the full output of the last gateway image build (the terminal shows one line; on failure, the last 20 lines) | 0644 (created by the build's output redirect) | `egresslock-setup` when it builds the gateway image | the next build overwrites it; `--purge-account-data`; safe to delete any time |
 
 ### How proxy allow writes the allowlist
 
-`egresslock allow <profile> <entry>` on the proxy path builds the
+`egresslock allow PROFILE ENTRY` on the proxy path builds the
 complete replacement allowlist — every existing byte, exactly one
 newline when a nonempty file lacks a final newline, then the missing
 entries in argument order — in a private 0700 staging directory beside
@@ -73,7 +72,7 @@ Squid has loaded the entry.
   DAC access, but inherited dormant ACL entries can differ from the
   source and become effective after a later `chmod`. If you rely on ACLs
   or security labels, make a metadata-preserving external edit while no
-  egresslock command is running, then run `egresslock ensure <profile>`;
+  egresslock command is running, then run `egresslock ensure PROFILE`;
   do not `chmod` a file whose access other users rely on.
 - **Concurrency:** the account-wide engine lock serializes this
   account's engine commands, but not your editor,
@@ -91,7 +90,7 @@ Squid has loaded the entry.
 
 ### How proxy disallow writes the allowlist
 
-`egresslock disallow <profile> <entry>` on the proxy path removes every
+`egresslock disallow PROFILE ENTRY` on the proxy path removes every
 requested entry that is present and commits the replacement allowlist
 with a same-filesystem rename. The replacement is built in a private
 0700 staging directory beside the source; the staged snapshot and
@@ -117,7 +116,7 @@ file and the backup is retained.
 - **Rewrite eligibility:** the source must be a regular file. A symlink
   is refused before the mode stat, staging, backup or rename; edit the
   file the link points to by hand while no egresslock command is
-  running, then run `egresslock ensure <profile>` (a plain `ensure`
+  running, then run `egresslock ensure PROFILE` (a plain `ensure`
   reloads; `ensure --replace-gateway` drops every proxied session on the
   profile). The rewrite also
   needs the source to be writable by this account or owned by it (an
@@ -153,7 +152,7 @@ file and the backup is retained.
   labels (SELinux and similar) are likewise not preserved. If you rely
   on a named ACL entry or a security label, make a metadata-preserving
   external edit while no egresslock command is running, then run
-  `egresslock ensure <profile>`.
+  `egresslock ensure PROFILE`.
 - **Hard links:** replacing the named path leaves its other names
   unchanged.
 - **Concurrency:** the engine lock serializes this account's engine
@@ -169,8 +168,8 @@ file and the backup is retained.
   says the allowlist may be unchanged or already replaced: inspect the
   file and retry the same command if the revoked entry is still there;
   if it is gone, apply the removal with
-  `egresslock ensure --replace-gateway <profile>`, which drops every
-  proxied session on the profile. A plain `egresslock ensure <profile>`
+  `egresslock ensure --replace-gateway PROFILE`, which drops every
+  proxied session on the profile. A plain `egresslock ensure PROFILE`
   only reloads the running gateway, so established proxied sessions to
   those destinations may keep running until they close. Delete the
   backup once you no longer need it. A run killed by a signal around
@@ -178,7 +177,7 @@ file and the backup is retained.
   no message naming it, and no apply or `removed:` line. Inspect the
   source: if the revoked entry is still there, retry the same command;
   if it is gone, apply the removal with
-  `egresslock ensure --replace-gateway <profile>` (this drops every
+  `egresslock ensure --replace-gateway PROFILE` (this drops every
   proxied session on the profile; a plain `ensure` only reloads and
   leaves established sessions up) before deleting the backup. Delete
   the backup once no egresslock command is running. A killed run can
@@ -190,7 +189,7 @@ file and the backup is retained.
 | File | What it is | Mode | Written by | Removed by |
 |---|---|---|---|---|
 | `~/.local/state/egresslock/engine.lock` | the account-wide lock that serializes `ensure`, `allow`, `disallow` (either path), `drop-unauthorized`, `teardown`, and `init`; the file records the current holder (`pid=… mode=… started=…`); a writer truncates it on acquire, so it stays tiny. The path is anchored to the account's home directory as the system account database records it, not the `HOME` variable. | directory 0700; file under your umask (0644 typical — the directory is what keeps it private) | the writer commands; `verify` shares the lock when it can | nothing — leave it in place. The kernel releases the lock when the holder exits; deleting the file while commands run would let two writers past the lock. The full story: [A concurrent command is in progress](../troubleshooting/concurrent-commands.md) |
-| `egresslock-proxy-<profile>.env` | the six proxy assignments (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, both cases) for a profile's gateway | 0600 | `egresslock proxy-env <profile> --out` (the recommended form; prints the path; `--out=<path>` is a backup that writes elsewhere) | nothing automatic. The default lives under the account's runtime directory (`${XDG_RUNTIME_DIR:-/run/user/<uid>}`), which goes away at reboot — and at logout without linger; regenerate with `--out` after any policy or env change, then recreate the container — [Proxy clients](proxy-clients.md) |
+| `egresslock-proxy-<profile>.env` | the six proxy assignments (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, both cases) for a profile's gateway | 0600 | `egresslock proxy-env PROFILE --out` (the recommended form; prints the path; `--out=<path>` is a backup that writes elsewhere) | nothing automatic. The default lives under the account's runtime directory (`${XDG_RUNTIME_DIR:-/run/user/<uid>}`), which goes away at reboot — and at logout without linger; regenerate with `--out` after any policy or env change, then recreate the container — [Proxy clients](proxy-clients.md) |
 
 ## Logs
 
@@ -199,6 +198,9 @@ confdir. The gateway's request and error logs (Squid `access.log` /
 `cache.log`) live inside the gateway container — read them with
 `egresslock denied` or `podman exec`:
 [Inspecting the gateway (Squid) logs](../troubleshooting/gateway-logs.md).
+The direct-path denial record is not a file: it is the bounded per-profile
+nft set in the rootless network namespace, read with
+`egresslock denied PROFILE --direct`.
 
 ## Transients — temp files a killed run can leave behind
 
@@ -215,17 +217,17 @@ running.
 | `/tmp/egresslock-verify.*` | the working file `verify` builds the expected ruleset in |
 | `/tmp/egresslock-allowlist.*/` | the staging directory for the generated gateway allowlist files |
 | `<allowlist>.egresslock-stage.*/` | the private staging directory beside a proxy-path allowlist while `allow` or `disallow` builds its replacement; contains the staged `candidate` (and, for `disallow`, the `snapshot` it filters from). If a run is killed before the commit, the source is unchanged and this directory is inert |
-| `<allowlist>.egresslock-disallow-backup.<pid>` | the hard-link pre-image proxy `disallow` keeps when the final rename returns nonzero (the S4 error names it) or a run is killed around it (no message may name it). Inspect the allowlist: if the revoked entry is still there, retry the same command; if it is gone, apply the removal with `egresslock ensure --replace-gateway <profile>` (it drops every proxied session on the profile) before deleting the backup. Delete the backup once no egresslock command is running |
-| `<file>.XXXXXX` beside a file being replaced | atomic-write temps beside the conf, pin record, and proxy env file (`XXXXXX` is mktemp's random suffix) |
+| `<allowlist>.egresslock-disallow-backup.<pid>` | the hard-link pre-image proxy `disallow` keeps when the final rename returns nonzero (the S4 error names it) or a run is killed around it (no message may name it). Inspect the allowlist: if the revoked entry is still there, retry the same command; if it is gone, apply the removal with `egresslock ensure --replace-gateway PROFILE` (it drops every proxied session on the profile) before deleting the backup. Delete the backup once no egresslock command is running |
+| `<file>.XXXXXX` beside a file being replaced | atomic-write temps beside the conf, pin record, pending-revocation record, and proxy env file (`XXXXXX` is mktemp's random suffix) |
 
 ## Backing up, moving, or removing these files
 
 To back up an account's policy, copy `~/.config/egresslock/` — the
-confs, allowlists, pin records, pending-revocation records, and
-`unit.env` are all small; `gateway-build.log` is a log, skip it.
-Regenerable (no backup needed): the pin records (re-run `ensure`),
-`unit.env` (re-run `egresslock-setup init`), the lock, and every
-transient above. The pending-revocation record is not regenerable — the
+confs, allowlists, pin records, and pending-revocation records are all
+small; `gateway-build.log` is a log, skip it.
+Regenerable (no backup needed): the pin records (re-run `ensure`), the
+lock, and every transient above. The pending-revocation record is not
+regenerable — the
 addresses captured by the interrupted revocation may no longer be
 recomputable — so archive it with the conf pair.
 

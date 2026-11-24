@@ -2,9 +2,9 @@
 
 ## Symptom
 
-`egresslock disallow <profile> <host>:<port> --direct` refuses — exit code 1,
+`egresslock disallow PROFILE HOST:PORT --direct` refuses — exit code 1,
 `nothing was changed` — saying the profile's installed firewall rules no
-longer match its pin record; the `egresslock ensure <profile>` it
+longer match its pin record; the `egresslock ensure PROFILE` it
 recommends then fails with `cannot resolve <host>`, and retrying
 `disallow --direct` refuses again. The revocation is stuck.
 
@@ -13,19 +13,19 @@ recommends then fails with `cannot resolve <host>`, and retrying
 `disallow --direct` refuses while the live firewall rules disagree with the
 profile's pin record (a tampered or drifted profile): it cannot prove which
 installed rule belongs to the one you are revoking. The healing step,
-`egresslock ensure <profile>`, rebuilds the rules from the profile conf and
+`egresslock ensure PROFILE`, rebuilds the rules from the profile conf and
 resolves every `allow-host` name in it; when the name being revoked no
 longer resolves, the rebuild cannot complete and the automatic recovery
 cannot run.
 
 ## Fix — manual recovery (the account shell)
 
-Run as the account (`sudo -iu <account>`; `egresslock` and `podman` from
+Run as the account (`sudo -iu ACCOUNT`; `egresslock` and `podman` from
 there). You remove the rule from the conf by hand, then end its
 connections with the engine's `drop-unauthorized` recovery command (the
 per-address `conntrack -D` fallback is in step 5 if that command cannot
 run). The procedure is **disruptive** — the profile's workloads stop,
-and (only if the profile has a gateway) the gateway restarts — and it is
+and the gateway restarts — and it is
 **not a `disallow --direct` severance proof**: no `removed:` line is printed,
 and you run and verify every step. Work in order; do not start workloads
 again before step 5 passes.
@@ -34,7 +34,7 @@ again before step 5 passes.
    profile's network:
 
    ```sh
-   podman ps --filter network="$(egresslock network <profile>)" --format '{{.Names}}  {{.Status}}'
+   podman ps --filter network="$(egresslock network PROFILE)" --format '{{.Names}}  {{.Status}}'
    ```
 
    Stop every container in the list except `egresslock-anchor-<profile>` —
@@ -42,7 +42,7 @@ again before step 5 passes.
    traffic. That includes the gateway `egresslock-gateway-<profile>`:
 
    ```sh
-   podman stop <workload-name> [...] egresslock-gateway-<profile>
+   podman stop WORKLOAD-NAME ... egresslock-gateway-PROFILE
    ```
 
    Run the first command again and confirm only the anchor remains.
@@ -51,7 +51,7 @@ again before step 5 passes.
    the conf (`~/.config/egresslock/<profile>.pins` by default):
 
    ```sh
-   grep '^<host>|<port> ' ~/.config/egresslock/<profile>.pins
+   grep '^<host>|<port> ' ~/.config/egresslock/PROFILE.pins
    ```
 
    The output is the rule's address set (for example
@@ -66,8 +66,8 @@ again before step 5 passes.
 4. **Rebuild and verify the rest of the profile.**
 
    ```sh
-   egresslock ensure <profile>
-   egresslock verify <profile>
+   egresslock ensure PROFILE
+   egresslock verify PROFILE
    ```
 
    `ensure` now resolves only the remaining rules and rebuilds the firewall
@@ -83,7 +83,7 @@ again before step 5 passes.
 5. **End the rule's remaining connections.**
 
    ```sh
-   egresslock drop-unauthorized <profile> <port>
+   egresslock drop-unauthorized PROFILE PORT
    ```
 
    This is the same recovery command a failed `disallow --direct` prints. It
@@ -98,8 +98,8 @@ again before step 5 passes.
    addresses saved in step 2:
 
    ```sh
-   podman unshare --rootless-netns conntrack -D -p tcp --dport <port> -d <address>
-   podman unshare --rootless-netns conntrack -L -p tcp --dport <port> -d <address>
+   podman unshare --rootless-netns conntrack -D -p tcp --dport PORT -d ADDRESS
+   podman unshare --rootless-netns conntrack -L -p tcp --dport PORT -d ADDRESS
    ```
 
    The check must exit 0 and print no connection line; if a connection
@@ -110,8 +110,8 @@ again before step 5 passes.
    any leftover the same way:
 
    ```sh
-   podman unshare --rootless-netns conntrack -L -p tcp --dport <port>
-   egresslock rules <profile>
+   podman unshare --rootless-netns conntrack -L -p tcp --dport PORT
+   egresslock rules PROFILE
    ```
 
 6. **Start the workloads again.** The rule is gone from the conf and the
@@ -130,8 +130,8 @@ check itself failed and is **not** proof that no connections remain.
   connections with `drop-unauthorized` (or the checked per-address
   fallback).
 - It removes the direct `allow-host` rule only. A `gateway` allowlist entry
-  for the same host is separate policy (`egresslock disallow <profile>
-  <host[:port]>`) and is unchanged.
+  for the same host is separate policy (`egresslock disallow PROFILE
+  HOST[:PORT]`) and is unchanged.
 
 ## Links
 

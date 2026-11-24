@@ -14,12 +14,12 @@ profile named `main`.)
 ## Cause
 
 The named podman network does not exist in **this user's** podman
-store. The network is created by `egresslock ensure <profile>` and
+store. The network is created by `egresslock ensure PROFILE` and
 lives in the container-owner account's rootless store — so this
 happens when:
 
 - the profile was never ensured (first run: you started a workload
-  before running `egresslock ensure <profile>` — the canonical
+  before running `egresslock ensure PROFILE` — the canonical
   trigger), or
 - the network was torn down (`egresslock teardown`) and not re-ensured, or
 - you are running podman as a different user than the account that
@@ -44,7 +44,7 @@ podman network ls
 
 Then start your workload again. If you were running podman as another
 user, switch to the container-owner account instead
-(`sudo -iu <account>` — see
+(`sudo -iu ACCOUNT` — see
 [who-runs-what](../reference/who-runs-what.md)).
 
 ## Links

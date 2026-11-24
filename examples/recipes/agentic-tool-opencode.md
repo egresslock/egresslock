@@ -87,7 +87,7 @@ egresslock ensure main \
     --read-only --tmpfs /tmp --tmpfs /run \
     -v "$HOME/work/agent:/workspace:rw" \
     localhost/agent-image-example \
-    sh -c 'cd /workspace && opencode'
+    sh -c 'mkdir -p /tmp/home && cd /workspace && opencode'
 ```
 
 The tool reaches exactly `openrouter.ai` (LLM API) + `github.com` (SSH).

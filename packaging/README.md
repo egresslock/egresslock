@@ -39,9 +39,13 @@ Install + first run on the target host:
 
 ```sh
 sudo dpkg -i ./packaging/egresslock_<VERSION>_all.deb
-sudo egresslock-setup init --account <acct> --init-conf --enable
+sudo egresslock-setup init <acct> --init-conf --enable
 sudo egresslock-setup apparmor check   # confirm pasta AppArmor compatibility on this host
 ```
+
+`apparmor check` is read-only. On an affected host, run
+`apparmor add` before the first `ensure` — the amendment is a setup
+prerequisite, and `ensure` fails closed without it.
 
 The account setup needs no repo and no `--prefix` on a .deb-only host
 (the prefix is derived from the installed unit template).
@@ -72,19 +76,23 @@ containing the build version string; `install-kit.sh` uses it as the
 `version:` value when present, so a tarball install does not re-stamp
 as `+git<install-time>.unknown`. `KIT_VERSION` is never committed.
 
-Uninstall: disable the per-account verify timer, then
-`sudo apt remove egresslock`:
+Uninstall, per account: stop that account's verify timer (stopping the
+timer also stops a verify run it already started), tear down its
+runtime, then remove the package:
 
     sudo systemctl disable --now egresslock-verify@<account>.timer
+    sudo -iu <account> -- egresslock teardown all --yes
+    sudo -iu <account> -- egresslock teardown --orphans
     sudo apt remove egresslock
 
-Repeat the timer line for each account you enabled. Before removal,
-per account: stop and remove every workload attached to a kit
-network, then run `egresslock teardown --runtime` as the account
-(while the engine still exists) — teardown deletes the kit's nft
-enforcement but does not remove non-kit-named workloads. Do this for
-EVERY account with kit runtime — including accounts without an
-enabled verify timer — before the host-global steps
+Repeat the timer line for each account you enabled. Before teardown,
+per account: stop and remove every workload attached to a kit network —
+teardown deletes the kit's nft enforcement but does not remove
+non-kit-named workloads. `all` selects every configured profile by conf
+file name; `--orphans` then sweeps kit objects whose conf is already
+gone and never touches a live profile. Do this for EVERY account with
+kit runtime — including accounts without an enabled verify timer —
+before the host-global steps
 (`egresslock-setup apparmor remove` if you applied the pasta
 amendment, then package removal). Podman state,
 account data (`~/.config/egresslock`), and the pasta local snippet are
@@ -102,19 +110,21 @@ fully gone.
 
 tar -xzf egresslock_<VERSION>.tar.gz && cd egresslock
 sudo ./install-kit.sh --prefix /opt/egresslock
-sudo /opt/egresslock/egresslock-setup init --account <acct> --init-conf --enable
+sudo /opt/egresslock/egresslock-setup init <acct> --init-conf --enable
 ```
 
 The tarball is the full kit tree (engine, helpers, gateway, examples,
 docs, apparmor, `install-kit.sh` **and** `uninstall-kit.sh`) plus the
-`systemd/` unit templates, so on-box uninstall needs no repo clone:
+`systemd/` unit templates, so on-box uninstall needs no repo clone.
+Before the uninstaller runs, per account: stop that account's verify
+timer (stopping the timer also stops a verify run it already started)
+and tear down its runtime (`egresslock teardown all --yes` then
+`egresslock teardown --orphans`, while the engine still exists):
 
 ```sh
+sudo systemctl disable --now egresslock-verify@<account>.timer
 sudo ./uninstall-kit.sh --prefix /opt/egresslock
 ```
-
-(account teardown first: `egresslock teardown --runtime` as the
-account, while the engine still exists.)
 
 ## Test hooks
 
@@ -122,7 +132,7 @@ account, while the engine still exists.)
 |---|---|
 | `EGRESSLOCK_DEB_OUT` / `EGRESSLOCK_TARBALL_OUT` | redirect the artifact path |
 | `EGRESSLOCK_DEB_KEEP_STAGE=<dir>` | keep the staged .deb tree instead of building (file-set asserts without dpkg); the value is classified at its lexical path (`.`/`..` resolved without following symlinks) and must be absent or an empty real directory — a symlink, a non-empty directory, a regular file, or any other shape is refused rc 2 before anything is written; a failed `readlink`/`realpath`/`dirname` is refused rather than trusted (even if it printed a complete record); only an empty real directory is replaced (with `rmdir`, never a recursive delete), a leaf this run creates is copied into, and the success line names that lexical destination (shell-quoted), not the input spelling |
-| `EGRESSLOCK_UNIT_SRC=<dir>` | unit-template source override |
+| `EGRESSLOCK_UNIT_SRC=<dir>` | build-time builder input (not a runtime test hook): selects the unit-template source at build time. The packaging builds run as any user, so there is no `EGRESSLOCK_KIT_ALLOW_NON_ROOT` test-mode gate here; `install-kit.sh` keeps its own gated runtime hook. |
 
 (The root-gated kit scripts are `install-kit.sh`/`uninstall-kit.sh`
 and `egresslock-setup`; the packaging builds themselves run as any
@@ -131,4 +141,5 @@ user.)
 Both scripts are exercised by the kit harness
 (`tests/test-kit.sh`; run all egresslock
 tests with `tests/run.sh` — the default full battery; `--track fast` is
-the per-push CI/iteration track and skips the registered slow sections).
+the local iteration shortcut and `--track lite` is the per-push CI
+track; both skip/defer sections and neither is the full battery).

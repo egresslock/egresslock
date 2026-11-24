@@ -63,7 +63,7 @@ is the gateway denial. `http_code=000` only means no origin HTTP
 response — a connection failure prints it too. See
 [paths-and-signatures](../reference/paths-and-signatures.md).
 Already `http_code=200`? The host is already allowed — skip to
-[step 4](#4-rerun-the-probe--expect-200).
+[step 4](#4-re-run-the-probe--expect-200).
 
 Troubleshooting: `localhost/egl-base:latest` not found? Build it:
 [egl-base](../../examples/egl-base/README.md#build).
@@ -83,12 +83,14 @@ egresslock denied main
 
 <pre>
 egl-runner@host:~$ egresslock denied main
+note: this view covers one lane and may be incomplete — a short or empty list is not proof nothing was denied. See: egresslock help denied.
 example.com
 </pre>
 
 One line per still-blocked destination (de-duplicated, hosts you
-already allowed omitted — `--all` shows the raw list); it is the feed
-for the next `allow`.
+already allowed omitted — `--all` shows the proxy view without the
+allow-covered filter, still parsed and de-duplicated, not the raw
+log); it is the feed for the next `allow`.
 
 Troubleshooting: empty when you expected a hit? Stale engine/env —
 [proxied-or-direct](../troubleshooting/proxied-or-direct.md).

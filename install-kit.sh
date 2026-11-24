@@ -14,8 +14,10 @@
 #      (per-account bootstrap), gateway/ (image build context),
 #      examples/ (starter conf + empty allowlist for egresslock-setup
 #      --init-conf, recipes/, egl-base/), apparmor/ (pasta snippet for
-#      --apparmor-add), and a VERSION stamp (version string + deployed
-#      commit SHA + UTC date). This is the ONLY thing accounts share.
+#      --apparmor-add), docs/ (the installed copy of the shipped pages
+#      the engine/verify messages point at), and a VERSION stamp
+#      (version string + deployed commit SHA + UTC date). This is the
+#      ONLY thing accounts share.
 #   1b. Installs PATH wrappers: /usr/local/bin/egresslock and
 #      /usr/local/sbin/egresslock-setup exec the deployed prefix copies,
 #      so the bare command works on prefix installs the way the .deb
@@ -27,9 +29,9 @@
 #
 # It does NOT touch accounts: per-account timers are enabled by
 # `egresslock-setup init --enable` at account setup, AFTER the account's
-# unit.env exists — never as a vacuous enable at install time.
-# Account-owned data (conf, allowlist, unit.env, gateway image) is NOT
-# installed here either: accounts execute, root distributes.
+# confdir is validated — never as a vacuous enable at install time.
+# Account-owned data (conf, allowlist, gateway image) is NOT installed
+# here either: accounts execute, root distributes.
 #
 # Options:
 #   --prefix <path>   deploy the kit here (default: /opt/egresslock)
@@ -71,7 +73,8 @@
 #   - deployed kit file set: egresslock, egresslock-start,
 #     egresslock-verify, egresslock-setup, gateway/, examples/ (starter
 #     conf + allowlist + recipes/ incl. the container example +
-#     egl-base/), apparmor/ (pasta snippet), VERSION (all root-owned)
+#     egl-base/), apparmor/ (pasta snippet), docs/ (regular .md pages;
+#     no tickets/ or BOARD.md), VERSION (all root-owned)
 #   - unit template names: egresslock-verify@.{service,timer}
 #   - the installed unit template's ExecStart is rewritten with the
 #     deployed prefix at install time
@@ -224,31 +227,37 @@ if [[ -L "$prefix_probe" ]]; then
     fi
     exit 2
 fi
-unset prefix_probe prefix_resolved q_prefix q_resolved
+unset prefix_resolved q_prefix q_resolved
 
-# EGL-68-D1 / EGL-90-D3: never rm -rf through a mistyped --prefix. The
-# install replaces gateway/, apparmor/, examples/recipes/ and
-# examples/egl-base/. Deleting one is allowed only when it is absent
-# (first install), $prefix carries a kit marker (VERSION or the
-# egresslock executable), or the path is kit-shaped
-# (gateway/Containerfile). Otherwise fail closed before any copy, naming
-# the path. EGL-265 item 4: keep this list in lockstep with the loop.
-for _dest in "$prefix/gateway" "$prefix/apparmor" \
-             "$prefix/examples/recipes" "$prefix/examples/egl-base"; do
-    if [[ ! -e "$_dest" ]]; then
-        continue                                   # first install
+# EGL-555-D1: capture the probed prefix's no-follow identity. The -L probe
+# above is name-based and the copies/deletes below run later; a writer that
+# can create entries in the prefix's parent could otherwise swap the prefix
+# for a symlink in between. Capture `dev:ino` now (or record that the prefix
+# is absent) and make every prefix-scoped write/delete resolve through a
+# held directory whose identity is checked against this capture. stat
+# without -L is intentional: it is the directory itself, never a referent.
+prefix_id=""
+if [[ -e "$prefix_probe" || -L "$prefix_probe" ]]; then
+    prefix_id="$(stat -c '%d:%i' -- "$prefix_probe" 2>/dev/null)" || prefix_id=""
+    if [[ -z "$prefix_id" ]]; then
+        printf -v q_prefix '%q' "$prefix"
+        echo "install-kit: refusing: cannot read the --prefix directory identity: $q_prefix" >&2
+        echo "  check that the path is a readable directory, then re-run; nothing was written or removed." >&2
+        exit 1
     fi
-    if [[ -f "$prefix/VERSION" || -x "$prefix/egresslock" \
-          || -f "$prefix/gateway/Containerfile" ]]; then
-        continue              # reinstall over this kit's deploy / kit-shaped
+fi
+# EGL-555-D1: one cause line for a prefix that no longer matches the probe
+# (swapped for a link, replaced, or appeared after an absent probe).
+_kit_prefix_refuse_changed() { # <check|appeared>
+    printf -v q_prefix '%q' "$prefix"
+    echo "install-kit: refusing: --prefix changed while the kit checked it: $q_prefix" >&2
+    if [[ "${1:-}" == appeared ]]; then
+        echo "  it appeared after the check, so this run cannot claim it; nothing was written or removed. Re-run when no other install is running." >&2
+    else
+        echo "  nothing was written or removed; name the real kit prefix and re-run." >&2
     fi
-    echo "install-kit: FAIL - refusing to delete $_dest" >&2
-    echo "  $prefix has no kit marker (VERSION, egresslock executable) and" >&2
-    echo "  the dest path is not kit-shaped (no gateway/Containerfile): a mistyped" >&2
-    echo "  --prefix would destroy a foreign tree. Remove it or name the real kit prefix." >&2
     exit 1
-done
-unset _dest
+}
 
 # EGL-72-D1: the release base lives in one VERSION_BASE at the kit root
 # (repo root or extracted tarball). Fail closed BEFORE any copy if it
@@ -267,20 +276,94 @@ base="$(tr -d ' \t\n' < "$src/VERSION_BASE")"
 # mid-deploy `install: cannot stat` used to leave a partial prefix
 # (binaries or templates missing, no next action); this gate fails
 # closed naming the missing files, before anything is written.
+# EGL-549-D5: ONE manifest drives this gate and the copy below. Rows are
+# `file <mode> <rel-path>`, `dir <mode> <rel-path>` and
+# `tree <mode> <rel-root>`; a `tree` root is installed by staging a temp
+# copy of the root and swapping it in. The modes are the DEPLOYED modes
+# (0644 everywhere except the four entry points and build-egl-base, and
+# all directories at 0755), so `install -m` makes them real even under a
+# nonstandard umask. systemd/ stays outside: its source is
+# EGRESSLOCK_UNIT_SRC when the test hook is on and it installs to the
+# unit dir, not the prefix.
+_kit_manifest() {
+    cat <<'EOF'
+file 0755 egresslock
+file 0755 egresslock-start
+file 0755 egresslock-verify
+file 0755 egresslock-setup
+dir 0755 examples
+file 0644 examples/main.conf
+file 0644 examples/main-allowlist
+tree 0755 gateway
+file 0644 gateway/Containerfile
+file 0644 gateway/entrypoint.sh
+file 0644 gateway/security-floor
+file 0644 gateway/squid.conf
+tree 0755 apparmor
+file 0644 apparmor/README.md
+file 0644 apparmor/usr.bin.pasta.local
+tree 0755 examples/recipes
+dir 0755 examples/recipes/agent-container-example
+file 0644 examples/recipes/agent-container-example/Containerfile
+file 0644 examples/recipes/agentic-tool-opencode.md
+file 0644 examples/recipes/ci-runner.md
+file 0644 examples/recipes/fleet-deploy.md
+file 0644 examples/recipes/github.md
+file 0644 examples/recipes/hermes-curl-install.md
+file 0644 examples/recipes/local-llm.md
+file 0644 examples/recipes/malware-analysis.md
+file 0644 examples/recipes/opencode-npm-install.md
+file 0644 examples/recipes/supply-chain-safe-build.md
+tree 0755 examples/egl-base
+file 0644 examples/egl-base/Containerfile
+file 0644 examples/egl-base/README.md
+file 0755 examples/egl-base/build-egl-base
+file 0644 examples/egl-base/security-floor
+tree 0755 docs
+EOF
+    # EGL-556-D2: the docs tree ships into the prefix so the engine and
+    # verify messages point at a copy that survives the checkout/tarball
+    # being removed. Only regular `.md` pages: `tickets/` and the
+    # generated `BOARD.md` are process material, and `find -type f`
+    # keeps symlinked leaves out of the stage (the EGL-399 class). The
+    # rows replay into the `docs.tmp` swap below like the other trees.
+    if [[ -d "$src/docs" && ! -L "$src/docs" ]]; then
+        local _doc_abs _doc_rel _doc_dir
+        while IFS= read -r _doc_abs; do
+            _doc_rel="docs/${_doc_abs#"$src/docs/"}"
+            _doc_dir="${_doc_rel%/*}"
+            [[ "$_doc_dir" == docs ]] || printf 'dir 0755 %s\n' "$_doc_dir"
+        done < <(find "$src/docs" -type f -name '*.md' \
+                      ! -path "$src/docs/tickets/*" \
+                      ! -path "$src/docs/BOARD.md")
+        while IFS= read -r _doc_abs; do
+            _doc_rel="docs/${_doc_abs#"$src/docs/"}"
+            printf 'file 0644 %s\n' "$_doc_rel"
+        done < <(find "$src/docs" -type f -name '*.md' \
+                      ! -path "$src/docs/tickets/*" \
+                      ! -path "$src/docs/BOARD.md")
+    fi
+}
+_kit_rows="$(_kit_manifest)"
 _kit_missing=""
-# EGL-102-D6-F3: cover the WHOLE unconditional copy list (binaries,
-# gateway/, apparmor/, examples incl. recipes/, unit templates). Keep
-# this list in lockstep with the copy list below: this gate guards the
-# copied set.
-for _src in egresslock egresslock-start egresslock-verify egresslock-setup \
-            gateway/Containerfile gateway/entrypoint.sh gateway/squid.conf \
-            gateway/security-floor \
-            apparmor/usr.bin.pasta.local apparmor/README.md \
-            examples/main.conf examples/main-allowlist examples/recipes \
-            examples/egl-base/Containerfile examples/egl-base/README.md \
-            examples/egl-base/build-egl-base examples/egl-base/security-floor; do
-    [[ -e "$src/$_src" ]] || _kit_missing+="$_src "
-done
+# EGL-102-D6-F3: cover the WHOLE deployed set (binaries, gateway/,
+# apparmor/, examples incl. every recipes/ and egl-base/ leaf). The rows
+# and the copy below are the same table, so the gate guards exactly what
+# is installed.
+while IFS=' ' read -r _kind _mode _rel; do
+    [[ -n "$_kind" ]] || continue
+    case "$_kind" in
+        tree|dir) [[ -d "$src/$_rel" ]] || _kit_missing+="$_rel " ;;
+        file) [[ -f "$src/$_rel" ]] || _kit_missing+="$_rel " ;;
+    esac
+done <<<"$_kit_rows"
+# EGL-556-D2: docs must be a real directory, not a link — `-d` accepts a
+# symlinked tree, but the manifest only enumerated regular `.md` leaves
+# under a real one, so a link would ship an empty docs/ and the messages
+# would silently fall back to titles. Refuse before any write.
+if [[ -L "$src/docs" && -d "$src/docs" ]]; then
+    _kit_missing+="docs "
+fi
 # EGL-456-D4: EGRESSLOCK_UNIT_SRC is a test-only hook. Resolve it once
 # here (gated) and use the same value for the completeness check and the
 # deploy; without the flag the kit's own systemd/ applies.
@@ -298,7 +381,7 @@ if [[ -n "$_kit_missing" ]]; then
     echo "  restore the full checkout or re-extract the release tarball, then re-run; nothing was written." >&2
     exit 1
 fi
-unset _kit_missing _src _ut
+unset _kit_missing _ut
 
 # EGL-72-D3: the version line. A tarball install carries KIT_VERSION
 # (written by build-tarball.sh) so the deployed stamp is the BUILD
@@ -312,7 +395,7 @@ if [[ -z "$kit_version" ]]; then
     vcommit="$(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null || true)"
     if [[ -z "$vcommit" ]]; then
         echo "install-kit: WARNING - cannot determine a git commit for the version;" \
-            "falls back to '${base}+git<ts>.unknown'" >&2
+            "falls back to '${base}+gitTS.unknown'" >&2
         vcommit=unknown
     fi
     if [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]]; then
@@ -324,41 +407,143 @@ fi
 # 1. Shared kit — root:root, the only shared copy (ARC-16-D6: gateway
 #    build context ships with the kit so accounts build from the PREFIX,
 #    not a checkout).
-install -d -m 0755 "$prefix"
-install -m 0755 "$src/egresslock"      "$prefix/egresslock"
-install -m 0755 "$src/egresslock-start" "$prefix/egresslock-start"
-install -m 0755 "$src/egresslock-verify"      "$prefix/egresslock-verify"
-install -m 0755 "$src/egresslock-setup"    "$prefix/egresslock-setup"
-cp -R "$src/gateway" "$prefix/gateway.tmp"
-rm -rf "$prefix/gateway"
-mv "$prefix/gateway.tmp" "$prefix/gateway"
-chmod -R go-w "$prefix/gateway"
-# EGL-69-D2: the pasta AppArmor snippet ships with the prefix
-# (root-owned, like gateway/) so `sudo $prefix/egresslock-setup
-# --apparmor-add` works on prefix installs. Shipping is distribution;
-# applying stays explicit --apparmor-add only (ARC-22-D3).
-cp -R "$src/apparmor" "$prefix/apparmor.tmp"
-rm -rf "$prefix/apparmor"
-mv "$prefix/apparmor.tmp" "$prefix/apparmor"
-chmod -R go-w "$prefix/apparmor"
+# EGL-555-D1: create/anchor the prefix without following a final link
+# (`install -d -m` follows a swapped link and chmods the referent;
+# `mkdir -p` returns 0 through a symlink-to-directory). A prefix absent at
+# the probe is created here, then its own identity becomes the reference;
+# a path that appeared in between refuses. Everything from the marker fence
+# through the last prefix write runs in a subshell whose cwd is the held
+# directory and whose `stat .` must still equal the reference: a swap
+# before this point refuses with nothing written or removed, and a swap
+# after it cannot redirect a relative operation.
+if [[ -z "$prefix_id" ]]; then
+    if [[ -e "$prefix_probe" || -L "$prefix_probe" ]]; then
+        _kit_prefix_refuse_changed appeared
+    fi
+    mkdir -p -- "$(dirname -- "$prefix_probe")" || {
+        printf -v q_prefix '%q' "$prefix"
+        echo "install-kit: FAIL - could not create the parent directory for $q_prefix" >&2
+        echo "  nothing was installed; check the path's permissions and re-run." >&2
+        exit 1
+    }
+    mkdir -- "$prefix_probe" || {
+        if [[ -e "$prefix_probe" || -L "$prefix_probe" ]]; then
+            _kit_prefix_refuse_changed appeared
+        fi
+        printf -v q_prefix '%q' "$prefix"
+        echo "install-kit: FAIL - could not create the kit prefix: $q_prefix" >&2
+        echo "  nothing was installed; check the parent directory's permissions and re-run." >&2
+        exit 1
+    }
+    prefix_id="$(stat -c '%d:%i' -- "$prefix_probe" 2>/dev/null)" || {
+        printf -v q_prefix '%q' "$prefix"
+        echo "install-kit: refusing: cannot read the --prefix directory identity: $q_prefix" >&2
+        echo "  check that the path is a readable directory, then re-run; nothing was installed." >&2
+        exit 1
+    }
+elif [[ ! -d "$prefix_probe" ]]; then
+    printf -v q_prefix '%q' "$prefix"
+    echo "install-kit: refusing: --prefix is not a directory: $q_prefix" >&2
+    echo "  pass a directory path here; nothing was written or removed." >&2
+    exit 1
+fi
+(
+cd -- "$prefix_probe" || _kit_prefix_refuse_changed check
+_kit_id_now="$(stat -c '%d:%i' . 2>/dev/null)" || _kit_prefix_refuse_changed check
+[[ "$_kit_id_now" == "$prefix_id" ]] || _kit_prefix_refuse_changed check
+# EGL-68-D1 / EGL-90-D3: never rm -rf through a mistyped --prefix. The
+# install replaces gateway/, apparmor/, examples/recipes/,
+# examples/egl-base/ and docs/. Deleting one is allowed only when it is
+# absent (first install), $prefix carries a kit marker (VERSION or the
+# egresslock executable), or the path is kit-shaped
+# (gateway/Containerfile). Otherwise fail closed before any copy, naming
+# the path. EGL-265 item 4: keep this list in lockstep with the loop.
+# EGL-556-D2: docs/ joins the replacement set and this fence.
+# EGL-555-D1: read through the held directory, relative names only.
+for _dest in gateway apparmor examples/recipes examples/egl-base docs; do
+    if [[ ! -e "$_dest" ]]; then
+        continue                                   # first install
+    fi
+    if [[ -f VERSION || -x egresslock || -f gateway/Containerfile ]]; then
+        continue              # reinstall over this kit's deploy / kit-shaped
+    fi
+    echo "install-kit: FAIL - refusing to delete $prefix/$_dest" >&2
+    echo "  $prefix has no kit marker (VERSION, egresslock executable) and" >&2
+    echo "  the dest path is not kit-shaped (no gateway/Containerfile): a mistyped" >&2
+    echo "  --prefix would destroy a foreign tree. Remove it or name the real kit prefix." >&2
+    exit 1
+done
+unset _dest
+# EGL-555-D1: the mode is set through the held directory, never at the name.
+chmod 0755 . || {
+    printf -v q_prefix '%q' "$prefix"
+    echo "install-kit: FAIL - could not set the kit prefix mode: $q_prefix" >&2
+    echo "  nothing was installed; check the directory's ownership and permissions, then re-run." >&2
+    exit 1
+}
+# EGL-549-D5: the manifest drives the copy too. Direct rows install in
+# order (the `examples` dir before its two files); each `tree` row is
+# staged as `<root>.tmp`, replayed from its own dir/file rows into the
+# temp, mode-normalized, and swapped in. The four atomic-replace sites
+# (gateway, apparmor, examples/recipes, examples/egl-base) are the same
+# temp+rm+mv shape as before (EGL-531-D1; EGL-555 keeps them
+# addressable), and a failure before the swap leaves the old tree.
+_kit_in_tree() { # <rel> — 0 when a tree root owns this row
+    local _t
+    for _t in "${_kit_tree_roots[@]}"; do
+        [[ "$1" == "$_t"/* ]] && return 0
+    done
+    return 1
+}
+_kit_tree_roots=()
+while IFS=' ' read -r _kind _mode _rel; do
+    [[ "$_kind" == tree ]] || continue
+    _kit_tree_roots+=("$_rel")
+done <<<"$_kit_rows"
+while IFS=' ' read -r _kind _mode _rel; do
+    [[ -n "$_kind" ]] || continue
+    case "$_kind" in
+        file)
+            if _kit_in_tree "$_rel"; then continue; fi
+            install -m "$_mode" "$src/$_rel" "$_rel"
+            ;;
+        dir)
+            if _kit_in_tree "$_rel"; then continue; fi
+            install -d -m "$_mode" "$_rel"
+            ;;
+    esac
+done <<<"$_kit_rows"
 # ARC-19-D3: starter conf + empty allowlist for egresslock-setup
 # --init-conf. Root-owned, never installed into account homes.
 # Recipes and egl-base ship too so accounts can build from the PREFIX
 # without a checkout (same rationale as the gateway context, ARC-16-D6).
-install -d -m 0755 "$prefix/examples"
-install -m 0644 "$src/examples/main.conf"       "$prefix/examples/main.conf"
-install -m 0644 "$src/examples/main-allowlist" "$prefix/examples/main-allowlist"
-cp -R "$src/examples/recipes" "$prefix/examples/recipes.tmp"
-rm -rf "$prefix/examples/recipes"
-mv "$prefix/examples/recipes.tmp" "$prefix/examples/recipes"
-chmod -R go-w "$prefix/examples/recipes"
+# EGL-69-D2: the pasta AppArmor snippet ships with the prefix
+# (root-owned, like gateway/) so `sudo $prefix/egresslock-setup
+# --apparmor-add` works on prefix installs. Shipping is distribution;
+# applying stays explicit --apparmor-add only (ARC-22-D3).
 # EGL-232: the shared example base image (egl-base) ships too so the
-# quickstarts can build it without a checkout (same rationale as the
-# recipes and the gateway context above).
-cp -R "$src/examples/egl-base" "$prefix/examples/egl-base.tmp"
-rm -rf "$prefix/examples/egl-base"
-mv "$prefix/examples/egl-base.tmp" "$prefix/examples/egl-base"
-chmod -R go-w "$prefix/examples/egl-base"
+# quickstarts can build it without a checkout.
+while IFS=' ' read -r _kind _mode _rel; do
+    [[ "$_kind" == tree ]] || continue
+    _tmp="$_rel.tmp"
+    # EGL-531-D1: pre-clean only the `.tmp` path; the live root stays in
+    # place until the copy succeeds. EGL-555-D1: relative to the held
+    # prefix directory, so a swapped prefix name cannot redirect it.
+    rm -rf "$_tmp"
+    install -d -m "$_mode" "$_tmp"
+    while IFS=' ' read -r _kind2 _mode2 _rel2; do
+        [[ "$_rel2" == "$_rel"/* ]] || continue
+        case "$_kind2" in
+            dir)  install -d -m "$_mode2" "$_tmp/${_rel2#"$_rel"/}" ;;
+            file) install -m "$_mode2" "$src/$_rel2" "$_tmp/${_rel2#"$_rel"/}" ;;
+        esac
+    done <<<"$_kit_rows"
+    chmod -R go-w "$_tmp"
+    rm -rf "$_rel"
+    mv "$_tmp" "$_rel"
+done <<<"$_kit_rows"
+unset _kit_rows _kit_tree_roots _kind _mode _rel _kind2 _mode2 _rel2 _tmp
+unset -f _kit_in_tree
 
 commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
 if [[ -z "$commit" ]]; then
@@ -376,8 +561,10 @@ fi
     printf 'commit: %s\n' "$commit"
     printf 'deployed: '
     date -u '+%Y-%m-%dT%H:%M:%SZ'
-} > "$prefix/VERSION"
-chmod 0644 "$prefix/VERSION"
+} > VERSION
+chmod 0644 VERSION
+)
+unset prefix_id _kit_id_now
 
 # 1b. PATH wrappers (EGL-43): the .deb ships /usr/bin wrappers, but a
 #     prefix deploy had none, so bare `egresslock` (the root-guard
@@ -558,8 +745,8 @@ if [[ -r "$_aa_profiles" ]]; then
 fi
 echo
 echo "next step — per-account setup (from the installed kit):"
-echo "  sudo $prefix/egresslock-setup init --account <acct> --init-conf --enable"
-echo "  (or --from <conf> to import a pair; import never overwrites a"
+echo "  sudo $prefix/egresslock-setup init ACCT --init-conf --enable"
+echo "  (or --from CONF to import a pair; import never overwrites a"
 echo "  differing/torn dest — use import --force deliberately; the starter"
 echo "  ships from examples/ only when the dest conf is missing)"
 echo

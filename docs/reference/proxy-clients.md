@@ -14,7 +14,7 @@ full path model: [allow-non-http](../quickstart/allow-non-http.md).)
 
 Run every command **as the account**, and derive the gateway address
 from the profile — never hardcode it (the profile's gateway IP and
-port come from `egresslock proxy-env <profile>`; in the table below
+port come from `egresslock proxy-env PROFILE`; in the table below
 `<gw-ip>`/`<gw-port>` are those two values for your profile):
 
 | Tool | Reads HTTP(S)_PROXY env? | How to point it at the gateway |
@@ -38,7 +38,7 @@ egresslock proxy-env main noproxy
 
 ## Why the recipes inject SIX proxy vars
 
-`egresslock proxy-env <profile>` prints six assignments — both cases
+`egresslock proxy-env PROFILE` prints six assignments — both cases
 of the same pair:
 
 - `HTTP_PROXY` / `HTTPS_PROXY` (uppercase) and `http_proxy` /
@@ -47,10 +47,11 @@ of the same pair:
   `HTTPS_PROXY`; apt, wget, git, and pip honor ONLY the lowercase
   spellings; tools that read either case get a consistent answer.
 - `NO_PROXY` / `no_proxy` — destinations that must bypass the proxy
-  and connect direct: `localhost,127.0.0.1`, the conf's `no-proxy`
-  entries, and every direct-path IPv4 pin. NO_PROXY matching
-  is host-only — port enforcement for bypassed destinations stays
-  with the nftables policy.
+  and connect direct: `localhost,127.0.0.1` plus every direct-path
+  IPv4 pin, derived from the profile (there is no hand-written entry
+  and no name bypass). NO_PROXY matching is host-only — port
+  enforcement for bypassed destinations stays with the nftables
+  policy.
 
 The recommended way to give podman the six variables is the bare
 `--out` form, read by podman in the same launch command:

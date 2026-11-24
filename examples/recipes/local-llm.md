@@ -39,13 +39,12 @@ egress](../../docs/quickstart/allow-non-http.md).
 
 The gateway cuts a non-streaming request whose origin stays silent for
 the profile's `read-timeout` (default 900 s) — a slow local model that
-thinks for longer will be cut. Add it to the profile's conf block,
-then re-ensure:
+thinks for longer will be cut. Add it to the profile's conf block —
+use your profile's existing subnet and gateway lines — then re-ensure:
 
 ```text
-profile main 10.199.3.0/24
-    rule gateway-only
-    gateway 10.199.3.2 3128 main-allowlist
+profile main 10.199.0.0/24
+    gateway 10.199.0.2 3128 main-allowlist
     rule allow-host 192.0.2.24:11434
     read-timeout 3600
 ```

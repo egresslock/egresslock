@@ -36,13 +36,12 @@ Set a per-profile timeout in that profile's conf block, then re-ensure:
 
 ```text
 profile main 10.199.3.0/24
-    rule gateway-only
     gateway 10.199.3.2 3128 main-allowlist
     read-timeout 3600
 ```
 
 ```sh
-egresslock ensure <profile>
+egresslock ensure PROFILE
 ```
 
 - Units are seconds: a positive integer. The default is **900**
@@ -55,7 +54,7 @@ egresslock ensure <profile>
   carries an explicit `read_timeout <N> seconds` line:
 
   ```sh
-  podman exec egresslock-gateway-<profile> \
+  podman exec egresslock-gateway-PROFILE \
       grep read_timeout /etc/squid/egresslock/squid.conf
   ```
 

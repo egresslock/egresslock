@@ -9,8 +9,8 @@
 # relocates to the public repo (ARC-13-D5); nothing references the site
 # tree or its conf.
 #
-# Consumer-bound actuals that exec the site's consumer wrapper or
-# forgejo-runner's copy_files.sh stay with their consumers (ARC-74-D7).
+# Consumer-bound actuals that exec the site's consumer wrapper or its
+# copy_files.sh stay with their consumers (ARC-74-D7).
 #
 # Run:  bash tests/test-kit.sh   (or tests/run.sh; either way as a
 #       non-root user — direct root invocation is refused, EGL-434)
@@ -70,7 +70,8 @@ strip_egl491_warnings() {
     grep -vE 'is set but (ignored: it is a test-harness override and requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1; the production default applies\.|is not the exact value 1, so test mode is off; test-harness overrides are ignored\.)$' || true
 }
 
-# EGL-513: kit success lines (`Building`, `Done:`, `unit.env written for`,
+# EGL-513: kit success lines (`Building`, `Done:`,
+# `the scheduled check will verify every profile whose anchor is running`,
 # `PATH wrapper installed:`) must be paste-safe. A `>` in one is a shell
 # redirect: `X -> <path>` truncates <path> and a leading `>>` append-creates
 # a file named after the next word. Assert the captured transcript has a
@@ -89,22 +90,108 @@ assert_kit_lines_paste_safe() { # <label> <transcript> <ERE>
     fi
 }
 
+# EGL-555: --init-conf now publishes with `ln -T`. The legacy EGL-433
+# legs exercise the documented `mv -T` fallback (a filesystem without
+# hard links); an `ln` that fails for a non-EEXIST reason selects that
+# path without changing the race each leg injects at the rename.
+force_mv_publish_fallback() { # <shim-dir>
+    cat > "$1/ln" <<'EOF'
+#!/usr/bin/env bash
+# Simulate a filesystem without hard links; the publisher falls back.
+exit 1
+EOF
+    chmod +x "$1/ln"
+}
+
+# EGL-517: setup help/usage text is paste-inert. Same shape as the engine
+# helper: select command-shaped lines (summary index, page synopsis,
+# Example body, usage/error) and assert no unquoted shell operator.
+assert_setup_help_lines_paste_safe() { # <label> <transcript>
+    local lines bad
+    lines="$(awk '
+        BEGIN { head = 1; inex = 0 }
+        head && /^[[:space:]]*$/ { head = 0 }
+        head && /^[[:space:]]*egresslock-setup[ -]/ { print; next }
+        /^Examples?:$/ { inex = 1; next }
+        /^[[:space:]]*$/ { inex = 0 }
+        /^  egresslock-setup[ -]/ { print; next }
+        /^usage: / { print; next }
+        /^Error: / { print; next }
+        inex { print }
+    ' <<<"$2")"
+    bad="$(sed -E "s/'[^']*'//g" <<<"$lines" | grep -E '[<>|&;`]' || true)"
+    if [[ -z "$lines" ]]; then
+        assert fail "$1 transcript has no command-shaped line"
+    elif [[ -n "$bad" ]]; then
+        assert fail "$1 command-shaped line carries a shell operator: $bad"
+    else
+        assert pass
+        echo "PASS: $1 command-shaped lines are paste-inert"
+    fi
+}
+
+# EGL-517-D2: every captured setup help-page line carries no angle bracket.
+assert_setup_help_page_no_angles() { # <label> <transcript>
+    local bad
+    bad="$(grep -F -e '<' -e '>' <<<"$2" || true)"
+    if [[ -z "$2" ]]; then
+        assert fail "$1 transcript is empty"
+    elif [[ -n "$bad" ]]; then
+        assert fail "$1 help line carries an angle bracket: $bad"
+    else
+        assert pass
+        echo "PASS: $1 help lines carry no angle bracket"
+    fi
+}
+
+# EGL-517-D2/D3: emitted non-help setup/kit text is paste-inert. Same source
+# scan as the engine: no `<...>` placeholder, no word|word alternation;
+# full-line comments, podman's `<no value>` literal, and the generated
+# Squid `#include <local/...>` line are allowlisted.
+assert_setup_source_clean() { # <file> <label>
+    local bad
+    bad="$(awk '
+        /^[[:space:]]*#/ { next }
+        /"<no value>"/ { next }
+        /#include[[:space:]]*<local\// { next }
+        !/^[[:space:]]*(echo|printf|die|config_error)[[:space:]]/ { next }
+        {
+            if ($0 ~ /<[A-Za-z][^<>]*>/) {
+                print "placeholder " FNR ": " $0
+                next
+            }
+            line = $0
+            gsub(/\|\|/, "", line)
+            if (line ~ /[A-Za-z0-9_.)]\|[A-Za-z0-9_(]/) print "alternation " FNR ": " $0
+        }
+    ' "$1")"
+    if [[ -n "$bad" ]]; then
+        assert fail "$2 emitted text is not paste-inert: $bad"
+    else
+        assert pass
+        echo "PASS: $2 emitted text has no placeholder/alternation"
+    fi
+}
+
 # Synthetic conf for the kit's engine-side exercises (neutral hosts).
 # EGL-325: there is no runtime conf selector. The account confdir is fixed
 # at <passwd-home>/.config/egresslock and the file basename must match the
-# profile it defines, so the fixture lives there as local-dev.conf.
+# profile it defines, so the fixture lives there as workstation.conf.
 export ARCMOCK_DNS_BASE="git.example.test=192.0.2.10,cache.example.test=192.0.2.11"
 mkdir -p "$HOME/.config/egresslock"
-KITCONF="$HOME/.config/egresslock/local-dev.conf"
+KITCONF="$HOME/.config/egresslock/workstation.conf"
 cat > "$KITCONF" <<'EOF'
-profile local-dev 10.50.0.0/24
+profile workstation 10.50.0.0/24
     rule allow-host git.example.test:443
     rule allow-host git.example.test:2222
     rule allow-host cache.example.test:11434
-    gateway 10.50.0.2 3128 local-dev-allowlist
+    gateway 10.50.0.2 3128 workstation-allowlist
 EOF
-: > "$HOME/.config/egresslock/local-dev-allowlist"
+: > "$HOME/.config/egresslock/workstation-allowlist"
 export PATH="$TESTROOT/bin:$TREE_ROOT:$PATH"
+# EGL-352: capture this harness process's own fd 2; the unconditional tail
+# check fails a green run that wrote to it.
+harness_stderr_guard_init
 
 # The mock state mirrors the fixture assumptions the moved kit blocks
 # relied on (gateway image marker, IPAM dir).
@@ -113,6 +200,15 @@ mkdir -p "$STATE/images" "$STATE/ips"
 # EGL-206-D2a: the alpine:latest anchor marker the kit's engine-side
 # exercises inspect is already seeded by tests/lib.sh (the mock `podman
 # run` never pulls) — do not re-seed here.
+
+# EGL-550-D6: the packaging producers are absent on the extracted kit
+# (ARC-22-D4), so their consumers skip with a named cause. These flags
+# used to live inside the deleted egl12 window; they stay outside every
+# section because egl420, egl49, arc22, egl27/egl72/egl83/egl491 and more
+# consume them (a naive section delete broke ~20 later skips under set -u).
+HAVE_BUILD_DEB=0; [[ -f "$TREE_ROOT/packaging/build-deb.sh" ]] && HAVE_BUILD_DEB=1
+HAVE_BUILD_TARBALL=0; [[ -f "$TREE_ROOT/packaging/build-tarball.sh" ]] && HAVE_BUILD_TARBALL=1
+PKG_SKIP_TAG="packaging-build-scripts absent"
 
 # --- ARC-16: kit productization ---
 section_begin arc16 "ARC-16 kit productization"
@@ -154,12 +250,108 @@ cmp -s "$TREE_ROOT/egresslock-setup" "$OPT/egresslock-setup" \
 # EGL-69-D2: the prefix ships the pasta AppArmor snippet (root-owned).
 [[ -f "$OPT/apparmor/usr.bin.pasta.local" && -f "$OPT/apparmor/README.md" ]] \
     && a16 pass || a16 fail "apparmor snippet deployed to prefix (EGL-69-D2)"
+# EGL-556-D2: the prefix ships the docs pages the messages point at —
+# regular .md only, structure preserved, and `go-w` like the other trees;
+# tickets/ and the generated BOARD.md stay process material.
+a16_docs_leaves() { ( cd "$1" && find docs -type f -name '*.md' \
+    ! -path 'docs/tickets/*' ! -name 'BOARD.md' -printf '%P\n' | sort ); }
+if [[ -f "$OPT/docs/reference/operator-obligations.md" \
+      && -f "$OPT/docs/troubleshooting/pasta-apparmor.md" \
+      && -f "$OPT/docs/README.md" \
+      && ! -e "$OPT/docs/tickets" && ! -e "$OPT/docs/BOARD.md" \
+      && -z "$(find "$OPT/docs" -perm /022 -print)" \
+      && "$(a16_docs_leaves "$TREE_ROOT")" == "$(a16_docs_leaves "$OPT")" ]]; then
+    a16 pass
+else
+    a16 fail "prefix docs stage ships the selected .md pages, go-w, no process material (diff: $(diff <(a16_docs_leaves "$TREE_ROOT") <(a16_docs_leaves "$OPT") 2>/dev/null | tr '\n' '|'))"
+fi
 # EGL-232: the shared example base image (egl-base) ships with the kit;
 # EGL-240: the build helper ships executable beside it.
 [[ -f "$OPT/examples/egl-base/Containerfile" && -f "$OPT/examples/egl-base/README.md" && -x "$OPT/examples/egl-base/build-egl-base" ]] \
     && a16 pass || a16 fail "egl-base build context deployed (EGL-232)"
+# EGL-549: one manifest drives the gate and the copy, so the installed
+# tree is exactly the source tree's leaf set (a new source leaf must be
+# added to the manifest or this reds) and the deployed modes are the
+# documented 0644/0755 set even under a nonstandard umask (install -m,
+# not cp -R).
+a16_tree_leaves() { ( cd "$1" && find gateway apparmor examples -type f -printf '%p\n' | sort ); }
+if [[ "$(a16_tree_leaves "$TREE_ROOT")" == "$(a16_tree_leaves "$OPT")" ]]; then
+    a16 pass
+else
+    a16 fail "installed kit leaf set matches the source tree (diff: $(diff <(a16_tree_leaves "$TREE_ROOT") <(a16_tree_leaves "$OPT") | tr '\n' '|'))"
+fi
+if [[ "$(stat -c %a "$OPT/gateway/squid.conf")" == 644 ]] \
+   && [[ "$(stat -c %a "$OPT/examples/egl-base/build-egl-base")" == 755 ]] \
+   && [[ -x "$OPT/examples/egl-base/build-egl-base" ]] \
+   && [[ "$(stat -c %a "$OPT/examples/recipes")" == 755 ]] \
+   && [[ -z "$(find "$OPT/examples/recipes" -maxdepth 0 -perm /022 -print)" ]]; then
+    a16 pass
+else
+    a16 fail "installed kit modes are the documented 0644/0755 set (squid.conf=$(stat -c %a "$OPT/gateway/squid.conf" 2>/dev/null), build-egl-base=$(stat -c %a "$OPT/examples/egl-base/build-egl-base" 2>/dev/null), recipes=$(stat -c %a "$OPT/examples/recipes" 2>/dev/null))"
+fi
+# EGL-549 mutation controls on a scratch kit tree: a listed-but-missing
+# leaf must fail the gate closed before any write, and a
+# present-but-unlisted source leaf must diverge from the installed set
+# (the pin is dynamic; a hardcoded expected list would pass the unlisted
+# case and fail the control).
+sc="$TESTROOT/kit549"
+scp="$TESTROOT/kit549-prefix"
+a16_kit549_run() { # <kit tree> <prefix>
+    env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
+        EGRESSLOCK_UNIT_DIR="$TESTROOT/kit549-units" \
+        EGRESSLOCK_PATH_BINDIR="$TESTROOT/kit549-wbin" \
+        EGRESSLOCK_PATH_SBINDIR="$TESTROOT/kit549-wsbin" \
+        "$1/install-kit.sh" --prefix "$2" 2>&1
+}
+rm -rf "$sc" "$scp"
+mkdir -p "$sc" "$TESTROOT/kit549-units" "$TESTROOT/kit549-wbin" "$TESTROOT/kit549-wsbin"
+cp -a "$TREE_ROOT/install-kit.sh" "$TREE_ROOT/VERSION_BASE" \
+      "$TREE_ROOT/egresslock" "$TREE_ROOT/egresslock-start" \
+      "$TREE_ROOT/egresslock-verify" "$TREE_ROOT/egresslock-setup" \
+      "$TREE_ROOT/gateway" "$TREE_ROOT/apparmor" "$TREE_ROOT/examples" \
+      "$TREE_ROOT/docs" "$TREE_ROOT/systemd" "$sc/"
+# 1. listed-but-missing: the gate names the leaf and writes nothing.
+rm -f "$sc/gateway/squid.conf"
+o="$(a16_kit549_run "$sc" "$scp")"; rc=$?
+if [[ "$rc" == 1 && "$o" == *"missing: gateway/squid.conf"* && ! -e "$scp" ]]; then
+    a16 pass
+else
+    a16 fail "listed-but-missing kit leaf fails closed before any write (rc=$rc, prefix exists: $([[ -e "$scp" ]] && echo yes || echo no), out: $(tail -2 <<<"$o" | tr '\n' '|'))"
+fi
+# 2. present-but-unlisted: the install succeeds and the pin sees the
+# divergence (the source set carries a leaf the installed set does not).
+cp -a "$TREE_ROOT/gateway/squid.conf" "$sc/gateway/squid.conf"
+: > "$sc/gateway/zz-unlisted"
+rm -rf "$scp"
+o="$(a16_kit549_run "$sc" "$scp")"; rc=$?
+if [[ "$rc" == 0 && "$(a16_tree_leaves "$sc")" != "$(a16_tree_leaves "$scp")" ]]; then
+    a16 pass
+else
+    a16 fail "present-but-unlisted kit leaf diverges from the installed set (rc=$rc, diff: $(diff <(a16_tree_leaves "$sc") <(a16_tree_leaves "$scp") 2>/dev/null | tr '\n' '|'), out: $(tail -2 <<<"$o" | tr '\n' '|'))"
+fi
+# EGL-556-D2: the docs tree joins the source gate. A missing docs/ and a
+# symlinked docs/ both fail closed before any copy, naming `docs`.
+rm -rf "$scp"
+rm -rf "$sc/docs"
+o="$(a16_kit549_run "$sc" "$scp")"; rc=$?
+if [[ "$rc" == 1 && "$o" == *"(missing: docs)"* && ! -e "$scp" ]]; then
+    a16 pass
+else
+    a16 fail "missing docs/ fails closed pre-copy (rc=$rc, prefix exists: $([[ -e "$scp" ]] && echo yes || echo no), out: $(tail -2 <<<"$o" | tr '\n' '|'))"
+fi
+ln -s "$TREE_ROOT/docs" "$sc/docs"
+rm -rf "$scp"
+o="$(a16_kit549_run "$sc" "$scp")"; rc=$?
+if [[ "$rc" == 1 && "$o" == *"(missing: docs)"* && ! -e "$scp" ]]; then
+    a16 pass
+else
+    a16 fail "symlinked docs/ fails closed pre-copy (rc=$rc, prefix exists: $([[ -e "$scp" ]] && echo yes || echo no), out: $(tail -2 <<<"$o" | tr '\n' '|'))"
+fi
+rm -rf "$sc" "$scp"
 [[ -f "$UNITS/egresslock-verify@.service" && -f "$UNITS/egresslock-verify@.timer" ]] \
     && a16 pass || a16 fail "instanced templates installed (D1)"
+grep -qxF 'PartOf=egresslock-verify@%i.timer' "$UNITS/egresslock-verify@.service" \
+    && a16 pass || a16 fail "installed unit stops the verify oneshot with its timer (PartOf=)"
 # EGL-103-D1: shipped unit text carries the generated-file notice and
 # short comments — no internal ticket IDs ride along.
 if grep -q "do not edit" "$UNITS/egresslock-verify@.service" \
@@ -175,7 +367,7 @@ else
     a16 pass
 fi
 # ARC-18-D4: install-kit is kit-level; it must NOT enable any per-account
-# timer (that is setup-account --enable, after unit.env exists).
+# timer (that is setup-account --enable, after the account is configured).
 grep -qE "enable --now egresslock-verify@" "$STATE/systemctl.log" \
     && a16 fail "install-kit enabled a timer (moved to setup-account)" \
     || a16 pass
@@ -193,10 +385,10 @@ if [[ "$w_rc" == 1 && "$w_out" == *"EGRESSLOCK_PROFILE is required"* ]]; then
 else
     a16 fail "wrapper fails closed without EGRESSLOCK_PROFILE (rc=$w_rc, out: $w_out)"
 fi
-w_out="$(env EGRESSLOCK_PROFILE=local-dev "$OPT/egresslock-start" daemon 2>&1)"; w_rc=$?
+w_out="$(env EGRESSLOCK_PROFILE=workstation "$OPT/egresslock-start" daemon 2>&1)"; w_rc=$?
 [[ "$w_rc" == 1 && "$w_out" == *"RUNNER_BIN is required"* ]] \
     && a16 pass || a16 fail "wrapper fails closed without RUNNER_BIN (rc=$w_rc, out: $w_out)"
-w_out="$(env EGRESSLOCK_PROFILE=local-dev \
+w_out="$(env EGRESSLOCK_PROFILE=workstation \
     RUNNER_BIN=echo "$OPT/egresslock-start" daemon -c /tmp/cfg 2>&1)"; w_rc=$?
 if [[ "$w_rc" == 0 && "$w_out" == *"daemon -c /tmp/cfg"* ]]; then
     a16 pass
@@ -204,7 +396,7 @@ else
     a16 fail "wrapper ensure+exec with explicit env (rc=$w_rc, out: $w_out)"
 fi
 # D4: a broken EGRESSLOCK_DIR wins over the working script dir.
-w_out="$(env EGRESSLOCK_DIR="$STATE/empty-dir" EGRESSLOCK_PROFILE=local-dev \
+w_out="$(env EGRESSLOCK_DIR="$STATE/empty-dir" EGRESSLOCK_PROFILE=workstation \
     RUNNER_BIN=echo "$OPT/egresslock-start" daemon 2>&1)"; w_rc=$?
 [[ "$w_rc" == 1 && "$w_out" == *"$STATE/empty-dir/egresslock"* ]] \
     && a16 pass || a16 fail "wrapper honors EGRESSLOCK_DIR first (rc=$w_rc, out: $w_out)"
@@ -212,31 +404,34 @@ w_out="$(env EGRESSLOCK_DIR="$STATE/empty-dir" EGRESSLOCK_PROFILE=local-dev \
 # 3. egresslock-verify (D3 hybrid), deployed copy.
 # EGL-325: nothing but the engine is required. Sweep mode with no profile
 # and nothing ensured is rc 0 with only the aggregate resolution line.
-egresslock teardown local-dev >/dev/null 2>&1 || true
+egresslock teardown workstation >/dev/null 2>&1 || true
 va_out="$(env -u EGRESSLOCK_PROFILE "$OPT/egresslock-verify" 2>&1)"; va_rc=$?
 [[ "$va_rc" == 0 && "$va_out" == "using configs in $HOME/.config/egresslock (1 profiles)"* \
    && "$va_out" != *"verified (ensured)"* ]] \
     && a16 pass || a16 fail "egresslock-verify sweep with nothing ensured (rc=$va_rc, out: $va_out)"
-# named mode: ensure local-dev first so verify has something to check.
-egresslock ensure local-dev >/dev/null 2>&1
-va_out="$(env EGRESSLOCK_PROFILE=local-dev "$OPT/egresslock-verify" 2>&1)"; va_rc=$?
-[[ "$va_rc" == 0 && "$va_out" == *"policy and gateway verified"* ]] \
-    && a16 pass || a16 fail "egresslock-verify named mode (rc=$va_rc, out: $va_out)"
+# EGL-333-D6: a set EGRESSLOCK_PROFILE is ignored silently — the wrapper
+# still runs bare `verify --ensured` (it belongs to egresslock-start).
+# Ensure workstation first so the sweep has something to check.
+egresslock ensure workstation >/dev/null 2>&1
+va_out="$(env EGRESSLOCK_PROFILE=workstation "$OPT/egresslock-verify" 2>&1)"; va_rc=$?
+[[ "$va_rc" == 0 && "$va_out" == *"verified (ensured)"* \
+   && "$va_out" != *"EGRESSLOCK_PROFILE"* ]] \
+    && a16 pass || a16 fail "egresslock-verify ignores a set EGRESSLOCK_PROFILE (rc=$va_rc, out: $va_out)"
 # ensured mode (PROFILE unset): the sweep runs bare `verify --ensured`
-# against the account's fixed confdir aggregate. The local-dev fixture
+# against the account's fixed confdir aggregate. The workstation fixture
 # already lives in that confdir, so the named-mode ensure above is the
 # anchor the sweep must find.
 # EGL-140-D1: the pin record is a sibling of the RESOLVED conf; re-ensure
 # so the record is present beside the confdir conf the sweep resolves.
-egresslock ensure local-dev >/dev/null 2>&1
+egresslock ensure workstation >/dev/null 2>&1
 va_out="$(env -u EGRESSLOCK_PROFILE "$OPT/egresslock-verify" 2>&1)"; va_rc=$?
 [[ "$va_rc" == 0 && "$va_out" == *"verified (ensured)"* ]] \
     && a16 pass || a16 fail "egresslock-verify ensured mode (rc=$va_rc, out: $va_out)"
 # tamper: drift in the ensured profile's chain must fail the timer entry.
-sed -i '/dport 2222/d' "$STATE/nft/egresslock.p_local_dev"
+sed -i '/dport 2222/d' "$STATE/nft/egresslock.p_workstation"
 va_out="$(env -u EGRESSLOCK_PROFILE "$OPT/egresslock-verify" 2>&1)"; va_rc=$?
 [[ "$va_rc" == 1 ]] && a16 pass || a16 fail "egresslock-verify fails on drift (rc=$va_rc, out: $va_out)"
-egresslock ensure local-dev >/dev/null 2>&1
+egresslock ensure workstation >/dev/null 2>&1
 
 section_end arc16
 
@@ -277,8 +472,111 @@ v_start=$SECONDS
 v_out="$(env -u EGRESSLOCK_PROFILE PATH="$TESTROOT/bin-verify-hang:$PATH" \
     "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
 v_elapsed=$(( SECONDS - v_start ))
-[[ "$v_rc" == 1 && "$v_out" == *"netns probe timed out after 5s"* && "$v_elapsed" -lt 15 ]] \
+[[ "$v_rc" == 1 && "$v_out" == *"netns probe timed out after 5s"* \
+    && "$v_out" != *"ignored TERM"* && "$v_elapsed" -lt 15 ]] \
     && a85 pass || a85 fail "verify probe expiry is a named 5s failure (rc=$v_rc, elapsed=${v_elapsed}s, out: $v_out)"
+
+# 2b. EGL-583: a probe that ignores TERM is KILLed after the 1s grace
+#     (`timeout -k 1 5`), so the 5s bound still holds; the named timeout
+#     line says so and echoes the real probe (no generic "broken"
+#     branch, which would blame podman for the bound working).
+mkdir -p "$TESTROOT/bin-verify-termtrap"
+cat > "$TESTROOT/bin-verify-termtrap/podman" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "unshare" && "\$2" == "--rootless-netns" && "\$3" == "true" ]]; then
+    trap '' TERM
+    # EGL-609: single process on purpose. The KILL must take the direct
+    # child on every timeout(1) implementation; a separate sleep 30
+    # grandchild can survive it and hold the captured pipe for the full
+    # 30s, so the elapsed bound would measure the leak, not the wrapper.
+    exec sleep 30
+fi
+exec "$TESTROOT/bin/podman" "\$@"
+EOF
+chmod +x "$TESTROOT/bin-verify-termtrap/podman"
+v_start=$SECONDS
+v_out="$(env -u EGRESSLOCK_PROFILE PATH="$TESTROOT/bin-verify-termtrap:$PATH" \
+    "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+v_elapsed=$(( SECONDS - v_start ))
+[[ "$v_rc" == 1 \
+    && "$v_out" == *"netns probe timed out after 5s"* \
+    && "$v_out" == *"timeout -k 1 5 podman unshare --rootless-netns true"* \
+    && "$v_out" == *"the probe ignored TERM and was killed after the 1s grace"* \
+    && "$v_out" != *"rootless-netns is broken"* \
+    && "$v_elapsed" -lt 15 ]] \
+    && a85 pass || a85 fail "verify TERM-ignoring probe is KILLed after the grace (rc=$v_rc, elapsed=${v_elapsed}s, out: $v_out)"
+
+# 2c. F1 (R-EGL-583-2): timeout(1) reports 137 for any SIGKILL death of
+#     the probe, so one killed from outside well under the 5s bound
+#     (here: a self-kill) must take the generic branch and report the
+#     real rc — never the 5s/TERM/grace timeout narrative.
+mkdir -p "$TESTROOT/bin-verify-selfkill"
+cat > "$TESTROOT/bin-verify-selfkill/podman" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "unshare" && "\$2" == "--rootless-netns" && "\$3" == "true" ]]; then
+    kill -9 "\$\$"
+fi
+exec "$TESTROOT/bin/podman" "\$@"
+EOF
+chmod +x "$TESTROOT/bin-verify-selfkill/podman"
+v_start=$SECONDS
+v_out="$(env -u EGRESSLOCK_PROFILE PATH="$TESTROOT/bin-verify-selfkill:$PATH" \
+    "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+v_elapsed=$(( SECONDS - v_start ))
+[[ "$v_rc" == 1 \
+    && "$v_out" == *"rootless-netns is broken"* \
+    && "$v_out" == *"rc=137"* \
+    && "$v_out" != *"netns probe timed out after 5s"* \
+    && "$v_out" != *"ignored TERM"* ]] \
+    && a85 pass || a85 fail "verify externally SIGKILLed probe reports the real cause (rc=$v_rc, elapsed=${v_elapsed}s, out: $v_out)"
+
+# 2d. F6 (R-EGL-583-4): a 137 that lands inside the (0s, 5s) window is an
+#     external SIGKILL, not the grace KILL, so the elapsed gate must send
+#     it to the generic branch. This also pins the gate threshold itself:
+#     the extreme-only legs would miss a drift like `>= 5` -> `>= 1`.
+mkdir -p "$TESTROOT/bin-verify-midkill"
+cat > "$TESTROOT/bin-verify-midkill/podman" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "unshare" && "\$2" == "--rootless-netns" && "\$3" == "true" ]]; then
+    sleep 2
+    kill -9 "\$\$"
+fi
+exec "$TESTROOT/bin/podman" "\$@"
+EOF
+chmod +x "$TESTROOT/bin-verify-midkill/podman"
+v_start=$SECONDS
+v_out="$(env -u EGRESSLOCK_PROFILE PATH="$TESTROOT/bin-verify-midkill:$PATH" \
+    "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+v_elapsed=$(( SECONDS - v_start ))
+[[ "$v_rc" == 1 \
+    && "$v_out" == *"rootless-netns is broken"* \
+    && "$v_out" == *"rc=137"* \
+    && "$v_out" != *"netns probe timed out after 5s"* \
+    && "$v_out" != *"ignored TERM"* ]] \
+    && a85 pass || a85 fail "verify mid-window SIGKILL stays off the timeout path (rc=$v_rc, elapsed=${v_elapsed}s, out: $v_out)"
+
+# 2e. F5 (R-EGL-583-4): timeout(1) also propagates a probe's own 124, so
+#     an early 124 must take the generic branch with the real rc — never
+#     the 5s narrative on a probe that never reached the bound.
+mkdir -p "$TESTROOT/bin-verify-exit124"
+cat > "$TESTROOT/bin-verify-exit124/podman" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "unshare" && "\$2" == "--rootless-netns" && "\$3" == "true" ]]; then
+    exit 124
+fi
+exec "$TESTROOT/bin/podman" "\$@"
+EOF
+chmod +x "$TESTROOT/bin-verify-exit124/podman"
+v_start=$SECONDS
+v_out="$(env -u EGRESSLOCK_PROFILE PATH="$TESTROOT/bin-verify-exit124:$PATH" \
+    "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+v_elapsed=$(( SECONDS - v_start ))
+[[ "$v_rc" == 1 \
+    && "$v_out" == *"rootless-netns is broken"* \
+    && "$v_out" == *"rc=124"* \
+    && "$v_out" != *"netns probe timed out after 5s"* \
+    && "$v_out" != *"ignored TERM"* ]] \
+    && a85 pass || a85 fail "verify early 124 exit reports the real cause (rc=$v_rc, elapsed=${v_elapsed}s, out: $v_out)"
 
 # 3. EGL-347-D1: the wrapper reports podman's actual error and routes the
 # AppArmor-shaped failure through the checker (no fixed claim, and the
@@ -295,11 +593,15 @@ EOF
 chmod +x "$TESTROOT/bin-verify-pasta/podman"
 v_out="$(env -u EGRESSLOCK_PROFILE PATH="$TESTROOT/bin-verify-pasta:$PATH" \
     "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+e556_vpasta="$OPT/docs/troubleshooting/pasta-apparmor.md"
 [[ "$v_rc" == 1 \
     && "$v_out" == *"egresslock-verify: Error: podman rootless-netns is broken"* \
     && "$v_out" == *"rootless netns: kill network process: permission denied"* \
     && "$v_out" == *"egresslock-setup apparmor check"* \
     && "$v_out" == *"egresslock-setup apparmor add"* \
+    && "$v_out" == *"the pasta/AppArmor troubleshooting page: $e556_vpasta"* \
+    && "$v_out" == *"the pasta/AppArmor troubleshooting page (Diagnosis): $e556_vpasta"* \
+    && "$(grep -cF "the pasta/AppArmor troubleshooting page: $e556_vpasta" <<<"$v_out")" == 2 \
     && "$v_out" != *"systemctl restart user@"* ]] \
     && a85 pass || a85 fail "verify pasta probe is checker-led, no fixed claim (rc=$v_rc, out: $v_out)"
 
@@ -320,7 +622,7 @@ v_out="$(env -u EGRESSLOCK_PROFILE PATH="$TESTROOT/bin-verify-cwd:$PATH" \
     "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
 [[ "$v_rc" == 1 \
     && "$v_out" == *"cannot chdir to /home/ben: Permission denied"* \
-    && "$v_out" == *"docs/troubleshooting/netns-inspection"* \
+    && "$v_out" == *"the shared-netns troubleshooting page: $OPT/docs/troubleshooting/netns-inspection.md"* \
     && "$v_out" != *"apparmor check"* && "$v_out" != *"apparmor add"* \
     && "$v_out" != *"sudo -iu"* \
     && "$v_out" != *"cannot use the directory"* ]] \
@@ -343,8 +645,22 @@ v_out="$(env -u EGRESSLOCK_PROFILE PATH="$TESTROOT/bin-verify-silent:$PATH" \
 [[ "$v_rc" == 1 \
     && "$v_out" == *"egresslock-verify:   (probe printed no output)"* \
     && "$v_out" == *"egresslock-setup apparmor check"* \
+    && "$v_out" == *"the pasta/AppArmor troubleshooting page: $e556_vpasta"* \
     && "$v_out" != *"systemctl restart user@"* ]] \
     && a85 pass || a85 fail "verify silent probe gets placeholder + checker route (rc=$v_rc, out: $v_out)"
+
+# 4c. EGL-556-D4: a kit with no docs tree prints the page title alone —
+#     the resolver never invents a path the operator cannot open.
+e556_vkit="$TESTROOT/verify-egl556-nodocs"; rm -rf "$e556_vkit"; mkdir -p "$e556_vkit"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$e556_vkit/egresslock"
+chmod +x "$e556_vkit/egresslock"
+v_out="$(env -u EGRESSLOCK_PROFILE EGRESSLOCK_DIR="$e556_vkit" \
+    PATH="$TESTROOT/bin-verify-cwd:$PATH" "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
+[[ "$v_rc" == 1 \
+    && "$v_out" == *"the shared-netns troubleshooting page"* \
+    && "$v_out" != *"the shared-netns troubleshooting page:"* \
+    && "$v_out" != *"docs/troubleshooting/netns-inspection.md"* ]] \
+    && a85 pass || a85 fail "verify missing docs tree prints the title only (rc=$v_rc, out: $v_out)"
 
 # 5. EGL-378-D4/D5: the probe itself runs from /, so an inherited CWD
 #    the account cannot traverse no longer kills the wrapper before the
@@ -451,18 +767,20 @@ else
     a115 fail "sweep argv is bare --ensured with no conf env (rc=$v_rc, record: $(cat "$mk115/record"), out: $v_out)"
 fi
 
-# 2. Named mode: only the profile name reaches the engine child — no
-#    --config and no EGRESSLOCK_CONF.
+# 2. EGL-333-D6: a set EGRESSLOCK_PROFILE is ignored silently. The argv
+#    stays bare `verify --ensured` (no named branch), no conf env, and the
+#    wrapper prints no warning about the live egresslock-start variable.
 : > "$mk115/record"
-v_out="$(env EGRESSLOCK_PROFILE=local-dev EGRESSLOCK_SKIP_NETNS_PROBE=1 \
+v_out="$(env EGRESSLOCK_PROFILE=workstation EGRESSLOCK_SKIP_NETNS_PROBE=1 \
     EGRESSLOCK_DIR="$mk115" \
     "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
 if [[ "$v_rc" == 0 \
-      && "$(sed -n 1p "$mk115/record")" == "argv: <verify> <local-dev>" \
-      && "$(sed -n 2p "$mk115/record")" == "conf-env:<unset>" ]]; then
+      && "$(sed -n 1p "$mk115/record")" == "argv: <verify> <--ensured>" \
+      && "$(sed -n 2p "$mk115/record")" == "conf-env:<unset>" \
+      && "$v_out" != *"EGRESSLOCK_PROFILE"* ]]; then
     a115 pass
 else
-    a115 fail "named mode passes profile only, no selector (rc=$v_rc, record: $(cat "$mk115/record"), out: $v_out)"
+    a115 fail "set EGRESSLOCK_PROFILE is ignored, argv stays --ensured (rc=$v_rc, record: $(cat "$mk115/record"), out: $v_out)"
 fi
 
 # 3. End-to-end aggregate: two *.conf in the fixed confdir, both anchors
@@ -475,14 +793,14 @@ profile second 10.50.1.0/24
 EOF
 : > "$HOME/.config/egresslock/second-allowlist"
 egresslock ensure second >/dev/null 2>&1
-# EGL-140-D1: re-ensure local-dev so its pin record is a sibling of the
+# EGL-140-D1: re-ensure workstation so its pin record is a sibling of the
 # conf the sweep resolves (the tamper drill above expects a green sweep
 # baseline for the tampered half only).
-egresslock ensure local-dev >/dev/null 2>&1
+egresslock ensure workstation >/dev/null 2>&1
 v_out="$(env -u EGRESSLOCK_PROFILE \
     "$OPT/egresslock-verify" 2>&1)"; v_rc=$?
 if [[ "$v_rc" == 0 \
-      && "$v_out" == *"profile 'local-dev' verified (ensured)"* \
+      && "$v_out" == *"profile 'workstation' verified (ensured)"* \
       && "$v_out" == *"profile 'second' verified (ensured)"* \
       && "$v_out" == *"using configs in"*"(2 profiles)"* ]]; then
     a115 pass
@@ -491,11 +809,11 @@ else
 fi
 
 # Cleanup: restore the harness's fixed-confdir and profile state. The
-# local-dev fixture (KITCONF) stays for the rest of the harness.
+# workstation fixture (KITCONF) stays for the rest of the harness.
 egresslock teardown second >/dev/null 2>&1 || true
 rm -f "$HOME/.config/egresslock/second.conf" \
       "$HOME/.config/egresslock/second-allowlist" \
-      "$HOME/.config/egresslock/local-dev.pins" "$HOME/.config/egresslock/second.pins"
+      "$HOME/.config/egresslock/workstation.pins" "$HOME/.config/egresslock/second.pins"
 
 section_end egl115
 
@@ -520,7 +838,7 @@ cp "$OPT/egresslock" "$u17/prefix/" 2>/dev/null \
 : > "$u17/prefix/gateway/Containerfile"
 : > "$u17/units/egresslock-verify@.service"
 : > "$u17/units/egresslock-verify@.timer"
-: > "$u17/home/runner/.config/egresslock/unit.env"
+: > "$u17/home/runner/.config/egresslock/main.conf"
 : > "$STATE/systemctl.log"
 # R-017-1 F5: a marker-less prefix must NOT be rm -rf'd.
 mkdir -p "$u17/notakit"
@@ -551,6 +869,12 @@ u_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
 [[ ! -L "$u17/units/timers.target.wants/egresslock-verify@ghost.timer" \
     && "$u_out" == *"removed dangling timer enablement"* ]] \
     && a17 pass || a17 fail "dangling kit wants symlink swept (out: $u_out)"
+# EGL-535-D4: a dangling wants link is not an enabled instance, so the
+# stop sweep must never attempt it. The harness mock returns 0 for every
+# disable, so the summary alone cannot reveal the over-reach; the call log
+# can (mutation: drop the `-e` test from the wants source -> red).
+grep -qF 'disable --now egresslock-verify@ghost.timer' "$STATE/systemctl.log" \
+    && a17 fail "dangling wants link was never passed to disable" || a17 pass
 [[ ! -e "$u17/units/egresslock-verify@.service" && ! -e "$u17/units/egresslock-verify@.timer" ]] \
     && a17 pass || a17 fail "templates removed"
 [[ ! -e "$u17/prefix/egresslock" && ! -e "$u17/prefix/VERSION" ]] \
@@ -574,18 +898,20 @@ grep -q "daemon-reload" "$STATE/systemctl.log" \
     && a17 pass || a17 fail "no reload warning on a systemctl host (out: $u_out)"
 [[ "$u_out" == *"instanced templates removed; timers stopped"* ]] \
     && a17 pass || a17 fail "confirmed summary says timers stopped (out: $u_out)"
-[[ -f "$u17/home/runner/.config/egresslock/unit.env" ]] \
+[[ -f "$u17/home/runner/.config/egresslock/main.conf" ]] \
     && a17 pass || a17 fail "account data preserved by default (D2)"
-grep -q "teardown --runtime" <<<"$u_out" \
-    && a17 pass || a17 fail "reminder points at teardown --runtime (ARC-60-D3)"
-grep -q "teardown all" <<<"$u_out" \
-    && a17 fail "reminder still says teardown all" || a17 pass
+grep -qF "teardown all --yes" <<<"$u_out" \
+    && a17 pass || a17 fail "reminder points at teardown all --yes (EGL-519)"
+grep -qF "teardown --orphans" <<<"$u_out" \
+    && a17 pass || a17 fail "reminder points at teardown --orphans (EGL-519)"
+grep -qF "teardown --runtime" <<<"$u_out" \
+    && a17 fail "reminder still says teardown --runtime (EGL-519 migration)" || a17 pass
 
 # --purge-account-data removes the confdir. EGL-140-D1:
 # the pin record rides the confdir — a fixture <profile>.pins is kept by
 # the default keep path and removed by the purge, never orphaned.
 mkdir -p "$u17/home/runner/.config/egresslock"
-: > "$u17/home/runner/.config/egresslock/unit.env"
+: > "$u17/home/runner/.config/egresslock/main.conf"
 : > "$u17/home/runner/.config/egresslock/main.pins"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
     EGRESSLOCK_ACCOUNT_HOME="$u17/home/runner" \
@@ -597,7 +923,7 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
 # EGL-140-D1: the default (no --purge) keep path keeps the pin record
 # WITH the confdir (account data, no root-side orphans).
 mkdir -p "$u17/home/runner/.config/egresslock"
-: > "$u17/home/runner/.config/egresslock/unit.env"
+: > "$u17/home/runner/.config/egresslock/main.conf"
 : > "$u17/home/runner/.config/egresslock/main.pins"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u17/units" \
     EGRESSLOCK_ACCOUNT_HOME="$u17/home/runner" \
@@ -712,7 +1038,7 @@ printf 'rm %s\n' "\$*" >> "$STATE/e89-path-hooks.log"
 for _a in "\$@"; do
     case "\$_a" in
         -*) continue ;;
-        "$STATE"/*) ;;
+        "$STATE"/*|./*) ;;
         *) exit 0 ;;
     esac
 done
@@ -734,8 +1060,8 @@ printf '#!/bin/sh\n# egresslock-path-wrapper prefix=%s\nexec true\n' "$u17/e89ne
 : > "$u17/wbin/egresslock-setup"
 : > "$STATE/e89-path-hooks.log"
 mkdir -p "$u17/e89home/.config/egresslock" "$u17/e89sentinel/.config/egresslock"
-: > "$u17/e89home/.config/egresslock/unit.env"
-: > "$u17/e89sentinel/.config/egresslock/unit.env"
+: > "$u17/e89home/.config/egresslock/main.conf"
+: > "$u17/e89sentinel/.config/egresslock/main.conf"
 e89_out="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT PATH="$e89_bin:$PATH" \
     EGRESSLOCK_UNIT_DIR="$u17/units" \
     EGRESSLOCK_ACCOUNT_HOME="$u17/e89sentinel" \
@@ -751,7 +1077,7 @@ e89_log="$(cat "$STATE/e89-path-hooks.log" 2>/dev/null || true)"
     && "$e89_log" != *"$u17/units"* && "$e89_log" != *"$u17/wbin"* ]] \
     && a17 pass || a17 fail "account-home hook ignored without the test flag (rc=$e89_rc, out: $e89_out, log: $e89_log)"
 mkdir -p "$u17/e89home/.config/egresslock"
-: > "$u17/e89home/.config/egresslock/unit.env"
+: > "$u17/e89home/.config/egresslock/main.conf"
 e89_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$e89_bin:$PATH" \
     EGRESSLOCK_UNIT_DIR="$u17/units" \
     EGRESSLOCK_ACCOUNT_HOME="$u17/e89sentinel" \
@@ -783,7 +1109,7 @@ cp "$OPT/egresslock" "$e433d/u/kit/" 2>/dev/null \
 : > "$e433d/u/kit/gateway/Containerfile"
 printf 'operator notes\n' > "$e433d/u/kit/operator-notes.txt"
 printf 'gateway-secret\n' > "$e433d/u/kit/gateway/secret.txt"
-: > "$e433d/u/home/root/.config/egresslock/unit.env"
+: > "$e433d/u/home/root/.config/egresslock/main.conf"
 : > "$e433d/u/units/egresslock-verify@.service"
 : > "$e433d/u/units/egresslock-verify@.timer"
 ln -s "$e433d/u/kit" "$e433d/u/link"
@@ -1056,6 +1382,165 @@ o="$(e433_irun "$e433_f1_root/link" 2>&1)"; rc=$?
 
 section_end egl433
 
+# --- EGL-555: anchored prefix replacement (H2) ------------------------------
+# The probe captures a no-follow dev:ino; every prefix-scoped delete/write
+# runs in a subshell whose cwd is that directory and whose `stat .` must
+# still match. A swap before the anchor refuses with nothing written or
+# removed; a swap after the anchor cannot redirect a relative operation.
+section_begin egl555 "EGL-555 anchored prefix replacement"
+e555() { assert "$@"; }
+e555d="$STATE/egl555"; rm -rf "$e555d"; mkdir -p "$e555d"
+e555_real_stat="$(type -P stat)"
+e555_real_rm="$(type -P rm)"
+e555_real_find="$(type -P find)"
+e555_real_mkdir="$(type -P mkdir)"
+mkdir -p "$e555d/units" "$e555d/home/root/.config/egresslock"
+e555_install() { # <prefix>
+    env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e555d/units" \
+        EGRESSLOCK_PATH_BINDIR="$1.bin" EGRESSLOCK_PATH_SBINDIR="$1.sbin" \
+        "$KIT" --prefix "$1"
+}
+e555_uninstall() { # <prefix>
+    env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e555d/units" \
+        EGRESSLOCK_ACCOUNT_HOME="$e555d/home/root" \
+        EGRESSLOCK_PATH_BINDIR="$1.bin" EGRESSLOCK_PATH_SBINDIR="$1.sbin" \
+        "$UKIT" --prefix "$1" --account root
+}
+
+# 1. Install, existing prefix: the identity capture is the last read of the
+#    name before the anchor. A swap right after it makes `cd` land in the
+#    referent and `stat .` mismatch; nothing is written or removed.
+e555_i1="$e555d/i1"; mkdir -p "$e555_i1/kit" "$e555_i1/victim" "$e555_i1/shim"
+e555_install "$e555_i1/kit" >/dev/null 2>&1
+printf 'victim sentinel\n' > "$e555_i1/victim/sentinel"
+e555_i1_ver="$(cat "$e555_i1/kit/VERSION")"
+cat > "$e555_i1/shim/stat" <<EOF
+#!/usr/bin/env bash
+"$e555_real_stat" "\$@" > "$e555_i1/shim/out" || exit \$?
+if [[ "\${@: -1}" == "$e555_i1/kit" && ! -e "$e555_i1/shim/swapped" ]]; then
+    : > "$e555_i1/shim/swapped"
+    mv -- "$e555_i1/kit" "$e555_i1/kit.real"
+    ln -s "$e555_i1/victim" "$e555_i1/kit"
+fi
+cat "$e555_i1/shim/out"
+rm -f "$e555_i1/shim/out"
+EOF
+chmod +x "$e555_i1/shim/stat"
+o="$(PATH="$e555_i1/shim:$PATH" e555_install "$e555_i1/kit" 2>&1)"; rc=$?
+[[ "$rc" == 1 \
+    && "$o" == *"install-kit: refusing: --prefix changed while the kit checked it: $e555_i1/kit"* \
+    && "$o" == *"nothing was written or removed; name the real kit prefix and re-run."* \
+    && -L "$e555_i1/kit" \
+    && "$(cat "$e555_i1/victim/sentinel")" == "victim sentinel" \
+    && ! -e "$e555_i1/victim/egresslock" && ! -e "$e555_i1/victim/VERSION" \
+    && -f "$e555_i1/kit.real/egresslock" \
+    && "$(cat "$e555_i1/kit.real/VERSION")" == "$e555_i1_ver" ]] \
+    && e555 pass || e555 fail "install refuses a prefix swapped after the probe (rc=$rc, out: $o)"
+
+# 2. Install, absent prefix: it appears between the absent probe and the
+#    leaf mkdir. The leaf `mkdir` (no -p) sees EEXIST and refuses as
+#    appeared; the racing path and its referent stay untouched.
+e555_i2="$e555d/i2"; mkdir -p "$e555_i2/victim" "$e555_i2/shim"
+printf 'i2 sentinel\n' > "$e555_i2/victim/sentinel"
+cat > "$e555_i2/shim/mkdir" <<EOF
+#!/usr/bin/env bash
+if [[ "\${@: -1}" == "$e555_i2/kit" ]]; then
+    ln -s "$e555_i2/victim" "$e555_i2/kit"
+fi
+exec "$e555_real_mkdir" "\$@"
+EOF
+chmod +x "$e555_i2/shim/mkdir"
+o="$(PATH="$e555_i2/shim:$PATH" e555_install "$e555_i2/kit" 2>&1)"; rc=$?
+[[ "$rc" == 1 \
+    && "$o" == *"install-kit: refusing: --prefix changed while the kit checked it: $e555_i2/kit"* \
+    && "$o" == *"it appeared after the check, so this run cannot claim it; nothing was written or removed. Re-run when no other install is running."* \
+    && -L "$e555_i2/kit" \
+    && "$(cat "$e555_i2/victim/sentinel")" == "i2 sentinel" \
+    && ! -e "$e555_i2/victim/egresslock" && ! -e "$e555_i2/victim/gateway" ]] \
+    && e555 pass || e555 fail "install refuses a prefix that appeared after an absent probe (rc=$rc, out: $o)"
+
+# 3. Install, swap after the anchor: the first tree-temp `rm -rf` moves the
+#    verified directory aside and points the name at a victim. Every
+#    relative write still lands in the held inode; the victim stays empty.
+e555_i3="$e555d/i3"; mkdir -p "$e555_i3/kit" "$e555_i3/victim" "$e555_i3/shim"
+e555_install "$e555_i3/kit" >/dev/null 2>&1
+printf 'i3 sentinel\n' > "$e555_i3/victim/sentinel"
+cat > "$e555_i3/shim/rm" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "-rf" && ! -e "$e555_i3/shim/swapped" ]]; then
+    : > "$e555_i3/shim/swapped"
+    mv -- "$e555_i3/kit" "$e555_i3/kit.moved"
+    ln -s "$e555_i3/victim" "$e555_i3/kit"
+fi
+exec "$e555_real_rm" "\$@"
+EOF
+chmod +x "$e555_i3/shim/rm"
+o="$(PATH="$e555_i3/shim:$PATH" e555_install "$e555_i3/kit" 2>&1)"; rc=$?
+[[ "$rc" == 0 \
+    && -L "$e555_i3/kit" \
+    && "$(cat "$e555_i3/victim/sentinel")" == "i3 sentinel" \
+    && ! -e "$e555_i3/victim/egresslock" && ! -e "$e555_i3/victim/VERSION" \
+    && -f "$e555_i3/kit.moved/egresslock" && -f "$e555_i3/kit.moved/VERSION" \
+    && -f "$e555_i3/kit.moved/gateway/Containerfile" ]] \
+    && e555 pass || e555 fail "install swap after the anchor cannot redirect the relative copies (rc=$rc, out: $o)"
+
+# 4. Uninstall, existing prefix: a swap after the identity capture makes
+#    the anchor see the referent and refuse; neither tree is touched.
+e555_u1="$e555d/u1"; mkdir -p "$e555_u1/kit" "$e555_u1/victim" "$e555_u1/shim"
+e555_install "$e555_u1/kit" >/dev/null 2>&1
+e555_install "$e555_u1/victim" >/dev/null 2>&1
+printf 'u1 sentinel\n' > "$e555_u1/victim/sentinel"
+cat > "$e555_u1/shim/stat" <<EOF
+#!/usr/bin/env bash
+"$e555_real_stat" "\$@" > "$e555_u1/shim/out" || exit \$?
+if [[ "\${@: -1}" == "$e555_u1/kit" && ! -e "$e555_u1/shim/swapped" ]]; then
+    : > "$e555_u1/shim/swapped"
+    mv -- "$e555_u1/kit" "$e555_u1/kit.real"
+    ln -s "$e555_u1/victim" "$e555_u1/kit"
+fi
+cat "$e555_u1/shim/out"
+rm -f "$e555_u1/shim/out"
+EOF
+chmod +x "$e555_u1/shim/stat"
+o="$(PATH="$e555_u1/shim:$PATH" e555_uninstall "$e555_u1/kit" 2>&1)"; rc=$?
+[[ "$rc" == 1 \
+    && "$o" == *"uninstall-kit: refusing: --prefix changed while the kit checked it: $e555_u1/kit"* \
+    && "$o" == *"no kit files were removed from it;"* \
+    && -L "$e555_u1/kit" \
+    && "$(cat "$e555_u1/victim/sentinel")" == "u1 sentinel" \
+    && -f "$e555_u1/victim/egresslock" && -f "$e555_u1/victim/VERSION" \
+    && -f "$e555_u1/kit.real/egresslock" && -f "$e555_u1/kit.real/VERSION" ]] \
+    && e555 pass || e555 fail "uninstall refuses a prefix swapped after the probe (rc=$rc, out: $o)"
+
+# 5. Uninstall, swap after the anchor: `find .` empties the held inode, and
+#    the final `rmdir` of the name fails because the name is now a link —
+#    never an `rm -rf` through it. The referent keeps every file.
+e555_u2="$e555d/u2"; mkdir -p "$e555_u2/kit" "$e555_u2/victim" "$e555_u2/shim"
+e555_install "$e555_u2/kit" >/dev/null 2>&1
+e555_install "$e555_u2/victim" >/dev/null 2>&1
+printf 'u2 sentinel\n' > "$e555_u2/victim/sentinel"
+cat > "$e555_u2/shim/find" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "." && ! -e "$e555_u2/shim/swapped" ]]; then
+    : > "$e555_u2/shim/swapped"
+    mv -- "$e555_u2/kit" "$e555_u2/kit.moved"
+    ln -s "$e555_u2/victim" "$e555_u2/kit"
+fi
+exec "$e555_real_find" "\$@"
+EOF
+chmod +x "$e555_u2/shim/find"
+o="$(PATH="$e555_u2/shim:$PATH" e555_uninstall "$e555_u2/kit" 2>&1)"; rc=$?
+[[ "$rc" == 1 \
+    && "$o" == *"uninstall-kit: FAIL - could not remove the emptied kit prefix: $e555_u2/kit"* \
+    && -L "$e555_u2/kit" \
+    && "$(cat "$e555_u2/victim/sentinel")" == "u2 sentinel" \
+    && -f "$e555_u2/victim/egresslock" && -f "$e555_u2/victim/VERSION" \
+    && -d "$e555_u2/kit.moved" \
+    && -z "$(ls -A "$e555_u2/kit.moved")" ]] \
+    && e555 pass || e555 fail "uninstall swap after the anchor empties the held dir, rmdir fails closed (rc=$rc, out: $o)"
+
+section_end egl555
+
 # --- EGL-121: guarded final daemon-reload -----------------------------------
 # A host without systemd (no systemctl on PATH, or a systemctl that cannot
 # reach a running systemd) must still complete the (un)install: rc 0, one
@@ -1075,12 +1560,12 @@ w121_i="install-kit: WARNING - systemd did not confirm the unit-file reload; the
 w121_u="uninstall-kit: WARNING - systemd did not confirm the unit-file reload; the verify timer templates were removed, but a running systemd may still have them loaded."
 next121_i="  An already-enabled verify timer may still run the previous unit definition; when systemd is available, run: systemctl daemon-reload"
 next121_u="  An enabled verify timer may still be active; when systemd is available, run: systemctl daemon-reload"
-stop121_u="  If a verify timer is still active, stop it: systemctl disable --now egresslock-verify@<acct>.timer"
+stop121_u="  If a verify timer is still active, stop it: systemctl disable --now egresslock-verify@ACCT.timer"
 unconfirmed121="timer stop not confirmed"
 
 n121="$TESTROOT/bin-kit-nosystemctl"
 rm -rf "$n121"; mkdir -p "$n121"
-for t in env bash dirname id git grep sed awk tr cut getent date install cp rm mv chmod mkdir cat xargs; do
+for t in env bash dirname id git grep sed awk tr cut getent date install cp rm mv chmod mkdir cat xargs stat find rmdir; do
     _t="$(command -v "$t" 2>/dev/null)" || continue
     ln -s "$_t" "$n121/$t"
 done
@@ -1205,7 +1690,7 @@ mk121_prefix() {
     : > "$u121/prefix/gateway/Containerfile"
     : > "$u121/units/egresslock-verify@.service"
     : > "$u121/units/egresslock-verify@.timer"
-    : > "$u121/home/runner/.config/egresslock/unit.env"
+    : > "$u121/home/runner/.config/egresslock/main.conf"
 }
 mk121_prefix
 o121="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u121/units" \
@@ -1259,6 +1744,29 @@ o121="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u121/units" \
     && a121 pass || a121 fail "failing shim: no raw diagnostic and no false timer claim (out: $o121)"
 grep -q '^systemctl daemon-reload$' "$s121/shim.log" \
     && a121 pass || a121 fail "failing shim recorded the uninstall daemon-reload (log: $(cat "$s121/shim.log" 2>&1))"
+
+# 5b. EGL-532-D2: a symlinked account confdir is removed as a link, never
+#     called purged account data; its target (the real policy tree) stays.
+mk121_prefix
+rm -rf "$u121/home/runner/.config/egresslock"
+mkdir -p "$u121/home/runner/policy-target"
+printf 'marker\n' > "$u121/home/runner/policy-target/keep"
+ln -s "$u121/home/runner/policy-target" "$u121/home/runner/.config/egresslock"
+o121="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$u121/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$u121/home/runner" \
+    EGRESSLOCK_PATH_BINDIR="$u121/wbin" EGRESSLOCK_PATH_SBINDIR="$u121/wsbin" \
+    PATH="$s121:$PATH" "$UKIT" --prefix "$u121/prefix" --account root \
+    --purge-account-data 2>&1)"; rc=$?
+[[ "$rc" == 0 ]] && a121 pass \
+    || a121 fail "symlink purge: uninstall exits 0 (rc=$rc, out: $o121)"
+[[ "$o121" == *"uninstall-kit: removed $u121/home/runner/.config/egresslock (symbolic link; its target was not touched)"* ]] \
+    && a121 pass || a121 fail "symlink purge: named removed-symlink line prints (out: $o121)"
+[[ "$o121" != *"uninstall-kit: purged $u121/home/runner/.config/egresslock (account data)"* ]] \
+    && a121 pass || a121 fail "symlink purge: no false purged-account-data line (out: $o121)"
+[[ ! -L "$u121/home/runner/.config/egresslock" && ! -e "$u121/home/runner/.config/egresslock" ]] \
+    && a121 pass || a121 fail "symlink purge: only the link is removed"
+[[ -d "$u121/home/runner/policy-target" && "$(cat "$u121/home/runner/policy-target/keep")" == "marker" ]] \
+    && a121 pass || a121 fail "symlink purge: the link target is untouched"
 
 # 6. uninstall, zero-exit chroot/offline shim (B1): the successful no-op is
 #    still unconfirmed — warning with the stop check and `timer stop not
@@ -1348,7 +1856,7 @@ w463="uninstall-kit: WARNING - could not confirm the verify timers stopped."
 d463_fail="  systemd did not disable:"
 d463_list="  The enabled verify timers could not be listed."
 n463_check="  When systemd is available, check: systemctl list-timers 'egresslock-verify@*.timer'"
-n463_stop="  If a verify timer is still active, stop it: systemctl disable --now egresslock-verify@<account>.timer"
+n463_stop="  If a verify timer is still active, stop it: systemctl disable --now egresslock-verify@ACCOUNT.timer"
 u463="timer stop not confirmed"
 
 d463="$STATE/egl463"; rm -rf "$d463"; mkdir -p "$d463"
@@ -1366,10 +1874,24 @@ case "$1" in
             printf '%s\n' "$EGL463_LIST_OUT"
         fi
         exit 0 ;;
+    # EGL-535-D5: the manager's loaded view is a separate source. Default
+    # empty/rc 0 keeps cases 1-7 byte-identical.
+    list-units)
+        [[ "${EGL463_UNITS_RC:-0}" == 0 ]] || exit "$EGL463_UNITS_RC"
+        if [[ -n "${EGL463_UNITS_OUT:-}" ]]; then
+            printf '%s\n' "$EGL463_UNITS_OUT"
+        fi
+        exit 0 ;;
     disable)
         if [[ -n "${EGL463_FAIL_UNIT:-}" && "${!#}" == "$EGL463_FAIL_UNIT" ]]; then
             echo "egl463-shim-diagnostic" >&2
             exit 1
+        fi
+        # Real `systemctl disable` prints the removed symlink on stdout
+        # (stderr stays empty). Off by default so cases 1-4 keep their
+        # byte-stable streams; case 7 turns it on to pin the pass-through.
+        if [[ "${EGL463_DISABLE_ECHO:-0}" == 1 ]]; then
+            printf 'Removed /etc/systemd/system/timers.target.wants/%s.\n' "${!#}"
         fi
         exit 0 ;;
 esac
@@ -1379,14 +1901,16 @@ chmod +x "$s463/systemctl"
 
 mk463_prefix() {
     rm -rf "$d463/prefix" "$d463/units" "$d463/home" "$d463/wbin" "$d463/wsbin"
-    mkdir -p "$d463/prefix/gateway" "$d463/units" "$d463/home/runner/.config/egresslock"
+    mkdir -p "$d463/prefix/gateway" "$d463/units" \
+        "$d463/units/timers.target.wants" \
+        "$d463/home/runner/.config/egresslock"
     : > "$d463/prefix/egresslock"; chmod +x "$d463/prefix/egresslock"
     : > "$d463/prefix/egresslock-verify"
     : > "$d463/prefix/VERSION"
     : > "$d463/prefix/gateway/Containerfile"
     : > "$d463/units/egresslock-verify@.service"
     : > "$d463/units/egresslock-verify@.timer"
-    : > "$d463/home/runner/.config/egresslock/unit.env"
+    : > "$d463/home/runner/.config/egresslock/main.conf"
 }
 
 # 1. Per-account disable fails: rc 0, one named warning, no false summary,
@@ -1504,7 +2028,237 @@ grep -qF 'systemctl disable --now egresslock-verify@root.timer' "$STATE/systemct
     && a463 pass || a463 fail "positive control: per-account disable recorded"
 grep -qF 'systemctl list-unit-files egresslock-verify@*.timer --no-legend' "$STATE/systemctl.log" \
     && a463 pass || a463 fail "positive control: list query recorded"
+
+# 5. The latch (EGL-463 F1): an earlier failed disable is not undone by a
+#    later success — the run keeps `timer stop not confirmed` and names
+#    the failed unit. Mutation: re-set timer_stop_confirmed=1 on a later
+#    success (`uninstall-kit.sh:240-247`) -> the summary flips to
+#    `timers stopped` and this case reds.
+mk463_prefix
+: > "$d463/shim.log"
+o463="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$d463/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$d463/home/runner" \
+    EGRESSLOCK_PATH_BINDIR="$d463/wbin" EGRESSLOCK_PATH_SBINDIR="$d463/wsbin" \
+    PATH="$s463:$PATH" EGL463_SHIM_LOG="$d463/shim.log" \
+    EGL463_FAIL_UNIT="egresslock-verify@acct1.timer" \
+    EGL463_LIST_OUT=$'egresslock-verify@acct1.timer enabled\negresslock-verify@acct2.timer enabled' \
+    "$UKIT" --prefix "$d463/prefix" --account root 2>&1)"; rc=$?
+[[ "$rc" == 0 ]] && a463 pass || a463 fail "latch: rc 0 (rc=$rc, out: $o463)"
+[[ "$o463" == *"$w463"* && "$o463" == *"$d463_fail egresslock-verify@acct1.timer"* ]] \
+    && a463 pass || a463 fail "latch: earlier failure stays warned and named (out: $o463)"
+grep -qF 'systemctl disable --now egresslock-verify@acct1.timer' "$d463/shim.log" \
+    && grep -qF 'systemctl disable --now egresslock-verify@acct2.timer' "$d463/shim.log" \
+    && a463 pass || a463 fail "latch: both sweep disable attempts recorded"
+[[ "$o463" == *"$u463"* && "$o463" != *"; timers stopped"* ]] \
+    && a463 pass || a463 fail "latch: summary stays qualified (out: $o463)"
+[[ ! -e "$d463/prefix" && ! -e "$d463/units/egresslock-verify@.timer" ]] && a463 pass \
+    || a463 fail "latch: removal completes"
+
+# 6. No-account sweep failure (EGL-463 F2): without --account the sweep
+#    still lists and names a failed instance. Mutation: move the sweep
+#    inside the `for acct` loop (`uninstall-kit.sh:262-278`) -> no list
+#    query, no warning, and the summary wrongly says `timers stopped`.
+mk463_prefix
+: > "$d463/shim.log"
+o463="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$d463/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$d463/home/runner" \
+    EGRESSLOCK_PATH_BINDIR="$d463/wbin" EGRESSLOCK_PATH_SBINDIR="$d463/wsbin" \
+    PATH="$s463:$PATH" EGL463_SHIM_LOG="$d463/shim.log" \
+    EGL463_FAIL_UNIT="egresslock-verify@acct2.timer" \
+    EGL463_LIST_OUT='egresslock-verify@acct2.timer enabled' \
+    "$UKIT" --prefix "$d463/prefix" 2>&1)"; rc=$?
+[[ "$rc" == 0 ]] && a463 pass || a463 fail "no-account sweep: rc 0 (rc=$rc, out: $o463)"
+[[ "$o463" == *"$w463"* && "$o463" == *"$d463_fail egresslock-verify@acct2.timer"* ]] \
+    && a463 pass || a463 fail "no-account sweep: failed instance named (out: $o463)"
+grep -qF 'systemctl list-unit-files egresslock-verify@*.timer --no-legend' "$d463/shim.log" \
+    && a463 pass || a463 fail "no-account sweep: list query recorded"
+[[ "$o463" == *"$u463"* && "$o463" != *"; timers stopped"* ]] \
+    && a463 pass || a463 fail "no-account sweep: summary stays qualified (out: $o463)"
+[[ ! -e "$d463/prefix" && ! -e "$d463/units/egresslock-verify@.timer" ]] && a463 pass \
+    || a463 fail "no-account sweep: removal completes"
+
+# 7. Disable-success stdout (EGL-463 F3): a real `systemctl disable`
+#    prints `Removed …` on stdout with stderr empty; the shim mirrors
+#    that on success, so capturing/suppressing `_stop_disable`'s stdout
+#    reds here. The harness mock (case 4) is silent and cannot catch it.
+mk463_prefix
+: > "$d463/shim.log"
+o463="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$d463/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$d463/home/runner" \
+    EGRESSLOCK_PATH_BINDIR="$d463/wbin" EGRESSLOCK_PATH_SBINDIR="$d463/wsbin" \
+    PATH="$s463:$PATH" EGL463_SHIM_LOG="$d463/shim.log" EGL463_DISABLE_ECHO=1 \
+    "$UKIT" --prefix "$d463/prefix" --account root 2>&1)"; rc=$?
+[[ "$rc" == 0 ]] && a463 pass || a463 fail "shim stdout: rc 0 (rc=$rc, out: $o463)"
+[[ "$o463" == *"timers stopped"* ]] && a463 pass \
+    || a463 fail "shim stdout: confirmed summary says timers stopped (out: $o463)"
+[[ "$o463" != *"$w463"* && "$o463" != *"$d463_fail"* && "$o463" != *"$d463_list"* ]] \
+    && a463 pass || a463 fail "shim stdout: no warning or cause detail (out: $o463)"
+[[ "$o463" == *"Removed /etc/systemd/system/timers.target.wants/egresslock-verify@root.timer"* ]] \
+    && a463 pass || a463 fail "shim stdout: the disable's Removed line is not swallowed (out: $o463)"
+
+# 8. EGL-535-D5 (wants-only, the live systemd 257 shape): the file query
+#    returns only the template row and the manager's loaded set is empty;
+#    the enablement link is the only source naming the instance. It must
+#    be attempted exactly once, the summary must keep `timers stopped`,
+#    and the template must never be disabled. Mutation: drop source (4)
+#    (the `timers.target.wants` glob) -> no attempt, red.
+mk463_prefix
+ln -s "$d463/units/egresslock-verify@.timer" \
+    "$d463/units/timers.target.wants/egresslock-verify@acct3.timer"
+: > "$d463/shim.log"
+o463="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$d463/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$d463/home/runner" \
+    EGRESSLOCK_PATH_BINDIR="$d463/wbin" EGRESSLOCK_PATH_SBINDIR="$d463/wsbin" \
+    PATH="$s463:$PATH" EGL463_SHIM_LOG="$d463/shim.log" \
+    EGL463_LIST_OUT='egresslock-verify@.timer indirect enabled' \
+    EGL463_UNITS_OUT='' \
+    "$UKIT" --prefix "$d463/prefix" --account root 2>&1)"; rc=$?
+[[ "$rc" == 0 ]] && a463 pass || a463 fail "wants-only: rc 0 (rc=$rc, out: $o463)"
+grep -qF 'systemctl list-units --all --type=timer --plain --no-legend egresslock-verify@*.timer' "$d463/shim.log" \
+    && a463 pass || a463 fail "wants-only: loaded-set query recorded (EGL-535-D1 source 2)"
+[[ "$(grep -cF 'systemctl disable --now egresslock-verify@acct3.timer' "$d463/shim.log")" == 1 ]] \
+    && a463 pass || a463 fail "wants-only: enablement-link instance disabled exactly once"
+[[ "$o463" == *"instanced templates removed; timers stopped"* ]] && a463 pass \
+    || a463 fail "wants-only: summary keeps timers stopped (out: $o463)"
+[[ "$o463" != *"$w463"* && "$o463" != *"$d463_fail"* && "$o463" != *"$d463_list"* ]] \
+    && a463 pass || a463 fail "wants-only: no warning or cause detail (out: $o463)"
+grep -qF 'systemctl disable --now egresslock-verify@.timer' "$d463/shim.log" \
+    && a463 fail "wants-only: bare template was not disabled" || a463 pass
+[[ ! -e "$d463/prefix" && ! -e "$d463/units/egresslock-verify@.timer" ]] && a463 pass \
+    || a463 fail "wants-only: removal completes"
+
+# 9. EGL-535-D5 (loaded-only): no wants link and an empty file query, but
+#    the manager's loaded set names the instance. Its failed disable must
+#    be named and the summary qualified. Mutation: drop source (2) (the
+#    `list-units --all` capture) -> no attempt, red.
+mk463_prefix
+: > "$d463/shim.log"
+o463="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$d463/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$d463/home/runner" \
+    EGRESSLOCK_PATH_BINDIR="$d463/wbin" EGRESSLOCK_PATH_SBINDIR="$d463/wsbin" \
+    PATH="$s463:$PATH" EGL463_SHIM_LOG="$d463/shim.log" \
+    EGL463_UNITS_OUT='egresslock-verify@acct4.timer loaded active waiting Periodic network policy verification for acct4' \
+    EGL463_FAIL_UNIT='egresslock-verify@acct4.timer' \
+    "$UKIT" --prefix "$d463/prefix" --account root 2>&1)"; rc=$?
+[[ "$rc" == 0 ]] && a463 pass || a463 fail "loaded-only: rc 0 (rc=$rc, out: $o463)"
+[[ "$o463" == *"$w463"* && "$o463" == *"$d463_fail egresslock-verify@acct4.timer"* ]] \
+    && a463 pass || a463 fail "loaded-only: failed loaded instance is named (out: $o463)"
+grep -qF 'systemctl disable --now egresslock-verify@acct4.timer' "$d463/shim.log" \
+    && a463 pass || a463 fail "loaded-only: loaded instance disable attempted"
+[[ "$o463" == *"$u463"* && "$o463" != *"; timers stopped"* ]] \
+    && a463 pass || a463 fail "loaded-only: summary stays qualified (out: $o463)"
+[[ ! -e "$d463/prefix" && ! -e "$d463/units/egresslock-verify@.timer" ]] && a463 pass \
+    || a463 fail "loaded-only: removal completes"
+
+# 9b. EGL-535-D3: the NEW source's own failure path — the file query
+#     answers (template row only) while `list-units` exits nonzero. The
+#     union is authoritative only for what the answering sources could
+#     see, so the unreadable-list line prints and the summary is
+#     qualified. Mutation: drop the `|| _stop_list_rc=$?` capture on the
+#     loaded-set query -> the summary wrongly says `timers stopped`, red.
+mk463_prefix
+: > "$d463/shim.log"
+o463="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$d463/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$d463/home/runner" \
+    EGRESSLOCK_PATH_BINDIR="$d463/wbin" EGRESSLOCK_PATH_SBINDIR="$d463/wsbin" \
+    PATH="$s463:$PATH" EGL463_SHIM_LOG="$d463/shim.log" \
+    EGL463_LIST_OUT='egresslock-verify@.timer indirect enabled' \
+    EGL463_UNITS_RC=1 \
+    "$UKIT" --prefix "$d463/prefix" --account root 2>&1)"; rc=$?
+[[ "$rc" == 0 ]] && a463 pass || a463 fail "loaded-set query failure: rc 0 (rc=$rc, out: $o463)"
+[[ "$o463" == *"$w463"* && "$o463" == *"$d463_list"* ]] && a463 pass \
+    || a463 fail "loaded-set query failure: unreadable list named (out: $o463)"
+[[ "$o463" != *"$d463_fail"* ]] && a463 pass \
+    || a463 fail "loaded-set query failure: no unit is falsely blamed (out: $o463)"
+[[ "$o463" == *"$u463"* && "$o463" != *"; timers stopped"* ]] && a463 pass \
+    || a463 fail "loaded-set query failure: summary stays qualified (out: $o463)"
+[[ ! -e "$d463/prefix" && ! -e "$d463/units/egresslock-verify@.timer" ]] && a463 pass \
+    || a463 fail "loaded-set query failure: removal completes"
+
+# 10. EGL-535-D5 (over-broad output): both listings carry a `.service`
+#     unit and a foreign timer; neither may be disabled, and the run keeps
+#     `timers stopped`. Mutation: drop the name-shape filter in
+#     `_stop_try_unit` -> both foreign names are disabled, red.
+mk463_prefix
+: > "$d463/shim.log"
+o463="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$d463/units" \
+    EGRESSLOCK_ACCOUNT_HOME="$d463/home/runner" \
+    EGRESSLOCK_PATH_BINDIR="$d463/wbin" EGRESSLOCK_PATH_SBINDIR="$d463/wsbin" \
+    PATH="$s463:$PATH" EGL463_SHIM_LOG="$d463/shim.log" \
+    EGL463_LIST_OUT=$'egresslock-verify@.timer enabled\negresslock-verify@acct5.service enabled\nother@acct.timer enabled' \
+    EGL463_UNITS_OUT=$'egresslock-verify@acct5.service loaded active running kit service\nother@acct.timer loaded active waiting foreign timer' \
+    "$UKIT" --prefix "$d463/prefix" --account root 2>&1)"; rc=$?
+[[ "$rc" == 0 ]] && a463 pass || a463 fail "over-broad: rc 0 (rc=$rc, out: $o463)"
+grep -qF 'disable --now egresslock-verify@acct5.service' "$d463/shim.log" \
+    && a463 fail "over-broad: a .service listing is never disabled" || a463 pass
+grep -qF 'disable --now other@acct.timer' "$d463/shim.log" \
+    && a463 fail "over-broad: a foreign timer is never disabled" || a463 pass
+[[ "$o463" == *"instanced templates removed; timers stopped"* ]] && a463 pass \
+    || a463 fail "over-broad: summary keeps timers stopped (out: $o463)"
+[[ "$o463" != *"$w463"* ]] && a463 pass \
+    || a463 fail "over-broad: no warning (out: $o463)"
+[[ ! -e "$d463/prefix" && ! -e "$d463/units/egresslock-verify@.timer" ]] && a463 pass \
+    || a463 fail "over-broad: removal completes"
+# EGL-535-D1 amendment (standing): an unmatched path glob yields its own
+# literal, and a pattern-shaped test would admit it. The unit dir here has
+# no instance files, so the existence guards plus `_stop_try_unit`'s
+# metacharacter rejection must keep that literal away from disable
+# (mutation: remove both the `-e`/`-L -e` guards and the metacharacter
+# test -> the literal is disabled, red).
+grep -qF 'disable --now egresslock-verify@*.timer' "$d463/shim.log" \
+    && a463 fail "glob literal: an unmatched-glob literal is never disabled" || a463 pass
 section_end egl463
+
+# --- EGL-258: timer stop stops a running verify (PartOf) --------------------
+# A running verify must not survive the timer stop: the shipped template
+# declares PartOf=, and both uninstall recipes stop the timer before
+# teardown. The host has no systemd, so the live propagation is the VM case
+# S9-timer-stop-stops-verify; these pins keep the line and the order from
+# drifting back.
+section_begin egl258 "EGL-258 timer-stop stops verify"
+e258() { assert "$@"; }
+e258_unit="$TREE_ROOT/systemd/egresslock-verify@.service"
+e258_doc="$TREE_ROOT/docs/setup/uninstall.md"
+
+grep -qxF 'PartOf=egresslock-verify@%i.timer' "$e258_unit" \
+    && e258 pass || e258 fail "repo unit declares PartOf=egresslock-verify@%i.timer"
+
+# Docs order: the timer stop precedes the first teardown command.
+e258_stop_ln=$(grep -nF 'systemctl disable --now egresslock-verify@' "$e258_doc" | head -1 | cut -d: -f1)
+e258_teardown_ln=$(grep -nF 'egresslock teardown' "$e258_doc" | head -1 | cut -d: -f1)
+if [[ -n "$e258_stop_ln" && -n "$e258_teardown_ln" && "$e258_stop_ln" -lt "$e258_teardown_ln" ]]; then
+    e258 pass
+else
+    e258 fail "uninstall.md stops the verify timer before teardown (stop=$e258_stop_ln teardown=$e258_teardown_ln)"
+fi
+
+# Step 1 owns the one timer-stop block; step 2 must not repeat it.
+e258_step1=$(awk '/^### 1\./{f=1} f&&/^### 2\./{exit} f' "$e258_doc")
+e258_step2=$(awk '/^### 2\./{f=1} f&&/^### 3\./{exit} f' "$e258_doc")
+grep -qF 'systemctl disable --now egresslock-verify@' <<<"$e258_step1" \
+    && e258 pass || e258 fail "uninstall.md step 1 stops the verify timer"
+grep -qF 'systemctl disable --now egresslock-verify@' <<<"$e258_step2" \
+    && e258 fail "uninstall.md step 2 repeats the timer stop" \
+    || e258 pass
+grep -qF 'stopping the timer also stops a' <<<"$e258_step1" \
+    && e258 pass || e258 fail "uninstall.md step 1 states the timer stop aborts a running verify"
+
+# packaging/README orders the deb recipe timer stop -> teardown -> remove.
+e258_readme="$TREE_ROOT/packaging/README.md"
+if [[ -f "$e258_readme" ]]; then
+    e258_stop_ln=$(grep -nF 'systemctl disable --now egresslock-verify@' "$e258_readme" | head -1 | cut -d: -f1)
+    e258_teardown_ln=$(grep -nF 'egresslock teardown' "$e258_readme" | head -1 | cut -d: -f1)
+    e258_remove_ln=$(grep -nF 'apt remove egresslock' "$e258_readme" | head -1 | cut -d: -f1)
+    if [[ -n "$e258_stop_ln" && -n "$e258_teardown_ln" && -n "$e258_remove_ln" \
+          && "$e258_stop_ln" -lt "$e258_teardown_ln" && "$e258_teardown_ln" -lt "$e258_remove_ln" ]]; then
+        e258 pass
+    else
+        e258 fail "packaging/README orders timer stop -> teardown -> apt remove (stop=$e258_stop_ln teardown=$e258_teardown_ln remove=$e258_remove_ln)"
+    fi
+else
+    skip "$PKG_SKIP_TAG" "EGL-258 packaging/README recipe order — packaging/README.md is not on this tree (extracted kit)"
+fi
+section_end egl258
 
 # --- EGL-43: install-kit PATH wrappers (D1–D4) ------------------------------
 section_begin egl43 "EGL-43 install-kit PATH wrappers"
@@ -1604,274 +2358,7 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$p43/units" \
     && a43 pass || a43 fail "unwritable PATH dir warns and continues (rc=$rc, out: $o)"
 
 section_end egl43
-section_begin egl12 "EGL-12 public snapshot staging"   # begin before the EGL-74 skip branch — one window owns both paths (EGL-184-D2)
 
-# --- EGL-12: public snapshot staging (allowlist copy, D1) -------------------
-# The snapshot script and tests are BOTH on the allowlist, so this file must
-# never contain a fleet fact literally — grep pattern and decoy are
-# assembled from parts (fleet_grep discipline).
-# EGL-74: the publisher is private-tree material; cases that invoke or
-# grep it SKIP when absent (EGL-74-D1/D2). Guards needing neither keep
-# running (D2).
-SNAP_PUBLIC="$TREE_ROOT/packaging/snapshot-public.sh"
-HAVE_SNAPSHOT=0; [[ -f "$SNAP_PUBLIC" ]] && HAVE_SNAPSHOT=1
-# EGL-107-D1: third tree shape (extracted manual-install tarball) — the
-# tarball excludes ./packaging by design (ARC-22-D4), so the two build
-# scripts are absent there and every check that invokes, greps, or
-# consumes their artifacts skips with a named cause instead of rc-127.
-# Independent of HAVE_SNAPSHOT: the public snapshot tree SHIPS the build
-# scripts (EGL-74-D2) and must keep running those checks.
-HAVE_BUILD_DEB=0; [[ -f "$TREE_ROOT/packaging/build-deb.sh" ]] && HAVE_BUILD_DEB=1
-HAVE_BUILD_TARBALL=0; [[ -f "$TREE_ROOT/packaging/build-tarball.sh" ]] && HAVE_BUILD_TARBALL=1
-PKG_SKIP_TAG="packaging-build-scripts absent"
-
-if [[ "$HAVE_SNAPSHOT" == 0 ]]; then
-    skip "snapshot-public.sh absent" "EGL-12 public snapshot staging — packaging/snapshot-public.sh is not on the public tree (EGL-74-D1)"
-else
-a12k() { assert "$@"; }
-p12="$STATE/egl12"; rm -rf "$p12"; mkdir -p "$p12/kit"
-(cd "$TREE_ROOT" && tar -cf - --exclude=./.git --exclude='./packaging/*.deb' --exclude='./packaging/*.tar.gz' .) \
-    | tar -xf - -C "$p12/kit"
-printf '# security policy (staged fixture for the snapshot gate)\n' > "$p12/kit/SECURITY.md"
-snap12="$p12/kit/packaging/snapshot-public.sh"
-# EGL-104-D2: synthetic pattern. This stage-clean assertion is a
-# re-assertion; the authoritative fail-closed fleet gate lives in
-# packaging/snapshot-public.sh (never shipped, EGL-65-D3). The local copy
-# uses synthetic literals of the same shapes (reserved TLD, docs-range
-# hosts, neutral words) so the shipped test publishes no fleet facts. The
-# dotted alternatives are escaped and word alternatives split, so this line
-# never matches its own grep (the stage includes this file; expect rc 1).
-pat12='kit-'"platform"'|example\.invalid|192\.0\.2\.250|192\.0\.2\.251|synthetic-'"org"'|sen'"try"'|haz'"less"
-
-# 1. Dry-run with SECURITY.md staged: rc 0, allowlist copy, process
-#    files excluded, fleet grep clean.
-s12o="$(bash "$snap12" --dry-run "$p12/stage" 2>&1)"; s12rc=$?
-[[ "$s12rc" == 0 && -f "$p12/stage/egresslock" && -x "$p12/stage/install-kit.sh" \
-    && -f "$p12/stage/SECURITY.md" && -f "$p12/stage/LICENSE" \
-    && -f "$p12/stage/VERSION_BASE" \
-    && -f "$p12/stage/CHANGELOG.md" \
-    && -f "$p12/stage/packaging/build-deb.sh" && -f "$p12/stage/packaging/build-tarball.sh" \
-    && -f "$p12/stage/packaging/README.md" \
-    && -f "$p12/stage/gateway/Containerfile" && -f "$p12/stage/tests/run.sh" \
-    && -f "$p12/stage/systemd/egresslock-verify@.service" ]] \
-    && a12k pass || a12k fail "snapshot dry-run stages the allowlist (rc=$s12rc, out: $s12o)"
-# EGL-75: the snapshot procedure doc is maintainer material (EGL-47) — it
-# must NOT appear in the stage.
-[[ ! -e "$p12/stage/docs/setup/public-snapshot.md" ]] \
-    && a12k pass || a12k fail "snapshot stage excludes the internal procedure doc (EGL-75)"
-# EGL-65-D3: the private publisher is not product — it never joins its
-# own stage (amends EGL-12-D1's blanket packaging/*.sh copy).
-[[ ! -e "$p12/stage/packaging/snapshot-public.sh" ]] \
-    && a12k pass || a12k fail "snapshot stage excludes snapshot-public.sh (EGL-65-D3)"
-[[ ! -e "$p12/stage/docs/tickets" && ! -L "$p12/stage/docs/tickets" \
-    && ! -e "$p12/stage/docs/BOARD.md" && ! -L "$p12/stage/docs/BOARD.md" \
-    && ! -e "$p12/stage/AGENTS.md" && ! -L "$p12/stage/AGENTS.md" \
-    && ! -e "$p12/stage/.git" && ! -L "$p12/stage/.git" ]] \
-    && a12k pass || a12k fail "snapshot stage excludes process files (symlinks count as present)"
-# EGL-343: `.forgejo/` is CI metadata (including the nightly dispatcher) —
-# never in the stage.
-[[ ! -e "$p12/stage/.forgejo" ]] \
-    && a12k pass || a12k fail "snapshot stage excludes .forgejo (EGL-343)"
-grep -rniE "$pat12" "$p12/stage" >/dev/null 2>&1
-[[ $? == 1 ]] && a12k pass || a12k fail "snapshot stage passes the fleet grep"
-
-# 1c. EGL-343: a widened allowlist that stages `.forgejo/` fails closed at
-#     gate 2 (CI-metadata guard), naming the directory. This is the
-#     mutation assertion for the EGL-343 publish boundary: allowlist-by-
-#     omission alone is not enough; the tripwire must actually fire.
-#     D12: on a tree without `.forgejo` (public snapshot shape) plant a
-#     synthetic fixture in the kit copy, so the widened allowlist reaches
-#     gate 2 instead of failing earlier on a missing allowlisted entry.
-forgejo_fixture=0
-if [[ ! -d "$p12/kit/.forgejo" ]]; then
-    mkdir -p "$p12/kit/.forgejo"
-    printf '# synthetic CI metadata fixture (publish-guard test)\n' \
-        > "$p12/kit/.forgejo/fixture.yml"
-    forgejo_fixture=1
-fi
-cp "$snap12" "$p12/snap12.orig"
-sed 's/^all_dirs=(/all_dirs=(.forgejo /' "$p12/snap12.orig" > "$snap12"
-o="$(bash "$snap12" --dry-run "$p12/stage-forgejo" 2>&1)"; rc=$?
-[[ "$rc" == 1 && "$o" == *"process/internal files"* && "$o" == *".forgejo"* ]] \
-    && a12k pass || a12k fail "widened snapshot allowlist trips the .forgejo guard (rc=$rc, out: $o)"
-cp "$p12/snap12.orig" "$snap12"
-rm -rf "$p12/stage-forgejo"
-if (( forgejo_fixture )); then rm -rf "$p12/kit/.forgejo"; fi
-
-# 2. SECURITY.md missing -> fail closed (EGL-9 gate), naming the file.
-rm -f "$p12/kit/SECURITY.md"
-o="$(bash "$snap12" --dry-run "$p12/stage-b" 2>&1)"; rc=$?
-[[ "$rc" == 1 && "$o" == *"SECURITY.md missing"* ]] \
-    && a12k pass || a12k fail "missing SECURITY.md fails closed (rc=$rc, out: $o)"
-
-# 3. A fleet fact anywhere in the staged set -> fail closed, stage
-#    removed, file named (never weaken the grep).
-printf '# security policy (staged fixture for the snapshot gate)\n' > "$p12/kit/SECURITY.md"
-printf 'site note: git.internal-fleet.home.'"arpa"' stays unreachable\n' > "$p12/kit/docs/leak-decoy.md"
-o="$(bash "$snap12" --dry-run "$p12/stage-c" 2>&1)"; rc=$?
-[[ "$rc" == 1 && "$o" == *"fleet facts"* && "$o" == *"leak-decoy.md"* && ! -e "$p12/stage-c" ]] \
-    && a12k pass || a12k fail "fleet-fact leak fails closed, stage removed (rc=$rc, out: $o)"
-
-# 4. Refuses a non-empty stage dir.
-mkdir -p "$p12/stage-d"; : > "$p12/stage-d/preexisting"
-o="$(bash "$snap12" --dry-run "$p12/stage-d" 2>&1)"; rc=$?
-[[ "$rc" == 1 && "$o" == *"not empty"* ]] \
-    && a12k pass || a12k fail "non-empty stage refused (rc=$rc, out: $o)"
-
-fi
-section_end egl12   # after the skip/else fi — both paths snapshot (EGL-184-D2)
-
-# --- EGL-364: a reintroduced old ticket/board path must fail the
-#     publication artifacts closed (R-EGL-364-3 F1–F3). One isolated
-#     fixture, one stage/output per case; shapes: ordinary bytes, a
-#     symlink that resolves in the source but dangles in the stage (the
-#     review's `.git/../../` shape), and a plain dangling link. The
-#     snapshot pins both layers independently: the pre-copy source gate
-#     (nothing reaches a caller-supplied stage; a fresh path is never
-#     created) and the symlink-aware stage tripwire backstop, exercised
-#     through a scratch copy with only the gate call disabled — never a
-#     production env var/flag. -----------------------------------------
-section_begin egl364 "EGL-364 publish reintroduction guards"
-e364() { assert "$@"; }
-if [[ "$HAVE_SNAPSHOT" == 0 && "$HAVE_BUILD_TARBALL" == 0 && "$HAVE_BUILD_DEB" == 0 ]]; then
-    skip "$PKG_SKIP_TAG" "EGL-364 publish reintroduction pins — no packaging build/publish script on this tree (extracted kit)"
-else
-p364="$STATE/egl364"; rm -rf "$p364"; mkdir -p "$p364/kit"
-(cd "$TREE_ROOT" && tar -cf - --exclude=./.git .) | tar -xf - -C "$p364/kit"
-printf '# security policy (staged fixture for the snapshot gate)\n' > "$p364/kit/SECURITY.md"
-# The escaping shape resolves through the fixture's .git to the sibling
-# canary dir; every artifact stage omits/excludes .git, so there it
-# dangles. The canary literal is split so this shipped file never
-# contains the bytes the pin searches for.
-mkdir -p "$p364/kit/.git" "$p364/private-canary"
-e364_canary='EGL364-synthetic-'"canary"' bytes must never publish'
-printf '%s\n' "$e364_canary" > "$p364/private-canary/secret.md"
-SNAP364="$p364/kit/packaging/snapshot-public.sh"
-TARBALL364="$p364/kit/packaging/build-tarball.sh"
-DEB364="$p364/kit/packaging/build-deb.sh"
-e364_escape='../.git/../../private-canary'
-e364_dangle='no-such-egl364-target'
-
-e364_clear() { rm -rf "$p364/kit/docs/tickets" "$p364/kit/docs/BOARD.md"; }
-e364_plant() { # e364_plant <name> <shape>
-    local name="$1" shape="$2"
-    e364_clear
-    mkdir -p "$(dirname "$p364/kit/$name")"
-    case "$shape" in
-        ordinary)
-            if [[ "$name" == "docs/tickets" ]]; then
-                mkdir -p "$p364/kit/docs/tickets"
-                printf '# synthetic ticket body\n' > "$p364/kit/docs/tickets/EGL-1.md"
-            else
-                printf '# synthetic board\n' > "$p364/kit/docs/BOARD.md"
-            fi ;;
-        escape) ln -s "$e364_escape" "$p364/kit/$name" ;;
-        dangle) ln -s "$e364_dangle" "$p364/kit/$name" ;;
-    esac
-}
-e364_snapshot_case() { # e364_snapshot_case <case-id> <name>
-    local id="$1" name="$2" o rc stage
-    [[ "$HAVE_SNAPSHOT" == 1 ]] || return 0
-    stage="$p364/stage-$id-pre"
-    rm -rf "$stage"; mkdir -p "$stage"; chmod 0777 "$stage"
-    o="$(bash "$SNAP364" --dry-run "$stage" 2>&1)"; rc=$?
-    [[ "$rc" == 1 && "$o" == *"$name"* && "$o" == *"source tree"* \
-        && -d "$stage" && -z "$(ls -A "$stage")" ]] \
-        && e364 pass || e364 fail "snapshot source gate: $name ($id) rc 1, path named, caller stage empty+present (rc=$rc, out: $o)"
-    stage="$p364/stage-$id-fresh"
-    rm -rf "$stage"
-    o="$(bash "$SNAP364" --dry-run "$stage" 2>&1)"; rc=$?
-    [[ "$rc" == 1 && "$o" == *"$name"* && "$o" == *"source tree"* && ! -e "$stage" ]] \
-        && e364 pass || e364 fail "snapshot source gate: $name ($id) never creates a fresh stage (rc=$rc, out: $o)"
-}
-e364_tarball_case() { # e364_tarball_case <case-id> <name>
-    local id="$1" name="$2" o rc out
-    [[ "$HAVE_BUILD_TARBALL" == 1 ]] || return 0
-    out="$p364/tarball-$id.tgz"; rm -f "$out"
-    o="$(env EGRESSLOCK_TARBALL_OUT="$out" "$TARBALL364" 2>&1)"; rc=$?
-    [[ "$rc" == 1 && "$o" == *"old ticket/board path"* && "$o" == *"$name"* && ! -e "$out" ]] \
-        && e364 pass || e364 fail "tarball: $name ($id) fails closed naming the path, no artifact (rc=$rc, out: $o)"
-}
-e364_deb_case() { # e364_deb_case <case-id> <name>
-    local id="$1" name="$2" o rc s
-    [[ "$HAVE_BUILD_DEB" == 1 ]] || return 0
-    s="$p364/debstage-$id"; rm -rf "$s"
-    o="$(env EGRESSLOCK_DEB_KEEP_STAGE="$s" EGRESSLOCK_DEB_OUT="$p364/deb-$id.deb" "$DEB364" 2>&1)"; rc=$?
-    if [[ "$rc" == 0 ]] \
-        && ! find "$s/usr/share/egresslock/doc/docs" \( -name tickets -o -name BOARD.md \) 2>/dev/null | grep -q . \
-        && ! grep -rIlF -- "$e364_canary" "$s" >/dev/null 2>&1; then
-        e364 pass
-    else
-        e364 fail "deb: $name ($id) rc 0 with neither name staged and canary absent (rc=$rc, out: $o)"
-    fi
-}
-
-[[ "$HAVE_SNAPSHOT" == 1 ]] || skip "snapshot-public.sh absent" "EGL-364 snapshot reintroduction pins — packaging/snapshot-public.sh is not on the public tree (EGL-74-D1)"
-[[ "$HAVE_BUILD_TARBALL" == 1 ]] || skip "$PKG_SKIP_TAG" "EGL-364 tarball reintroduction pins — packaging/build-tarball.sh is not on this tree (extracted kit)"
-[[ "$HAVE_BUILD_DEB" == 1 ]] || skip "$PKG_SKIP_TAG" "EGL-364 deb filter pins — packaging/build-deb.sh is not on this tree (extracted kit)"
-
-for e364_case in tickets-ordinary tickets-escape tickets-dangle board-ordinary board-escape board-dangle; do
-    e364_key="${e364_case%%-*}"
-    e364_shape="${e364_case##*-}"
-    if [[ "$e364_key" == tickets ]]; then e364_name="docs/tickets"; else e364_name="docs/BOARD.md"; fi
-    e364_plant "$e364_name" "$e364_shape"
-    e364_snapshot_case "$e364_case" "$e364_name"
-    e364_tarball_case "$e364_case" "$e364_name"
-    e364_deb_case "$e364_case" "$e364_name"
-done
-e364_clear
-
-# Clean control: no old path -> every artifact builds, carries neither
-# forbidden name, and no canary bytes reach a stage/artifact.
-if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
-    cstage="$p364/stage-clean"; rm -rf "$cstage"
-    o="$(bash "$SNAP364" --dry-run "$cstage" 2>&1)"; rc=$?
-    [[ "$rc" == 0 && -f "$cstage/SECURITY.md" \
-        && ! -e "$cstage/docs/tickets" && ! -L "$cstage/docs/tickets" \
-        && ! -e "$cstage/docs/BOARD.md" && ! -L "$cstage/docs/BOARD.md" ]] \
-        && ! grep -rIlF -- "$e364_canary" "$cstage" >/dev/null 2>&1 \
-        && e364 pass || e364 fail "snapshot clean control: rc 0, neither old name staged, canary absent (rc=$rc, out: $o)"
-fi
-if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
-    cout="$p364/tarball-clean.tgz"; rm -f "$cout"
-    o="$(env EGRESSLOCK_TARBALL_OUT="$cout" "$TARBALL364" 2>&1)"; rc=$?
-    cdir="$p364/tarball-clean-tree"; rm -rf "$cdir"; mkdir -p "$cdir"
-    if [[ "$rc" == 0 && -f "$cout" ]]; then tar -xzf "$cout" -C "$cdir" 2>/dev/null || true; fi
-    [[ "$rc" == 0 && -f "$cout" ]] \
-        && ! tar -tzf "$cout" | grep -qE '(^|/)docs/(tickets|BOARD\.md)(/|$)' \
-        && ! grep -rIlF -- "$e364_canary" "$cdir" >/dev/null 2>&1 \
-        && e364 pass || e364 fail "tarball clean control: rc 0, neither old name archived, canary absent (rc=$rc, out: $o)"
-fi
-if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
-    cs="$p364/debstage-clean"; rm -rf "$cs"
-    o="$(env EGRESSLOCK_DEB_KEEP_STAGE="$cs" EGRESSLOCK_DEB_OUT="$p364/deb-clean.deb" "$DEB364" 2>&1)"; rc=$?
-    [[ "$rc" == 0 ]] \
-        && ! find "$cs/usr/share/egresslock/doc/docs" \( -name tickets -o -name BOARD.md \) 2>/dev/null | grep -q . \
-        && ! grep -rIlF -- "$e364_canary" "$cs" >/dev/null 2>&1 \
-        && e364 pass || e364 fail "deb clean control: rc 0, neither old name staged, canary absent (rc=$rc, out: $o)"
-fi
-
-# Durable backstop: a scratch copy under the kit root (so its src
-# resolution is unchanged; the dot-dir keeps it out of the allowlist)
-# with ONLY the source-gate call disabled must still be rejected by the
-# symlink-aware stage tripwire, which removes the caller's stage — no
-# rejected copy stays behind.
-if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
-    e364_nogate="$p364/kit/.egl364-scratch/snapshot-nogate.sh"
-    mkdir -p "$(dirname "$e364_nogate")"
-    sed 's/^old_path_source_gate || exit 1$/:/' "$SNAP364" > "$e364_nogate"
-    chmod 0755 "$e364_nogate"
-    e364_plant "docs/tickets" "dangle"
-    bstage="$p364/stage-backstop"; rm -rf "$bstage"; mkdir -p "$bstage"; chmod 0777 "$bstage"
-    o="$(bash "$e364_nogate" --dry-run "$bstage" 2>&1)"; rc=$?
-    [[ "$rc" == 1 && "$o" == *"process/internal files in the stage"* \
-        && "$o" == *"docs/tickets"* && "$o" != *"source tree"* && ! -e "$bstage" ]] \
-        && e364 pass || e364 fail "snapshot stage tripwire backstop: source gate disabled, dangling docs/tickets still rejected and stage removed (rc=$rc, out: $o)"
-    rm -rf "$p364/kit/.egl364-scratch"
-    e364_clear
-fi
-fi
-section_end egl364
 
 # --- EGL-420: build-deb must not dereference a recipe symlink -------------
 # Sibling of EGL-399 (docs loop): the recipes loop admitted a symlink via
@@ -2010,74 +2497,6 @@ fi
 fi
 section_end egl420
 
-# --- EGL-343: .forgejo never reaches a distribution path -------------------
-section_begin egl47 "EGL-343 .forgejo distribution guards"
-a47() { assert "$@"; }
-p47="$STATE/egl47"; rm -rf "$p47"; mkdir -p "$p47/kit" "$p47/bin" "$p47/sbin" "$p47/units"
-# Copy the whole tree so the guards are exercised against the real hazard.
-(cd "$TREE_ROOT" && tar -cf - --exclude=./.git .) | tar -xf - -C "$p47/kit"
-
-# 1. Deb staging (KEEP_STAGE): no staged path contains .forgejo.
-s47="$p47/debstage"
-if [[ "$HAVE_BUILD_DEB" == 1 ]]; then
-    o="$(env EGRESSLOCK_DEB_KEEP_STAGE="$s47" EGRESSLOCK_DEB_OUT="$p47/deb" \
-        "$p47/kit/packaging/build-deb.sh" 2>&1)"; rc=$?
-    [[ "$rc" == 0 ]] && ! find "$s47" -name '.forgejo' | grep -q . \
-        && a47 pass || a47 fail "deb stage has no .forgejo (EGL-343)"
-else
-    skip "$PKG_SKIP_TAG" "EGL-343 deb stage guard — packaging/build-deb.sh is not on this tree (extracted kit)"
-fi
-
-# 2. EGL-343: `.forgejo/` (CI workflows, including the nightly
-#    dispatcher) is repo-only — excluded from the tarball, named in the
-#    guard, and a widened copy fails closed. D12: the public snapshot
-#    ships this test but has no `.forgejo` — plant a synthetic fixture so
-#    the widened-exclude mutation still proves the tripwire instead of
-#    passing vacuously.
-if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
-    forgejo_fixture=0
-    if [[ -d "$p47/kit/.forgejo" ]]; then
-        a47 pass
-    else
-        skip "forgejo absent" "EGL-343 fixture sanity — .forgejo/ is not on the public tree; planting a synthetic fixture for the publish tripwire (EGL-74-D1)"
-        mkdir -p "$p47/kit/.forgejo"
-        printf '# synthetic CI metadata fixture (publish-guard test)\n' \
-            > "$p47/kit/.forgejo/fixture.yml"
-        forgejo_fixture=1
-    fi
-    env EGRESSLOCK_TARBALL_OUT="$p47/k5.tgz" "$p47/kit/packaging/build-tarball.sh" >"$p47/tlog5" 2>&1; t47rc=$?
-    [[ "$t47rc" == 0 ]] && ! tar -tzf "$p47/k5.tgz" | grep -qE '(^|/)\.forgejo(/|$)' \
-        && a47 pass || a47 fail "tarball listing has no .forgejo (rc=$t47rc, log: $(cat "$p47/tlog5"))"
-    cp "$p47/kit/packaging/build-tarball.sh" "$p47/kit/packaging/build-tarball.sh.orig"
-    sed 's/--exclude=\.\/\.forgejo//' "$p47/kit/packaging/build-tarball.sh.orig" > "$p47/kit/packaging/build-tarball.sh"
-    o="$(env EGRESSLOCK_TARBALL_OUT="$p47/k6.tgz" bash "$p47/kit/packaging/build-tarball.sh" 2>&1)"; rc=$?
-    [[ "$rc" == 1 && "$o" == *".forgejo leaked"* ]] \
-        && a47 pass || a47 fail "widened tarball copy trips the .forgejo guard (rc=$rc, out: $o)"
-    mv "$p47/kit/packaging/build-tarball.sh.orig" "$p47/kit/packaging/build-tarball.sh"
-    if (( forgejo_fixture )); then rm -rf "$p47/kit/.forgejo"; fi
-else
-    skip "$PKG_SKIP_TAG" "EGL-343 tarball .forgejo exclude — packaging/build-tarball.sh is not on this tree (extracted kit)"
-fi
-
-# 3. The guards are explicit in the scripts (not layout accidents).
-#    build-tarball.sh ships on the public tree — its grep stays
-#    (EGL-74-D2); the publisher grep needs the private script (EGL-74-D1).
-if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
-grep -q '\.forgejo' "$TREE_ROOT/packaging/snapshot-public.sh" \
-    && a47 pass || a47 fail "snapshot-public.sh names .forgejo (EGL-343)"
-else
-    skip "snapshot-public.sh absent" "EGL-343 publisher grep — packaging/snapshot-public.sh not on the public tree (EGL-74-D1)"
-fi
-# EGL-107-D1: the build-script greps skip on the extracted kit (scripts
-# absent there).
-if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
-grep -q -- '--exclude=./.forgejo' "$TREE_ROOT/packaging/build-tarball.sh" \
-    && a47 pass || a47 fail "build-tarball.sh excludes .forgejo (EGL-343)"
-else
-    skip "$PKG_SKIP_TAG" "EGL-343 build-tarball exclude grep — packaging/build-tarball.sh is not on this tree (extracted kit)"
-fi
-
-section_end egl47
 
 # --- EGL-49: .deb other-readable for apt's _apt sandbox (D1) ----------------
 section_begin egl49 "EGL-49 deb other-readable"
@@ -2115,7 +2534,7 @@ SKITP="$OPT"
 rm -rf "$a18d"
 mkdir -p "$a18d/home/cacct/.config/egresslock"
 # Minimal conf with one gateway profile; allowlist next to the conf.
-printf 'profile p1 10.99.0.0/24\n    rule gateway-only\n    gateway 10.99.0.2 3128 p1-allowlist\n' \
+printf 'profile p1 10.99.0.0/24\n    gateway 10.99.0.2 3128 p1-allowlist\n' \
     > "$a18d/site.conf"
 printf '# starter\n' > "$a18d/p1-allowlist"
 # Pathless/aggregate fixture used by the derived-prefix and AppArmor legs.
@@ -2125,13 +2544,13 @@ printf '# starter\n' > "$a18d/p2-allowlist"
 : > "$STATE/systemctl.log"; : > "$STATE/buildlog"
 
 # Root-only refusal (no hook).
-env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" >/dev/null 2>&1
+env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" >/dev/null 2>&1
 [[ $? == 1 ]] && a18 pass || a18 fail "refuses non-root without the test hook"
 # Usage errors → rc 2.
 a18_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
     $SKIT --prefix "$SKITP" --account cacct 2>&1)"; a18_rc=$?
 [[ "$a18_rc" == 1 && "$a18_out" == *"no profile configs in"* \
-    && "$a18_out" == *"--init-conf"* && "$a18_out" == *"import --account cacct --from"* ]] \
+    && "$a18_out" == *"--init-conf"* && "$a18_out" == *"import cacct --from"* ]] \
     && a18 pass || a18 fail "pathless init on an empty confdir → rc 1 naming both writers (rc=$a18_rc, out: $a18_out)"
 $SKIT --prefix "$SKITP" -h 2>/dev/null | grep -q "one-command" \
     && a18 pass || a18 fail "-h prints the header (mawk-safe)"
@@ -2139,54 +2558,61 @@ $SKIT --prefix "$SKITP" -h 2>/dev/null | grep -q "one-command" \
 # the run reaches the check (without it the root guard exits first and
 # the assertion is vacuous — R-EGL-325-2 F3).
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/missing.conf" >/dev/null 2>&1
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/missing.conf" >/dev/null 2>&1
 [[ $? == 1 && ! -e "$a18d/home/cacct/.config/egresslock/unit.env" ]] \
     && a18 pass || a18 fail "missing conf → rc 1, nothing written"
 chmod 000 "$a18d/site.conf"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" >/dev/null 2>&1
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" >/dev/null 2>&1
 [[ $? == 1 && ! -e "$a18d/home/cacct/.config/egresslock/unit.env" ]] \
     && a18 pass || a18 fail "unreadable conf → rc 1, nothing written"
 chmod 644 "$a18d/site.conf"
 
-# Happy path: named profile, gateway conf → unit.env + gateway build.
+# Happy path: aggregate init, gateway conf -> imported pair + gateway
+# build, and no per-account wiring file (EGL-333-D2).
 s_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
     EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:test \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" --profile p1 2>&1)"; s_rc=$?
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" 2>&1)"; s_rc=$?
 [[ "$s_rc" == 0 ]] && a18 pass || a18 fail "setup-account run (rc=$s_rc, out: $s_out)"
-# EGL-200 M1: the named tail ends on the next-step block (--profile wins).
+# EGL-200 M1: the tail ends on the next-step block, naming the confdir's
+# first profile (the imported p1) and the aggregate timer behavior.
 [[ "$s_out" == *"next steps (as the account):"* \
     && "$s_out" == *"  sudo -iu cacct"* \
     && "$s_out" == *"  egresslock ensure p1"* \
     && "$s_out" == *"  egresslock verify p1"* \
     && "$s_out" == *"read more: egresslock-setup help"* ]] \
     && a18 pass || a18 fail "EGL-200 M1: next-step block names account + profile (out: $s_out)"
-uenv="$a18d/home/cacct/.config/egresslock/unit.env"
-[[ "$(grep -c . "$uenv")" == 1 ]] && a18 pass || a18 fail "unit.env has exactly 1 assignment"
-grep -qx "EGRESSLOCK_PROFILE=p1" "$uenv" && a18 pass || a18 fail "named mode recorded"
-[[ -f "$a18d/home/cacct/.config/egresslock/p1.conf" ]] \
-    && a18 pass || a18 fail "--conf installed as <profile>.conf in the fixed confdir"
-[[ "$(stat -c %a "$uenv")" == 600 ]] && a18 pass || a18 fail "unit.env is 0600"
+# EGL-600 P3: --enable was absent, so no scheduled-check claim may print.
+[[ "$s_out" != *"the scheduled check"* ]] \
+    && a18 pass || a18 fail "EGL-600 P3: no scheduled-check claim without --enable (out: $s_out)"
+p1conf="$a18d/home/cacct/.config/egresslock/p1.conf"
+[[ -f "$p1conf" ]] \
+    && a18 pass || a18 fail "--from installs as <profile>.conf in the fixed confdir"
+[[ ! -e "$a18d/home/cacct/.config/egresslock/unit.env" ]] \
+    && a18 pass || a18 fail "init writes no unit.env (EGL-333-D2)"
+[[ "$(stat -c %a "$p1conf")" == 600 ]] && a18 pass || a18 fail "imported conf is 0600"
 grep -q "build -t localhost/egresslock-gateway:test" "$STATE/buildlog" \
     && a18 pass || a18 fail "gateway image built as the account (build-if-missing)"
-# Idempotent re-run: wholesale overwrite, no duplicates.
+# Idempotent re-run: same pair, still no wiring file.
+s_rc=0
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
     EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:test \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" --profile p1 >/dev/null 2>&1
-[[ "$(grep -c . "$uenv")" == 1 ]] && a18 pass || a18 fail "re-run overwrites wholesale (no dup lines)"
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" >/dev/null 2>&1 || s_rc=$?
+[[ "$s_rc" == 0 && ! -e "$a18d/home/cacct/.config/egresslock/unit.env" ]] \
+    && a18 pass || a18 fail "re-run is a no-op and writes no unit.env (rc=$s_rc)"
 
 # A conf with no gateway line is rejected at staged validation (EGL-366):
-# rc 1 with the engine's named cause, nothing imported, unit.env and the
-# build log untouched.
+# rc 1 with the engine's named cause, nothing imported, the existing conf
+# and the build log untouched.
 printf 'profile p2 10.99.1.0/24\n' > "$a18d/nogw.conf"
 builds_before="$(wc -l < "$STATE/buildlog")"
-uenv_before="$(cat "$uenv")"
+p1conf_before="$(cat "$p1conf")"
 plain_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/nogw.conf" 2>&1)"; plain_rc=$?
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/nogw.conf" 2>&1)"; plain_rc=$?
 if [[ "$plain_rc" == 1 \
       && "$plain_out" == *"staged pair failed validation"* \
       && "$plain_out" == *"profile 'p2' has no 'gateway' directive"* \
-      && "$(cat "$uenv")" == "$uenv_before" \
+      && "$(cat "$p1conf")" == "$p1conf_before" \
       && ! -e "$a18d/home/cacct/.config/egresslock/p2.conf" \
       && "$(wc -l < "$STATE/buildlog")" == "$builds_before" ]]; then
     a18 pass
@@ -2194,22 +2620,23 @@ else
     a18 fail "no-gateway conf is rejected named before wiring (rc=$plain_rc, out: $plain_out)"
 fi
 
-# Conf that fails engine validation → rc 1, unit.env untouched, and the
-# install really rolled back (hook mode so install/validation actually
-# run — R-EGL-325-2 F3; without the hook the root guard exits first).
+# Conf that fails engine validation → rc 1, the existing conf untouched,
+# and the install really rolled back (hook mode so install/validation
+# actually run — R-EGL-325-2 F3; without the hook the root guard exits
+# first).
 printf 'profile p3 10.99.2.0/24\n    rule bogus-directive\n' > "$a18d/bad.conf"
 p3conf="$a18d/home/cacct/.config/egresslock/p3.conf"
 rm -f "$p3conf"
-bad_uenv_before="$(cat "$uenv")"
+p1conf_before="$(cat "$p1conf")"
 bad_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/bad.conf" 2>&1)"; bad_rc=$?
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/bad.conf" 2>&1)"; bad_rc=$?
 if [[ "$bad_rc" == 1 && "$bad_out" == *"staged pair failed validation"* ]]; then
     a18 pass
 else
     a18 fail "unparseable conf → rc 1 at import validation (rc=$bad_rc, out: $bad_out)"
 fi
-[[ "$(cat "$uenv")" == "$bad_uenv_before" ]] \
-    && a18 pass || a18 fail "unparseable conf → unit.env unchanged"
+[[ "$(cat "$p1conf")" == "$p1conf_before" ]] \
+    && a18 pass || a18 fail "unparseable conf → existing conf unchanged"
 [[ ! -e "$p3conf" ]] \
     && a18 pass || a18 fail "unparseable conf → no partial dest"
 # A pre-existing different destination is never replaced (A1): import
@@ -2217,21 +2644,44 @@ fi
 printf 'profile p3 10.99.77.0/24\n' > "$p3conf"; chmod 600 "$p3conf"
 cp -p "$p3conf" "$a18d/p3.prior"
 bad_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/bad.conf" 2>&1)"; bad_rc=$?
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/bad.conf" 2>&1)"; bad_rc=$?
 [[ "$bad_rc" == 1 && "$bad_out" == *"destination conf differs"* ]] \
     && a18 pass || a18 fail "differing prior dest refused (A1; rc=$bad_rc, out: $bad_out)"
 cmp -s "$a18d/p3.prior" "$p3conf" \
     && a18 pass || a18 fail "differing prior dest untouched byte-identically"
 rm -f "$p3conf" "$a18d/p3.prior"
 
-# Profile name that contradicts the source conf (hook mode: the refusal
-# must be the mismatch check, not the root guard).
+# EGL-333-D9: --profile is a doctor-only flag; init rejects it with the
+# specific usage error before any account-side work (hook mode so the
+# refusal is the verb gate, not the root guard).
 bad_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" --profile nope 2>&1)"; bad_rc=$?
-if [[ "$bad_rc" == 2 && "$bad_out" == *"does not match the source conf's profile 'p1'"* ]]; then
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" --profile nope 2>&1)"; bad_rc=$?
+if [[ "$bad_rc" == 2 \
+      && "$bad_out" == *"--profile is a doctor flag only (inspection narrowing); the verify timer checks every profile"* \
+      && "$bad_out" == *"egresslock-setup doctor ACCOUNT --profile NAME"* ]]; then
     a18 pass
 else
-    a18 fail "unknown --profile → rc 2 with the mismatch line (rc=$bad_rc, out: $bad_out)"
+    a18 fail "init --profile → rc 2 with the D9 doctor-flag message (rc=$bad_rc, out: $bad_out)"
+fi
+
+# EGL-333-F4 (R-EGL-333-2): the D9 gate keys on the --profile FLAG, not a
+# nonempty value. An empty value on a non-doctor form takes the same rc 2
+# usage error instead of silently running the pathless bundle.
+bad_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
+    "$SKIT" --prefix "$SKITP" --account cacct --profile '' 2>&1)"; bad_rc=$?
+if [[ "$bad_rc" == 2 \
+      && "$bad_out" == *"--profile is a doctor flag only (inspection narrowing); the verify timer checks every profile"* ]]; then
+    a18 pass
+else
+    a18 fail "empty --profile (legacy bundle) → rc 2 with the D9 doctor-flag message (rc=$bad_rc, out: $bad_out)"
+fi
+bad_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" --profile '' --enable 2>&1)"; bad_rc=$?
+if [[ "$bad_rc" == 2 \
+      && "$bad_out" == *"--profile is a doctor flag only (inspection narrowing); the verify timer checks every profile"* ]]; then
+    a18 pass
+else
+    a18 fail "empty --profile (init verb) → rc 2 with the D9 doctor-flag message (rc=$bad_rc, out: $bad_out)"
 fi
 
 # Prefix derivation (R-follow-up): no --prefix → read the deployed
@@ -2241,20 +2691,20 @@ sd="$STATE/a18-derived"
 rm -rf "$sd"; mkdir -p "$sd/home/dacct"
 s_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$sd/home/dacct" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
-    "$SKIT" --account dacct --conf "$a18d/plain.conf" 2>&1)"; s_rc=$?
+    "$SKIT" init --account dacct --from "$a18d/plain.conf" 2>&1)"; s_rc=$?
 [[ "$s_rc" == 0 ]] && a18 pass || a18 fail "no --prefix derives from the installed template (rc=$s_rc, out: $s_out)"
 [[ -f "$sd/home/dacct/.config/egresslock/p2.conf" ]] \
     && a18 pass || a18 fail "derived-prefix run installs <profile>.conf"
 # And a custom --prefix still wins over the derived one.
 s_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$sd/home/dacct" \
-    "$SKIT" --prefix "$a18d" --account dacct --conf "$a18d/plain.conf" 2>&1)"; s_rc=$?
+    "$SKIT" init --prefix "$a18d" --account dacct --from "$a18d/plain.conf" 2>&1)"; s_rc=$?
 [[ "$s_rc" == 1 && "$s_out" == *"no engine at $a18d/egresslock"* ]] \
     && a18 pass || a18 fail "explicit --prefix overrides the derivation (rc=$s_rc, out: $s_out)"
 
 # --enable asks systemd for the timer and enables linger (ARC-28).
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" --enable >/dev/null 2>&1
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" --enable >/dev/null 2>&1
 grep -q "enable --now egresslock-verify@cacct.timer" "$STATE/systemctl.log" \
     && a18 pass || a18 fail "--enable enables the per-account timer"
 grep -q "enable-linger cacct" "$STATE/loginctl.log" \
@@ -2264,7 +2714,7 @@ grep -q "show-user cacct -p Linger --value" "$STATE/loginctl.log" \
 # Plain run (no --enable) must not touch loginctl (ARC-28-D3).
 : > "$STATE/loginctl.log"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" >/dev/null 2>&1
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" >/dev/null 2>&1
 [[ ! -s "$STATE/loginctl.log" ]] \
     && a18 pass || a18 fail "no --enable -> no loginctl (ARC-28-D3)"
 # Fail-closed linger branch (ARC-28 review note 2 follow-up): when
@@ -2273,7 +2723,7 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"
 f_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
     ARCMOCK_LINGER_ANSWER=no \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" --enable 2>&1)"; f_rc=$?
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" --enable 2>&1)"; f_rc=$?
 if [[ "$f_rc" == 1 && "$f_out" == *"linger for 'cacct' did not stick"* \
       && "$f_out" == *"loginctl enable-linger cacct"* ]]; then
     a18 pass
@@ -2287,13 +2737,13 @@ section_begin egl328 "EGL-328 import pair writer + pathless init"
 e328() { assert "$@"; }
 e328d="$STATE/e328"
 rm -rf "$e328d"; mkdir -p "$e328d/home"
-printf 'profile ci 10.98.0.0/24\n    rule gateway-only\n    gateway 10.98.0.2 3128 ci-allowlist\n' \
+printf 'profile ci 10.98.0.0/24\n    gateway 10.98.0.2 3128 ci-allowlist\n' \
     > "$e328d/site.conf"
 printf '# ci allowlist\n.example.test\n' > "$e328d/ci-allowlist"
 printf 'profile p2 10.98.1.0/24\n    gateway 10.98.1.2 3128 p2-allowlist\n' > "$e328d/p2.conf"
 printf '# starter\n' > "$e328d/p2-allowlist"
 printf 'profile p2 10.98.1.0/24\n' > "$e328d/nogw.conf"
-printf 'profile abs 10.98.2.0/24\n    rule gateway-only\n    gateway 10.98.2.2 3128 %s/abs-allowlist\n' "$e328d" \
+printf 'profile abs 10.98.2.0/24\n    gateway 10.98.2.2 3128 %s/abs-allowlist\n' "$e328d" \
     > "$e328d/abs.conf"
 printf '.abs.example.test\n' > "$e328d/abs-allowlist"
 e328_run() { # <home> <setup args...>
@@ -2317,12 +2767,12 @@ e328_h="$e328d/home/u1"
 o="$("$SKIT" help import 2>&1)"; rc=$?
 if [[ "$rc" == 0 && "$o" == *"every profile needs a gateway"* \
       && "$o" == *"refused at staged validation"* \
-      && "$o" == *'gateway <ip> <port> <profile>-allowlist'* \
+      && "$o" == *'gateway IP PORT PROFILE-allowlist'* \
       && "$o" == *"both destination halves"*"must be regular files or absent"* \
       && "$o" == *"non-regular half        refuse, rc 1, nothing moved or deleted"* \
       && "$o" == *"regular files only; refused for a directory"* \
       && "$o" == *"private mount namespace"* \
-      && "$o" == *"Import does not write unit.env, alter"*"linger/timer/user@, or run ensure."* \
+      && "$o" == *"Import does not write into the confdir beyond the"*"pair, alter linger/timer/user@, or run ensure."* \
       && "$o" == *"A forced replacement deletes the"*"regular files it replaces, after the staged pair validates"* \
       && "$o" != *"No gateway line means conf only"* ]]; then
     e328 pass
@@ -2443,7 +2893,7 @@ cmp -s "$e328d/ci.prior" "$ci_conf" \
     && e328 pass || e328 fail "refused import leaves the dest conf byte-identical"
 
 # 4. Missing source allowlist is A2: refuse before any dest write.
-printf 'profile ci 10.98.0.0/24\n    rule gateway-only\n    gateway 10.98.0.2 3128 ci-allowlist\n' \
+printf 'profile ci 10.98.0.0/24\n    gateway 10.98.0.2 3128 ci-allowlist\n' \
     > "$e328d/site.conf"
 e328_h2="$e328d/home/u2"
 mv "$e328d/ci-allowlist" "$e328d/ci-allowlist.away"
@@ -2456,7 +2906,7 @@ mv "$e328d/ci-allowlist.away" "$e328d/ci-allowlist"
 
 # 5. Torn destination: refused by default; --force replaces both halves
 #    (never writes only the missing half). Restore the source first.
-printf 'profile ci 10.98.0.0/24\n    rule gateway-only\n    gateway 10.98.0.2 3128 ci-allowlist\n' \
+printf 'profile ci 10.98.0.0/24\n    gateway 10.98.0.2 3128 ci-allowlist\n' \
     > "$e328d/site.conf"
 printf '# ci allowlist\n.example.test\n' > "$e328d/ci-allowlist"
 e328_h3="$e328d/home/u3"
@@ -2473,7 +2923,7 @@ o="$(e328_run "$e328_h3" import --account u3 --from "$e328d/site.conf" --force 2
     && e328 pass || e328 fail "import --force replaces a torn pair (rc=$rc, out: $o)"
 
 # 6. --force replaces a differing pair (allowlist and conf together).
-printf 'profile ci 10.98.3.0/24\n    rule gateway-only\n    gateway 10.98.3.2 3128 ci-allowlist\n' \
+printf 'profile ci 10.98.3.0/24\n    gateway 10.98.3.2 3128 ci-allowlist\n' \
     > "$e328d/site.conf"
 printf '.forced.example.test\n' > "$e328d/ci-allowlist"
 o="$(e328_run "$e328_h" import --account u1 --from "$e328d/site.conf" --force 2>&1)"; rc=$?
@@ -2488,19 +2938,21 @@ cmp -s "$e328d/site.conf" "$ci_conf" \
 #     makes the same import succeed with the marker preserved.
 e418d="$e328d/e418"
 mkdir -p "$e418d"
-printf 'profile ci 10.98.30.0/24\n    rule gateway-only\n    gateway 10.98.30.2 3128 ci-allowlist\n' \
+printf 'profile ci 10.98.30.0/24\n    gateway 10.98.30.2 3128 ci-allowlist\n' \
     > "$e418d/ci.conf"
 printf '# e418 source\n.e418.example.test\n' > "$e418d/ci-allowlist"
 e418_h40="$e328d/home/e418-u40"
 rm -rf "$e418_h40"; mkdir -p "$e418_h40/.config/egresslock/ci-allowlist"
 printf 'marker\n' > "$e418_h40/.config/egresslock/ci-allowlist/marker"
 e418_dir="$e418_h40/.config/egresslock/ci-allowlist"
+e418_q="$(printf '%q' "$e418_dir")"; e418_qbak="$(printf '%q' "$e418_dir.bak")"
 for force in "" "--force"; do
     o="$(e328_run "$e418_h40" import --account e418u40 --from "$e418d/ci.conf" $force 2>&1)"; rc=$?
     if [[ "$rc" == 1 \
           && "$o" == *"refusing: destination allowlist is a directory: $e418_dir"* \
           && "$o" == *"fix: move it aside (only that directory moves; its contents are not deleted), then re-run this import; --force cannot replace it:"* \
-          && "$o" == *"         mv '$e418_dir' '$e418_dir.bak'"* \
+          && "$o" == *"         mv -n -T -- $e418_q $e418_qbak"* \
+          && "$o" == *"if that name already exists, nothing moves; pick another name."* \
           && -d "$e418_dir" && "$(cat "$e418_dir/marker")" == "marker" \
           && ! -e "$e418_h40/.config/egresslock/ci.conf" \
           && -z "$(find "$e418_h40/.config/egresslock" -maxdepth 1 -name '.import*' -print -quit)" ]]; then
@@ -2509,7 +2961,17 @@ for force in "" "--force"; do
         e328 fail "destination allowlist directory refused${force:+ with --force} (rc=$rc, out: $o)"
     fi
 done
-fix_cmd="$(printf '%s\n' "$o" | sed -n "s/^         \(mv '.*' '.*'\)$/\1/p" | head -n 1)"
+# 6d-occupied. EGL-532-D3: the printed move-aside is non-clobbering — an
+#     occupied `.bak` name moves nothing (`-n`), so the source and the
+#     occupant both stay.
+mkdir -p "$e418_dir.bak"
+occ_cmd="$(printf '%s\n' "$o" | sed -n "s/^         \(mv .*\)$/\1/p" | head -n 1)"
+eval "$occ_cmd" 2>/dev/null
+[[ -d "$e418_dir" && "$(cat "$e418_dir/marker")" == "marker" \
+   && -d "$e418_dir.bak" && -z "$(ls -A "$e418_dir.bak")" ]] \
+    && e328 pass || e328 fail "occupied .bak: printed mv -n moves nothing (out: $o)"
+rmdir "$e418_dir.bak"
+fix_cmd="$(printf '%s\n' "$o" | sed -n "s/^         \(mv .*\)$/\1/p" | head -n 1)"
 eval "$fix_cmd" 2>/dev/null
 [[ -d "$e418_dir.bak" && "$(cat "$e418_dir.bak/marker")" == "marker" ]] \
     && e328 pass || e328 fail "printed move-aside command moves only the directory (out: $o)"
@@ -2827,7 +3289,7 @@ rm -rf "$e418_leftover_backup"
 # destination-unchanged wording, and installs nothing.
 e418_bad_src="$e328d/e418bad"
 mkdir -p "$e418_bad_src"
-printf 'profile e418bad 10.98.31.0/24\n    rule gateway-only\n    gateway 10.98.31.2 3128 e418bad-allowlist\n' \
+printf 'profile e418bad 10.98.31.0/24\n    gateway 10.98.31.2 3128 e418bad-allowlist\n' \
     > "$e418_bad_src/e418bad.conf"
 printf '+ .bad.example.test\n' > "$e418_bad_src/e418bad-allowlist"
 e418_h52="$e328d/home/e418-u52"
@@ -2881,7 +3343,6 @@ fi
 rb_src="$e328d/rb.conf"
 cat > "$rb_src" <<'EOF'
 profile rbci 10.98.4.0/24
-    rule gateway-only
     gateway 10.98.4.2 3128 rbci-allowlist
 EOF
 printf '.new.example.test\n' > "$e328d/rbci-allowlist"
@@ -3013,6 +3474,7 @@ fi
 exec "$real_mv" "\$@"
 EOF
 chmod +x "$init_shim/mv"
+force_mv_publish_fallback "$init_shim"
 rb_h3="$e328d/home/u14"
 mkdir -p "$rb_h3"
 o="$(PATH="$init_shim:$PATH" e328_run "$rb_h3" init --account u14 --init-conf 2>&1)"; rc=$?
@@ -3034,8 +3496,14 @@ o="$(e328_run "$e328_h2" import --account u2 --conf "$e328d/site.conf" 2>&1)"; r
 [[ "$rc" == 2 && "$o" == *"takes --from, not --conf"* ]] \
     && e328 pass || e328 fail "import --conf rc 2 (rc=$rc, out: $o)"
 o="$(e328_run "$e328_h2" import --account u2 --from "$e328d/site.conf" --profile ci 2>&1)"; rc=$?
-[[ "$rc" == 2 && "$o" == *"--profile is an init flag"* ]] \
+[[ "$rc" == 2 && "$o" == *"--profile is a doctor flag only (inspection narrowing)"* \
+    && "$o" == *"import names the dest from the source conf's profile line"* ]] \
     && e328 pass || e328 fail "import --profile rc 2 (rc=$rc, out: $o)"
+# EGL-333-F4 (R-EGL-333-2): an empty value is the same flag, same refusal.
+o="$(e328_run "$e328_h2" import --account u2 --from "$e328d/site.conf" --profile '' 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"--profile is a doctor flag only (inspection narrowing)"* \
+    && "$o" == *"import names the dest from the source conf's profile line"* ]] \
+    && e328 pass || e328 fail "import --profile '' rc 2 (rc=$rc, out: $o)"
 o="$(e328_run "$e328_h2" import --account u2 --from "$e328d/site.conf" --init-conf 2>&1)"; rc=$?
 [[ "$rc" == 2 && "$o" == *"belong to init"* ]] \
     && e328 pass || e328 fail "import --init-conf rc 2 (rc=$rc, out: $o)"
@@ -3059,7 +3527,7 @@ o="$(e328_run "$e328_h2" import --account u2 --from "$e328d/site.conf" --allowli
 #     (the file exists, so the refusal is the name rule, not a missing
 #     source half). A fresh home gets no confdir/staging; a pre-existing
 #     destination pair keeps its bytes, with and without --force.
-printf 'profile collide 10.98.6.0/24\n    rule gateway-only\n    gateway 10.98.6.2 3128 shared-allowlist\n' \
+printf 'profile collide 10.98.6.0/24\n    gateway 10.98.6.2 3128 shared-allowlist\n' \
     > "$e328d/collide.conf"
 printf '# another profile\n' > "$e328d/shared-allowlist"
 rm -rf "$e328d/home/u12"
@@ -3140,10 +3608,10 @@ fi
 #     does (strip a `#` comment, CR, and surrounding whitespace). A
 #     conforming inline-comment or CRLF pair must import and validate
 #     in place, not be mistaken for a non-pair refusal.
-printf 'profile commented 10.98.12.0/24\n    rule gateway-only\n    gateway 10.98.12.2 3128 commented-allowlist#pair-half\n' \
+printf 'profile commented 10.98.12.0/24\n    gateway 10.98.12.2 3128 commented-allowlist#pair-half\n' \
     > "$e328d/commented.conf"
 printf '# commented\n' > "$e328d/commented-allowlist"
-printf 'profile crlf 10.98.13.0/24\r\n    rule gateway-only\r\n    gateway 10.98.13.2 3128 crlf-allowlist\r\n' \
+printf 'profile crlf 10.98.13.0/24\r\n    gateway 10.98.13.2 3128 crlf-allowlist\r\n' \
     > "$e328d/crlf.conf"
 printf '# crlf\r\n' > "$e328d/crlf-allowlist"
 for form in commented crlf; do
@@ -3176,7 +3644,7 @@ for lead in cr vt; do
         vt) lpre=$'\v' ;;
     esac
     form="lead$lead"
-    printf 'profile %s 10.98.14.0/24\n    rule gateway-only\n%s    gateway 10.98.14.2 3128 %s-allowlist\n' \
+    printf 'profile %s 10.98.14.0/24\n%s    gateway 10.98.14.2 3128 %s-allowlist\n' \
         "$form" "$lpre" "$form" > "$e328d/$form.conf"
     printf '# %s source\n.%s.example.test\n' "$lead" "$lead" > "$e328d/$form-allowlist"
     # Fresh import: both halves, byte-identical.
@@ -3213,7 +3681,7 @@ for lead in cr vt; do
     # Non-pair with the same leading whitespace: refused by name before
     # staging or any destination write (no fresh confdir).
     npform="nonpair$lead"
-    printf 'profile %s 10.98.15.0/24\n    rule gateway-only\n%s    gateway 10.98.15.2 3128 shared-allowlist\n' \
+    printf 'profile %s 10.98.15.0/24\n%s    gateway 10.98.15.2 3128 shared-allowlist\n' \
         "$npform" "$lpre" > "$e328d/$npform.conf"
     printf '# shared\n' > "$e328d/shared-allowlist"
     h3="$e328d/home/u24$lead"
@@ -3231,7 +3699,7 @@ done
 # 8d. EGL-375-D8: import/init inherit the engine's strict allowlist-entry
 #     validation through the bare `allowlist` probe. An invalid entry is
 #     refused before commit and named; the destination is untouched.
-printf 'profile inv 10.98.20.0/24\n    rule gateway-only\n    gateway 10.98.20.2 3128 inv-allowlist\n' \
+printf 'profile inv 10.98.20.0/24\n    gateway 10.98.20.2 3128 inv-allowlist\n' \
     > "$e328d/inv.conf"
 printf '# invalid entry\n+ .bad.example.test\n' > "$e328d/inv-allowlist"
 inv_bad="invalid allowlist entry '+.bad.example.test'"
@@ -3282,6 +3750,7 @@ inv_modes="$(stat -c '%a %n' "$inv_h3/.config/egresslock/inv.conf" "$inv_h3/.con
 o="$(e328_run "$inv_h3" import --account u32 --from "$inv_h3/.config/egresslock/inv.conf" 2>&1)"; rc=$?
 if [[ "$rc" == 1 \
       && "$o" == *"allowlist failed validation in place: $inv_h3/.config/egresslock/inv-allowlist"* \
+      && "$o" == *"fix: correct the allowlist at $inv_h3/.config/egresslock/inv-allowlist (the --from source is also the destination), then re-run this import; nothing was changed."* \
       && "$o" == *"$inv_bad"* && "$o" != *"unchanged"* \
       && "$(stat -c '%a %n' "$inv_h3/.config/egresslock/inv.conf" "$inv_h3/.config/egresslock/inv-allowlist")" == "$inv_modes" ]] \
    && cmp -s "$e328d/inv.inplace.conf" "$inv_h3/.config/egresslock/inv.conf" \
@@ -3291,7 +3760,49 @@ else
     e328 fail "files-in-place refusal relays the engine entry error (rc=$rc, out: $o)"
 fi
 
-# (e) init --from: refused at import before unit.env/timer work.
+# (d2) files-in-place: a conf that fails the deployed engine's load is
+#      refused in place, the engine line relayed, with the staged
+#      sibling's fix naming the in-place file; bytes/modes stay.
+inv_h4b="$e328d/home/u40"
+mkdir -p "$inv_h4b/.config/egresslock"
+printf 'profile invc 10.98.21.0/24\n    bogus-directive yes\n' > "$inv_h4b/.config/egresslock/invc.conf"
+cp -p "$inv_h4b/.config/egresslock/invc.conf" "$e328d/invc.inplace.conf"
+inv_c_modes="$(stat -c '%a %n' "$inv_h4b/.config/egresslock/invc.conf")"
+o="$(e328_run "$inv_h4b" import --account u40 --from "$inv_h4b/.config/egresslock/invc.conf" 2>&1)"; rc=$?
+if [[ "$rc" == 1 \
+      && "$o" == *"conf failed validation in place: $inv_h4b/.config/egresslock/invc.conf"* \
+      && "$o" == *"fix: correct the conf at $inv_h4b/.config/egresslock/invc.conf (the --from source is also the destination), then re-run this import; nothing was changed."* \
+      && "$o" != *"unchanged"* \
+      && "$(stat -c '%a %n' "$inv_h4b/.config/egresslock/invc.conf")" == "$inv_c_modes" ]] \
+   && cmp -s "$e328d/invc.inplace.conf" "$inv_h4b/.config/egresslock/invc.conf"; then
+    e328 pass
+else
+    e328 fail "files-in-place conf refusal carries the fix line (rc=$rc, out: $o)"
+fi
+
+# (d3) files-in-place torn pair: the gateway names its sibling allowlist,
+#      which is missing; --allowlist supplies a readable stand-in so the
+#      in-place torn branch (not the source-pair "allowlist not found"
+#      gate) is reached. The fix names the in-place allowlist and the
+#      account, advises no --force, and nothing is created.
+inv_h4c="$e328d/home/u41"
+mkdir -p "$inv_h4c/.config/egresslock"
+printf 'profile invt 10.98.22.0/24\n    gateway 10.98.22.2 3128 invt-allowlist\n' \
+    > "$inv_h4c/.config/egresslock/invt.conf"
+: > "$e328d/invt-standin-allowlist"
+o="$(e328_run "$inv_h4c" import --account u41 --from "$inv_h4c/.config/egresslock/invt.conf" \
+    --allowlist "$e328d/invt-standin-allowlist" 2>&1)"; rc=$?
+if [[ "$rc" == 1 \
+      && "$o" == *"destination pair is torn (source --from is the destination)"* \
+      && "$o" == *"fix: create the missing allowlist at $inv_h4c/.config/egresslock/invt-allowlist as u41 (an empty file is the valid deny-all starter), then re-run this import; nothing was changed."* \
+      && "$o" != *"--force"* \
+      && ! -e "$inv_h4c/.config/egresslock/invt-allowlist" ]]; then
+    e328 pass
+else
+    e328 fail "files-in-place torn refusal carries the no-force fix line (rc=$rc, out: $o)"
+fi
+
+# (e) init --from: refused at import before any account wiring/timer work.
 inv_h4="$e328d/home/u33"
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"
 o="$(e328_run "$inv_h4" init --account u33 --from "$e328d/inv.conf" --enable 2>&1)"; rc=$?
@@ -3309,7 +3820,7 @@ fi
 #     staging/backup survives.
 inv_h5="$e328d/home/u34"
 mkdir -p "$inv_h5/.config/egresslock"
-printf 'profile inv 10.98.99.0/24\n    rule gateway-only\n    gateway 10.98.99.2 3128 inv-allowlist\n' \
+printf 'profile inv 10.98.99.0/24\n    gateway 10.98.99.2 3128 inv-allowlist\n' \
     > "$inv_h5/.config/egresslock/inv.conf"
 printf '.prior.example.test\n' > "$inv_h5/.config/egresslock/inv-allowlist"
 cp -p "$inv_h5/.config/egresslock/inv.conf" "$e328d/inv.force.conf"
@@ -3330,40 +3841,43 @@ o="$(e328_run "$e328_h" import --account u1 --from "$ci_conf" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"source is the destination"* ]] \
     && e328 pass || e328 fail "import --from dest validates in place (rc=$rc, out: $o)"
 
-# 10. init --from wires after import; no --profile = aggregate (D8).
+# 10. init --from wires after import; the timer is aggregate and no
+#     per-account wiring file is written (EGL-333-D2).
 e328_h5="$e328d/home/u5"
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"
 o="$(e328_run "$e328_h5" init --account u5 --from "$e328d/site.conf" --enable 2>&1)"; rc=$?
 [[ "$rc" == 0 && -f "$e328_h5/.config/egresslock/ci.conf" \
-    && -f "$e328_h5/.config/egresslock/unit.env" && ! -s "$e328_h5/.config/egresslock/unit.env" \
-    && "$o" == *"the scheduled check will verify every profile"* ]] \
-    && e328 pass || e328 fail "init --from imports then wires aggregate (rc=$rc, out: $o)"
-[[ "$o" == *"egresslock-setup: unit.env written for u5 to $e328_h5/.config/egresslock/unit.env"* ]] \
-    && e328 pass || e328 fail "unit.env success line joins with 'to' (out: $o)"
-assert_kit_lines_paste_safe "setup unit.env line" "$o" '^egresslock-setup: unit\.env written for'
+    && ! -e "$e328_h5/.config/egresslock/unit.env" \
+    && "$o" == *"the scheduled check will verify every profile whose anchor is running"* ]] \
+    && e328 pass || e328 fail "init --from imports, wires aggregate, writes no unit.env (rc=$rc, out: $o)"
+assert_kit_lines_paste_safe "setup aggregate line" "$o" '^egresslock-setup: the scheduled check will verify every profile whose anchor is running$'
 grep -q "enable --now egresslock-verify@u5.timer" "$STATE/systemctl.log" \
     && e328 pass || e328 fail "init --from --enable arms the timer"
 
-# 11. init --from --profile must match the source profile (rc 2, no writes).
+# 11. init --from --profile is rejected by the EGL-333-D9 verb gate
+#     (rc 2, no writes) — --profile is doctor's inspection narrowing only.
 e328_h6="$e328d/home/u6"
 o="$(e328_run "$e328_h6" init --account u6 --from "$e328d/site.conf" --profile nope 2>&1)"; rc=$?
-[[ "$rc" == 2 && "$o" == *"does not match the source conf's profile 'ci'"* \
+[[ "$rc" == 2 \
+    && "$o" == *"--profile is a doctor flag only (inspection narrowing); the verify timer checks every profile"* \
     && ! -e "$e328_h6/.config/egresslock/ci.conf" \
     && ! -e "$e328_h6/.config/egresslock/unit.env" ]] \
-    && e328 pass || e328 fail "init --from --profile mismatch rc 2 before wiring (rc=$rc, out: $o)"
+    && e328 pass || e328 fail "init --from --profile rc 2 at the D9 gate before wiring (rc=$rc, out: $o)"
 
-# 11b. EGL-380: 'all' is reserved at the setup CLI edge — rc 2 before any
-#      account-side read/write.
+# 11b. EGL-380: 'all' stays reserved at the setup CLI edge — rc 2 before
+#      any account-side read/write. init now rejects --profile earlier
+#      (D9), so the reserved edge is exercised through doctor, which still
+#      parses the flag.
 e328_h12="$e328d/home/u12"
-o="$(e328_run "$e328_h12" init --account u12 --profile all 2>&1)"; rc=$?
+o="$(e328_run "$e328_h12" doctor --account u12 --profile all 2>&1)"; rc=$?
 [[ "$rc" == 2 && "$o" == *"reserved"* && "$o" == *"teardown all"* \
     && "$o" == *"choose another name"* \
     && ! -e "$e328_h12/.config/egresslock" ]] \
-    && e328 pass || e328 fail "init --profile all reserved, no writes (rc=$rc, out: $o)"
+    && e328 pass || e328 fail "doctor --profile all reserved, no writes (rc=$rc, out: $o)"
 
 # 11c. EGL-380: importing a source whose profile line names 'all' is rc 1
 #      (the source-check shape) and leaves the destination untouched.
-printf 'profile all 10.98.3.0/24\n    rule gateway-only\n    gateway 10.98.3.2 3128 all-allowlist\n' \
+printf 'profile all 10.98.3.0/24\n    gateway 10.98.3.2 3128 all-allowlist\n' \
     > "$e328d/all-src.conf"
 printf '# all\n' > "$e328d/all-allowlist"
 e328_h13="$e328d/home/u13"
@@ -3374,39 +3888,67 @@ o="$(e328_run "$e328_h13" import --account u13 --from "$e328d/all-src.conf" 2>&1
     && ! -e "$e328_h13/.config/egresslock/all-allowlist" ]] \
     && e328 pass || e328 fail "import of profile all rc 1, no dest pair (rc=$rc, out: $o)"
 
-# 12. Named init: pathless re-arm preserves only an explicit --profile;
-#     import itself never rewrites unit.env (A4).
+# 11d. EGL-573/EGL-519-P6: 'v6deny' is reserved at the same setup CLI
+#      edge — rc 2 before any account-side read/write, naming the shared
+#      IPv6-deny chain it would derive.
+e328_h14="$e328d/home/u519d"
+o="$(e328_run "$e328_h14" doctor --account u519d --profile v6deny 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"profile name 'v6deny' is reserved"* \
+    && "$o" == *"shared IPv6-deny chain 'p_v6deny'"* \
+    && "$o" == *"choose another name"* \
+    && ! -e "$e328_h14/.config/egresslock" ]] \
+    && e328 pass || e328 fail "doctor --profile v6deny reserved, no writes (rc=$rc, out: $o)"
+
+# 11e. EGL-573/EGL-519-P6: importing a source whose profile line names
+#      'v6deny' is rc 1 (the source-check shape) and leaves the
+#      destination untouched.
+printf 'profile v6deny 10.98.4.0/24\n    gateway 10.98.4.2 3128 v6deny-allowlist\n' \
+    > "$e328d/v6deny-src.conf"
+printf '# v6deny\n' > "$e328d/v6deny-allowlist"
+e328_h15="$e328d/home/u519i"
+o="$(e328_run "$e328_h15" import --account u519i --from "$e328d/v6deny-src.conf" 2>&1)"; rc=$?
+[[ "$rc" == 1 && "$o" == *"profile name 'v6deny' is reserved"* \
+    && "$o" == *"shared IPv6-deny chain 'p_v6deny'"* \
+    && "$o" == *"choose another name"* \
+    && ! -e "$e328_h15/.config/egresslock/v6deny.conf" \
+    && ! -e "$e328_h15/.config/egresslock/v6deny-allowlist" ]] \
+    && e328 pass || e328 fail "import of profile v6deny rc 1, no dest pair (rc=$rc, out: $o)"
+
+# 12. Pathless re-arm is aggregate: init writes no wiring file, and
+#     importing another profile never creates one (EGL-333-D2/D5).
 e328_h7="$e328d/home/u7"
 e328_run "$e328_h7" import --account u7 --from "$e328d/site.conf" >/dev/null 2>&1
-e328_run "$e328_h7" init --account u7 --profile ci --enable >/dev/null 2>&1
-[[ "$(cat "$e328_h7/.config/egresslock/unit.env")" == "EGRESSLOCK_PROFILE=ci" ]] \
-    && e328 pass || e328 fail "init --profile ci writes named unit.env"
-cp -p "$e328_h7/.config/egresslock/unit.env" "$e328d/u7.unit.env"
-e328_run "$e328_h7" import --account u7 --from "$e328d/p2.conf" >/dev/null 2>&1
-cmp -s "$e328d/u7.unit.env" "$e328_h7/.config/egresslock/unit.env" \
-    && e328 pass || e328 fail "import of another profile leaves unit.env untouched (A4)"
-e328_run "$e328_h7" init --account u7 --enable >/dev/null 2>&1
-[[ ! -s "$e328_h7/.config/egresslock/unit.env" ]] \
-    && e328 pass || e328 fail "pathless init without --profile clears named mode (D8)"
+: > "$STATE/systemctl.log"
+e328_run "$e328_h7" init --account u7 --enable >/dev/null 2>&1; rc=$?
+[[ "$rc" == 0 && ! -e "$e328_h7/.config/egresslock/unit.env" ]] \
+    && e328 pass || e328 fail "pathless init arms the timer and writes no unit.env (rc=$rc)"
+grep -q "enable --now egresslock-verify@u7.timer" "$STATE/systemctl.log" \
+    && e328 pass || e328 fail "pathless init without --from arms the timer"
+e328_run "$e328_h7" import --account u7 --from "$e328d/p2.conf" >/dev/null 2>&1; rc=$?
+[[ "$rc" == 0 && ! -e "$e328_h7/.config/egresslock/unit.env" ]] \
+    && e328 pass || e328 fail "import of another profile creates no unit.env (A4, rc=$rc)"
+e328_run "$e328_h7" init --account u7 --enable >/dev/null 2>&1; rc=$?
+[[ "$rc" == 0 && ! -e "$e328_h7/.config/egresslock/unit.env" ]] \
+    && e328 pass || e328 fail "re-run init stays aggregate with no unit.env (rc=$rc)"
 
-# 13. Doctor resolves unit.env (named) with no --conf; a missing named conf
-#     fails rc 1 and the fix points at import --from.
+# 13. Doctor inspects the confdir without unit.env; a missing conf fails
+#     rc 1 with the import fix, and no unit.env row exists (EGL-333-D2).
 e328_h8="$e328d/home/u8"
 e328_run "$e328_h8" import --account u8 --from "$e328d/site.conf" >/dev/null 2>&1
 : > "$STATE/systemctl.log"
-e328_run "$e328_h8" init --account u8 --profile ci --enable >/dev/null 2>&1
+e328_run "$e328_h8" init --account u8 --enable >/dev/null 2>&1
 grep -q "enable --now egresslock-verify@u8.timer" "$STATE/systemctl.log" \
-    && e328 pass || e328 fail "pathless init --profile arms the timer without --from"
+    && e328 pass || e328 fail "pathless init arms the timer without --from"
 o="$(e328_run "$e328_h8" doctor --account u8 2>&1)"; rc=$?
-[[ "$rc" == 0 && "$o" == *"OK: conf parse: ok (profile 'ci'"* \
-    && "$o" == *"OK: unit.env: matches"* && "$o" == *"(named mode: ci)"* ]] \
-    && e328 pass || e328 fail "doctor resolves named unit.env without --conf (rc=$rc, out: $o)"
+[[ "$rc" == 0 && "$o" == *"OK: conf parse: ok ($e328_h8/.config/egresslock)"* \
+    && "$o" != *"unit.env"* ]] \
+    && e328 pass || e328 fail "doctor inspects the confdir with no unit.env row (rc=$rc, out: $o)"
 rm -f "$e328_h8/.config/egresslock/ci.conf"
 o="$(e328_run "$e328_h8" doctor --account u8 2>&1)"; rc=$?
-[[ "$rc" == 1 && "$o" == *"PROBLEM: conf parse: FAIL (profile 'ci')"* \
-    && "$o" == *"PROBLEM: unit.env: named profile 'ci' has no conf"* \
-    && "$o" == *"import --account u8 --from"* && "$o" != *"OK: conf parse"* ]] \
-    && e328 pass || e328 fail "doctor names missing named conf + import fix (rc=$rc, out: $o)"
+[[ "$rc" == 1 && "$o" == *"PROBLEM: conf parse: FAIL ($e328_h8/.config/egresslock)"* \
+    && "$o" == *"import u8 --from"* && "$o" != *"OK: conf parse"* \
+    && "$o" != *"unit.env"* ]] \
+    && e328 pass || e328 fail "doctor on an emptied confdir names import fix, no unit.env (rc=$rc, out: $o)"
 
 # 14. Doctor on an empty confdir fails closed, naming both writers (never
 #     inventing main.conf).
@@ -3414,40 +3956,34 @@ e328_h9="$e328d/home/u9"
 mkdir -p "$e328_h9"
 o="$(e328_run "$e328_h9" doctor --account u9 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$o" == *"PROBLEM: conf parse: FAIL ($e328_h9/.config/egresslock)"* \
-    && "$o" == *"init --account u9 --init-conf"* \
-    && "$o" == *"import --account u9 --from"* ]] \
+    && "$o" == *"init u9 --init-conf"* \
+    && "$o" == *"import u9 --from"* ]] \
     && e328 pass || e328 fail "empty-confdir doctor names --init-conf/import --from (rc=$rc, out: $o)"
 
 # 14b. A --conf hint selects the profile for inspection but is NOT a
-#      named-mode request: doctor's pathless fix must not narrow the timer.
+#      named-mode request: doctor's pathless timer fix must not carry
+#      --profile even while the hint selects 'ci'.
 e328_h11="$e328d/home/u11"
 e328_run "$e328_h11" import --account u11 --from "$e328d/site.conf" >/dev/null 2>&1
-rm -f "$e328_h11/.config/egresslock/unit.env"
+: > "$STATE/systemctl-timer-off"
 o="$(e328_run "$e328_h11" doctor --account u11 --conf "$e328_h11/.config/egresslock/ci.conf" 2>&1)"; rc=$?
+rm -f "$STATE/systemctl-timer-off"
 [[ "$rc" == 1 \
     && "$o" == *"OK: conf parse: ok (profile 'ci'"* \
-    && "$o" == *"fix: sudo egresslock-setup init --account u11 --enable"* \
-    && "$o" != *"init --account u11 --profile ci --enable"* ]] \
+    && "$o" == *"fix: sudo egresslock-setup init u11 --enable"* \
+    && "$o" != *"init u11 --profile ci --enable"* ]] \
     && e328 pass || e328 fail "doctor --conf hint does not narrow the fix (rc=$rc, out: $o)"
 
-# 14c. An invalid unit.env profile token is reported, never joined into
-#      a path; the fix is pathless (aggregate rewrite).
-printf 'EGRESSLOCK_PROFILE=../evil\n' > "$e328_h11/.config/egresslock/unit.env"
+# 14c. EGL-333-D5: an existing unit.env is inert. A legacy/invalid token
+#      neither adds a doctor row nor changes rc or the rest of the output.
+o1="$(e328_run "$e328_h11" doctor --account u11 2>&1)"; rc1=$?
+printf 'EGRESSLOCK_PROFILE=../evil\nEGRESSLOCK_CONF=/stale/path.conf\n' \
+    > "$e328_h11/.config/egresslock/unit.env"
 o="$(e328_run "$e328_h11" doctor --account u11 2>&1)"; rc=$?
-[[ "$rc" == 1 && "$o" == *"PROBLEM: unit.env: invalid EGRESSLOCK_PROFILE '../evil'"* \
-    && "$o" == *"fix: sudo egresslock-setup init --account u11 --enable"* ]] \
-    && e328 pass || e328 fail "doctor rejects invalid unit.env profile, pathless fix (rc=$rc, out: $o)"
-
-# 14d. EGL-380: unit.env naming the reserved token 'all' gets the reserved
-#      row, a pathless fix, and never renders `--profile all`.
-printf 'EGRESSLOCK_PROFILE=all\n' > "$e328_h11/.config/egresslock/unit.env"
-o="$(e328_run "$e328_h11" doctor --account u11 2>&1)"; rc=$?
-[[ "$rc" == 1 \
-    && "$o" == *"PROBLEM: unit.env: EGRESSLOCK_PROFILE 'all' is reserved ('teardown all' names the main profile)"* \
-    && "$o" == *"rename this profile and its conf file"* \
-    && "$o" == *"fix: sudo egresslock-setup init --account u11 --enable"* \
-    && "$o" != *"--profile all"* ]] \
-    && e328 pass || e328 fail "doctor reserved unit.env profile, pathless fix (rc=$rc, out: $o)"
+[[ "$rc" == "$rc1" && "$o" == "$o1" && "$o" != *"unit.env"* \
+    && "$o" != *"../evil"* ]] \
+    && e328 pass || e328 fail "legacy unit.env is ignored by doctor (rc=$rc/$rc1, out: $o)"
+rm -f "$e328_h11/.config/egresslock/unit.env"
 
 # 15. Unreadable source refused before dest write.
 chmod 000 "$e328d/p2.conf"
@@ -3463,18 +3999,42 @@ o="$(e328_run "$e328_h10" init --account u10 --init-conf --from "$e328d/site.con
 [[ "$rc" == 2 && "$o" == *"mutually exclusive"* \
     && ! -e "$e328_h10/.config/egresslock/main.conf" ]] \
     && e328 pass || e328 fail "--init-conf + --from rc 2, no writes (rc=$rc, out: $o)"
-# 16b. The legacy flat bundle runs the alias coalesce after the verb-time
-#      checks; it must still refuse --conf + --init-conf before import.
+# 16b. EGL-329: the retired init alias is a flag-keyed rc 2 refusal; the
+#      verb-less bundle takes the same line, and nothing is written.
 o="$(e328_run "$e328_h10" --account u10 --conf "$e328d/site.conf" --init-conf 2>&1)"; rc=$?
-[[ "$rc" == 2 && "$o" == *"mutually exclusive"* \
+[[ "$rc" == 2 && "$o" == *"init no longer accepts --conf; use init ACCOUNT --from PATH, or import ACCOUNT --from PATH"* \
     && ! -e "$e328_h10/.config/egresslock/main.conf" \
     && ! -e "$e328_h10/.config/egresslock/ci.conf" ]] \
-    && e328 pass || e328 fail "flat --conf + --init-conf rc 2, no writes (rc=$rc, out: $o)"
+    && e328 pass || e328 fail "flat --conf + --init-conf refusal rc 2, no writes (rc=$rc, out: $o)"
+
+# 16c. EGL-329 fresh pins: init --conf PATH and init --conf '' take the
+#      same refusal (the check keys on the flag, not the value), and
+#      init --conf PATH --init-conf ships no starter.
+e328_h12="$e328d/home/u12"
+o="$(e328_run "$e328_h12" init --account u12 --conf "$e328d/site.conf" 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"init no longer accepts --conf; use init ACCOUNT --from PATH, or import ACCOUNT --from PATH"* \
+    && ! -e "$e328_h12/.config/egresslock" ]] \
+    && e328 pass || e328 fail "init --conf rc 2 before any write (rc=$rc, out: $o)"
+o="$(e328_run "$e328_h12" init --account u12 --conf '' 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"init no longer accepts --conf; use init ACCOUNT --from PATH, or import ACCOUNT --from PATH"* \
+    && ! -e "$e328_h12/.config/egresslock" ]] \
+    && e328 pass || e328 fail "init --conf '' rc 2 keys on the flag (rc=$rc, out: $o)"
+o="$(e328_run "$e328_h12" init --account u12 --conf "$e328d/site.conf" --init-conf 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"init no longer accepts --conf; use init ACCOUNT --from PATH, or import ACCOUNT --from PATH"* \
+    && ! -e "$e328_h12/.config/egresslock/main.conf" ]] \
+    && e328 pass || e328 fail "init --conf + --init-conf rc 2, no starter (rc=$rc, out: $o)"
+o="$(e328_run "$e328_h12" --account u12 --conf "$e328d/site.conf" 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"init no longer accepts --conf; use init ACCOUNT --from PATH, or import ACCOUNT --from PATH"* \
+    && ! -e "$e328_h12/.config/egresslock" ]] \
+    && e328 pass || e328 fail "verb-less --conf rc 2 before any write (rc=$rc, out: $o)"
+o="$(e328_run "$e328_h12" --account u12 --from "$e328d/site.conf" 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"--from is only valid with init or import"* ]] \
+    && e328 pass || e328 fail "verb-less --from stays rc 2 at the from-gate (rc=$rc, out: $o)"
 
 # 17. EGL-408: import's first write creates the confdir leaf 0700 while a
 #     missing ~/.config stays at the ambient umask; an existing 0755
 #     confdir keeps its mode.
-printf 'profile e408 10.98.40.0/24\n    rule gateway-only\n    gateway 10.98.40.2 3128 e408-allowlist\n' \
+printf 'profile e408 10.98.40.0/24\n    gateway 10.98.40.2 3128 e408-allowlist\n' \
     > "$e328d/e408.conf"
 printf '# e408\n' > "$e328d/e408-allowlist"
 e408_h="$e328d/home/e408-fresh"
@@ -3499,7 +4059,7 @@ section_begin egl51 "EGL-51 user manager before build"
 e51() { assert "$@"; }
 e51d="$STATE/e51"
 rm -rf "$e51d"; mkdir -p "$e51d/home/gacct/.config/egresslock"
-printf 'profile p1 10.99.3.0/24\n    rule gateway-only\n    gateway 10.99.3.2 3128 p1-allowlist\n' > "$e51d/site.conf"
+printf 'profile p1 10.99.3.0/24\n    gateway 10.99.3.2 3128 p1-allowlist\n' > "$e51d/site.conf"
 printf '# starter\n' > "$e51d/p1-allowlist"
 printf 'profile p2 10.99.4.0/24\n' > "$e51d/plain.conf"
 e51uid="$(id -u)"   # hook mode: the invoking process IS the account
@@ -3510,7 +4070,7 @@ e51uid="$(id -u)"   # hook mode: the invoking process IS the account
 rm -f "$STATE/callorder.log" "$STATE/buildlog"
 s_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e51d/home/gacct" \
     EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e51a \
-    $SKIT --prefix "$SKITP" --account gacct --conf "$e51d/site.conf" --enable 2>&1)"; s_rc=$?
+    $SKIT init --prefix "$SKITP" --account gacct --from "$e51d/site.conf" --enable 2>&1)"; s_rc=$?
 [[ "$s_rc" == 0 ]] && e51 pass || e51 fail "--enable gateway run (rc=$s_rc, out: $s_out)"
 grep -q "loginctl enable-linger gacct" "$STATE/callorder.log" \
     && e51 pass || e51 fail "linger enabled during the same run (EGL-51-D2)"
@@ -3538,7 +4098,7 @@ grep -q "build -t localhost/egresslock-gateway:e51a --format docker -f $SKITP/ga
 : > "$STATE/loginctl.log"; rm -f "$STATE/callorder.log" "$STATE/buildlog"
 s_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e51d/home/gacct" \
     EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e51b \
-    $SKIT --prefix "$SKITP" --account gacct --conf "$e51d/site.conf" 2>&1)"; s_rc=$?
+    $SKIT init --prefix "$SKITP" --account gacct --from "$e51d/site.conf" 2>&1)"; s_rc=$?
 [[ "$s_rc" == 0 && ! -s "$STATE/loginctl.log" ]] \
     && e51 pass || e51 fail "no --enable: rc 0, no loginctl (ARC-28-D3; rc=$s_rc, out: $s_out)"
 um_i="$(grep -n 'systemctl start user@' "$STATE/callorder.log" | head -1 | cut -d: -f1)"
@@ -3554,7 +4114,7 @@ rm -f "$STATE/callorder.log"
 e51plain="$e51d/home/plain"
 rm -rf "$e51plain"; mkdir -p "$e51plain"
 e51ng_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e51plain" \
-    $SKIT --prefix "$SKITP" --account gacct --conf "$e51d/plain.conf" 2>&1)"; e51ng_rc=$?
+    $SKIT init --prefix "$SKITP" --account gacct --from "$e51d/plain.conf" 2>&1)"; e51ng_rc=$?
 if [[ "$e51ng_rc" == 1 \
       && "$e51ng_out" == *"staged pair failed validation"* \
       && "$e51ng_out" == *"profile 'p2' has no 'gateway' directive"* ]] \
@@ -3569,7 +4129,7 @@ fi
 touch "$STATE/systemctl-usermgr-fails"
 : > "$STATE/buildlog"; rm -f "$STATE/callorder.log"
 f_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e51d/home/gacct" \
-    $SKIT --prefix "$SKITP" --account gacct --conf "$e51d/site.conf" 2>&1)"; f_rc=$?
+    $SKIT init --prefix "$SKITP" --account gacct --from "$e51d/site.conf" 2>&1)"; f_rc=$?
 if [[ "$f_rc" == 1 && "$f_out" == *"no systemd user manager for 'gacct'"* \
       && "$f_out" == *"user@${e51uid}.service inactive"* \
       && "$f_out" == *"systemctl start user@${e51uid}.service"* ]]; then
@@ -3584,7 +4144,7 @@ rm -f "$STATE/systemctl-usermgr-fails"
 touch "$STATE/systemctl-usermgr-fails"
 f_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e51d/home/gacct" \
     ARCMOCK_LINGER_ANSWER=no \
-    $SKIT --prefix "$SKITP" --account gacct --conf "$e51d/site.conf" 2>&1)"; f_rc=$?
+    $SKIT init --prefix "$SKITP" --account gacct --from "$e51d/site.conf" 2>&1)"; f_rc=$?
 if [[ "$f_rc" == 1 && "$f_out" == *"loginctl enable-linger gacct"* \
       && "$f_out" == *"or re-run setup with --enable"* ]]; then
     e51 pass
@@ -3633,7 +4193,7 @@ a19_out="$( ( umask 022; env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_
       && "$(stat -c %a "$a408e/.config/egresslock")" == 755 ]] \
     && a19 pass || a19 fail "--init-conf leaves an existing 0755 confdir unchanged (rc=$a19_rc, out: $a19_out)"
 
-# 2. --init-conf without --conf: writes the README well-known path + the
+# 2. --init-conf alone: writes the README well-known path + the
 #    empty sibling allowlist, byte-compatible with the shipped pair.
 a19_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19h" \
     $SKIT --prefix "$a19p" --account iacct --init-conf 2>&1)"; a19_rc=$?
@@ -3649,27 +4209,23 @@ cmp -s "$a19p/examples/main-allowlist" "$a19_al" \
 a19_list="$(env ARCMOCK_PASSWD_HOME="$a19h" "$a19p/egresslock" list 2>&1)"
 [[ "$a19_list" == *"main"* ]] \
     && a19 pass || a19 fail "init'd conf parses and lists 'main'"
-[[ ! -s "$a19h/.config/egresslock/unit.env" ]] \
-    && a19 pass || a19 fail "--init-conf unit.env carries no conf path (fixed confdir)"
+[[ ! -e "$a19h/.config/egresslock/unit.env" ]] \
+    && a19 pass || a19 fail "--init-conf writes no unit.env (fixed confdir)"
 
-# 2b. EGL-325 F5: --init-conf ships `profile main`; a named --profile
-#     without --conf is rejected as a usage error instead of failing
-#     step 1 with a misleading "no profile config: <name>.conf".
+# 2b. EGL-333-D9: --init-conf no longer accepts --profile (named mode is
+#     gone). Both a non-main and `main` name hit the doctor-flag gate and
+#     neither writes the starter.
 a19f5h="$STATE/a19/f5home"
 rm -rf "$a19f5h"; mkdir -p "$a19f5h"
-a19_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19f5h" \
-    $SKIT --prefix "$a19p" --account iacct --init-conf --profile named 2>&1)"; a19_rc=$?
-[[ "$a19_rc" == 2 && "$a19_out" == *"ships the 'main' starter"* \
-    && "$a19_out" == *"import --from <path>"* ]] \
-    && a19 pass || a19 fail "--init-conf --profile named → usage rc 2 (rc=$a19_rc, out: $a19_out)"
-[[ ! -e "$a19f5h/.config/egresslock/main.conf" && ! -e "$a19f5h/.config/egresslock/named.conf" ]] \
-    && a19 pass || a19 fail "--init-conf --profile named writes nothing"
-# --profile main still describes the starter it ships.
-a19_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19f5h" \
-    $SKIT --prefix "$a19p" --account iacct --init-conf --profile main 2>&1)"; a19_rc=$?
-[[ "$a19_rc" == 0 && -f "$a19f5h/.config/egresslock/main.conf" \
-    && "$(grep -x 'EGRESSLOCK_PROFILE=main' "$a19f5h/.config/egresslock/unit.env")" == "EGRESSLOCK_PROFILE=main" ]] \
-    && a19 pass || a19 fail "--init-conf --profile main still works (rc=$a19_rc, out: $a19_out)"
+for a19p_named in named main; do
+    a19_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19f5h" \
+        $SKIT --prefix "$a19p" --account iacct --init-conf --profile "$a19p_named" 2>&1)"; a19_rc=$?
+    [[ "$a19_rc" == 2 \
+        && "$a19_out" == *"--profile is a doctor flag only (inspection narrowing); the verify timer checks every profile"* ]] \
+        && a19 pass || a19 fail "--init-conf --profile $a19p_named → D9 usage rc 2 (rc=$a19_rc, out: $a19_out)"
+    [[ ! -e "$a19f5h/.config/egresslock/main.conf" && ! -e "$a19f5h/.config/egresslock/named.conf" ]] \
+        && a19 pass || a19 fail "--init-conf --profile $a19p_named writes nothing"
+done
 rm -rf "$a19f5h"
 
 # 3. Never overwrites: an existing conf keeps its content. A complete
@@ -3708,6 +4264,7 @@ e433_init() { # <home>
 }
 e433_real_cp="$(type -P cp)"
 e433_real_mv="$(type -P mv)"
+e433_real_ln="$(type -P ln)"
 e433_dh="$STATE/a19/e433-dangling-conf"
 rm -rf "$e433_dh"; mkdir -p "$e433_dh/.config/egresslock"
 ln -s "$e433_dh/missing-conf" "$e433_dh/.config/egresslock/main.conf"
@@ -3838,6 +4395,7 @@ fi
 exec "$e433_real_mv" "\$@"
 EOF
 chmod +x "$e433_mvshim/mv"
+force_mv_publish_fallback "$e433_mvshim"
 e433_rh="$STATE/a19/e433-race-conf-dir"
 rm -rf "$e433_rh"; mkdir -p "$e433_rh"
 a19_out="$(PATH="$e433_mvshim:$PATH" e433_init "$e433_rh" 2>&1)"; a19_rc=$?
@@ -3870,6 +4428,7 @@ fi
 exec "$e433_real_mv" "\$@"
 EOF
 chmod +x "$e433_mval_shim/mv"
+force_mv_publish_fallback "$e433_mval_shim"
 e433_rah="$STATE/a19/e433-race-al-dir"
 rm -rf "$e433_rah"; mkdir -p "$e433_rah"
 a19_out="$(PATH="$e433_mval_shim:$PATH" e433_init "$e433_rah" 2>&1)"; a19_rc=$?
@@ -3997,6 +4556,7 @@ fi
 exit \$st
 EOF
 chmod +x "$e433_b2shim/mv"
+force_mv_publish_fallback "$e433_b2shim"
 e433_b2h="$STATE/a19/e433-sibling-pair"
 rm -rf "$e433_b2h"; mkdir -p "$e433_b2h"
 a19_out="$(PATH="$e433_b2shim:$PATH" e433_init "$e433_b2h" 2>&1)"; a19_rc=$?
@@ -4038,6 +4598,7 @@ fi
 exec "$e433_real_mv" "\$@"
 EOF
 chmod +x "$e433_failshim/mv"
+force_mv_publish_fallback "$e433_failshim"
 e433_failh="$STATE/a19/e433-conffail"
 rm -rf "$e433_failh"; mkdir -p "$e433_failh"
 a19_out="$(PATH="$e433_failshim:$PATH" e433_init "$e433_failh" 2>&1)"; a19_rc=$?
@@ -4089,6 +4650,7 @@ fi
 exec "$e433_real_mv" "\$@"
 EOF
 chmod +x "$e433_repshim/mv"
+force_mv_publish_fallback "$e433_repshim"
 e433_reph="$STATE/a19/e433-replace"
 rm -rf "$e433_reph"; mkdir -p "$e433_reph"
 rm -f "$STATE/a19/e433-replace-inode"
@@ -4127,6 +4689,7 @@ fi
 exec "$e433_real_mv" "\$@"
 EOF
 chmod +x "$e433_rmshim/mv"
+force_mv_publish_fallback "$e433_rmshim"
 e433_rmh="$STATE/a19/e433-replace-rm"
 rm -rf "$e433_rmh"; mkdir -p "$e433_rmh"
 rm -f "$STATE/a19/e433-rm-inode" "$STATE/a19/e433-rm-published-inode"
@@ -4164,6 +4727,7 @@ fi
 exit \$st
 EOF
 chmod +x "$e433_f4shim/mv"
+force_mv_publish_fallback "$e433_f4shim"
 e433_f4h="$STATE/a19/e433-f4-s5"
 rm -rf "$e433_f4h"; mkdir -p "$e433_f4h"
 a19_out="$(PATH="$e433_f4shim:$PATH" e433_init "$e433_f4h" 2>&1)"; a19_rc=$?
@@ -4233,6 +4797,7 @@ fi
 exec "$e433_real_mv" "\$@"
 EOF
 chmod +x "$e433_f4gshim/mv"
+force_mv_publish_fallback "$e433_f4gshim"
 e433_f4gh="$STATE/a19/e433-f4-generic"
 rm -rf "$e433_f4gh"; mkdir -p "$e433_f4gh"
 a19_out="$(PATH="$e433_f4gshim:$PATH" e433_init "$e433_f4gh" 2>&1)"; a19_rc=$?
@@ -4255,7 +4820,228 @@ a19_out="$(e433_init "$e433_f4gh" 2>&1)"; a19_rc=$?
     && -z "$(find "$e433_f4gh/.config/egresslock" -maxdepth 1 -name '.main-*.init.*' -print -quit)" ]] \
     && a19 pass || a19 fail "F4 re-run after a failed conf write keeps the retained allowlist and writes the conf (rc=$a19_rc, out: $a19_out)"
 
-# 4. EGL-325: --conf is an install-time copy into the fixed confdir,
+# 3m. EGL-555-D3/P2: H4 publishes with `ln -T` (one link(2), dest is a
+#     leaf). A regular allowlist that appears between the outer check and
+#     the link is left in place; the conf is published, the pair completes
+#     rc 0, and the success line does not claim this run wrote the
+#     allowlist. A live link to a regular file is the same shape.
+e555_alregshim="$STATE/a19/e555-ln-allowlist-regular"
+rm -rf "$e555_alregshim"; mkdir -p "$e555_alregshim"
+cat > "$e555_alregshim/ln" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+n=\${#args[@]}
+src="\${args[n-2]:-}"
+dst="\${args[n-1]:-}"
+if [[ "\$src" == *"/.main-allowlist.init."* && "\$dst" == */main-allowlist ]]; then
+    printf '# racing allowlist\n.racing.example.test\n' > "\$dst"
+fi
+exec "$e433_real_ln" "\$@"
+EOF
+chmod +x "$e555_alregshim/ln"
+e555_alregh="$STATE/a19/e555-allowlist-regular"
+rm -rf "$e555_alregh"; mkdir -p "$e555_alregh"
+a19_out="$(PATH="$e555_alregshim:$PATH" e433_init "$e555_alregh" 2>&1)"; a19_rc=$?
+e555_alreg_al="$e555_alregh/.config/egresslock/main-allowlist"
+e555_alreg_conf="$e555_alregh/.config/egresslock/main.conf"
+if [[ "$a19_rc" == 0 \
+    && "$a19_out" == *"egresslock-setup: --init-conf: wrote starter $e555_alreg_conf (the allowlist at $e555_alreg_al was already present and was left in place)"* \
+    && "$a19_out" != *"wrote starter $e555_alreg_conf (+ "* \
+    && "$(cat "$e555_alreg_al")" == $'# racing allowlist\n.racing.example.test' \
+    && -f "$e555_alreg_conf" && ! -L "$e555_alreg_conf" \
+    && -z "$(find "$e555_alregh/.config/egresslock" -maxdepth 1 -name '.main-*.init.*' -print -quit)" ]] \
+      && cmp -s "$a19p/examples/main.conf" "$e555_alreg_conf"; then
+    a19 pass
+else
+    a19 fail "ln EEXIST on a racing regular allowlist completes the pair honestly (rc=$a19_rc, out: $a19_out)"
+fi
+
+e555_allnkshim="$STATE/a19/e555-ln-allowlist-live-link"
+rm -rf "$e555_allnkshim"; mkdir -p "$e555_allnkshim"
+e555_allnktarget="$STATE/a19/e555-allowlist-live-target"
+printf '# live allowlist\n.live.example.test\n' > "$e555_allnktarget"
+cat > "$e555_allnkshim/ln" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+n=\${#args[@]}
+src="\${args[n-2]:-}"
+dst="\${args[n-1]:-}"
+if [[ "\$src" == *"/.main-allowlist.init."* && "\$dst" == */main-allowlist ]]; then
+    ln -s "$e555_allnktarget" "\$dst"
+fi
+exec "$e433_real_ln" "\$@"
+EOF
+chmod +x "$e555_allnkshim/ln"
+e555_allnkh="$STATE/a19/e555-allowlist-live-link"
+rm -rf "$e555_allnkh"; mkdir -p "$e555_allnkh"
+a19_out="$(PATH="$e555_allnkshim:$PATH" e433_init "$e555_allnkh" 2>&1)"; a19_rc=$?
+e555_allnk_al="$e555_allnkh/.config/egresslock/main-allowlist"
+e555_allnk_conf="$e555_allnkh/.config/egresslock/main.conf"
+if [[ "$a19_rc" == 0 \
+    && "$a19_out" == *"egresslock-setup: --init-conf: wrote starter $e555_allnk_conf (the allowlist at $e555_allnk_al was already present and was left in place)"* \
+    && "$a19_out" != *"wrote starter $e555_allnk_conf (+ "* \
+    && -L "$e555_allnk_al" \
+    && "$(cat "$e555_allnktarget")" == $'# live allowlist\n.live.example.test' \
+    && -f "$e555_allnk_conf" && ! -L "$e555_allnk_conf" ]]; then
+    a19 pass
+else
+    a19 fail "ln EEXIST on a racing live allowlist link leaves it and completes the pair (rc=$a19_rc, out: $a19_out)"
+fi
+
+# 3n. A dangling allowlist that appears at the link keeps S4: name the
+#     link, write no conf, leave it intact, no generic wrapper.
+e555_aldangshim="$STATE/a19/e555-ln-allowlist-dangling"
+rm -rf "$e555_aldangshim"; mkdir -p "$e555_aldangshim"
+cat > "$e555_aldangshim/ln" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+n=\${#args[@]}
+src="\${args[n-2]:-}"
+dst="\${args[n-1]:-}"
+if [[ "\$src" == *"/.main-allowlist.init."* && "\$dst" == */main-allowlist ]]; then
+    ln -s "$STATE/a19/e555-racing-missing-allowlist" "\$dst"
+fi
+exec "$e433_real_ln" "\$@"
+EOF
+chmod +x "$e555_aldangshim/ln"
+e555_aldangh="$STATE/a19/e555-allowlist-dangling"
+rm -rf "$e555_aldangh"; mkdir -p "$e555_aldangh"
+a19_out="$(PATH="$e555_aldangshim:$PATH" e433_init "$e555_aldangh" 2>&1)"; a19_rc=$?
+e555_aldang_al="$e555_aldangh/.config/egresslock/main-allowlist"
+[[ "$a19_rc" == 1 \
+    && "$a19_out" == *"egresslock-setup: --init-conf: refusing: destination allowlist is a symbolic link to a missing file: $e555_aldang_al"* \
+    && "$a19_out" != *"could not write the starter pair"* \
+    && -L "$e555_aldang_al" && ! -e "$e555_aldang_al" \
+    && ! -e "$e555_aldangh/.config/egresslock/main.conf" \
+    && -z "$(find "$e555_aldangh/.config/egresslock" -maxdepth 1 -name '.main-*.init.*' -print -quit)" ]] \
+    && a19 pass || a19 fail "ln EEXIST on a racing dangling allowlist keeps S4, no conf (rc=$a19_rc, out: $a19_out)"
+
+# 3o. A directory, a live directory-symlink, or a special file that
+#     appears at the link fails closed with the generic cause (never S4's
+#     dangling wording, never a write through the shape).
+e555_aldirshim="$STATE/a19/e555-ln-allowlist-dir"
+rm -rf "$e555_aldirshim"; mkdir -p "$e555_aldirshim"
+cat > "$e555_aldirshim/ln" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+n=\${#args[@]}
+src="\${args[n-2]:-}"
+dst="\${args[n-1]:-}"
+if [[ "\$src" == *"/.main-allowlist.init."* && "\$dst" == */main-allowlist ]]; then
+    mkdir -p "\$dst"
+    printf 'racing-dir\n' > "\$dst/marker"
+fi
+exec "$e433_real_ln" "\$@"
+EOF
+chmod +x "$e555_aldirshim/ln"
+e555_aldirh="$STATE/a19/e555-allowlist-dir"
+rm -rf "$e555_aldirh"; mkdir -p "$e555_aldirh"
+a19_out="$(PATH="$e555_aldirshim:$PATH" e433_init "$e555_aldirh" 2>&1)"; a19_rc=$?
+e555_aldir_al="$e555_aldirh/.config/egresslock/main-allowlist"
+[[ "$a19_rc" == 1 \
+    && "$a19_out" == *"egresslock-setup: --init-conf: could not write the starter pair as iacct"* \
+    && "$a19_out" != *"symbolic link to a missing file"* \
+    && "$(grep -c 'could not write the starter pair' <<<"$a19_out")" == 1 \
+    && -d "$e555_aldir_al" \
+    && "$(cat "$e555_aldir_al/marker")" == "racing-dir" \
+    && ! -e "$e555_aldirh/.config/egresslock/main.conf" \
+    && -z "$(find "$e555_aldirh/.config/egresslock" -maxdepth 1 -name '.main-*.init.*' -print -quit)" ]] \
+    && a19 pass || a19 fail "ln EEXIST on a racing allowlist directory fails closed, not S4 (rc=$a19_rc, out: $a19_out)"
+
+e555_allnkdshim="$STATE/a19/e555-ln-allowlist-dirlink"
+rm -rf "$e555_allnkdshim"; mkdir -p "$e555_allnkdshim"
+e555_allnkdtarget="$STATE/a19/e555-allowlist-dirlink-target"
+rm -rf "$e555_allnkdtarget"; mkdir -p "$e555_allnkdtarget"
+cat > "$e555_allnkdshim/ln" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+n=\${#args[@]}
+src="\${args[n-2]:-}"
+dst="\${args[n-1]:-}"
+if [[ "\$src" == *"/.main-allowlist.init."* && "\$dst" == */main-allowlist ]]; then
+    ln -s "$e555_allnkdtarget" "\$dst"
+fi
+exec "$e433_real_ln" "\$@"
+EOF
+chmod +x "$e555_allnkdshim/ln"
+e555_allnkd_h="$STATE/a19/e555-allowlist-dirlink"
+rm -rf "$e555_allnkd_h"; mkdir -p "$e555_allnkd_h"
+a19_out="$(PATH="$e555_allnkdshim:$PATH" e433_init "$e555_allnkd_h" 2>&1)"; a19_rc=$?
+e555_allnkd_al="$e555_allnkd_h/.config/egresslock/main-allowlist"
+[[ "$a19_rc" == 1 \
+    && "$a19_out" == *"could not write the starter pair as iacct"* \
+    && "$a19_out" != *"symbolic link to a missing file"* \
+    && -L "$e555_allnkd_al" \
+    && -z "$(ls -A "$e555_allnkdtarget")" \
+    && ! -e "$e555_allnkd_h/.config/egresslock/main.conf" ]] \
+    && a19 pass || a19 fail "ln EEXIST on a racing live allowlist dir-link fails closed, no write-through (rc=$a19_rc, out: $a19_out)"
+
+# 3p. A regular conf that appears at its link keeps S5: one cause line,
+#     the allowlist this run published stays byte-identical, the racing
+#     conf keeps its bytes, rc 1.
+e555_confshim="$STATE/a19/e555-ln-conf-regular"
+rm -rf "$e555_confshim"; mkdir -p "$e555_confshim"
+cat > "$e555_confshim/ln" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+n=\${#args[@]}
+src="\${args[n-2]:-}"
+dst="\${args[n-1]:-}"
+if [[ "\$src" == *"/.main.conf.init."* && "\$dst" == */main.conf ]]; then
+    printf 'foreign conf\n' > "\$dst"
+fi
+exec "$e433_real_ln" "\$@"
+EOF
+chmod +x "$e555_confshim/ln"
+e555_confh="$STATE/a19/e555-conf-regular"
+rm -rf "$e555_confh"; mkdir -p "$e555_confh"
+a19_out="$(PATH="$e555_confshim:$PATH" e433_init "$e555_confh" 2>&1)"; a19_rc=$?
+e555_conf_al="$e555_confh/.config/egresslock/main-allowlist"
+e555_conf_conf="$e555_confh/.config/egresslock/main.conf"
+if [[ "$a19_rc" == 1 \
+    && "$a19_out" == *"egresslock-setup: --init-conf: refusing: destination conf appeared while the starter pair was being written (another initializer may have completed it): $e555_conf_conf"* \
+    && "$a19_out" != *"could not write the starter pair"* \
+    && "$(grep -c 'destination conf appeared while the starter pair was being written' <<<"$a19_out")" == 1 \
+    && "$(cat "$e555_conf_conf")" == "foreign conf" \
+    && -z "$(find "$e555_confh/.config/egresslock" -maxdepth 1 -name '.main-*.init.*' -print -quit)" ]] \
+      && cmp -s "$a19p/examples/main-allowlist" "$e555_conf_al"; then
+    a19 pass
+else
+    a19 fail "ln EEXIST on a racing regular conf keeps S5, allowlist intact (rc=$a19_rc, out: $a19_out)"
+fi
+
+# 3q. The documented Q3 fallback: when `ln -T` fails for a non-EEXIST
+#     reason (a filesystem without hard links), each half is published
+#     with `mv -T` and the normal pair success line is printed.
+e555_fbshim="$STATE/a19/e555-ln-fallback"
+rm -rf "$e555_fbshim"; mkdir -p "$e555_fbshim"
+force_mv_publish_fallback "$e555_fbshim"
+e555_fbmark="$STATE/a19/e555-fallback-mv.log"
+rm -f "$e555_fbmark"
+cat > "$e555_fbshim/mv" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\${@: -1}" >> "$e555_fbmark"
+exec "$e433_real_mv" "\$@"
+EOF
+chmod +x "$e555_fbshim/mv"
+e555_fbh="$STATE/a19/e555-fallback"
+rm -rf "$e555_fbh"; mkdir -p "$e555_fbh"
+a19_out="$(PATH="$e555_fbshim:$PATH" e433_init "$e555_fbh" 2>&1)"; a19_rc=$?
+e555_fb_al="$e555_fbh/.config/egresslock/main-allowlist"
+e555_fb_conf="$e555_fbh/.config/egresslock/main.conf"
+if [[ "$a19_rc" == 0 \
+    && "$a19_out" == *"egresslock-setup: --init-conf: wrote starter $e555_fb_conf (+ $e555_fb_al)"* \
+    && "$a19_out" != *"was already present"* \
+    && "$(grep -c -x -e "$e555_fb_conf" -e "$e555_fb_al" "$e555_fbmark")" == 2 \
+    && -z "$(find "$e555_fbh/.config/egresslock" -maxdepth 1 -name '.main-*.init.*' -print -quit)" ]] \
+      && cmp -s "$a19p/examples/main.conf" "$e555_fb_conf" \
+      && cmp -s "$a19p/examples/main-allowlist" "$e555_fb_al"; then
+    a19 pass
+else
+    a19 fail "non-EEXIST ln falls back to mv -T for both halves (rc=$a19_rc, out: $a19_out)"
+fi
+
+# 4. EGL-325: init --from is an install-time copy into the fixed confdir,
 #    not a destination selector. The source is installed as
 #    <profile>.conf (profile from the source's first `profile` line),
 #    0600, and the source path is left untouched; no starter pair is
@@ -4265,15 +5051,15 @@ mkdir -p "$STATE/a19/custom"
 printf 'profile site 10.197.0.0/24\n    gateway 10.197.0.2 3128 site-allowlist\n' > "$a19_src"
 printf '# starter\n' > "$STATE/a19/custom/site-allowlist"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19h" \
-    $SKIT --prefix "$a19p" --account iacct --conf "$a19_src" >/dev/null 2>&1
+    $SKIT init --prefix "$a19p" --account iacct --from "$a19_src" >/dev/null 2>&1
 [[ -f "$a19h/.config/egresslock/site.conf" && -f "$a19_src" ]] \
-    && a19 pass || a19 fail "--conf installs as <profile>.conf in the fixed confdir"
+    && a19 pass || a19 fail "--from installs as <profile>.conf in the fixed confdir"
 cmp -s "$a19_src" "$a19h/.config/egresslock/site.conf" \
-    && a19 pass || a19 fail "--conf install copies the source byte-identically"
+    && a19 pass || a19 fail "--from install copies the source byte-identically"
 [[ "$(stat -c %a "$a19h/.config/egresslock/site.conf" 2>/dev/null)" == "600" ]] \
-    && a19 pass || a19 fail "--conf install is 0600"
+    && a19 pass || a19 fail "--from install is 0600"
 [[ ! -e "$STATE/a19/custom/main-allowlist" ]] \
-    && a19 pass || a19 fail "--conf install writes no starter pair next to the source"
+    && a19 pass || a19 fail "--from install writes no starter pair next to the source"
 rm -rf "$STATE/a19/custom"
 
 # 5. Missing examples fail closed with a pointer at install-kit.
@@ -4292,7 +5078,7 @@ a19_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19h" \
 [[ "$a19_rc" == 0 && "$a19_out" == *"1) validate conf … OK"* ]] \
     && a19 pass || a19 fail "pathless init wires an existing confdir (rc=$a19_rc, out: $a19_out)"
 a19_out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a19h" \
-    $SKIT --prefix "$a19p" --account iacct --conf "$STATE/a19/nope.conf" --profile nope 2>&1)"; a19_rc=$?
+    $SKIT init --prefix "$a19p" --account iacct --from "$STATE/a19/nope.conf" 2>&1)"; a19_rc=$?
 [[ "$a19_rc" == 1 && "$a19_out" == *"conf not found"* ]] \
     && a19 pass || a19 fail "missing --from still exits 1 fail-closed (rc=$a19_rc)"
 
@@ -4318,7 +5104,7 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
     && e38 pass || e38 fail "e38 fixture: kit deployed to $e38p"
 e38h="$STATE/e38/home/uctx"
 mkdir -p "$e38h/.config/egresslock"
-printf 'profile p1 10.99.5.0/24\n    rule gateway-only\n    gateway 10.99.5.2 3128 p1-allowlist\n' > "$STATE/e38/site.conf"
+printf 'profile p1 10.99.5.0/24\n    gateway 10.99.5.2 3128 p1-allowlist\n' > "$STATE/e38/site.conf"
 printf '# starter\n' > "$STATE/e38/p1-allowlist"
 printf 'profile p2 10.99.6.0/24\n' > "$STATE/e38/plain.conf"
 # Run-map extractor: the numbered lines only (D38-6 format).
@@ -4331,8 +5117,8 @@ e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e38a \
     $SKIT --prefix "$e38p" --account uctx --init-conf 2>&1)"; e38_rc=$?
 [[ "$e38_rc" == 0 ]] && e38 pass || e38 fail "--init-conf bundle run (rc=$e38_rc, out: $e38o)"
-[[ "$(e38_map "$e38o")" == $'1) validate conf … OK\n2) write unit.env … OK\n3) linger … SKIP\n4) user manager … OK\n5) gateway image … OK\n6) timer … SKIP' ]] \
-    && e38 pass || e38 fail "init-conf map order/status (D38-7): $(e38_map "$e38o" | tr '\n' '|')"
+[[ "$(e38_map "$e38o")" == $'1) validate conf … OK\n2) linger … SKIP\n3) user manager … OK\n4) gateway image … OK\n5) timer … SKIP' ]] \
+    && e38 pass || e38 fail "init-conf map order/status (EGL-333-D2: 5 steps): $(e38_map "$e38o" | tr '\n' '|')"
 # EGL-200 M1: the init-conf tail ends on the next-step block (starter
 # conf first profile 'main').
 [[ "$e38o" == *"next steps (as the account):"* \
@@ -4345,22 +5131,22 @@ e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"; : > "$STATE/buildlog"
 e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e38b \
-    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --enable 2>&1)"; e38_rc=$?
+    $SKIT init --prefix "$e38p" --account uctx --from "$STATE/e38/site.conf" --enable 2>&1)"; e38_rc=$?
 [[ "$e38_rc" == 0 ]] && e38 pass || e38 fail "--enable bundle run (rc=$e38_rc, out: $e38o)"
-li="$(grep -n '3) linger … OK' <<<"$e38o" | head -1 | cut -d: -f1)"
-ui="$(grep -n '4) user manager … OK' <<<"$e38o" | head -1 | cut -d: -f1)"
-gi="$(grep -n '5) gateway image … OK' <<<"$e38o" | head -1 | cut -d: -f1)"
-ti="$(grep -n '6) timer … OK' <<<"$e38o" | head -1 | cut -d: -f1)"
+li="$(grep -n '2) linger … OK' <<<"$e38o" | head -1 | cut -d: -f1)"
+ui="$(grep -n '3) user manager … OK' <<<"$e38o" | head -1 | cut -d: -f1)"
+gi="$(grep -n '4) gateway image … OK' <<<"$e38o" | head -1 | cut -d: -f1)"
+ti="$(grep -n '5) timer … OK' <<<"$e38o" | head -1 | cut -d: -f1)"
 [[ -n "$li" && -n "$ui" && -n "$gi" && -n "$ti" && "$li" -lt "$ui" && "$ui" -lt "$gi" && "$gi" -lt "$ti" ]] \
     && e38 pass || e38 fail "enable map order linger<usermgr<image<timer ($li/$ui/$gi/$ti)"
 
 # 2b. FAIL is the last printed numbered step: linger Linger=no with
-#     --enable stops the map at 3) linger … FAIL.
+#     --enable stops the map at 2) linger … FAIL.
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"
 e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     ARCMOCK_LINGER_ANSWER=no \
-    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --enable 2>&1)"; e38_rc=$?
-[[ "$e38_rc" == 1 && "$(e38_map "$e38o" | tail -1)" == "3) linger … FAIL" ]] \
+    $SKIT init --prefix "$e38p" --account uctx --from "$STATE/e38/site.conf" --enable 2>&1)"; e38_rc=$?
+[[ "$e38_rc" == 1 && "$(e38_map "$e38o" | tail -1)" == "2) linger … FAIL" ]] \
     && e38 pass || e38 fail "FAIL is the last numbered step (rc=$e38_rc, map: $(e38_map "$e38o" | tr '\n' '|'))"
 
 # 3. Conf with no gateway line is refused at import validation (EGL-366):
@@ -4370,7 +5156,7 @@ e38plain="$STATE/e38/home/plain"
 rm -rf "$e38plain"; mkdir -p "$e38plain"
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"
 e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38plain" \
-    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/plain.conf" --enable 2>&1)"; e38_rc=$?
+    $SKIT init --prefix "$e38p" --account uctx --from "$STATE/e38/plain.conf" --enable 2>&1)"; e38_rc=$?
 if [[ "$e38_rc" == 1 \
       && -z "$(e38_map "$e38o")" \
       && "$e38o" == *"import: staged pair failed validation as uctx:"* \
@@ -4381,17 +5167,20 @@ else
     e38 fail "no-gateway conf refused at import validation, no step runs (rc=$e38_rc, out: $e38o)"
 fi
 
-# 4. --doctor with --account, unit.env missing: rc 1 with a fix command
-#    naming egresslock-setup (D38-2).
+# 4. --doctor with --account on a fresh home: rc 1 from the missing conf,
+#    with the import fix (D38-2); there is no unit.env row to report
+#    (EGL-333-D2).
 e38h2="$STATE/e38/home/fresh"
 mkdir -p "$e38h2"
 e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h2" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
     $SKIT --prefix "$e38p" --account fresh --conf "$STATE/e38/site.conf" --doctor 2>&1)"; e38_rc=$?
-if [[ "$e38_rc" == 1 && "$e38o" == *"PROBLEM: unit.env: missing"* && "$e38o" == *"fix: sudo egresslock-setup"* ]]; then
+if [[ "$e38_rc" == 1 && "$e38o" == *"PROBLEM: conf parse: FAIL (profile 'p1')"* \
+      && "$e38o" == *"import fresh --from"* \
+      && "$e38o" != *"unit.env"* ]]; then
     e38 pass
 else
-    e38 fail "doctor: unit.env missing (rc=$e38_rc, out: $e38o)"
+    e38 fail "doctor: missing conf, no unit.env row (rc=$e38_rc, out: $e38o)"
 fi
 # Host slice stays clean: engine + templates present.
 [[ "$e38o" == *"OK: kit engine: present ($e38p)"* && "$e38o" == *"OK: unit templates: installed ($UNITS)"* ]] \
@@ -4410,18 +5199,18 @@ else
     e38 fail "doctor: inactive user manager (rc=$e38_rc, out: $e38o)"
 fi
 rm -f "$STATE/systemctl-usermgr-fails"
-# Healthy account slice (marker gone): rc 0, image + parse rows ok.
-# Restore the unit.env the plain-conf run above rewrote.
-# The unit.env pin carries the full OK row incl. its EGL-62 clause, so a
-# dropped clause bites the battery too (negative-control coverage).
+# Healthy account slice (marker gone): rc 0, image + parse rows ok, and
+# no unit.env row (EGL-333-D2). --profile p1 stays as inspection narrowing.
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
-    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 >/dev/null 2>&1
+    $SKIT init --prefix "$e38p" --account uctx --from "$STATE/e38/site.conf" >/dev/null 2>&1
 e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
     $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e38_rc=$?
-[[ "$e38_rc" == 0 && "$e38o" == *"OK: gateway image: present"* && "$e38o" == *"OK: unit.env: matches ($e38h/.config/egresslock/unit.env) — the account's fixed confdir is wired (named mode: p1)"* \
-    && "$e38o" == *"OK: conf parse: ok"* && "$e38o" == *"OK: timer: enabled"* && "$e38o" == *"OK: linger: on"* ]] \
-    && e38 pass || e38 fail "doctor: healthy account slice rc 0 (rc=$e38_rc, out: $e38o)"
+[[ "$e38_rc" == 0 && "$e38o" == *"OK: gateway image: present"* \
+    && "$e38o" == *"OK: conf parse: ok (profile 'p1'"* \
+    && "$e38o" == *"OK: timer: enabled"* && "$e38o" == *"OK: linger: on"* \
+    && "$e38o" != *"unit.env"* ]] \
+    && e38 pass || e38 fail "doctor: healthy account slice rc 0, no unit.env row (rc=$e38_rc, out: $e38o)"
 # EGL-62 uniform-token pin: every non-indented output line of the
 # healthy doctor capture carries the `OK:`/`PROBLEM:`/`NOTE:` tokens;
 # continuation lines keep the two-space indent. Greps for any line
@@ -4440,22 +5229,24 @@ e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_GW_IMAGE='-privileged' \
     $SKIT --prefix "$e38p" --doctor 2>&1)"; e38_rc=$?
 [[ "$e38_rc" == 2 && "$e38o" == *"EGRESSLOCK_GW_IMAGE value must not start with '-'"* ]] \
     && e38 pass || e38 fail "flag-on gw_img '-' value still dies (rc=$e38_rc, out: $e38o)"
-# EGL-325 F4: a pre-325 unit.env that still carries a conf path is a
-# distinct STALE PROBLEM row (rc 1), with the full re-run fix.
+# EGL-333-D5: a legacy unit.env (with a conf path) is inert — the doctor
+# output and rc are byte-identical to the run without it, and no row names
+# the retired file.
 e38uenv="$e38h/.config/egresslock/unit.env"
-cp -p "$e38uenv" "$STATE/e38/unit.env.good"
+e38o_before="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
+    EGRESSLOCK_UNIT_DIR="$UNITS" \
+    $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e38_rc_before=$?
 printf 'EGRESSLOCK_PROFILE=p1\nEGRESSLOCK_CONF=%s\n' "$e38h/.config/egresslock/p1.conf" > "$e38uenv"
 e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
     $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e38_rc=$?
-if [[ "$e38_rc" == 1 \
-      && "$e38o" == *"PROBLEM: unit.env: STALE (carries the removed EGRESSLOCK_CONF wiring; see $e38uenv)"* \
-      && "$e38o" == *"fix: sudo egresslock-setup init --account uctx --profile p1 --enable"* ]]; then
+if [[ "$e38_rc" == "$e38_rc_before" && "$e38o" == "$e38o_before" \
+      && "$e38o" != *"unit.env"* ]]; then
     e38 pass
 else
-    e38 fail "doctor: legacy unit.env STALE row (rc=$e38_rc, out: $e38o)"
+    e38 fail "doctor: legacy unit.env is ignored (rc=$e38_rc/$e38_rc_before, out: $e38o)"
 fi
-cp -p "$STATE/e38/unit.env.good" "$e38uenv"; rm -f "$STATE/e38/unit.env.good"
+rm -f "$e38uenv"
 # Account-less doctor = host slice only, rc 0; and the EGL-24 pin: NOT
 # rc 2 unknown-argument (D38-5). EGL-201: no fixtures -> the M8 NOTE.
 e38o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" $SKIT --doctor 2>&1)"; e38_rc=$?
@@ -4551,64 +5342,60 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e409u" \
     "$KIT" --prefix "$e409p" >/dev/null 2>&1
 [[ -f "$e409p/egresslock" && -f "$e409u/egresslock-verify@.service" ]] \
     && e409 pass || e409 fail "e409 fixture: kit deployed to $e409p with unit templates in $e409u"
-printf 'profile p1 10.99.9.0/24\n    rule gateway-only\n    gateway 10.99.9.2 3128 p1-allowlist\n' > "$e409d/site.conf"
-printf 'profile p2 10.99.10.0/24\n    rule gateway-only\n    gateway 10.99.10.2 3128 p2-allowlist\n' > "$e409d/site2.conf"
+printf 'profile p1 10.99.9.0/24\n    gateway 10.99.9.2 3128 p1-allowlist\n' > "$e409d/site.conf"
+printf 'profile p2 10.99.10.0/24\n    gateway 10.99.10.2 3128 p2-allowlist\n' > "$e409d/site2.conf"
 printf '# starter\n' > "$e409d/p1-allowlist"
 printf '# starter\n' > "$e409d/p2-allowlist"
 
-# Named fixture: the p1 pair + named unit.env, all 0600; the confdir is the
-# supported 0755 default.
+# Named fixture: the p1 pair, 0600; the confdir is the supported 0755
+# default.
 e409_stage() {
     rm -rf "$e409cd"; mkdir -p "$e409cd"; chmod 755 "$e409cd"
     cp "$e409d/site.conf" "$e409cd/p1.conf"
     cp "$e409d/p1-allowlist" "$e409cd/p1-allowlist"
-    printf 'EGRESSLOCK_PROFILE=p1\n' > "$e409cd/unit.env"
-    chmod 600 "$e409cd/p1.conf" "$e409cd/p1-allowlist" "$e409cd/unit.env"
+    chmod 600 "$e409cd/p1.conf" "$e409cd/p1-allowlist"
 }
-# Aggregate fixture: empty unit.env, two 0600 pairs.
+# Aggregate fixture: two 0600 pairs.
 e409_stage_aggregate() {
     rm -rf "$e409cd"; mkdir -p "$e409cd"; chmod 755 "$e409cd"
     cp "$e409d/site.conf" "$e409cd/p1.conf"
     cp "$e409d/p1-allowlist" "$e409cd/p1-allowlist"
     cp "$e409d/site2.conf" "$e409cd/p2.conf"
     cp "$e409d/p2-allowlist" "$e409cd/p2-allowlist"
-    : > "$e409cd/unit.env"
     chmod 600 "$e409cd/p1.conf" "$e409cd/p1-allowlist" \
-        "$e409cd/p2.conf" "$e409cd/p2-allowlist" "$e409cd/unit.env"
+        "$e409cd/p2.conf" "$e409cd/p2-allowlist"
 }
 e409_run() {
     env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e409h" \
         EGRESSLOCK_UNIT_DIR="$e409u" \
         $SKIT --prefix "$e409p" --account u409 --doctor "$@" 2>&1
 }
-e409_modes() { stat -c '%a %n' "$e409cd/p1.conf" "$e409cd/p1-allowlist" "$e409cd/unit.env" "$e409cd" | sort; }
+e409_modes() { stat -c '%a %n' "$e409cd/p1.conf" "$e409cd/p1-allowlist" "$e409cd" | sort; }
 
 # 1. Healthy named install: one OK row with the checked-file count, rc 0;
 #    the supported 0755 confdir is silent.
 e409_stage
 e409o="$(e409_run --profile p1)"; e409rc=$?
 [[ "$e409rc" == 0 \
-    && "$e409o" == *"OK: policy file modes: 0600 (3 files) — every checked policy file is owner-only"* \
+    && "$e409o" == *"OK: policy file modes: 0600 (2 files) — every checked policy file is owner-only"* \
     && "$e409o" != *"PROBLEM: policy file modes"* ]] \
-    && e409 pass || e409 fail "healthy named install: one OK row (3 files), rc 0 (rc=$e409rc, out: $e409o)"
+    && e409 pass || e409 fail "healthy named install: one OK row (2 files), rc 0 (rc=$e409rc, out: $e409o)"
 
-# 2. Legacy 0644 trio: 3 PROBLEM rows naming each path + its mode, each with
+# 2. Legacy 0644 pair: 2 PROBLEM rows naming each path + its mode, each with
 #    the account chmod fix, rc 1, no OK row; the run must not chmod anything.
 e409_stage
-chmod 644 "$e409cd/p1.conf" "$e409cd/p1-allowlist" "$e409cd/unit.env"
+chmod 644 "$e409cd/p1.conf" "$e409cd/p1-allowlist"
 e409_before="$(e409_modes)"
 e409o="$(e409_run --profile p1)"; e409rc=$?
 e409_after="$(e409_modes)"
 e409_n="$(printf '%s\n' "$e409o" | grep -c '^PROBLEM: policy file modes: ' || true)"
-[[ "$e409rc" == 1 && "$e409_n" == 3 \
+[[ "$e409rc" == 1 && "$e409_n" == 2 \
     && "$e409o" == *"PROBLEM: policy file modes: $e409cd/p1.conf is 644, not 0600 — the account's policy files are owner-only (0600), and proxy allow rewrites only a 0600 allowlist"* \
     && "$e409o" == *"PROBLEM: policy file modes: $e409cd/p1-allowlist is 644, not 0600"* \
-    && "$e409o" == *"PROBLEM: policy file modes: $e409cd/unit.env is 644, not 0600"* \
     && "$e409o" == *"  fix: sudo -u u409 -- chmod 600 -- $e409cd/p1.conf"* \
     && "$e409o" == *"  fix: sudo -u u409 -- chmod 600 -- $e409cd/p1-allowlist"* \
-    && "$e409o" == *"  fix: sudo -u u409 -- chmod 600 -- $e409cd/unit.env"* \
     && "$e409o" != *"OK: policy file modes"* ]] \
-    && e409 pass || e409 fail "legacy 0644 trio: 3 PROBLEM rows + fixes, rc 1, no OK (rc=$e409rc, n=$e409_n, out: $e409o)"
+    && e409 pass || e409 fail "legacy 0644 pair: 2 PROBLEM rows + fixes, rc 1, no OK (rc=$e409rc, n=$e409_n, out: $e409o)"
 [[ "$e409_before" == "$e409_after" ]] \
     && e409 pass || e409 fail "doctor never chmods: modes unchanged (before: $(printf '%s' "$e409_before" | tr '\n' '|'), after: $(printf '%s' "$e409_after" | tr '\n' '|'))"
 
@@ -4630,7 +5417,7 @@ e409_stage
 mv "$e409cd/p1-allowlist" "$e409d/al-0600"; chmod 600 "$e409d/al-0600"
 ln -s "$e409d/al-0600" "$e409cd/p1-allowlist"
 e409o="$(e409_run --profile p1)"; e409rc=$?
-[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (3 files)"* ]] \
+[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (2 files)"* ]] \
     && e409 pass || e409 fail "symlink to a 0600 target is clean (rc=$e409rc, out: $e409o)"
 chmod 644 "$e409d/al-0600"
 e409o="$(e409_run --profile p1)"; e409rc=$?
@@ -4639,14 +5426,14 @@ e409o="$(e409_run --profile p1)"; e409rc=$?
     && "$e409o" != *"OK: policy file modes"* ]] \
     && e409 pass || e409 fail "symlink to a 0644 target reports the symlink path (rc=$e409rc, out: $e409o)"
 
-# 5. A missing candidate adds no row (conf parse / unit.env own missing
-#    wiring); the OK count covers only present files.
+# 5. A missing candidate adds no row (conf parse owns missing wiring);
+#    the OK count covers only present files.
 e409_stage
 rm -f "$e409cd/p1-allowlist"
 e409o="$(e409_run --profile p1)"; e409rc=$?
-[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (2 files)"* \
+[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (1 files)"* \
     && "$(printf '%s\n' "$e409o" | grep -c 'policy file modes.*p1-allowlist' || true)" == 0 ]] \
-    && e409 pass || e409 fail "missing allowlist: skipped, count 2 (rc=$e409rc, out: $e409o)"
+    && e409 pass || e409 fail "missing allowlist: skipped, count 1 (rc=$e409rc, out: $e409o)"
 
 # 6. Confdir: only other-write reports. 755/775/700 are supported and
 #    silent; 777 (and sticky 1777) are PROBLEM; setgid 2775 is silent.
@@ -4691,18 +5478,18 @@ printf '# pending\n' > "$e409cd/p1.revoke-pending"; chmod 644 "$e409cd/p1.revoke
 printf 'build log\n' > "$e409cd/gateway-build.log"; chmod 644 "$e409cd/gateway-build.log"
 printf '# orphan\n' > "$e409cd/orphan-allowlist"; chmod 644 "$e409cd/orphan-allowlist"
 e409o="$(e409_run)"; e409rc=$?
-[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (5 files)"* \
+[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (4 files)"* \
     && "$e409o" != *"p1.pins"* && "$e409o" != *"revoke-pending"* \
     && "$e409o" != *"gateway-build.log"* && "$e409o" != *"orphan-allowlist"* ]] \
     && e409 pass || e409 fail "excluded family + orphan allowlist produce no mode rows (rc=$e409rc, out: $e409o)"
 
-# 8. Aggregate checks every *.conf pair + unit.env; named checks only the
-#    selected pair + unit.env. A bad p2 is an aggregate PROBLEM but is
-#    invisible to the named p1 run.
+# 8. Aggregate checks every *.conf pair; named checks only the selected
+#    pair. A bad p2 is an aggregate PROBLEM but is invisible to the named
+#    p1 run.
 e409_stage_aggregate
 e409o="$(e409_run)"; e409rc=$?
-[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (5 files)"* ]] \
-    && e409 pass || e409 fail "aggregate healthy: 5 files OK, rc 0 (rc=$e409rc, out: $e409o)"
+[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (4 files)"* ]] \
+    && e409 pass || e409 fail "aggregate healthy: 4 files OK, rc 0 (rc=$e409rc, out: $e409o)"
 chmod 644 "$e409cd/p2.conf"
 e409o="$(e409_run)"; e409rc=$?
 e409_n="$(printf '%s\n' "$e409o" | grep -c '^PROBLEM: policy file modes: ' || true)"
@@ -4710,9 +5497,8 @@ e409_n="$(printf '%s\n' "$e409o" | grep -c '^PROBLEM: policy file modes: ' || tr
     && "$e409o" == *"PROBLEM: policy file modes: $e409cd/p2.conf is 644"* \
     && "$e409o" != *"OK: policy file modes"* ]] \
     && e409 pass || e409 fail "aggregate reports the bad p2 only (rc=$e409rc, n=$e409_n, out: $e409o)"
-printf 'EGRESSLOCK_PROFILE=p1\n' > "$e409cd/unit.env"; chmod 600 "$e409cd/unit.env"
 e409o="$(e409_run --profile p1)"; e409rc=$?
-[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (3 files)"* \
+[[ "$e409rc" == 0 && "$e409o" == *"OK: policy file modes: 0600 (2 files)"* \
     && "$e409o" != *"p2.conf"* ]] \
     && e409 pass || e409 fail "named p1 ignores the bad p2 (rc=$e409rc, out: $e409o)"
 
@@ -4724,11 +5510,59 @@ e409o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e409u" \
 [[ "$e409rc" == 0 \
     && "$e409o" != *"OK: policy file modes"* \
     && "$e409o" != *"PROBLEM: policy file modes"* \
-    && "$e409o" == *"account wiring (conf, policy file modes, unit.env"* ]] \
+    && "$e409o" == *"account wiring (conf, policy file modes, timer"* ]] \
     && e409 pass || e409 fail "account-less host slice is mode-silent (rc=$e409rc, out: $e409o)"
 e409o="$($SKIT help doctor 2>&1)"; e409rc=$?
 [[ "$e409rc" == 0 && "$e409o" == *"policy file modes"* ]] \
     && e409 pass || e409 fail "help doctor names the policy file modes row (rc=$e409rc)"
+
+# 10. EGL-531-D4: both repair rows %q-quote their path, so a home/confdir
+#     carrying a space and a quote still yields a paste-safe line. The
+#     captured lines are re-parsed through a `sudo` stub that records its
+#     argv; each path must arrive as one argv element.
+e409q="$e409d/home u'q"; e409qcd="$e409q/.config/egresslock"
+rm -rf "$e409q"; mkdir -p "$e409qcd"; chmod 777 "$e409qcd"
+cp "$e409d/site.conf" "$e409qcd/p1.conf"
+cp "$e409d/p1-allowlist" "$e409qcd/p1-allowlist"
+chmod 644 "$e409qcd/p1.conf"; chmod 600 "$e409qcd/p1-allowlist"
+e409qo="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e409q" \
+    EGRESSLOCK_UNIT_DIR="$e409u" \
+    $SKIT --prefix "$e409p" --account u409 --doctor --profile p1 2>&1)"; e409qrc=$?
+printf -v e409q_qcf '%q' "$e409qcd/p1.conf"
+printf -v e409q_qcd '%q' "$e409qcd"
+e409qfix="$(printf '%s\n' "$e409qo" | grep '^  fix: ' || true)"
+e409q_n="$(printf '%s\n' "$e409qfix" | grep -c . || true)"
+e409qbin="$e409d/bin-fix"; mkdir -p "$e409qbin"
+cat > "$e409qbin/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\0' "$@" > "${FIX_ARGV_OUT:?}"
+EOF
+chmod +x "$e409qbin/sudo"
+e409q_ok=1
+[[ "$e409qrc" == 1 && "$e409q_n" == 2 ]] || e409q_ok=0
+[[ "$e409qfix" == *"  fix: sudo -u u409 -- chmod 600 -- $e409q_qcf"* \
+    && "$e409qfix" == *"  fix: sudo -u u409 -- chmod o-w -- $e409q_qcd"* ]] || e409q_ok=0
+e409qi=0
+while IFS= read -r e409qline; do
+    [[ -n "$e409qline" ]] || continue
+    e409qi=$((e409qi + 1))
+    ( export PATH="$e409qbin:$PATH" FIX_ARGV_OUT="$e409d/argv-$e409qi"
+      eval "${e409qline#  fix: }" ) || e409q_ok=0
+done <<< "$e409qfix"
+mapfile -d '' -t e409q_a1 < "$e409d/argv-1" 2>/dev/null || e409q_ok=0
+mapfile -d '' -t e409q_a2 < "$e409d/argv-2" 2>/dev/null || e409q_ok=0
+[[ "${#e409q_a1[@]}" == 7 \
+    && "${e409q_a1[0]}" == "-u" && "${e409q_a1[1]}" == "u409" \
+    && "${e409q_a1[2]}" == "--" && "${e409q_a1[3]}" == "chmod" \
+    && "${e409q_a1[4]}" == "600" && "${e409q_a1[5]}" == "--" \
+    && "${e409q_a1[6]}" == "$e409qcd/p1.conf" ]] || e409q_ok=0
+[[ "${#e409q_a2[@]}" == 7 \
+    && "${e409q_a2[0]}" == "-u" && "${e409q_a2[1]}" == "u409" \
+    && "${e409q_a2[2]}" == "--" && "${e409q_a2[3]}" == "chmod" \
+    && "${e409q_a2[4]}" == "o-w" && "${e409q_a2[5]}" == "--" \
+    && "${e409q_a2[6]}" == "$e409qcd" ]] || e409q_ok=0
+(( e409q_ok )) \
+    && e409 pass || e409 fail "spaced/quoted home: both fix rows are %q and re-parse to one argv (rc=$e409qrc, n=$e409q_n, out: $e409qo)"
 section_end egl409
 
 # --- ARC-22: packaging (.deb + tar.gz) --------------------------------------
@@ -4765,7 +5599,7 @@ done
 # EGL-1 flatten: the kit root is now the repo root, so the tar sweep
 # must keep shipping kit payload only — no git dir, no process files.
 if tar -tzf "$p22/k.tgz" \
-        | grep -qE '(^|/)\.git(/|$)|egresslock/(AGENTS\.md|\.gitignore|\.forgejo/|docs/(tickets|BOARD\.md))'; then
+        | grep -qE '(^|/)\.git(/|$)|egresslock/(AGENTS\.md|\.gitignore|docs/(tickets|BOARD\.md))'; then
     a22 fail "tarball leaks repo-only process files"
 else
     a22 pass
@@ -4785,8 +5619,9 @@ done
 [[ -d "$p22/opt/gateway" && -f "$p22/opt/examples/main.conf" \
     && -f "$p22/opt/examples/egl-base/Containerfile" \
     && -x "$p22/opt/examples/egl-base/build-egl-base" \
+    && -f "$p22/opt/docs/reference/operator-obligations.md" \
     && -f "$u22/egresslock-verify@.service" ]] \
-    && a22 pass || a22 fail "tarball install deployed gateway/examples/egl-base/units"
+    && a22 pass || a22 fail "tarball install deployed gateway/examples/egl-base/docs/units"
 grep -q "ExecStart=$p22/opt/egresslock-verify" "$u22/egresslock-verify@.service" \
     && a22 pass || a22 fail "tarball install rewrote ExecStart with the prefix"
 
@@ -4832,16 +5667,40 @@ for f in DEBIAN/control DEBIAN/postinst DEBIAN/postrm \
          usr/lib/systemd/system/egresslock-verify@.timer; do
     [[ -e "$p22/stage/$f" ]] && a22 pass || a22 fail "deb stage contains $f"
 done
-# EGL-1 flatten / EGL-364: the generated ticket board is process
-# material, not shipped; the package doc dir ships manuals only, and the
-# deb keeps its BOARD.md skip as its only process-file guard.
+# EGL-1 flatten / EGL-550-D9: the generated ticket board is process
+# material, not shipped; the package doc dir ships manuals only. The
+# build-deb process filters are retired (the ticket flow now lives
+# outside the shipped tree), so this file-set assert stays as the
+# layout check on the staged artifact.
 [[ ! -e "$p22/stage/usr/share/egresslock/doc/BOARD.md" ]] \
     && a22 pass || a22 fail "deb doc dir excludes BOARD.md (process file)"
+# EGL-556-D3: one docs path on the deb layout. A relative `docs -> doc/docs`
+# alias resolves the pages the messages name and apparmor/README.md's
+# relative link, while every documented doc/ path stays in place.
+if [[ -L "$p22/stage/usr/share/egresslock/docs" \
+      && "$(readlink "$p22/stage/usr/share/egresslock/docs")" == "doc/docs" \
+      && -f "$p22/stage/usr/share/egresslock/docs/reference/operator-obligations.md" \
+      && -f "$p22/stage/usr/share/egresslock/docs/troubleshooting/pasta-apparmor.md" \
+      && -f "$p22/stage/usr/share/egresslock/docs/troubleshooting/netns-inspection.md" \
+      && -f "$p22/stage/usr/share/egresslock/docs/setup/upgrade.md" \
+      && -f "$p22/stage/usr/share/egresslock/doc/README.md" \
+      && -f "$p22/stage/usr/share/egresslock/doc/docs/setup/install.md" \
+      && -e "$p22/stage/usr/share/egresslock/apparmor/../docs/troubleshooting/pasta-apparmor.md" ]]; then
+    a22 pass
+else
+    a22 fail "deb docs alias is doc/docs and resolves the shipped pages + apparmor relative link"
+fi
+grep -q 'doc/upgrade.md' "$p22/stage/DEBIAN/postinst" \
+    && a22 fail "deb postinst still names the nonexistent doc/upgrade.md" \
+    || a22 pass
 grep -q 'exec /usr/lib/egresslock/egresslock' "$p22/stage/usr/bin/egresslock" \
     && a22 pass || a22 fail "usr/bin wrapper targets libdir (D1)"
 grep -q 'ExecStart=/usr/lib/egresslock/egresslock-verify' \
     "$p22/stage/usr/lib/systemd/system/egresslock-verify@.service" \
     && a22 pass || a22 fail "deb unit ExecStart uses libdir (D1)"
+grep -qxF 'PartOf=egresslock-verify@%i.timer' \
+    "$p22/stage/usr/lib/systemd/system/egresslock-verify@.service" \
+    && a22 pass || a22 fail "deb unit stops the verify oneshot with its timer (PartOf=)"
 # EGL-103-D1: the deb's unit copies keep the generated-file notice and
 # stay ticket-ID-free.
 if grep -q "do not edit" "$p22/stage/usr/lib/systemd/system/egresslock-verify@.service" \
@@ -5130,6 +5989,66 @@ o="$(env EGRESSLOCK_DEB_KEEP_STAGE="$e433_f5m" \
     && "$o" == *"build-deb: staged tree copied to $e433_f5_qm (not built)"* \
     && "$(printf '%s\n' "$o" | grep -c 'staged tree copied to')" == 1 ]] \
     && a22 pass || a22 fail "EGL-433 F5 metacharacter lexical path is one shell token (rc=$rc, out: $o)"
+
+# EGL-555-D1/P3: the keep-stage copy is bound to the leaf this run
+# created. A swap at the identity capture makes `stat .` mismatch and
+# refuses rc 2 with nothing copied; a swap after the anchor cannot
+# redirect the relative `cp -R`, so the referent stays untouched.
+e555_ks1="$k433/e555-ks1"
+rm -rf "$e555_ks1"; mkdir -p "$e555_ks1/victim" "$e555_ks1/shim"
+printf 'ks1 sentinel\n' > "$e555_ks1/victim/sentinel"
+e555_ks1_real_stat="$(type -P stat)"
+cat > "$e555_ks1/shim/stat" <<EOF
+#!/usr/bin/env bash
+"$e555_ks1_real_stat" "\$@" > "$e555_ks1/shim/out" || exit \$?
+if [[ "\${@: -1}" == "$e555_ks1/stage" && ! -e "$e555_ks1/shim/swapped" ]]; then
+    : > "$e555_ks1/shim/swapped"
+    mv -- "$e555_ks1/stage" "$e555_ks1/stage.real"
+    ln -s "$e555_ks1/victim" "$e555_ks1/stage"
+fi
+cat "$e555_ks1/shim/out"
+rm -f "$e555_ks1/shim/out"
+EOF
+chmod +x "$e555_ks1/shim/stat"
+printf -v e555_ks1_qstage '%q' "$e555_ks1/stage"
+o="$(PATH="$e555_ks1/shim:$PATH" EGRESSLOCK_DEB_KEEP_STAGE="$e555_ks1/stage" \
+    EGRESSLOCK_DEB_OUT="$e555_ks1/x.deb" "$DEBSH" 2>&1)"; rc=$?
+[[ "$rc" == 2 \
+    && "$o" == *"build-deb: refusing: EGRESSLOCK_DEB_KEEP_STAGE changed while the staged tree was checked: $e555_ks1_qstage"* \
+    && "$o" == *"nothing was copied to $e555_ks1_qstage"* \
+    && -L "$e555_ks1/stage" \
+    && "$(cat "$e555_ks1/victim/sentinel")" == "ks1 sentinel" \
+    && ! -e "$e555_ks1/victim/DEBIAN" && ! -e "$e555_ks1/victim/usr" \
+    && -d "$e555_ks1/stage.real" \
+    && -z "$(ls -A "$e555_ks1/stage.real")" ]] \
+    && a22 pass || a22 fail "keep-stage refuses a leaf swapped after the mkdir (rc=$rc, out: $o)"
+
+e555_ks2="$k433/e555-ks2"
+rm -rf "$e555_ks2"; mkdir -p "$e555_ks2/victim" "$e555_ks2/shim"
+printf 'ks2 sentinel\n' > "$e555_ks2/victim/sentinel"
+e555_ks2_real_cp="$(type -P cp)"
+cat > "$e555_ks2/shim/cp" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "-R" && "\$2" == "--" && "\$3" == */. && "\$4" == "." \
+      && ! -e "$e555_ks2/shim/swapped" ]]; then
+    : > "$e555_ks2/shim/swapped"
+    mv -- "$e555_ks2/stage" "$e555_ks2/stage.moved"
+    ln -s "$e555_ks2/victim" "$e555_ks2/stage"
+fi
+exec "$e555_ks2_real_cp" "\$@"
+EOF
+chmod +x "$e555_ks2/shim/cp"
+printf -v e555_ks2_qstage '%q' "$e555_ks2/stage"
+o="$(PATH="$e555_ks2/shim:$PATH" EGRESSLOCK_DEB_KEEP_STAGE="$e555_ks2/stage" \
+    EGRESSLOCK_DEB_OUT="$e555_ks2/x.deb" "$DEBSH" 2>&1)"; rc=$?
+[[ "$rc" == 0 \
+    && "$o" == *"build-deb: staged tree copied to $e555_ks2_qstage (not built)"* \
+    && -L "$e555_ks2/stage" \
+    && "$(cat "$e555_ks2/victim/sentinel")" == "ks2 sentinel" \
+    && ! -e "$e555_ks2/victim/DEBIAN" && ! -e "$e555_ks2/victim/usr" \
+    && -f "$e555_ks2/stage.moved/DEBIAN/control" \
+    && -f "$e555_ks2/stage.moved/usr/lib/egresslock/egresslock" ]] \
+    && a22 pass || a22 fail "keep-stage swap after the anchor cannot redirect the copy (rc=$rc, out: $o)"
 else
     skip "$PKG_SKIP_TAG" "ARC-22 deb staging + staged-tree asserts — packaging/build-deb.sh is not on this tree (extracted kit)"
 fi
@@ -5146,7 +6065,7 @@ install -m 0755 "$TREE_ROOT/egresslock" "$f1/libdir/egresslock"
 f1_out="$(env -u EGRESSLOCK_UNIT_DIR EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
     EGRESSLOCK_DEB_UNIT_DIR="$f1/debunits" EGRESSLOCK_ACCOUNT_HOME="$f1/home/uacct" \
     "$SKIT" --account uacct --init-conf 2>&1)"; f1_rc=$?
-if [[ "$f1_rc" == 0 && -f "$f1/home/uacct/.config/egresslock/unit.env" \
+if [[ "$f1_rc" == 0 && ! -e "$f1/home/uacct/.config/egresslock/unit.env" \
       && -f "$f1/home/uacct/.config/egresslock/main.conf" \
       && "$f1_out" != *"no engine at"* ]]; then
     a22 pass
@@ -5337,7 +6256,7 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin:$PATH" \
     EGRESSLOCK_SHARE="$aa22/share" EGRESSLOCK_APPARMOR_D="$aa22/aad" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles" \
     EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/plain.conf" 2>&1)"; rc=$?
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/plain.conf" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"hint: the podman network helper (pasta) is confined by AppArmor"* \
     && "$o" == *"apparmor add"* \
     && ! -e "$aa22/aad/local/usr.bin.pasta" \
@@ -5498,7 +6417,7 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin:$PATH" \
     EGRESSLOCK_SHARE="$aa22/share" EGRESSLOCK_APPARMOR_D="$aa22/aad" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles" \
     EGRESSLOCK_ACCOUNT_HOME="$aa22/home39" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/plain.conf" 2>&1)"; rc=$?
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/plain.conf" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"hint: the podman network helper (pasta) is confined by AppArmor"* \
     && "$o" == *"is confined by AppArmor."* \
     && "$o" != *"(rule file:"* \
@@ -5510,7 +6429,7 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 PATH="$aa22/bin:$PATH" \
     EGRESSLOCK_SHARE="$aa22/share" EGRESSLOCK_APPARMOR_D="$aa22/aad" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles.nopodman" \
     EGRESSLOCK_ACCOUNT_HOME="$aa22/home39" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/plain.conf" 2>&1)"; rc=$?
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/plain.conf" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" != *"hint: the podman network helper"* \
     && "$o" == *"AppArmor: this host's podman is not confined by AppArmor, so no extra AppArmor rule is needed — no action needed."* ]] \
     && a22 pass || a22 fail "EGL-39 unlabeled no-flag run: no hint, one-liner (rc=$rc, out: $o)"
@@ -5899,7 +6818,7 @@ mkdir -p "$aa22/neg-aad/local"
 printf '/usr/bin/pasta {\n  #include <local/usr.bin.pasta>\n}\n' > "$aa22/neg-aad/usr.bin.pasta"
 : > "$aa22/neg-aad/local/usr.bin.pasta"
 o="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT PATH="$aa22/bin:$PATH" \
-    EGRESSLOCK_SHARE="$aa22/share" EGRESSLOCK_APPARMOR_D="$aa22/neg-aad" \
+    EGRESSLOCK_APPARMOR_D="$aa22/neg-aad" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles" "$SKIT" --apparmor-check 2>&1)"; rc=$?
 [[ "$o" == *"pasta profile:"* && "$o" != *"$aa22/neg-aad"* \
     && "$o" == *"pasta enforcement: enforced"* \
@@ -5934,10 +6853,10 @@ EOF
 chmod +x "$aa390/id" "$aa390/getent"
 # Root check: fixture must not steer; the output matches the unset control.
 o390_ctl="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT -u EGRESSLOCK_APPARMOR_PROFILES \
-    PATH="$aa390:$aa22/bin:$PATH" EGRESSLOCK_SHARE="$aa22/share" \
+    PATH="$aa390:$aa22/bin:$PATH" \
     EGRESSLOCK_APPARMOR_D="$aa22/aad39" "$SKIT" --apparmor-check 2>&1)"; rc390_ctl=$?
 o390_neg="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT \
-    PATH="$aa390:$aa22/bin:$PATH" EGRESSLOCK_SHARE="$aa22/share" \
+    PATH="$aa390:$aa22/bin:$PATH" \
     EGRESSLOCK_APPARMOR_D="$aa22/aad39" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles" "$SKIT" --apparmor-check 2>&1)"; rc390_neg=$?
 # EGL-491-D7: equal modulo the ignored-hook warnings, which are pinned.
@@ -5959,12 +6878,12 @@ o390_pos="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
 # Root add: a `profiles.none` fixture (would skip) must not steer the
 # decision; the no-snippet share keeps a broken gate write-free.
 o390_actl="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT -u EGRESSLOCK_APPARMOR_PROFILES \
-    PATH="$aa390:$aa22/bin:$PATH" EGRESSLOCK_SHARE="$aa22/nosnippet" \
-    EGRESSLOCK_APPARMOR_D="$aa22/aad39" "$SKIT" --apparmor-add 2>&1)"; rc390_actl=$?
+    PATH="$aa390:$aa22/bin:$PATH" \
+    EGRESSLOCK_APPARMOR_D="$aa22/aad39" "$SKIT" --prefix "$aa22/nosnippet" --apparmor-add 2>&1)"; rc390_actl=$?
 o390_aneg="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT \
-    PATH="$aa390:$aa22/bin:$PATH" EGRESSLOCK_SHARE="$aa22/nosnippet" \
+    PATH="$aa390:$aa22/bin:$PATH" \
     EGRESSLOCK_APPARMOR_D="$aa22/aad39" \
-    EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles.none" "$SKIT" --apparmor-add 2>&1)"; rc390_aneg=$?
+    EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles.none" "$SKIT" --prefix "$aa22/nosnippet" --apparmor-add 2>&1)"; rc390_aneg=$?
 # EGL-491-D7: equal modulo the ignored-hook warnings, which are pinned.
 o390_actls="$(printf '%s\n' "$o390_actl" | strip_egl491_warnings)"
 o390_anegs="$(printf '%s\n' "$o390_aneg" | strip_egl491_warnings)"
@@ -6002,7 +6921,7 @@ exec /usr/bin/grep "$@"
 EOF
 chmod +x "$aa390p/id" "$aa390p/grep"
 o390_ref="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT \
-    PATH="$aa390p:$aa22/bin:$PATH" EGRESSLOCK_SHARE="$aa22/share" \
+    PATH="$aa390p:$aa22/bin:$PATH" \
     EGRESSLOCK_APPARMOR_D="$aa22/aad39" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles-dir" "$SKIT" --apparmor-add 2>&1)"; rc390_ref=$?
 [[ "$rc390_ref" == 1 \
@@ -6011,14 +6930,14 @@ o390_ref="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT \
     && a22 pass || a22 fail "EGL-390 unknown-listing refuse names the resolved kernel path, never the fixture (rc=$rc390_ref, out: $o390_ref)"
 # Root account preamble: same rule (the hint is driven by the listing read).
 o390_pctl="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT -u EGRESSLOCK_APPARMOR_PROFILES \
-    PATH="$aa390:$aa22/bin:$PATH" EGRESSLOCK_SHARE="$aa22/share" \
+    PATH="$aa390:$aa22/bin:$PATH" \
     EGRESSLOCK_APPARMOR_D="$aa22/aad39" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/plain.conf" 2>&1)"; rc390_pctl=$?
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/plain.conf" 2>&1)"; rc390_pctl=$?
 o390_pneg="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT \
-    PATH="$aa390:$aa22/bin:$PATH" EGRESSLOCK_SHARE="$aa22/share" \
+    PATH="$aa390:$aa22/bin:$PATH" \
     EGRESSLOCK_APPARMOR_D="$aa22/aad39" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/plain.conf" 2>&1)"; rc390_pneg=$?
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/plain.conf" 2>&1)"; rc390_pneg=$?
 # EGL-491-D7: equal modulo the ignored-hook warnings, which are pinned.
 # The preamble reads the profiles listing (not the profile dir), so the
 # PROFILES warning is the one it must add.
@@ -6033,7 +6952,7 @@ o390_ppos="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 \
     PATH="$aa390:$aa22/bin:$PATH" EGRESSLOCK_SHARE="$aa22/share" \
     EGRESSLOCK_APPARMOR_D="$aa22/aad39" \
     EGRESSLOCK_APPARMOR_PROFILES="$aa22/profiles" \
-    "$SKIT" --prefix "$SKITP" --account cacct --conf "$a18d/plain.conf" 2>&1)"; rc390_ppos=$?
+    "$SKIT" init --prefix "$SKITP" --account cacct --from "$a18d/plain.conf" 2>&1)"; rc390_ppos=$?
 [[ "$o390_ppos" == *"hint: the podman network helper (pasta) is confined by AppArmor"* ]] \
     && a22 pass || a22 fail "EGL-390 profiles hook honored by the account preamble with the test flag (rc=$rc390_ppos, out: $o390_ppos)"
 
@@ -6279,7 +7198,7 @@ printf 'rm %s\n' "\$*" >> "$e434u/rm.log"
 for _a in "\$@"; do
     case "\$_a" in
         -*) continue ;;
-        "$STATE"/*) ;;
+        "$STATE"/*|./*) ;;
         *) exit 0 ;;
     esac
 done
@@ -7013,23 +7932,21 @@ section_begin arc70 "ARC-70 drift-signal hint"
 a70() { assert "$@"; }
 
 # 1. Account setup without --enable: the re-run line is runnable and
-#    named with the account's own paths (EGL-102-F1/R4: carries --conf,
-#    and --profile when one was passed; the old text claimed "linger not
-#    set", which is false on a re-run of a wired account). EGL-270 P3
-#    (candidate 5): the bare "timer NOT enabled" clause was trimmed —
-#    egl51 #2 pins the hint line's presence; the ("did not arm drift
-#    checks" + re-arm) bits below are its only home.
+#    named with the account's own paths (EGL-102-F1/R4; EGL-333-D7: plain
+#    pathless init — no --profile). EGL-270 P3 (candidate 5): the bare
+#    "timer NOT enabled" clause was trimmed — egl51 #2 pins the hint
+#    line's presence; the ("did not arm drift checks" + re-arm) bits
+#    below are its only home.
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" --profile p1 2>&1)"
-[[ "$rc" == 0 ]] || true
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" 2>&1)"
 [[ "$o" == *"this run did not arm drift checks"* \
-    && "$o" == *"sudo egresslock-setup init --account cacct --profile p1 --enable"* ]] \
+    && "$o" == *"sudo egresslock-setup init cacct --enable"* ]] \
     && a70 pass || a70 fail "no --enable -> loud hint with runnable re-run line (out: $o)"
 
 # 2. With --enable: no hint (the enable commands already ran), and the
 #    system changes are announced before they happen (post-R-070-2).
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$a18d/home/cacct" \
-    $SKIT --prefix "$SKITP" --account cacct --conf "$a18d/site.conf" --enable 2>&1)"
+    $SKIT init --prefix "$SKITP" --account cacct --from "$a18d/site.conf" --enable 2>&1)"
 [[ "$o" != *"timer NOT enabled"* \
     && "$o" == *"enabling verify timer for cacct"* \
     && "$o" == *"enabling linger for cacct"* ]] \
@@ -7252,6 +8169,10 @@ grep -q 'apparmor check' "$p22/stage/DEBIAN/postinst" \
     && e50 pass || e50 fail "postinst points at apparmor check"
 grep -qF -- '[--enable]' "$p22/stage/DEBIAN/postinst" \
     && e50 fail "postinst still shows [--enable]" || e50 pass
+# EGL-517 F8: the shipped next-step line is paste-inert — no `<...>`
+# placeholder (a pasted `<acct>` redirects before command lookup).
+grep -qE '<[A-Za-z][^<>]*>' "$p22/stage/DEBIAN/postinst" \
+    && e50 fail "postinst still carries an angle-bracket placeholder" || e50 pass
 else
     skip "$PKG_SKIP_TAG" "D50-5 postinst hygiene greps — packaging/build-deb.sh is not on this tree (extracted kit)"
 fi
@@ -7265,6 +8186,9 @@ grep -q 'apparmor check' "$p22/x/README.txt" \
     && e50 pass || e50 fail "tarball README fragment points at apparmor check"
 grep -qF -- '[--enable]' "$p22/x/README.txt" \
     && e50 fail "tarball README still shows [--enable]" || e50 pass
+# EGL-517 F8: the tarball README next-step line is paste-inert too.
+grep -qE '<[A-Za-z][^<>]*>' "$p22/x/README.txt" \
+    && e50 fail "tarball README still carries an angle-bracket placeholder" || e50 pass
 else
     skip "$PKG_SKIP_TAG" "D50-5 tarball README hygiene greps — packaging/build-tarball.sh is not on this tree (extracted kit)"
 fi
@@ -7450,7 +8374,7 @@ e203o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
     $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e203rc=$?
 [[ "$e203rc" == 0 && "$e203o" == *"stale: base pin moved (image base $e203short != deployed pin 000000000000)"* \
-    && "$e203o" == *"rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"* ]] \
+    && "$e203o" == *"rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway PROFILE per affected profile (see \"The gateway image\" reference page)"* ]] \
     && e203 pass || e203 fail "D203-3 neighbor-pin-moved stale row with pointer, rc-neutral (rc=$e203rc, out: $e203o)"
 cp -f "$TREE_ROOT/gateway/Containerfile" "$e38p/gateway/Containerfile"   # restore the fixture prefix
 rm -f "$e203fix" "$e203share/gateway/Containerfile"
@@ -7462,7 +8386,7 @@ e203o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
     $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e203rc=$?
 [[ "$e203rc" == 0 && "$e203o" == *"OK: gateway image: present ($e203img) — base unknown (pre-label image), built 2026-08-01"* \
-    && "$e203o" == *"stale: base unknown (pre-label image) — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"* ]] \
+    && "$e203o" == *"stale: base unknown (pre-label image) — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway PROFILE per affected profile (see \"The gateway image\" reference page)"* ]] \
     && e203 pass || e203 fail "D203-3 pre-label row with pointer, rc-neutral (rc=$e203rc, out: $e203o)"
 rm -f "$e203fix"
 
@@ -7507,7 +8431,7 @@ e203o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     $SKIT --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e203rc=$?
 [[ "$e203rc" == 0 \
     && "$e203o" == *"rebuild: gateway image built $e203_before_floor is older than the kit's security rebuild floor $e203_floor"* \
-    && "$e203o" == *"egresslock build-gateway --force && egresslock ensure --replace-gateway <profile> per affected profile"* \
+    && "$e203o" == *"egresslock build-gateway --force && egresslock ensure --replace-gateway PROFILE per affected profile"* \
     && "$e203o" != *"stale:"* && "$e203o" != *"days old"* ]] \
     && e203 pass || e203 fail "EGL-487 below-floor gateway rebuild line + --force remedy, rc-neutral (rc=$e203rc, out: $e203o)"
 
@@ -7616,13 +8540,6 @@ k59_id_re='ARC-[0-9]|EGL-[0-9]|docs/tickets/[A-Za-z0-9]'
 entries59=("egresslock-setup:-h" "egresslock-verify:-h" \
            "install-kit.sh:-h" "uninstall-kit.sh:-h" \
            "egresslock-setup:help")
-# EGL-74-D1: the private publisher is not on the public tree — skip its
-# -h entry there.
-if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
-    entries59+=("packaging/snapshot-public.sh:-h")
-else
-    skip "snapshot-public.sh absent" "packaging/snapshot-public.sh -h — not on the public tree (EGL-74-D1)"
-fi
 for entry in "${entries59[@]}"; do
     f="${entry%%:*}"; flag="${entry##*:}"
     o="$(bash "$TREE_ROOT/$f" "$flag" 2>&1)"; rc=$?
@@ -7789,6 +8706,23 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
 [[ "$e68_rc" == 0 && -f "$e68m/gateway/Containerfile" \
     && ! -e "$e68m/gateway/Containerfile.stale" ]] \
     && e68 pass || e68 fail "reinstall on marked prefix replaces gateway/ (rc=$e68_rc)"
+# EGL-531-D1: a leftover `.tmp` staging path used to receive `cp -R` INTO
+# it, so the later `mv` deployed gateway/gateway/… — pre-clean each of the
+# four staging paths and pin the shipped tree shape.
+e68t="$STATE/e68/stale-tmp"; rm -rf "$e68t"
+mkdir -p "$e68t/gateway.tmp/stale" "$e68t/apparmor.tmp/stale" \
+    "$e68t/examples/recipes.tmp/stale" "$e68t/examples/egl-base.tmp/stale"
+env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
+    EGRESSLOCK_PATH_BINDIR="$e68t/wbin" EGRESSLOCK_PATH_SBINDIR="$e68t/wsbin" \
+    "$KIT" --prefix "$e68t" >/dev/null 2>&1; e68_rc=$?
+[[ "$e68_rc" == 0 \
+    && -f "$e68t/gateway/Containerfile" && ! -e "$e68t/gateway/gateway" \
+    && -f "$e68t/apparmor/usr.bin.pasta.local" && ! -e "$e68t/apparmor/apparmor" \
+    && -f "$e68t/examples/recipes/github.md" && ! -e "$e68t/examples/recipes/recipes" \
+    && -f "$e68t/examples/egl-base/Containerfile" \
+    && ! -e "$e68t/examples/egl-base/egl-base" \
+    && ! -e "$e68t/gateway.tmp" && ! -e "$e68t/apparmor.tmp" ]] \
+    && e68 pass || e68 fail "stale .tmp staging paths are pre-cleaned, no nested deploy (rc=$e68_rc)"
 # EGL-69-D2: a fresh prefix ships apparmor/usr.bin.pasta.local.
 e68a="$STATE/e68/aaprefix"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
@@ -7894,6 +8828,16 @@ grep -q 'prefix-live' "$e83pi" \
     && e83 pass || e83 fail "live custom-prefix detection via ExecStart markers (R1/R5)"
 grep -q 'reset-failed' "$e83pi" \
     && e83 pass || e83 fail "postinst resets failed instances (D1)"
+# EGL-531-D2: the /opt-only co-install shape (a live prefix engine with
+# no /etc template to shadow the deb units) hard-fails instead of
+# completing warn-only, with the uninstall remediation + configure finisher.
+e83opt="$(awk '/^if \[ -e \/opt\/egresslock\/egresslock \]; then$/{f=1} f{print} f&&/^fi$/{exit}' "$e83pi")"
+[[ -n "$e83opt" && "$e83opt" == *"exit 1"* \
+    && "$e83opt" == *"The two install channels must never"* \
+    && "$e83opt" == *"uninstall-kit.sh --prefix /opt/egresslock"* \
+    && "$e83opt" == *"dpkg --configure egresslock"* \
+    && "$e83opt" != *"WARNING: a prefix kit also exists"* ]] \
+    && e83 pass || e83 fail "postinst /opt-only co-install shape hard-fails (block: $e83opt)"
 if grep -vE '^\s*(#|$)' "$e83pi" | grep -qE 'systemctl enable|apparmor_parser'; then
     e83 fail "postinst enables a timer or applies AppArmor (D1 boundary)"
 else
@@ -7973,6 +8917,7 @@ e102_manifest=(
     examples/main.conf examples/main-allowlist examples/recipes
     examples/egl-base/Containerfile examples/egl-base/README.md
     examples/egl-base/build-egl-base examples/egl-base/security-floor
+    docs
     systemd/egresslock-verify@.service systemd/egresslock-verify@.timer
 )
 e102_stage_tree() { # e102_stage_tree <dest> [missing...] — manifest minus exclusions, VERSION_BASE seeded
@@ -7992,7 +8937,8 @@ e102_stage_tree() { # e102_stage_tree <dest> [missing...] — manifest minus exc
 # examples/recipes — the preflight must still fail closed BEFORE any
 # copy (the copy list copies recipes unconditionally; without this, the
 # gate passes and a bare `cp: cannot stat ... recipes` kills a partial
-# deploy mid-way).
+# deploy mid-way). EGL-549: the widened manifest names the tree root and
+# its leaves, so the refusal names the missing recipes set (root first).
 e102p="$e102d/partial"; mkdir -p "$e102p"
 e102_stage_tree "$e102p" examples/recipes
 e102d2="$e102d/dest2"; mkdir -p "$e102d2"
@@ -8000,7 +8946,9 @@ e102o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e102d/units" 
     EGRESSLOCK_PATH_BINDIR="$e102d/wbin" EGRESSLOCK_PATH_SBINDIR="$e102d/wsbin" \
     "$e102p/install-kit.sh" --prefix "$e102d2" 2>&1)"; e102_rc=$?
 [[ "$e102_rc" == 1 && "$e102o" == *"incomplete kit tree at $e102p"* \
-    && "$e102o" == *"(missing: examples/recipes)"* \
+    && "$e102o" == *"(missing: examples/recipes "* \
+    && "$e102o" == *"examples/recipes/github.md"* \
+    && "$e102o" == *"examples/recipes/agent-container-example/Containerfile"* \
     && ! -e "$e102d2/egresslock" && ! -e "$e102d2/gateway" && ! -e "$e102d2/examples" ]] \
     && e102r2 pass || e102r2 fail "recipes-only gap fails closed pre-copy (rc=$e102_rc, out: $e102o)"
 
@@ -8042,6 +8990,30 @@ e102o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e102d/units" 
     && "$e102o" == *"(missing: examples/egl-base/README.md)"* \
     && ! -e "$e102d5/egresslock" && ! -e "$e102d5/gateway" && ! -e "$e102d5/examples" ]] \
     && e102r2 pass || e102r2 fail "README-only gap fails closed pre-copy (rc=$e102_rc, out: $e102o)"
+
+# EGL-556-D2: the docs tree is part of the gate. Missing and symlinked
+# trees both fail closed naming exactly `docs`, before any copy.
+e102doc="$e102d/partial-docs"; mkdir -p "$e102doc"
+e102_stage_tree "$e102doc" docs
+e102d6="$e102d/dest6"; mkdir -p "$e102d6"
+e102o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e102d/units" \
+    EGRESSLOCK_PATH_BINDIR="$e102d/wbin" EGRESSLOCK_PATH_SBINDIR="$e102d/wsbin" \
+    "$e102doc/install-kit.sh" --prefix "$e102d6" 2>&1)"; e102_rc=$?
+[[ "$e102_rc" == 1 && "$e102o" == *"incomplete kit tree at $e102doc"* \
+    && "$e102o" == *"(missing: docs)"* \
+    && ! -e "$e102d6/egresslock" && ! -e "$e102d6/gateway" ]] \
+    && e102r2 pass || e102r2 fail "docs-only gap fails closed pre-copy (rc=$e102_rc, out: $e102o)"
+e102sym="$e102d/partial-docs-link"; mkdir -p "$e102sym"
+e102_stage_tree "$e102sym" docs
+ln -s "$TREE_ROOT/docs" "$e102sym/docs"
+e102d7="$e102d/dest7"; mkdir -p "$e102d7"
+e102o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e102d/units" \
+    EGRESSLOCK_PATH_BINDIR="$e102d/wbin" EGRESSLOCK_PATH_SBINDIR="$e102d/wsbin" \
+    "$e102sym/install-kit.sh" --prefix "$e102d7" 2>&1)"; e102_rc=$?
+[[ "$e102_rc" == 1 && "$e102o" == *"incomplete kit tree at $e102sym"* \
+    && "$e102o" == *"(missing: docs)"* \
+    && ! -e "$e102d7/egresslock" && ! -e "$e102d7/docs" ]] \
+    && e102r2 pass || e102r2 fail "symlinked docs/ fails closed pre-copy (rc=$e102_rc, out: $e102o)"
 section_end egl102r2
 
 # --- EGL-240: build-egl-base helper (mock podman) ------------------------
@@ -8430,8 +9402,8 @@ e84clean() {
 e84o="$(e84run --doctor)"; e84_rc=$?
 [[ "$e84_rc" == 0 && "$e84o" == *"NOTE: verify unit fragment: not resolved by systemctl"* \
     && "$e84o" == *"daemon-reload"* \
-    && "$e84o" == *"not examined (no --account)"* \
-    && "$e84o" == *"sudo egresslock-setup doctor --account <acct>"* \
+    && "$e84o" == *"not examined (no account operand)"* \
+    && "$e84o" == *"sudo egresslock-setup doctor ACCOUNT"* \
     && "$e84o" == *"NOTE: no accounts have egresslock-verify services on this host"* \
     && "$e84o" != *"services healthy"* && "$e84o" != *"egresslock-verify services:"* \
     && "$e84o" != *"are set up for"* \
@@ -8448,7 +9420,7 @@ printf 'egresslock-verify@alice.service loaded active running\negresslock-verify
 : > "$STATE/systemctl-list-units-failed"
 e84o="$(e84run --doctor)"; e84_rc=$?
 [[ "$e84_rc" == 0 && "$e84o" == *"OK: all egresslock-verify services healthy (2/2)"* \
-    && "$e84o" == *"NOTE: egresslock-verify services are set up for 2 accounts: alice, svc — to check an account: sudo egresslock-setup doctor --account <acct>"* \
+    && "$e84o" == *"NOTE: egresslock-verify services are set up for 2 accounts: alice, svc — to check an account: sudo egresslock-setup doctor ACCOUNT"* \
     && "$e84o" != *"PROBLEM: "* ]] \
     && e84 pass || e84 fail "healthy 2-account host: M9 (2/2) + M7 plural (rc=$e84_rc, out: $e84o)"
 
@@ -8510,7 +9482,7 @@ e84o="$(e84run --doctor)"; e84_rc=$?
     && "$e84o" != *"bash -c"* && "$e84o" != *"manually as uacct"* \
     && "$e84o" != *"sudo -iu uacct -- egresslock ensure"* \
     && "$e84o" == *"inspect: sudo journalctl -u egresslock-verify@uacct.service -n 20"* \
-    && "$e84o" == *"check: sudo egresslock-setup doctor --account uacct"* ]] \
+    && "$e84o" == *"check: sudo egresslock-setup doctor uacct"* ]] \
     && e84 pass || e84 fail "exit-1 row text + recency + systemctl re-run rc 1 (rc=$e84_rc, out: $e84o)"
 e84clean
 
@@ -8527,8 +9499,8 @@ e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e84d/home"
 [[ "$e84_rc" == 1 \
     && "$e84o" == *"PROBLEM: egresslock-verify@dtmr.timer: FAILED and not enabled — the drift-check timer is disarmed; no verify run is scheduled"* \
     && "$e84o" == *"  fix: sudo systemctl reset-failed egresslock-verify@dtmr.timer"* \
-    && "$e84o" == *"  fix: sudo egresslock-setup init --account dtmr --enable"* \
-    && "$e84o" == *"  check: sudo egresslock-setup doctor --account dtmr"* \
+    && "$e84o" == *"  fix: sudo egresslock-setup init dtmr --enable"* \
+    && "$e84o" == *"  check: sudo egresslock-setup doctor dtmr"* \
     && "$e84o" != *"inspect:"* \
     && "$e84o" != *"OK: timer: enabled"* ]] \
     && e84 pass || e84 fail "disabled+failed timer: state row, no inspect, no OK (rc=$e84_rc, out: $e84o)"
@@ -8580,15 +9552,15 @@ e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e84d/home"
     && "$e84o" == *"  fix: sudo systemctl start egresslock-verify@svcrun.service"* \
     && "$e84o" != *"bash -c"* && "$e84o" != *"manually as svcrun"* \
     && "$e84o" == *"  inspect: sudo journalctl -u egresslock-verify@svcrun.service -n 20"* \
-    && "$e84o" == *"  check: sudo egresslock-setup doctor --account svcrun"* \
+    && "$e84o" == *"  check: sudo egresslock-setup doctor svcrun"* \
     && "$e84o" != *"journalctl -u egresslock-verify@svcrun.timer"* ]] \
     && e84 pass || e84 fail "armed+failed service: last/next + systemctl re-run + service journal (rc=$e84_rc, out: $e84o)"
 e84clean
 
-# 3c-1. EGL-346: exit-1 row with a known named profile (the invoked
-#     account's unit.env, or --profile) prints the scoped repair as the
-#     first fix, ahead of the reset-failed/start re-run. An unnamed,
-#     non-exit-1, or host-sweep row never prints it.
+# 3c-1. EGL-346/EGL-333-D8: the scoped `ensure <profile>` repair prints
+#     only for an explicit `doctor --profile`. A unit.env profile is inert
+#     (D5): with no --profile the first fix is the reset-failed re-run and
+#     no ensure line prints.
 mkdir -p "$e84d/home/.config/egresslock"
 printf 'EGRESSLOCK_PROFILE=namedprof\n' > "$e84d/home/.config/egresslock/unit.env"
 printf '1\n' > "$STATE/systemctl-mainstatus"
@@ -8601,11 +9573,11 @@ e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e84d/home"
 e84_svcblock="$(printf '%s\n' "$e84o" | sed -n '/PROBLEM: egresslock-verify@svcprof.service/,/^[^ ]/p')"
 e84_first_fix="$(grep -m1 '^  fix:' <<<"$e84_svcblock")"
 [[ "$e84_rc" == 1 \
-    && "$e84_first_fix" == "  fix: sudo -iu svcprof -- egresslock ensure namedprof" \
-    && "$e84o" == *"  fix: sudo systemctl reset-failed egresslock-verify@svcprof.service"* \
+    && "$e84_first_fix" == "  fix: sudo systemctl reset-failed egresslock-verify@svcprof.service" \
+    && "$e84o" != *"egresslock ensure"* \
     && "$e84o" == *"  fix: sudo systemctl start egresslock-verify@svcprof.service"* ]] \
-    && e84 pass || e84 fail "exit-1 + named unit.env: scoped ensure is the first fix (rc=$e84_rc, first='$e84_first_fix', out: $e84o)"
-# --profile wins over unit.env for the printed repair.
+    && e84 pass || e84 fail "exit-1 + inert unit.env: no scoped ensure repair (rc=$e84_rc, first='$e84_first_fix', out: $e84o)"
+# An explicit --profile seeds the scoped repair; unit.env still does not.
 e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e84d/home" \
     EGRESSLOCK_UNIT_DIR="$e84d/units" \
     "$SKIT" --prefix "$e84d/prefix" --account svcprof --profile flagprof --conf "$e84d/nosuch.conf" --doctor 2>&1)"; e84_rc=$?
@@ -8687,7 +9659,7 @@ e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e84d/home"
 [[ "$e84_rc" == 1 \
     && "$e84o" == *"PROBLEM: egresslock-verify@mtmr.timer: FAILED and masked — systemd will not start it until it is unmasked"* \
     && "$e84o" == *"  fix: sudo systemctl unmask egresslock-verify@mtmr.timer"* \
-    && "$e84o" == *"  fix: sudo egresslock-setup init --account mtmr --enable"* \
+    && "$e84o" == *"  fix: sudo egresslock-setup init mtmr --enable"* \
     && "$e84o" != *"inspect:"* ]] \
     && e84 pass || e84 fail "masked timer: state remedy, no inspect (rc=$e84_rc, out: $e84o)"
 e84clean
@@ -8733,7 +9705,7 @@ e84_svcblock="$(printf '%s\n' "$e84o" | sed -n '/PROBLEM: egresslock-verify@rect
     && "$e84o" == *"PROBLEM: egresslock-verify@rectmr.service: FAILED — the verify run failed (exit 1); the timer is not enabled, so no further checks are scheduled"* \
     && "$e84o" == *"  fix: re-arm the timer — see its FAILED row above for the exact command"* \
     && "$e84o" == *"  inspect: sudo journalctl -u egresslock-verify@rectmr.service -n 20"* \
-    && "$e84_svcblock" != *"egresslock-setup init --account rectmr"* \
+    && "$e84_svcblock" != *"egresslock-setup init rectmr"* \
     && "$e84o" != *"OK: timer: enabled"* ]] \
     && e84 pass || e84 fail "service+timer reconcile: one re-arm, service journal (rc=$e84_rc, out: $e84o)"
 e84clean
@@ -8753,7 +9725,7 @@ e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e84d/home"
 [[ "$e84_rc" == 1 \
     && "$e84o" == *"PROBLEM: egresslock-verify@unkacct.service: FAILED — the verify run failed (exit 1); the timer's armed state could not be determined, so whether further checks are scheduled is unknown"* \
     && "$e84o" == *"  fix: check whether the timer is enabled: systemctl is-enabled egresslock-verify@unkacct.timer"* \
-    && "$e84o" == *"  fix: if it is not enabled, re-arm: sudo egresslock-setup init --account unkacct --enable"* \
+    && "$e84o" == *"  fix: if it is not enabled, re-arm: sudo egresslock-setup init unkacct --enable"* \
     && "$e84o" == *"PROBLEM: timer: armed state unknown (egresslock-verify@unkacct.timer)"* \
     && "$e84o" != *"the timer is not enabled"* \
     && "$e84o" != *"timer: not enabled"* ]] \
@@ -8771,7 +9743,7 @@ e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
 [[ "$e84_rc" == 1 \
     && "$e84o" == *"PROBLEM: timer: enabled but its running state is unknown (egresslock-verify@uctx.timer)"* \
     && "$e84o" == *"  fix: sudo systemctl status egresslock-verify@uctx.timer"* \
-    && "$e84o" == *"  check: sudo egresslock-setup doctor --account uctx"* \
+    && "$e84o" == *"  check: sudo egresslock-setup doctor uctx"* \
     && "$e84o" != *"OK: timer: enabled"* ]] \
     && e84 pass || e84 fail "failed ActiveState probe is a named unknown, never armed OK (rc=$e84_rc, out: $e84o)"
 rm -f "$STATE/systemctl-is-enabled" "$STATE/systemctl-show-fail-ActiveState"
@@ -8789,7 +9761,7 @@ e84o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
 [[ "$e84_rc" == 1 \
     && "$e84o" == *"PROBLEM: timer: enabled but its running state is unknown (egresslock-verify@uctx.timer)"* \
     && "$e84o" == *"  fix: sudo systemctl status egresslock-verify@uctx.timer"* \
-    && "$e84o" == *"  check: sudo egresslock-setup doctor --account uctx"* \
+    && "$e84o" == *"  check: sudo egresslock-setup doctor uctx"* \
     && "$e84o" != *"OK: timer: enabled"* ]] \
     && e84 pass || e84 fail "empty ActiveState answer is a named unknown, never armed OK (rc=$e84_rc, out: $e84o)"
 rm -f "$STATE/systemctl-is-enabled" "$STATE/systemctl-show-ActiveState.egresslock-verify@uctx.timer"
@@ -9212,18 +10184,19 @@ e84o="$(env ARCMOCK_LINGER_ANSWER=no EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_
     && e84 pass || e84 fail "enabled-but-stopped timer is a PROBLEM, not OK (rc=$e84_rc, out: $e84o)"
 rm -f "$STATE/systemctl-is-enabled" "$STATE/systemctl-show-ActiveState.egresslock-verify@uctx.timer"
 
-# 13. (R4 runnable fix) the timer-not-enabled arm command carries the
-#     conf/profile the reporting invocation already holds — a bare
-#     --enable re-run would exit 2 on the missing --conf. EGL-201: the
-#     timer/linger PROBLEM rows name the unit/account (M10/M11).
+# 13. (R4 runnable fix) the timer-not-enabled arm command is the plain
+#     pathless init (EGL-333-D7: the timer verifies every profile, so the
+#     fix carries no --profile). EGL-201: the timer/linger PROBLEM rows
+#     name the unit/account (M10/M11).
 : > "$STATE/systemctl-timer-off"
 e84o="$(env ARCMOCK_LINGER_ANSWER=no EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e38h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
     "$SKIT" --prefix "$e38p" --account uctx --conf "$STATE/e38/site.conf" --profile p1 --doctor 2>&1)"; e84_rc=$?
 [[ "$e84_rc" == 1 && "$e84o" == *"PROBLEM: timer: not enabled (egresslock-verify@uctx.timer)"* \
-    && "$e84o" == *"fix: sudo egresslock-setup init --account uctx --profile p1 --enable"* \
+    && "$e84o" == *"fix: sudo egresslock-setup init uctx --enable"* \
+    && "$e84o" != *"init uctx --profile"* \
     && "$e84o" == *"PROBLEM: linger: off (account uctx)"* ]] \
-    && e84 pass || e84 fail "timer fix line is runnable (--conf/--profile); M10/M11 rows (rc=$e84_rc, out: $e84o)"
+    && e84 pass || e84 fail "timer fix line is the plain pathless init; M10/M11 rows (rc=$e84_rc, out: $e84o)"
 rm -f "$STATE/systemctl-timer-off"
 
 # 14. (R1 named skip) DELETED per EGL-270 P3 (candidate 1): the
@@ -9233,103 +10206,6 @@ rm -f "$STATE/systemctl-timer-off"
 
 section_end egl84
 
-# --- EGL-65: artifact hygiene — tarball excludes the internal
-#     bug-report drafts; the fleet grep catches the widened names; the
-#     private publisher never joins its own stage; the product tree is
-#     scrubbed. ----------------------------------------------------------
-section_begin egl65 "EGL-65 artifact hygiene"
-e65() { assert "$@"; }
-p65="$STATE/egl65"; rm -rf "$p65"; mkdir -p "$p65/kit"
-(cd "$TREE_ROOT" && tar -cf - --exclude=./.git --exclude='./packaging/*.deb' --exclude='./packaging/*.tar.gz' .) \
-    | tar -xf - -C "$p65/kit"
-printf '# security policy (staged fixture for the snapshot gate)\n' > "$p65/kit/SECURITY.md"
-
-# 1. (D1) the tarball excludes the internal bug-report drafts; docs
-#    otherwise ship. EGL-107-D1: skips with the producer on the
-#    extracted kit.
-if [[ "$HAVE_BUILD_TARBALL" == 1 ]]; then
-env EGRESSLOCK_TARBALL_OUT="$p65/k.tgz" "$TARSH" >/dev/null 2>&1; e65_rc=$?
-[[ "$e65_rc" == 0 && -f "$p65/k.tgz" ]] \
-    && e65 pass || e65 fail "tarball build (rc=$e65_rc)"
-if tar -tzf "$p65/k.tgz" | grep -qE 'docs/(lp-|debian-).*\.txt'; then
-    e65 fail "tarball ships an internal bug-report draft (EGL-65-D1)"
-else
-    e65 pass
-fi
-tar -tzf "$p65/k.tgz" | grep -q 'docs/README.md' \
-    && e65 pass || e65 fail "tarball still ships docs (sanity)"
-else
-    skip "$PKG_SKIP_TAG" "EGL-65 tarball listing asserts — packaging/build-tarball.sh is not on this tree (extracted kit)"
-fi
-
-# 2. (D2) the widened fleet grep fails closed on each widened name,
-#    naming the file and removing the stage. Decoys are assembled from
-#    parts — this file is itself in the staged set.
-#    EGL-74-D1: the dry-runs invoke the private publisher; skip on the
-#    public tree.
-if [[ "$HAVE_SNAPSHOT" == 1 ]]; then
-printf 'note: confirmed on ni'"tro"' with the profile\n' > "$p65/kit/docs/leak-decoy-a.md"
-printf 'worked through on haz'"mat"' box\n' > "$p65/kit/docs/leak-decoy-b.md"
-o="$(bash "$p65/kit/packaging/snapshot-public.sh" --dry-run "$p65/stage-a" 2>&1)"; e65_rc=$?
-[[ "$e65_rc" == 1 && "$o" == *"fleet facts"* && "$o" == *"leak-decoy-a.md"* && ! -e "$p65/stage-a" ]] \
-    && e65 pass || e65 fail "widened grep catches first nickname (rc=$e65_rc, out: $o)"
-rm -f "$p65/kit/docs/leak-decoy-a.md"
-o="$(bash "$p65/kit/packaging/snapshot-public.sh" --dry-run "$p65/stage-b" 2>&1)"; e65_rc=$?
-[[ "$e65_rc" == 1 && "$o" == *"fleet facts"* && "$o" == *"leak-decoy-b.md"* && ! -e "$p65/stage-b" ]] \
-    && e65 pass || e65 fail "widened grep catches second nickname (rc=$e65_rc, out: $o)"
-rm -f "$p65/kit/docs/leak-decoy-b.md"
-else
-    skip "snapshot-public.sh absent" "EGL-65 widened-fleet-grep dry-runs — packaging/snapshot-public.sh not on the public tree (EGL-74-D1)"
-fi
-
-# 3. (D2) the scrubbed product tree carries no fleet nickname. Scope is
-#    the shipped allowlist paths; the repo-only paths (the publisher's
-#    own pattern literals, the excluded bug-report drafts) stay out.
-e65_scan=()
-for e65_root in gateway apparmor systemd examples tests docs packaging \
-                egresslock egresslock-start egresslock-verify egresslock-setup \
-                install-kit.sh uninstall-kit.sh LICENSE README.md SECURITY.md \
-                VERSION_BASE CHANGELOG.md; do
-    [[ -e "$TREE_ROOT/$e65_root" ]] && e65_scan+=( "$TREE_ROOT/$e65_root" )
-done
-if (( ${#e65_scan[@]} == 0 )); then
-    skip "shipped paths absent" "EGL-65 fleet-nickname scan — no shipped allowlist path on this tree"
-elif grep -rnIiE 'ni'"tro"'|haz'"mat" "${e65_scan[@]}" \
-        --exclude=snapshot-public.sh \
-        --exclude='lp-*.txt' --exclude='debian-*.txt' \
-        >/dev/null 2>&1; then
-    e65 fail "product tree still carries a fleet nickname (see grep above)"
-    grep -rnIiE 'ni'"tro"'|haz'"mat" "${e65_scan[@]}" \
-        --exclude=snapshot-public.sh \
-        --exclude='lp-*.txt' --exclude='debian-*.txt' >&2 || true
-else
-    e65 pass
-fi
-
-# 4. (D2) the RFC 5737 rebase: the private-LAN example IP is gone from
-#    the shipped docs. EGL-372: the positive pin accepts any complete RFC
-#    5737 TEST-NET address instead of freezing one address (a legitimate
-#    example renumbering survives; the negative sweep below is unchanged).
-#    R-EGL-372-2: a bare prefix is not an address — require a valid 0-255
-#    fourth octet with no alphanumeric/dot continuation, so prefix-only
-#    (`192.0.2.`), nonnumeric-suffix (`192.0.2.foo`), and out-of-range
-#    (`192.0.2.999`) text cannot satisfy the pin.
-if grep -rn '192\.168\.0\.24' "$TREE_ROOT/docs" >/dev/null 2>&1; then
-    e65 fail "docs still carry the private-LAN example IP"
-else
-    e65 pass
-fi
-e65_octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
-e65_testnet="(^|[^0-9A-Za-z.])(192\\.0\\.2|198\\.51\\.100|203\\.0\\.113)\\.${e65_octet}([^0-9A-Za-z.]|\$)"
-grep -qE "$e65_testnet" "$TREE_ROOT/docs/reference/policy-reference.md" \
-    && e65 pass || e65 fail "policy-reference example is a complete RFC 5737 TEST-NET address"
-if grep -q 'llm-cloud' "$TREE_ROOT/gateway/Containerfile"; then
-    e65 fail "Containerfile still names the pre-rename profile"
-else
-    e65 pass
-fi
-
-section_end egl65
 
 # --- EGL-287: setup verb grammar — summary/pages, aliases, conflicts -----
 # P1/P2: the four summary surfaces (-h, --help, bare, help) are byte-equal,
@@ -9338,8 +10214,8 @@ section_end egl65
 # help wins); error edges (unknown topic, extra token, help help, bare
 # apparmor) are rc 2 with the named message + summary on stderr; help is
 # rootless/config-free. D2 aliases are the legacy code: --doctor == doctor,
-# legacy flag bundle == init (same rc/output/unit.env); a legacy mode flag
-# beside a verb is a named rc 2 usage error.
+# legacy flag bundle == init (same rc/output); a legacy mode flag beside a
+# verb is a named rc 2 usage error.
 section_begin egl287 "EGL-287 setup verb grammar"
 eg287() { assert "$@"; }
 
@@ -9368,16 +10244,56 @@ else
     eg287 pass
 fi
 
-# 2. Verb/topic pages. EGL-372: pin each page's named property — the four
+# 1b. EGL-517: setup help/usage is paste-inert — no unquoted `<`, `>`,
+#     `|`, `&`, `;`, or backtick on a command-shaped line.
+#     EGL-517-F2: derive the verb list from the live summary index, never a
+#     literal here, so a verb added later cannot silently escape the scan.
+verbs517=()
+while IFS= read -r v517; do
+    [[ -n "$v517" ]] && verbs517+=( "$v517" )
+done < <("$SKIT" -h 2>&1 | awk '
+    /^Verbs:$/ { inb = 1; next }
+    inb && /^[[:space:]]*$/ { exit }
+    inb {
+        line = $0
+        sub(/^[[:space:]]*egresslock-setup[[:space:]]+/, "", line)
+        if (line == $0) next
+        split(line, a, /[[:space:]]+/)
+        if (a[1] == "help") next
+        if (a[1] ~ /^[a-z][a-z-]*$/) print a[1]
+    }')
+(( ${#verbs517[@]} > 0 )) \
+    && eg287 pass || eg287 fail "derived verbs: summary index not parsed"
+assert_setup_help_lines_paste_safe "summary" "$("$SKIT" -h 2>&1)"
+assert_setup_help_page_no_angles "summary" "$("$SKIT" -h 2>&1)"
+for t287 in "${verbs517[@]}"; do
+    o287="$("$SKIT" help "$t287" 2>&1)"; r287=$?
+    [[ "$r287" == 0 ]] && eg287 pass || eg287 fail "derived verb help $t287 (rc=$r287)"
+    assert_setup_help_lines_paste_safe "help $t287" "$o287"
+    assert_setup_help_page_no_angles "help $t287" "$o287"
+done
+for t287 in env "env test"; do
+    assert_setup_help_page_no_angles "help $t287" "$("$SKIT" help $t287 2>&1)"
+done
+# EGL-517-D3: the setup/kit non-help emitted text (Error/NOTE/fix/usage) is
+# swept too; the source scan keeps a new site from escaping. install-kit.sh
+# and uninstall-kit.sh are absent from an extracted kit, so scan when present.
+assert_setup_source_clean "$TREE_ROOT/egresslock-setup" "egresslock-setup"
+for f517 in install-kit.sh uninstall-kit.sh; do
+    [[ -f "$TREE_ROOT/$f517" ]] && assert_setup_source_clean "$TREE_ROOT/$f517" "$f517"
+done
+
+# 2. Verb/topic pages. EGL-372: pin each page's named property — the five
 #    verb pages open with their usage synopsis; `env` is a reference page
 #    (no synopsis) and opens with its title + Environment block.
-for t287 in init doctor build-gateway apparmor env; do
+for t287 in init import doctor build-gateway apparmor env; do
     o="$("$SKIT" help "$t287" 2>/dev/null)"; rc=$?
     case "$t287" in
-        init) want287='egresslock-setup init --account <acct> [--from <conf>] [--profile <p>] [--init-conf] [--prefix <path>]' ;;
-        doctor) want287='egresslock-setup doctor [--account <acct>] [--prefix <path>]' ;;
-        build-gateway) want287='egresslock-setup build-gateway [--force] [--prefix <path>]' ;;
-        apparmor) want287='egresslock-setup apparmor add|remove|check' ;;
+        init) want287='egresslock-setup init ACCOUNT [--from CONF] [--init-conf] [--prefix PATH]' ;;
+        import) want287='egresslock-setup import ACCOUNT --from CONF [--allowlist PATH] [--force] [--prefix PATH]' ;;
+        doctor) want287='egresslock-setup doctor [ACCOUNT] [--profile PROFILE] [--prefix PATH]' ;;
+        build-gateway) want287='egresslock-setup build-gateway [--force] [--prefix PATH]' ;;
+        apparmor) want287='egresslock-setup apparmor add, remove, or check' ;;
     esac
     if [[ "$t287" == env ]]; then
         [[ "$rc" == 0 \
@@ -9399,7 +10315,7 @@ for t287 in init doctor build-gateway apparmor env; do
         eg287 pass
     fi
 done
-for t287 in init doctor build-gateway apparmor; do
+for t287 in init import doctor build-gateway apparmor; do
     o="$("$SKIT" "$t287" --help 2>/dev/null)"; rc=$?
     [[ "$rc" == 0 && "$o" == "$("$SKIT" help "$t287" 2>/dev/null)" ]] \
         && eg287 pass || eg287 fail "$t287 --help == help $t287 (rc=$rc)"
@@ -9425,6 +10341,12 @@ done
 [[ "$s287_env" == *"help env test"* ]] || s287_ok=0
 [[ "$s287_env_rc" == 0 && "$s287_test_rc" == 0 && "$s287_ok" == 1 ]] \
     && eg287 pass || eg287 fail "EGL-410 env/test split (rc=$s287_env_rc/$s287_test_rc)"
+# EGL-531-D3: the SHARE row carries the same test-mode marker as its
+# siblings now that the hook is gated.
+s287_share="$(printf '%s\n' "$s287_test" | grep -A4 '^  EGRESSLOCK_SHARE=')"
+[[ "$s287_share" == *"requires"* \
+    && "$s287_share" == *"EGRESSLOCK_KIT_ALLOW_NON_ROOT=1"* ]] \
+    && eg287 pass || eg287 fail "help env test SHARE row carries the test-mode marker"
 if grep -qE "$k59_id_re" <<<"$s287_test"; then
     eg287 fail "help env test leaks ticket/process refs"
 else
@@ -9479,36 +10401,33 @@ o1="$("$SKIT" --apparmor-check 2>&1)"; r1=$?
 o2="$("$SKIT" apparmor check 2>&1)"; r2=$?
 [[ "$r1" == "$r2" && "$o1" == "$o2" ]] \
     && eg287 pass || eg287 fail "--apparmor-check == apparmor check (rc $r1/$r2)"
-# 4d. init: the verb wires the same account state (unit.env) as the
-#     legacy bundle, byte-equal output.
+# 4d. init: the verb wires the same account state as the legacy bundle,
+#     byte-equal output, and neither writes a unit.env (EGL-333-D2).
 s287_i="$STATE/egl287/init"; rm -rf "$s287_i"
 mkdir -p "$s287_i/prefix" "$s287_i/home/u287/.config/egresslock"
 env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
     EGRESSLOCK_PATH_BINDIR="$s287_i/prefix/wbin" EGRESSLOCK_PATH_SBINDIR="$s287_i/prefix/wsbin" \
     "$KIT" --prefix "$s287_i/prefix" >/dev/null 2>&1
-printf 'profile p1 10.99.0.0/24\n    rule gateway-only\n    gateway 10.99.0.2 3128 p1-allowlist\n' > "$s287_i/site.conf"
-printf '# starter\n' > "$s287_i/p1-allowlist"
 s287_legen() { # <legacy|verb> <image-tag>
     local form="$1" tag="$2"
+    rm -f "$s287_i/home/u287/.config/egresslock/main.conf" \
+          "$s287_i/home/u287/.config/egresslock/main-allowlist"
     if [[ "$form" == legacy ]]; then
         env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$s287_i/home/u287" \
             EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_GW_IMAGE="localhost/egresslock-gateway:$tag" \
-            "$SKIT" --prefix "$s287_i/prefix" --account u287 --conf "$s287_i/site.conf" --profile p1 2>&1
+            "$SKIT" --prefix "$s287_i/prefix" --account u287 --init-conf 2>&1
     else
         env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$s287_i/home/u287" \
             EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_GW_IMAGE="localhost/egresslock-gateway:$tag" \
-            "$SKIT" init --prefix "$s287_i/prefix" --account u287 --conf "$s287_i/site.conf" --profile p1 2>&1
+            "$SKIT" init --prefix "$s287_i/prefix" --account u287 --init-conf 2>&1
     fi
 }
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"; : > "$STATE/buildlog"
 o1="$(s287_legen legacy e287a)"; r1=$?
-rm -f "$s287_i/home/u287/.config/egresslock/unit.env" \
-      "$s287_i/home/u287/.config/egresslock/p1.conf" \
-      "$s287_i/home/u287/.config/egresslock/p1-allowlist"
 : > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"; : > "$STATE/buildlog"
 o2="$(s287_legen verb e287b)"; r2=$?
-[[ "$(cat "$s287_i/home/u287/.config/egresslock/unit.env")" == "EGRESSLOCK_PROFILE=p1" ]] \
-    && eg287 pass || eg287 fail "init verb wires unit.env (got: $(cat "$s287_i/home/u287/.config/egresslock/unit.env" 2>/dev/null))"
+[[ ! -e "$s287_i/home/u287/.config/egresslock/unit.env" ]] \
+    && eg287 pass || eg287 fail "init verb writes no unit.env (got: $(cat "$s287_i/home/u287/.config/egresslock/unit.env" 2>/dev/null))"
 [[ "$r1" == "$r2" && "$o1" == "$o2" ]] \
     && eg287 pass || eg287 fail "init verb == legacy bundle (rc $r1/$r2; diff: $(diff <(printf '%s' "$o1") <(printf '%s' "$o2") >/dev/null 2>&1 || diff <(printf '%s' "$o1") <(printf '%s' "$o2") 2>&1 | head -3))"
 
@@ -9533,6 +10452,81 @@ o2="$("$SKIT" init --build-gateway 2>&1 1>/dev/null)"
 [[ "$rc" == 2 && "$o2" == *"egresslock-setup: --build-gateway is a verb: run 'egresslock-setup build-gateway'"* ]] \
     && eg287 pass || eg287 fail "init --build-gateway refused (rc=$rc, out: $o2)"
 
+# 6. EGL-517: seeded-sandbox paste — a swept setup synopsis line performs
+#    no file operation. Seed the placeholder names and the old lowercase
+#    trigger words; paste each command-shaped line; assert rc 2 and a
+#    byte-identical file set (no truncation, no junk).
+s517="$TESTROOT/s517"; rm -rf "$s517"; mkdir -p "$s517"
+for w in profile print apply list p PROFILE NAME ACCOUNT CONF PATH COMMAND CIDR HOST PORT HOST:PORT VERB UID PROFILE.conf .pins .conf .revoke-pending; do
+    printf 'seed:%s\n' "$w" > "$s517/$w"
+done
+# EGL-517-F2: one single-char file per kept bracket class, derived from the
+# same emitted lines (a pasted `[--flag]` group is a bash character class).
+s517_cls=()
+while IFS= read -r b517; do
+    [[ -n "$b517" ]] && s517_cls+=( "$b517" )
+done < <(
+    { "$SKIT" -h 2>&1
+      for t287 in "${verbs517[@]}"; do "$SKIT" help "$t287" 2>&1; done
+    } | grep -oE '\[[^]]*\]' | sed -E 's/^\[//; s/\]$//' \
+      | awk 'match($0, /[A-Za-z0-9]/) { print substr($0, RSTART, 1) }' | sort -u)
+(( ${#s517_cls[@]} > 0 )) \
+    && eg287 pass || eg287 fail "seeded paste: no bracket class derived"
+for b517 in "${s517_cls[@]}"; do
+    printf 'seed:%s\n' "$b517" > "$s517/$b517"
+done
+# R-EGL-517-5 F12: hash dotfiles too — `<profile>.pins` pastes as an
+# output redirect to a dot-named target, which `sha256sum -- *` cannot see.
+s517_snap() { ( cd "$s517" && ls -A && sha256sum -- * .[!.]* 2>/dev/null ) | sort; }
+s517_before="$(s517_snap)"
+s517_bad=""
+paste517s() { # paste517s <line>
+    local rc=0 out after
+    out="$( cd "$s517" && eval "$1" 2>&1 )" || rc=$?
+    after="$(s517_snap)"
+    if [[ "$1" == 'egresslock-setup doctor [ACCOUNT]' ]]; then
+        # EGL-581/EGL-600: the account is a real optional operand, so the
+        # seeded bracket-class file makes this synopsis paste as a
+        # one-character account name — a valid read-only account-slice
+        # request that must refuse as non-root, not a usage error. Keep the
+        # file-op guard; require the root refusal.
+        if [[ "$rc" != 1 || "$out" != *"must run as root"* ]]; then
+            s517_bad="rc=$rc line=$1 out=$out"
+        elif [[ "$after" != "$s517_before" ]]; then
+            s517_bad="file change line=$1"
+        fi
+        return
+    fi
+    if [[ "$rc" != 2 ]]; then
+        s517_bad="rc=$rc line=$1 out=$out"
+    elif [[ "$after" != "$s517_before" ]]; then
+        s517_bad="file change line=$1"
+    fi
+}
+paste517s_any() { # paste517s_any <line> — file-op check only (rc may vary)
+    local after
+    ( cd "$s517" && eval "$1" ) >/dev/null 2>&1 || true
+    after="$(s517_snap)"
+    if [[ "$after" != "$s517_before" ]]; then
+        s517_bad="file change line=$1"
+    fi
+}
+while IFS= read -r l; do
+    paste517s "$l"
+done < <("$SKIT" -h 2>&1 \
+    | awk '/^  egresslock-setup / { sub(/^  /, ""); split($0, a, /  +/); print a[1] }' \
+    | grep -E '[A-Z]{2}|\[[^]]|apparmor add, remove, or check')
+while IFS= read -r l; do
+    paste517s "$l"
+done < <(for t287 in "${verbs517[@]}"; do
+              "$SKIT" help "$t287" 2>&1 | grep -E '^egresslock-setup '
+          done | grep -E '[A-Z]{2}|\[[^]]|apparmor add, remove, or check')
+# Full index lines (description included): file-op check only.
+while IFS= read -r l; do
+    paste517s_any "$l"
+done < <("$SKIT" -h 2>&1 | grep -E '^  egresslock-setup ')
+[[ -z "$s517_bad" ]] && eg287 pass || eg287 fail "seeded paste: $s517_bad"
+
 section_end egl287
 
 # --- EGL-200: setup console output ------------------------------------------
@@ -9549,10 +10543,10 @@ env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$UNITS" \
     && e200 pass || e200 fail "egl200 fixture: kit deployed to $e200p"
 e200h="$STATE/egl200/home/actx"
 mkdir -p "$e200h/.config/egresslock"
-printf 'profile p1 10.99.7.0/24\n    rule gateway-only\n    gateway 10.99.7.2 3128 p1-allowlist\n' \
+printf 'profile p1 10.99.7.0/24\n    gateway 10.99.7.2 3128 p1-allowlist\n' \
     > "$STATE/egl200/gw.conf"
 printf '# starter\n' > "$STATE/egl200/p1-allowlist"
-printf 'profile pa 10.99.8.0/24\n    rule gateway-only\n    gateway 10.99.8.2 3128 pa-allowlist\n' > "$STATE/egl200/pa.conf"
+printf 'profile pa 10.99.8.0/24\n    gateway 10.99.8.2 3128 pa-allowlist\n' > "$STATE/egl200/pa.conf"
 printf '# starter\n' > "$STATE/egl200/pa-allowlist"
 e200_map() { grep -E '^[0-9]\) .* … (OK|SKIP|FAIL)$' <<<"$1"; }
 
@@ -9561,7 +10555,7 @@ e200_map() { grep -E '^[0-9]\) .* … (OK|SKIP|FAIL)$' <<<"$1"; }
 : > "$STATE/build-noisy"
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e200h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e200gw \
-    $SKIT --prefix "$e200p" --account actx --conf "$STATE/egl200/gw.conf" 2>&1)"; rc=$?
+    $SKIT init --prefix "$e200p" --account actx --from "$STATE/egl200/gw.conf" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"egresslock-setup: building the gateway image — first run downloads the base image and packages; a few minutes. Build log: $e200h/.config/egresslock/gateway-build.log"* \
     && "$o" != *"MOCK-BUILD-OUTPUT"* ]] \
     && e200 pass || e200 fail "EGL-200 P3-C quiet build: M8 only, stream not on terminal (rc=$rc, out: $o)"
@@ -9572,41 +10566,67 @@ grep -q "MOCK-BUILD-OUTPUT" "$e200h/.config/egresslock/gateway-build.log" \
 [[ "$o" == *"next steps (as the account):"* \
     && "$o" == *"  sudo -iu actx"* \
     && "$o" == *"  egresslock ensure p1"* \
-    && "$o" == *"the scheduled check will verify every profile"* ]] \
-    && e200 pass || e200 fail "EGL-200 M1(c)/M3: block + derived-profile wording (out: $o)"
+    && "$o" != *"the scheduled check"* ]] \
+    && e200 pass || e200 fail "EGL-200 M1(c)/EGL-600 P3: block + no claim without --enable (out: $o)"
 rm -f "$STATE/build-noisy"
 
 # 2. Image present re-run: the quiet path is skipped entirely.
 : > "$STATE/buildlog"
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e200h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e200gw \
-    $SKIT --prefix "$e200p" --account actx --conf "$STATE/egl200/gw.conf" 2>&1)"; rc=$?
+    $SKIT init --prefix "$e200p" --account actx --from "$STATE/egl200/gw.conf" 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"gateway image present"* && "$o" != *"building the gateway image"* ]] \
     && e200 pass || e200 fail "EGL-200 P3-C re-run: image present, no build line (rc=$rc, out: $o)"
 
-# 3. Failing build: rc 1, step 5 FAIL, M9 names the log and its last
+# 3. Failing build: rc 1, step 4 FAIL, M9 names the log and its last
 #    lines are shown (noisy marker feeds the log the tail prints).
 : > "$STATE/build-noisy"; : > "$STATE/build-fails"
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e200h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e200gw2 \
-    $SKIT --prefix "$e200p" --account actx --conf "$STATE/egl200/gw.conf" 2>&1)"; rc=$?
+    $SKIT init --prefix "$e200p" --account actx --from "$STATE/egl200/gw.conf" 2>&1)"; rc=$?
 rm -f "$STATE/build-fails"; rm -f "$STATE/build-noisy"
-[[ "$rc" == 1 && "$(e200_map "$o" | tail -1)" == "5) gateway image … FAIL" \
+[[ "$rc" == 1 && "$(e200_map "$o" | tail -1)" == "4) gateway image … FAIL" \
     && "$o" == *"egresslock-setup: gateway image build failed; last lines of the build log ($e200h/.config/egresslock/gateway-build.log):"* \
     && "$o" == *"MOCK-BUILD-OUTPUT"* ]] \
     && e200 pass || e200 fail "EGL-200 P3-C build failure: M9 + tail shown (rc=$rc, map: $(e200_map "$o" | tr '\n' '|'))"
 
-# 4. EGL-200 M2: named --profile keeps the operator wording, no
-#    'verify mode:' label; single-profile conf (EGL-323: one profile
-#    per conf) with the required gateway line (EGL-366).
+# 4. EGL-200 M2/EGL-333: a second profile is wired aggregate — no
+#    'named mode' or 'verify mode:' wording survives, and without
+#    --enable no scheduled-check claim prints (EGL-600 P3). EGL-333-F5:
+#    the next-step block names the profile THIS run imported (pa), not
+#    the aggregate list's first entry (p1), so the freshly imported
+#    profile is the one the operator is told to ensure.
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e200h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
-    $SKIT --prefix "$e200p" --account actx --conf "$STATE/egl200/pa.conf" --profile pa 2>&1)"; rc=$?
-[[ "$rc" == 0 && "$o" == *"egresslock-setup: the scheduled check will verify only profile 'pa'"* \
-    && "$o" != *"verify mode:"* && "$o" == *"  egresslock ensure pa"* ]] \
-    && e200 pass || e200 fail "EGL-200 M2: named scheduled-check wording (rc=$rc, out: $o)"
+    $SKIT init --prefix "$e200p" --account actx --from "$STATE/egl200/pa.conf" 2>&1)"; rc=$?
+[[ "$rc" == 0 && "$o" != *"the scheduled check"* \
+    && "$o" != *"only profile"* && "$o" != *"verify mode:"* \
+    && "$o" == *"  egresslock ensure pa"* && "$o" == *"  egresslock verify pa"* ]] \
+    && e200 pass || e200 fail "EGL-200 M2/F5 + EGL-600 P3: no claim without --enable (rc=$rc, out: $o)"
 
-# 5. EGL-200 M1(c): a sweep-mode setup (--init-conf only: no --conf, so
+# 4b. EGL-333-F5: an unchanged import stages nothing ("import:
+#     unchanged"), so the next-step block must name the profile --from
+#     named (pa), not the aggregate list's first entry (p1). The pair
+#     imported by leg 4 already matches, so this takes the unchanged
+#     branch.
+o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e200h" \
+    EGRESSLOCK_UNIT_DIR="$UNITS" \
+    $SKIT init --prefix "$e200p" --account actx --from "$STATE/egl200/pa.conf" 2>&1)"; rc=$?
+[[ "$rc" == 0 && "$o" == *"egresslock-setup: import: unchanged"* \
+    && "$o" == *"  egresslock ensure pa"* && "$o" == *"  egresslock verify pa"* ]] \
+    && e200 pass || e200 fail "EGL-333-F5: unchanged pair import names the imported profile (rc=$rc, out: $o)"
+
+# 4c. EGL-333-F5, the source-is-destination unchanged return: --from
+#     naming the live destination pair validates in place — the block
+#     still names the imported profile.
+o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e200h" \
+    EGRESSLOCK_UNIT_DIR="$UNITS" \
+    $SKIT init --prefix "$e200p" --account actx --from "$e200h/.config/egresslock/pa.conf" 2>&1)"; rc=$?
+[[ "$rc" == 0 && "$o" == *"egresslock-setup: import: unchanged"* \
+    && "$o" == *"  egresslock ensure pa"* ]] \
+    && e200 pass || e200 fail "EGL-333-F5: source-is-destination import names the imported profile (rc=$rc, out: $o)"
+
+# 5. EGL-200 M1(c): a sweep-mode setup (--init-conf only: no --from, so
 #    no profile is derived) names the first profile from the step-1
 #    list capture for the ensure hint.
 e200h5="$STATE/egl200/home/sweep"
@@ -9615,19 +10635,206 @@ o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e200h5" \
     EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:e200gw \
     $SKIT --prefix "$e200p" --account actx --init-conf 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$o" == *"  egresslock ensure main"* \
-    && "$o" == *"the scheduled check will verify every profile"* ]] \
-    && e200 pass || e200 fail "EGL-200 M1(c): first-profile fallback from the list capture (rc=$rc, out: $o)"
+    && "$o" != *"the scheduled check"* ]] \
+    && e200 pass || e200 fail "EGL-200 M1(c)/EGL-600 P3: first-profile fallback, no claim (rc=$rc, out: $o)"
 
-# 6. EGL-325: --profile must match the source conf's profile; the
-#    refusal is named before anything is installed (no stray conf).
+# 6. EGL-333-D9: init rejects --profile with the doctor-flag usage error
+#    before anything is installed (no stray conf).
 o="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e200h" \
     EGRESSLOCK_UNIT_DIR="$UNITS" \
-    $SKIT --prefix "$e200p" --account actx --conf "$STATE/egl200/pa.conf" --profile nope 2>&1)"; rc=$?
-[[ "$rc" == 2 && "$o" == *"--profile 'nope' does not match the source conf's profile 'pa'"* \
+    $SKIT init --prefix "$e200p" --account actx --from "$STATE/egl200/pa.conf" --profile nope 2>&1)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"--profile is a doctor flag only (inspection narrowing)"* \
     && ! -e "$e200h/.config/egresslock/nope.conf" ]] \
-    && e200 pass || e200 fail "EGL-325: --profile/source-profile mismatch refused (rc=$rc, out: $o)"
+    && e200 pass || e200 fail "EGL-333-D9: init --profile refused rc 2 (rc=$rc, out: $o)"
 
 section_end egl200
+
+# --- EGL-581: positional ACCOUNT on init/import/doctor; reserved 'all' ----
+section_begin egl581 "EGL-581 positional ACCOUNT + reserved all"
+e581() { assert "$@"; }
+e581d="$STATE/egl581"; rm -rf "$e581d"
+mkdir -p "$e581d/home/u581" "$e581d/home/u582"
+e581_run() { # <home> <setup args...>
+    local h="$1"; shift
+    env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$h" \
+        EGRESSLOCK_UNIT_DIR="$UNITS" EGRESSLOCK_GW_IMAGE=localhost/egresslock-gateway:latest \
+        "$SKIT" "$@" --prefix "$SKITP"
+}
+e581_ng() { env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT "$SKIT" "$@" 2>&1; }
+
+# 1. Parse equivalence, root-gate witness (hook off, non-root): the
+#    positional, the flags-before-operand spelling, and the legacy
+#    --account alias all reach the same gate with the same bytes. A
+#    parser miss would be rc 2 `unknown argument` instead.
+for e581_v in init import doctor; do
+    case "$e581_v" in
+        init)   e581_tail=(--from /nonexistent/none.conf) ;;
+        import) e581_tail=(--from /nonexistent/none.conf) ;;
+        doctor) e581_tail=() ;;
+    esac
+    o1="$(e581_ng "$e581_v" u581 "${e581_tail[@]}")"; r1=$?
+    o2="$(e581_ng "$e581_v" "${e581_tail[@]}" u581)"; r2=$?
+    o3="$(e581_ng "$e581_v" --account u581 "${e581_tail[@]}")"; r3=$?
+    if [[ "$r1" == 1 && "$r2" == 1 && "$r3" == 1 \
+          && "$o1" == "$o2" && "$o1" == "$o3" \
+          && "$o1" == *"must run as root"* && "$o1" != *"unknown argument"* ]]; then
+        e581 pass
+    else
+        e581 fail "$e581_v positional/flags/alias root-gate parity (rc $r1/$r2/$r3, out: $o1)"
+    fi
+done
+
+# 2. Accepted forms in kit-test mode (account slice reached): the
+#    positional and the alias run the same code path, flags may sit
+#    before or after the operand, and the same value in both forms is
+#    accepted.
+o1="$(e581_run "$e581d/home/u581" init u581 2>&1)"; r1=$?
+o2="$(e581_run "$e581d/home/u581" init --account u581 2>&1)"; r2=$?
+[[ "$r1" == "$r2" && "$o1" == "$o2" && "$o1" == *"no profile configs in"* ]] \
+    && e581 pass || e581 fail "init positional == --account (rc $r1/$r2, out: $o1)"
+o1="$(e581_run "$e581d/home/u581" import u581 --from /nonexistent/none.conf 2>&1)"; r1=$?
+o2="$(e581_run "$e581d/home/u581" import --account u581 --from /nonexistent/none.conf 2>&1)"; r2=$?
+[[ "$r1" == "$r2" && "$o1" == "$o2" && "$o1" == *"conf not found"* ]] \
+    && e581 pass || e581 fail "import positional == --account (rc $r1/$r2, out: $o1)"
+o1="$(e581_run "$e581d/home/u581" init u581 --from /nonexistent/none.conf 2>&1)"; r1=$?
+o2="$(e581_run "$e581d/home/u581" init --from /nonexistent/none.conf u581 2>&1)"; r2=$?
+o3="$(e581_run "$e581d/home/u581" init u581 --account u581 --from /nonexistent/none.conf 2>&1)"; r3=$?
+[[ "$r1" == "$r2" && "$r2" == "$r3" && "$o1" == "$o2" && "$o2" == "$o3" ]] \
+    && e581 pass || e581 fail "init operand before/after flags + same value both forms (rc $r1/$r2/$r3)"
+
+# 3. Both forms with different values is rc 2 before any account read;
+#    the message names both values and the one-form rule.
+o1="$(e581_run "$e581d/home/u581" init u581 --account u582 2>&1)"; r1=$?
+[[ "$r1" == 2 \
+    && "$o1" == *"egresslock-setup: account names differ: --account 'u582' and positional 'u581' (pass one form, or the same value in both)"* \
+    && "$o1" != *"no profile configs"* ]] \
+    && e581 pass || e581 fail "different --account/positional values rc 2 named (rc=$r1, out: $o1)"
+
+# 4. One positional max: a second one rides the existing unknown-argument
+#    arm for the three account verbs; the other verbs take no operand.
+for e581_case in "init u581 u582" "import u581 u582 --from /nonexistent/none.conf" "doctor u581 u582"; do
+    read -r -a e581_argv <<<"$e581_case"
+    o="$(e581_ng "${e581_argv[@]}")"; rc=$?
+    [[ "$rc" == 2 && "$o" == *"unknown argument: u582"* ]] \
+        && e581 pass || e581 fail "second positional refused: $e581_case (rc=$rc, out: $o)"
+done
+for e581_case in "apparmor add u581" "build-gateway u581"; do
+    read -r -a e581_argv <<<"$e581_case"
+    o="$(e581_ng "${e581_argv[@]}")"; rc=$?
+    [[ "$rc" == 2 && "$o" == *"unknown argument: u581"* ]] \
+        && e581 pass || e581 fail "non-account verb rejects operand: $e581_case (rc=$rc, out: $o)"
+done
+
+# 5. Bare doctor stays the host slice; doctor ACCOUNT adds the account
+#    slice; --profile narrows the positional form identically.
+o1="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT "$SKIT" doctor --prefix "$SKITP" 2>&1)"; r1=$?
+o2="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT "$SKIT" --doctor --prefix "$SKITP" 2>&1)"; r2=$?
+[[ "$r1" == "$r2" && "$o1" == "$o2" \
+    && "$o1" == *"not examined (no account operand)"* \
+    && "$o1" == *"sudo egresslock-setup doctor ACCOUNT"* ]] \
+    && e581 pass || e581 fail "bare doctor host slice + pointer (rc $r1/$r2, out: $o1)"
+o1="$(e581_run "$e581d/home/u581" doctor u581)"; r1=$?
+o2="$(e581_run "$e581d/home/u581" doctor --account u581)"; r2=$?
+[[ "$r1" == "$r2" && "$o1" == "$o2" && "$o1" == *"conf parse: FAIL"* ]] \
+    && e581 pass || e581 fail "doctor ACCOUNT == doctor --account ACCOUNT (rc $r1/$r2, out: $o1)"
+o1="$(e581_run "$e581d/home/u581" doctor u581 --profile main)"; r1=$?
+o2="$(e581_run "$e581d/home/u581" doctor --account u581 --profile main)"; r2=$?
+[[ "$r1" == "$r2" && "$o1" == "$o2" ]] \
+    && e581 pass || e581 fail "doctor ACCOUNT --profile == alias form (rc $r1/$r2)"
+
+# 6. Required-account usage names the positional spelling per verb; the
+#    verb-less bundle keeps the legacy flag spelling.
+o="$(e581_ng init)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"egresslock-setup: init requires an account: egresslock-setup init ACCOUNT [--from CONF or --init-conf]"* ]] \
+    && e581 pass || e581 fail "init missing account names init ACCOUNT (rc=$rc, out: $o)"
+o="$(e581_ng import --from /nonexistent/none.conf)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"egresslock-setup: import requires an account: egresslock-setup import ACCOUNT --from CONF"* ]] \
+    && e581 pass || e581 fail "import missing account names import ACCOUNT (rc=$rc, out: $o)"
+o="$(e581_ng --init-conf)"; rc=$?
+[[ "$rc" == 2 && "$o" == *"egresslock-setup: --account is required (or a verb: doctor, build-gateway, apparmor add, remove, or check)"* ]] \
+    && e581 pass || e581 fail "legacy bundle keeps the --account-required wording (rc=$rc, out: $o)"
+
+# 7. 'all' is reserved on every setup path that resolves an account name:
+#    one message, rc 2, before root/id/account-home, and it fires in
+#    kit-test mode too (no hook bypass). The fix line points at the
+#    shipped reference note.
+e581_reserved="egresslock-setup: account name 'all' is reserved (it means every account in setup commands); use a different account name"
+e581_fix="  fix: if this is your runner account, rename it and re-run setup (steps: docs/reference/scripts-and-environment.md)"
+e581_hall="$e581d/home/all-never"
+: > "$STATE/systemctl.log"; : > "$STATE/loginctl.log"; : > "$STATE/buildlog"
+e581_allcheck() { # <label> <setup args...>
+    local label="$1"; shift
+    local err="$e581d/all.err" out rc
+    out="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_ACCOUNT_HOME="$e581_hall" \
+        EGRESSLOCK_UNIT_DIR="$UNITS" "$SKIT" "$@" --prefix "$SKITP" 2>"$err")"; rc=$?
+    if [[ "$rc" == 2 && -z "$out" \
+          && "$(sed -n '1p' "$err")" == "$e581_reserved" \
+          && "$(sed -n '2p' "$err")" == "$e581_fix" \
+          && "$(sed -n '3p' "$err")" == "Usage:" \
+          && "$(grep -cF -- "$e581_reserved" "$err")" == 1 \
+          && "$(grep -cF 'must run as root' "$err")" == 0 \
+          && "$(grep -cF 'no such account' "$err")" == 0 ]]; then
+        e581 pass
+    else
+        e581 fail "reserved all ($label): rc=$rc out=$out err=$(head -3 "$err" | tr '\n' '|')"
+    fi
+}
+e581_allcheck "init" init all
+e581_allcheck "import" import all --from /nonexistent/none.conf
+e581_allcheck "doctor" doctor all
+e581_allcheck "legacy bundle" --account all --init-conf
+e581_allcheck "init --account" init --account all
+e581_allcheck "import --account" import --account all --from /nonexistent/none.conf
+e581_allcheck "doctor --account" doctor --account all
+e581_allcheck "both forms same value" init all --account all
+[[ ! -e "$e581_hall" ]] \
+    && e581 pass || e581 fail "reserved all never resolves the account home"
+[[ ! -s "$STATE/systemctl.log" && ! -s "$STATE/loginctl.log" && ! -s "$STATE/buildlog" ]] \
+    && e581 pass || e581 fail "reserved all has no systemd/linger/build side effect"
+# Case-sensitive: ALL is a different OS name and stays legal.
+o="$(e581_ng init ALL --from /nonexistent/none.conf)"; rc=$?
+[[ "$rc" == 1 && "$o" == *"must run as root"* && "$o" != *"is reserved"* ]] \
+    && e581 pass || e581 fail "ALL is not reserved (rc=$rc, out: $o)"
+o="$(e581_run "$e581d/home/u581" doctor ALL)"; rc=$?
+[[ "$rc" == 1 && "$o" == *"conf parse: FAIL"* && "$o" != *"is reserved"* ]] \
+    && e581 pass || e581 fail "doctor ALL reaches the account slice (rc=$rc, out: $o)"
+
+# 8. Help surfaces: the canonical synopses are positional (pinned above in
+#    egl287), the summary and reference page keep the alias discoverable,
+#    and no verb page teaches the old required flag form.
+e581_sum="$("$SKIT" -h 2>&1)"
+[[ "$e581_sum" == *"accepted as a hidden alias of the positional ACCOUNT on init, import,"* ]] \
+    && e581 pass || e581 fail "summary keeps the --account hidden-alias line"
+for e581_t in init import doctor; do
+    o="$("$SKIT" help "$e581_t" 2>/dev/null)"; rc=$?
+    [[ "$rc" == 0 ]] || e581 fail "help $e581_t rc 0 (rc=$rc)"
+    if grep -qE "^egresslock-setup $e581_t --account" <<<"$o"; then
+        e581 fail "help $e581_t still opens with the flag form"
+    else
+        e581 pass
+    fi
+done
+o="$("$SKIT" help init 2>/dev/null)"
+[[ "$o" == *"--account NAME"* && "$o" == *"legacy alias of ACCOUNT"* ]] \
+    && e581 pass || e581 fail "help init documents --account as the hidden alias"
+o="$("$SKIT" help import 2>/dev/null)"
+[[ "$(head -n1 <<<"$o")" == 'egresslock-setup import ACCOUNT --from CONF [--allowlist PATH] [--force] [--prefix PATH]' ]] \
+    && e581 pass || e581 fail "help import synopsis is positional (got: $(head -n1 <<<"$o"))"
+
+# 9. Emitted next-step producers teach the positional form (the installed
+#    kit and both packaging channels). The files are absent on an
+#    extracted kit, so skip with a named cause there.
+for e581_f in install-kit.sh packaging/build-deb.sh packaging/build-tarball.sh; do
+    [[ -f "$TREE_ROOT/$e581_f" ]] || continue
+    if grep -qF 'egresslock-setup init ACCT --init-conf --enable' "$TREE_ROOT/$e581_f" \
+       && ! grep -qF 'egresslock-setup init --account' "$TREE_ROOT/$e581_f"; then
+        e581 pass
+    else
+        e581 fail "$e581_f next step is not the positional form"
+    fi
+done
+
+section_end egl581
 
 # --- EGL-491: ignored test-hook warnings on the kit entry points ----------
 # D1/D2: every recognized gated hook set without the test flag warns once
@@ -9699,7 +10906,6 @@ profile main 10.99.0.0/24
     gateway 10.99.0.2 3128 main-allowlist
 EOF
 : > "$e491d/accthome/.config/egresslock/main-allowlist"
-printf 'EGRESSLOCK_PROFILE=main\n' > "$e491d/accthome/.config/egresslock/unit.env"
 : > "$e491d/decoyhome/.config/egresslock/e491-keep"
 cat > "$e491d/bin/id" <<'EOF'
 #!/usr/bin/env bash
@@ -9953,7 +11159,7 @@ printf '#!/bin/sh\n# egresslock-path-wrapper prefix=%s\nexec true\n' "$e491u/pre
 : > "$e491u/hook-units/egresslock-verify@.timer"
 : > "$e491u/hook-bin/egresslock"
 : > "$e491u/hook-sbin/egresslock-setup"
-: > "$e491u/accthome/.config/egresslock/unit.env"
+: > "$e491u/accthome/.config/egresslock/main.conf"
 : > "$e491u/decoyhome/.config/egresslock/e491-keep"
 cat > "$e491u/bin/id" <<'EOF'
 #!/usr/bin/env bash
@@ -10021,8 +11227,10 @@ else
 fi
 
 # 6. Silence negatives: unset hooks, an empty-string hook (counts as
-#    unset), an accepted-live name (EGRESSLOCK_SHARE), and the flag on
-#    (hooks live/honored) all stay silent.
+#    unset), and the flag on (hooks live/honored) all stay silent.
+#    EGL-531-D3: EGRESSLOCK_SHARE is no longer an accepted-live name —
+#    it moves to the warns arm, its one warning pinned where this leg
+#    used to pin silence.
 e491_sok=1
 e491_sctl="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT -u EGRESSLOCK_GW_IMAGE \
     -u EGRESSLOCK_UNIT_DIR -u EGRESSLOCK_SHARE "$SKIT" --help 2>"$e491d/silent-ctl.err")"; e491_sctl_rc=$?
@@ -10032,31 +11240,264 @@ e491_sout="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT EGRESSLOCK_GW_IMAGE= \
 [[ "$e491_src" == "$e491_sctl_rc" && "$e491_sout" == "$e491_sctl" \
     && ! -s "$e491d/silent-empty.err" ]] || e491_sok=0
 e491_sout="$(env -u EGRESSLOCK_KIT_ALLOW_NON_ROOT EGRESSLOCK_SHARE="$e491d/share" \
-    "$SKIT" --help 2>"$e491d/silent-live.err")"; e491_src=$?
+    "$SKIT" --help 2>"$e491d/silent-share.err")"; e491_src=$?
+e491_serr="$(cat "$e491d/silent-share.err")"
 [[ "$e491_src" == "$e491_sctl_rc" && "$e491_sout" == "$e491_sctl" \
-    && ! -s "$e491d/silent-live.err" ]] || e491_sok=0
+    && "$(e491_count "$e491_serr" EGRESSLOCK_SHARE)" == 1 \
+    && "$(printf '%s\n' "$e491_serr" | grep -c 'is set but ignored' || true)" == 1 \
+    && "$e491_serr" == *"EGRESSLOCK_SHARE $e491_hsent"* \
+    && "$e491_serr" != *"$e491d/share"* ]] || e491_sok=0
 e491_sout="$(env EGRESSLOCK_KIT_ALLOW_NON_ROOT=1 EGRESSLOCK_UNIT_DIR="$e491d/hook-units" \
     EGRESSLOCK_GW_IMAGE='localhost/egl491-on:latest' \
     "$SKIT" --help 2>"$e491d/silent-on.err")"; e491_src=$?
 [[ "$e491_src" == "$e491_sctl_rc" && "$e491_sout" == "$e491_sctl" \
     && ! -s "$e491d/silent-on.err" ]] || e491_sok=0
 (( e491_sok )) \
-    && e491 pass || e491 fail "silence negatives: unset/empty/accepted-live/flag-on stay warning-free (control rc=$e491_sctl_rc, errs: $(cat "$e491d"/silent-*.err 2>/dev/null))"
+    && e491 pass || e491 fail "silence negatives: unset/empty/flag-on stay warning-free; the ignored SHARE hook warns once (control rc=$e491_sctl_rc, errs: $(cat "$e491d"/silent-*.err 2>/dev/null))"
 
 section_end egl491
+
+# --- EGL-558: battery closing block (subtotal rows + BATTERY TOTAL) -----
+# Scratch tree: a copied tests/run.sh beside stub test-*.sh harnesses.
+# run.sh takes tests_dir from BASH_SOURCE (tests/run.sh:77), and --serial
+# skips the engine selection/weights machinery, so each probe is ~1s.
+section_begin egl558 "EGL-558 battery closing block"
+e558() { assert "$@"; }
+e558d="$STATE/egl558"
+rm -rf "$e558d"
+mkdir -p "$e558d/tests"
+cp "$TREE_ROOT/tests/run.sh" "$TREE_ROOT/tests/lib.sh" "$e558d/tests/"
+
+# Green stub: two asserts, no skips, record + printed TOTAL via lib.sh.
+cat > "$e558d/tests/test-a.sh" <<'EOF'
+#!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+section_begin e558a "EGL-558 scratch green"
+assert pass; assert pass
+section_end e558a
+results_emit e558a
+results_total
+EOF
+# Green stub with one named skip.
+cat > "$e558d/tests/test-b.sh" <<'EOF'
+#!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+section_begin e558b "EGL-558 scratch skip"
+assert pass
+section_end e558b
+skip "scratch-skip" "scratch skip (EGL-558 probe)"
+results_emit e558b
+results_total
+EOF
+chmod +x "$e558d/tests/test-a.sh" "$e558d/tests/test-b.sh"
+
+# Probe 1 — all green: subtotal rows, one battery-wide TOTAL as the last
+# numeric line, the per-harness TOTAL lines byte-identical, and the battery
+# skipped count reconciled with `run.sh: skips`. An inherited record path
+# must be dropped (a decoy file must not appear).
+e558_decoy="$e558d/decoy.result"
+e558rc=0
+( cd "$e558d" && EGRESSLOCK_TEST_BATTERY_RESULT="$e558_decoy" \
+    bash tests/run.sh --serial ) >"$e558d/green.out" 2>"$e558d/green.err" || e558rc=$?
+e558ok=1
+[[ "$e558rc" == 0 ]] || e558ok=0
+[[ ! -e "$e558_decoy" ]] || e558ok=0
+[[ ! -s "$e558d/green.err" ]] || e558ok=0
+grep -qxF 'run.sh: subtotal — test-a.sh: 2 passed, 0 failed, 0 skipped' "$e558d/green.out" || e558ok=0
+grep -qxF 'run.sh: subtotal — test-b.sh: 1 passed, 0 failed, 1 skipped' "$e558d/green.out" || e558ok=0
+grep -qxF 'RESULTS TOTAL: 2 passed, 0 failed, 0 skipped (tree: no-git)' "$e558d/green.out" || e558ok=0
+grep -qxF 'RESULTS TOTAL: 1 passed, 0 failed, 1 skipped (scratch-skip) (tree: no-git)' "$e558d/green.out" || e558ok=0
+grep -q '^run.sh: skips — 1 ' "$e558d/green.out" || e558ok=0
+[[ "$(grep -c '^BATTERY TOTAL:' "$e558d/green.out")" == 1 ]] || e558ok=0
+e558_want=$'BATTERY TOTAL: 3 passed, 0 failed, 1 skipped (tree: no-git)\nrun.sh: egresslock tests done (rc=0)'
+[[ "$(tail -n 2 "$e558d/green.out")" == "$e558_want" ]] || e558ok=0
+(( e558ok )) && e558 pass || e558 fail "all-green closing block (rc=$e558rc, tail: $(tail -n 4 "$e558d/green.out" 2>/dev/null | tr '\n' '|'))"
+
+# Probe 2 — red harness with a record: its counts still aggregate, the
+# battery line prints, rc stays 1 (a red run must not lose its total).
+cat > "$e558d/tests/test-red.sh" <<'EOF'
+#!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+section_begin e558r "EGL-558 scratch red"
+assert pass; assert fail "scratch red A"; assert fail "scratch red B"
+section_end e558r
+results_emit e558r
+results_total
+[[ "$total_fail" -eq 0 ]]
+EOF
+chmod +x "$e558d/tests/test-red.sh"
+e558rc=0
+( cd "$e558d" && bash tests/run.sh --serial ) >"$e558d/red.out" 2>"$e558d/red.err" || e558rc=$?
+e558ok=1
+[[ "$e558rc" == 1 ]] || e558ok=0
+grep -qxF 'run.sh: subtotal — test-red.sh: 1 passed, 2 failed, 0 skipped' "$e558d/red.out" || e558ok=0
+grep -qxF 'BATTERY TOTAL: 4 passed, 2 failed, 1 skipped (tree: no-git)' "$e558d/red.out" || e558ok=0
+grep -q 'battery TOTAL unavailable' "$e558d/red.err" && e558ok=0
+(( e558ok )) && e558 pass || e558 fail "red-with-record aggregates its counts (rc=$e558rc, tail: $(tail -n 3 "$e558d/red.out" 2>/dev/null | tr '\n' '|'))"
+rm -f "$e558d/tests/test-red.sh"
+
+# Probe 3 — crash before a total: named refusal, no battery line, healthy
+# rows still print, rc 1.
+cat > "$e558d/tests/test-crash.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "RESULTS (EGL-558 scratch crash): 5 passed, 0 failed"
+echo "scratch crash before a TOTAL"
+exit 1
+EOF
+chmod +x "$e558d/tests/test-crash.sh"
+e558rc=0
+( cd "$e558d" && bash tests/run.sh --serial ) >"$e558d/crash.out" 2>"$e558d/crash.err" || e558rc=$?
+e558ok=1
+[[ "$e558rc" == 1 ]] || e558ok=0
+grep -q '^BATTERY TOTAL:' "$e558d/crash.out" && e558ok=0
+grep -qxF 'run.sh: FAIL battery TOTAL unavailable — test-crash.sh (EGL-558)' "$e558d/crash.err" || e558ok=0
+grep -qxF 'run.sh: subtotal — test-a.sh: 2 passed, 0 failed, 0 skipped' "$e558d/crash.out" || e558ok=0
+grep -qxF 'run.sh: subtotal — test-b.sh: 1 passed, 0 failed, 1 skipped' "$e558d/crash.out" || e558ok=0
+(( e558ok )) && e558 pass || e558 fail "crash-before-total refuses the aggregate (rc=$e558rc, err: $(tr '\n' '|' < "$e558d/crash.err" 2>/dev/null))"
+rm -f "$e558d/tests/test-crash.sh"
+
+# Probe 4 — green harness with no record (the D5 gap): the run must not
+# exit 0 without a battery total; refusal names the harness.
+cat > "$e558d/tests/test-norec.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "RESULTS TOTAL: 9 passed, 0 failed, 0 skipped (tree: no-git)"
+exit 0
+EOF
+chmod +x "$e558d/tests/test-norec.sh"
+e558rc=0
+( cd "$e558d" && bash tests/run.sh --serial ) >"$e558d/norec.out" 2>"$e558d/norec.err" || e558rc=$?
+e558ok=1
+[[ "$e558rc" == 1 ]] || e558ok=0
+grep -q '^BATTERY TOTAL:' "$e558d/norec.out" && e558ok=0
+grep -qxF 'run.sh: FAIL battery TOTAL unavailable — test-norec.sh (EGL-558)' "$e558d/norec.err" || e558ok=0
+(( e558ok )) && e558 pass || e558 fail "green-without-record forces rc=1 and refuses (rc=$e558rc, err: $(tr '\n' '|' < "$e558d/norec.err" 2>/dev/null))"
+rm -f "$e558d/tests/test-norec.sh"
+
+# Probe 5 — disagreeing tree tags: refusal names the harness whose tag
+# differs, no battery line, rows still print.
+cat > "$e558d/tests/test-tree.sh" <<'EOF'
+#!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+section_begin e558t "EGL-558 scratch tree"
+assert pass
+section_end e558t
+results_emit e558t
+results_total
+rf="$EGRESSLOCK_TEST_BATTERY_RESULT"
+awk 'BEGIN{FS=OFS="\t"} $1=="tree"{$2="tree: git-checkout"} {print}' "$rf" > "$rf.tmp" && mv -f "$rf.tmp" "$rf"
+EOF
+chmod +x "$e558d/tests/test-tree.sh"
+e558rc=0
+( cd "$e558d" && bash tests/run.sh --serial ) >"$e558d/tree.out" 2>"$e558d/tree.err" || e558rc=$?
+e558ok=1
+[[ "$e558rc" == 1 ]] || e558ok=0
+grep -q '^BATTERY TOTAL:' "$e558d/tree.out" && e558ok=0
+grep -qxF 'run.sh: FAIL battery TOTAL unavailable — test-tree.sh (EGL-558)' "$e558d/tree.err" || e558ok=0
+[[ "$(grep -c '^run.sh: subtotal — ' "$e558d/tree.out")" == 3 ]] || e558ok=0
+(( e558ok )) && e558 pass || e558 fail "tree-tag disagreement refuses the aggregate (rc=$e558rc, err: $(tr '\n' '|' < "$e558d/tree.err" 2>/dev/null))"
+rm -f "$e558d/tests/test-tree.sh"
+
+# Fake engine for the suppression/shard probes: four gated sections (the
+# EGL-532 planner requires the arc12/egl139 alias pairing) and one pass each.
+cat > "$e558d/tests/test-engine.sh" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--list-sections" ]]; then
+    printf '%s\n' s1 s2 arc12 egl139
+    exit 0
+fi
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+if shard_section_run s1; then
+section_begin s1 "EGL-558 scratch engine s1"
+assert pass
+section_end s1
+results_emit s1
+fi
+if shard_section_run s2; then
+section_begin s2 "EGL-558 scratch engine s2"
+assert pass
+section_end s2
+results_emit s2
+fi
+if shard_section_run arc12; then
+section_begin arc12 "EGL-558 scratch engine arc12"
+assert pass
+section_end arc12
+results_emit arc12
+fi
+if shard_section_run egl139; then
+section_begin egl139 "EGL-558 scratch engine egl139"
+assert pass
+section_end egl139
+results_emit egl139
+fi
+arc14_pass=0; arc14_fail=0
+egl140_pass=0; egl140_fail=0
+if shard_section_run arc12; then
+    echo "RESULTS (ARC-14 site defaults): $arc14_pass passed, $arc14_fail failed"
+fi
+if shard_section_run egl139; then
+    echo "RESULTS (EGL-140 pin record witness): $egl140_pass passed, $egl140_fail failed"
+fi
+results_total
+EOF
+printf 's1\t100\ns2\t100\narc12\t100\negl139\t100\n' > "$e558d/tests/shard-weights.tsv"
+chmod +x "$e558d/tests/test-engine.sh"
+
+# Probe 6 — partial modes print no battery line and keep their caveat.
+e558rc=0
+( cd "$e558d" && bash tests/run.sh --section s1 ) >"$e558d/section.out" 2>"$e558d/section.err" || e558rc=$?
+e558ok=1
+[[ "$e558rc" == 0 ]] || e558ok=0
+grep -q '^BATTERY TOTAL:' "$e558d/section.out" && e558ok=0
+grep -q '^run.sh: subtotal — ' "$e558d/section.out" && e558ok=0
+grep -qxF 'run.sh: --section partial TOTAL over: s1 (not the battery total; EGL-464)' "$e558d/section.out" || e558ok=0
+e558rc=0
+( cd "$e558d" && bash tests/run.sh --shard 1/2 ) >"$e558d/shard1.out" 2>"$e558d/shard1.err" || e558rc=$?
+[[ "$e558rc" == 0 ]] || e558ok=0
+grep -q '^BATTERY TOTAL:' "$e558d/shard1.out" && e558ok=0
+grep -q '^run.sh: subtotal — ' "$e558d/shard1.out" && e558ok=0
+grep -q '^run.sh: harness test-engine.sh shard 1/2 ' "$e558d/shard1.out" || e558ok=0
+(( e558ok )) && e558 pass || e558 fail "partial modes suppress the battery block (section rc, shard rc=$e558rc)"
+
+# Probe 7 — sharded engine: the parent-rendered merged TOTAL publishes the
+# engine record, so the battery line sums it; shard children never write
+# the inherited decoy path.
+e558_decoy2="$e558d/decoy2.result"
+e558rc=0
+( cd "$e558d" && EGRESSLOCK_TEST_BATTERY_RESULT="$e558_decoy2" \
+    bash tests/run.sh --shard 2 ) >"$e558d/shard2.out" 2>"$e558d/shard2.err" || e558rc=$?
+e558ok=1
+[[ "$e558rc" == 0 ]] || e558ok=0
+[[ ! -e "$e558_decoy2" ]] || e558ok=0
+grep -qxF 'run.sh: subtotal — test-engine.sh: 4 passed, 0 failed, 0 skipped' "$e558d/shard2.out" || e558ok=0
+grep -qxF 'BATTERY TOTAL: 7 passed, 0 failed, 1 skipped (tree: no-git)' "$e558d/shard2.out" || e558ok=0
+[[ "$(grep -c '^RESULTS TOTAL: 4 passed, 0 failed, 0 skipped (tree: no-git)$' "$e558d/shard2.out")" == 1 ]] || e558ok=0
+(( e558ok )) && e558 pass || e558 fail "sharded engine merged record aggregates (rc=$e558rc, err: $(tr '\n' '|' < "$e558d/shard2.err" 2>/dev/null))"
+
+# Real-run anchor: a single-harness run on the shipped tree keeps today's
+# tail — a harness TOTAL, the skip/coverage trailer, done; no battery line.
+e558rc=0
+bash "$TREE_ROOT/tests/run.sh" --harness docs >"$e558d/docs.out" 2>"$e558d/docs.err" || e558rc=$?
+e558ok=1
+[[ "$e558rc" == 0 ]] || e558ok=0
+grep -q '^RESULTS TOTAL: ' "$e558d/docs.out" || e558ok=0
+grep -q '^BATTERY TOTAL:' "$e558d/docs.out" && e558ok=0
+grep -q '^run.sh: subtotal — ' "$e558d/docs.out" && e558ok=0
+(( e558ok )) && e558 pass || e558 fail "real --harness docs tail has no battery line (rc=$e558rc, tail: $(tail -n 3 "$e558d/docs.out" 2>/dev/null | tr '\n' '|'))"
+
+section_end egl558
 
 echo
 results_emit arc16
 results_emit egl85
 results_emit arc17
 results_emit egl433
+results_emit egl555
 results_emit egl121
 results_emit egl463
+results_emit egl258
 results_emit egl43
-results_emit egl12
-results_emit egl364
 results_emit egl420
-results_emit egl47
 results_emit egl49
 results_emit arc18
 results_emit egl328
@@ -10082,12 +11523,16 @@ results_emit egl90
 results_emit egl83
 results_emit egl115
 results_emit egl84
-results_emit egl65
 results_emit egl203
 results_emit egl240
 results_emit egl287
 results_emit egl200
+results_emit egl581
 results_emit egl491
+results_emit egl558
+# EGL-352: unconditional tail check — a leak books a fail-only counted
+# egl352_guard section and reds TOTAL without moving a green count.
+harness_stderr_guard_check
 # EGL-184: the hand-maintained 31-term sums are replaced by the register
 # (counted snapshots; no externals — every kit increment runs the funnels).
 # Fail-closed completeness per EGL-184-D4; the TOTAL line keeps the

@@ -74,7 +74,7 @@ address(es) the current pin holds — the pin was an answer too, and your
 observations need not return it again. Both methods read the pin record
 (`~/.config/egresslock/<profile>.pins`; one `<host>|<port> <addresses>`
 line per direct-pin entry — [File locations](file-locations.md)), so pin
-the name first (`egresslock allow <profile> <name>:<port> --direct`) and keep
+the name first (`egresslock allow PROFILE NAME:PORT --direct`) and keep
 it pinned while you discover — a method that cannot read a pin (no record,
 or no entry for the name) stops with a message instead of printing a set
 that is missing the current pin. Both methods read the host resolver as
@@ -82,12 +82,13 @@ the account — the same resolver `ensure` and `verify` use; run these as
 the account.
 
 **Harvest the verify timer's own findings.** Pin the name
-`egresslock allow <profile> <name>:<port> --direct` and wait. In its default
-sweep mode the timer verifies every ensured profile, so the journal
-carries other hosts' `drift:` lines too; the filter keeps only the host
-you are replacing. Only the `resolved to` value is an observation — the
-fresh answer of that cycle; a `pins` value records what the pin was at
-that moment, not what the resolver returns, so the harvest leaves it out
+`egresslock allow PROFILE NAME:PORT --direct` and wait. In its aggregate
+sweep the timer verifies every profile with a running anchor, so the
+journal carries other hosts' `drift:` lines too; the filter keeps only
+the host you are replacing. Only the `resolved to` value is an
+observation — the fresh answer of that cycle; a `pins` value records
+what the pin was at that moment, not what the resolver returns, so the
+harvest leaves it out
 (a pin an earlier `ensure` moved past is a historical candidate, not
 evidence). The one pin the set keeps is the current one, read from the
 pin record at the account's real home — the command resolves that home
@@ -98,15 +99,15 @@ cannot be read:
 # root — via sudo from your own shell
 # prompt: $ (your own prompt)
 
-rec="$(getent passwd <account> | cut -d: -f6)/.config/egresslock/<profile>.pins"
+rec="$(getent passwd ACCOUNT | cut -d: -f6)/.config/egresslock/PROFILE.pins"
 pin="$(sudo sed -n 's/^github\.com|22 //p' "$rec" 2>/dev/null)"
 if [ -n "$pin" ]; then
-    { sudo journalctl -u egresslock-verify@<account>.service --since "7 days ago" \
+    { sudo journalctl -u egresslock-verify@ACCOUNT.service --since "7 days ago" \
         | sed -n 's/.*host github\.com resolved to \([^ ]*\) but the policy pins .*/\1/p'
       printf '%s\n' "$pin"
     } | tr ', ' '\n\n' | sort -u
 else
-    echo "no pin found for the name you are replacing ($rec) — pin the name first (egresslock allow <profile> <name>:<port> --direct), wait, then re-run" >&2
+    echo "no pin found for the name you are replacing ($rec) — pin the name first (egresslock allow PROFILE NAME:PORT --direct), wait, then re-run" >&2
     false
 fi
 ```
@@ -115,8 +116,8 @@ Run it with your own name in place of `github\.com` (escape the dot) and
 your own port in place of `22`; `<account>` names the account whose home
 holds the pin record — the first line resolves that home from the account
 database, so a home outside `/home` works the same. When the message
-appears, the name is not pinned: run `egresslock allow <profile>
-<name>:<port> --direct`, wait, and re-run — no address list is printed, so a set
+appears, the name is not pinned: run `egresslock allow PROFILE
+NAME:PORT --direct`, wait, and re-run — no address list is printed, so a set
 missing the current pin cannot be mistaken for a result. Lines that say
 `no longer resolves` are skipped — there is no pool to replace until the
 name answers again. The pipeline prints each address once, one per line
@@ -141,7 +142,7 @@ first time the resolver returns it — a repeat is silent:
 # account — run as the dedicated account: sudo -iu <account>
 # prompt: <account>@host:~$
 
-seen="$(sed -n 's/^github\.com|22 //p' ~/.config/egresslock/<profile>.pins 2>/dev/null | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+seen="$(sed -n 's/^github\.com|22 //p' ~/.config/egresslock/PROFILE.pins 2>/dev/null | tr ' ' '\n' | sort -u | tr '\n' ' ')"
 if [ -n "$seen" ]; then
   for addr in $seen; do echo "$addr"; done
   for i in $(seq 1 30); do getent ahostsv4 github.com; sleep 60; done \
@@ -152,14 +153,14 @@ if [ -n "$seen" ]; then
         esac
       done
 else
-  echo "no pin found for the name you are replacing — pin the name first (egresslock allow <profile> <name>:<port> --direct), wait, then re-run" >&2
+  echo "no pin found for the name you are replacing — pin the name first (egresslock allow PROFILE NAME:PORT --direct), wait, then re-run" >&2
   false
 fi
 ```
 
 Run it with your own name and port in place of `github\.com` and `22`.
 When the message appears, the name is not pinned: run `egresslock
-allow <profile> <name>:<port> --direct`, wait, and re-run. Stop with Ctrl-C
+allow PROFILE NAME:PORT --direct`, wait, and re-run. Stop with Ctrl-C
 once no new address has appeared for a while; ten minutes of samples is a
 starting window. A longer run samples more of the pool,
 but no amount of sampling proves it complete. Ctrl-C is safe: everything
@@ -180,14 +181,14 @@ With the members known, replace the name line. `disallow --direct` exits with
 # prompt: <account>@host:~$
 
 egresslock disallow main github.com:22 --direct
-egresslock allow main <member-ip-1>:22 --direct
-egresslock allow main <member-ip-2>:22 --direct
+egresslock allow main MEMBER-IP-1:22 --direct
+egresslock allow main MEMBER-IP-2:22 --direct
 # …one line per member you observed
 ```
 
 Add a line when you observe a new member, and remove a member's line when
 a fresh discovery pass no longer shows it (`egresslock disallow main
-<member-ip-1>:22 --direct` removes one) — nothing expires on its own, so re-running
+MEMBER-IP-1:22 --direct` removes one) — nothing expires on its own, so re-running
 the method is what re-checks the set. A pass covers your observation
 window (the harvest's `--since`, or one sampling run), and an address the
 window no longer shows is your removal candidate; a rarely returned
@@ -211,7 +212,7 @@ egresslock allow main ssh.github.com
 ```
 
 Then point the SSH client at the gateway. The gateway address for your profile
-comes from `egresslock proxy-env <profile>` — never hardcode it. On the client
+comes from `egresslock proxy-env PROFILE` — never hardcode it. On the client
 side (the workload container, or any machine that can reach the gateway):
 
 ```sshconfig

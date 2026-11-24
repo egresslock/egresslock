@@ -1,8 +1,10 @@
 # Threat model
 
 What this kit protects, from whom, what it assumes, and what an attacker
-should expect when it fails. This is the single source of truth for the
-security claims; the README's Security model section only points here.
+should expect when it fails. This page is the single source of truth for
+the security claims; the
+[security model summary](overview.md#security-model-summary) is the
+short version (the README links both).
 
 Every row in the [attacks table](#attacks-table) carries an honest
 status: `lab-verified` (probed on a dogfood host), `code-verified`
@@ -23,7 +25,7 @@ one bypass — the source-address-keyed gateway exemption — closed on
 [accepted risks](#non-goals--accepted-risks). Neither exercise was a
 pentest.
 
-Last reviewed: 2026-11-10. The claims below are scoped to the dogfood
+Last reviewed: 2026-11-19. The claims below are scoped to the dogfood
 hosts in the [version matrix](#version-matrix), not to "any rootless
 Podman" install.
 
@@ -80,7 +82,7 @@ workload container (A1)      sibling container on same profile network (A2)
     forward hook priority -150
     default drop for the profile subnet
 
-    explicit exceptions (gateway-only shape):
+    explicit exceptions (every profile):
       * established / related
       * DNS -> bridge-ip:53
       * allow-host destination pins
@@ -110,7 +112,7 @@ workload container (A1)      sibling container on same profile network (A2)
                 defense in depth only
 ```
 
-Picture is the **gateway-only** forward path. A1↔A2 on the
+Picture is the **gateway** forward path. A1↔A2 on the
 bridge is L2 (T7), not this hook.
 
 Two consequences follow from where the chain sits:
@@ -184,44 +186,66 @@ any (see I2).
 
 Operator obligations the kit does not enforce:
 
+The one-screen do / do-not index is the
+[operator obligations checklist](operator-obligations.md); this list
+stays the normative wording.
+
 - launch workloads through a launcher that passes `--cap-drop=all
   --security-opt=no-new-privileges`. The kit ships no workload
-  launcher: this is the operator's launcher's job, and examples or
-  recipes showing a `podman run` line are operator-owned, not a kit
-  guarantee. Plain `podman run` keeps the default capability set,
+  launcher (its only shipped start wrapper, `egresslock-start`, is an
+  ensure-then-exec gate that starts a site daemon after `ensure`; it
+  does not launch workloads): this is the operator's launcher's job,
+  and examples or recipes showing a `podman run` line are
+  operator-owned, not a kit guarantee. Plain `podman run` keeps the
+  default capability set,
   which in the tested rootless lane (Podman 5.4.2 configured
   defaults) included neither `CAP_NET_ADMIN` nor `CAP_NET_RAW`. The
   T9 add-address technique needs `CAP_NET_ADMIN`; creating the
   tested `AF_PACKET`/`SOCK_RAW` socket under those defaults returned
   `EPERM` — version-scoped observations, not a claim about every
   Podman configuration (see the version matrix). **Flags passed are
-  not flags honored**
-  (CVE-2026-94603 / GHSA-2cvf-wqm6-wr9g): the trigger is
-  live-observed — in the kit's VM lane (guest Podman 5.4.2, in the
-  advisory range) `podman run` on a benign image carrying the
-  annotation `io.podman.annotations.checkpoint.runtime.name`
-  interpreted the image as a container checkpoint and failed at the
-  restore import — while the advisory reports the end state: a
-  *successful* restore runs the checkpoint's embedded configuration,
-  silently discarding the requested sandbox flags, so the launcher's
-  `--cap-drop=all` never takes effect (that discard — and how far the
-  checkpoint's own configuration reaches, e.g. network mode — is
-  advisory / unresolved: not observed from this tree; the benign
-  construction fails closed at import). The affected range is per
-  the advisory (4.4.0–5.8.7, and 6.x before 6.1.3 — figures from the
-  advisory; the fixed floor is not confirmed from this tree). Prefer
-  a fixed Podman (≥ 5.8.8 / 6.1.3, or your distribution's backport)
-  and reject images carrying the checkpoint annotation — Podman
-  provides no automatic rejection, so that refusal is the upstream
-  workaround. The kit side of this — the refusal on its own
-  gateway/anchor images and the live pair assertion on both at
-  `ensure` and `verify` — is a TCB fact, not an operator obligation
-  (see the TCB list above); a workload launcher remains your
-  obligation. The residual this closes (see T9): dropping
-  capabilities is what keeps a workload
-  away from `CAP_NET_ADMIN`/`CAP_NET_RAW` and the rootless-netns
-  boundary — a silently discarded drop would make that residual
-  reachable with no operator-cap violation at all;
+  not flags honored**:
+  (CVE-2026-94603 / GHSA-2cvf-wqm6-wr9g):
+  - The hazard: on a Podman in the advisory range, restoring a
+    container checkpoint restores the **dumped** configuration, not
+    the launcher's — `podman run` of a checkpoint image with the
+    requested `--cap-drop=all --security-opt=no-new-privileges` comes
+    up with the dumped capability set (`CapEff 800405fb`,
+    `NoNewPrivs 0`); the requested flags are silently discarded —
+    `restore` accepts neither. Dropping capabilities is what keeps a
+    workload away from `CAP_NET_ADMIN`/`CAP_NET_RAW` and the
+    rootless-netns boundary (see T9), so a silently discarded drop
+    makes that residual reachable with no operator-cap violation at
+    all.
+  - What to do: launch the workload with the pair, then `podman
+    container checkpoint` it — the dump, not the launcher line, is
+    the restored configuration; a container already running
+    unhardened must be recreated hardened and checkpointed. Prefer a
+    fixed Podman (≥ 5.8.10 / 6.2.0, or your distribution's backport —
+    the newest floor covering the advisories recorded here, not a
+    claim that it is the last fix for every advisory) and reject
+    images carrying the checkpoint annotation — Podman provides no
+    automatic rejection, so that refusal is the upstream workaround.
+  - Scope of the evidence: the trigger is live-observed in the kit's
+    VM lane (guest Podman 5.4.2, in the advisory range) — `podman
+    run` on a benign image carrying the annotation
+    `io.podman.annotations.checkpoint.runtime.name` is interpreted as
+    a container checkpoint and fails at the restore import; the
+    end state above is measured in the same lab on a rootful podman
+    5.4.2. The tested rootless lane refuses checkpointing
+    (`checkpointing a container requires root`), and a 5.4.2
+    `image save`/`load` round trip strips the checkpoint annotations —
+    the kit's rootless context could not produce or receive a payload
+    in the lab, so the discard is a rootful-podman workload surface.
+    How far the checkpoint's own configuration reaches beyond
+    capabilities and `NoNewPrivs` (e.g. network mode) remains
+    unmeasured. The affected range is per the advisory
+    (4.4.0–5.8.7, and 6.x before 6.1.3 — figures from the advisory;
+    the fixed floor is not confirmed from this tree).
+  - The kit side — the refusal on its own gateway/anchor images and
+    the live pair assertion on both at `ensure` and `verify` — is a
+    TCB fact, not an operator obligation (see the TCB list above); a
+    workload launcher remains your obligation;
 - do not bind-mount the account's home (or `~/.config/egresslock/`)
   into workloads — a launcher that does changes I5. Policy files are
   not in the workload unless the operator mounts them there;
@@ -260,7 +284,7 @@ attacks table or an explicit non-goal.
 |---|---|---|
 | I1 | Default drop for the profile subnet, except established/related flows, DNS to the bridge gateway `:53`, explicit `allow-host` pins, the gateway's own port, and the gateway's own egress — keyed on the gateway's source address **and** its pinned MAC since 2026-09-21 (the address alone no longer satisfies it). The gateway exemption is unscoped by destination, port, and protocol (live-confirmed 2026-11-06): the gateway's own direct TCP and UDP:53 match it — a min-privilege acceptance, not a workload path (see the gateway-egress bullet below). DNS has two paths by design: (a) workload DNS to the bridge gateway `:53`; (b) the **gateway process's own DNS**, which pasta forwards to `169.254.1.1` — i.e. the **host resolver, for any name** | direct internet or LAN reach from the workload. (b) is not a workload bypass — Squid still allowlists the proxy requests it handles — but its DNS egress is host-resolver-wide by design |
 | I2 | The proxy env is not the boundary: nftables is | an operator believes unsetting the proxy stops egress, or setting it grants egress |
-| I3 | On a gateway-only profile the gateway being down means no direct internet (nothing else is accepted) | fail-open when Squid dies |
+| I3 | On a profile with no direct rules, the gateway being down means no direct internet (nothing else is accepted) | fail-open when Squid dies |
 | I4 | Forwarded IPv6 is dropped (`p_v6deny`, before Netavark) | IPv6 bypass of an IPv4-only policy |
 | I5 | The conf/allowlist never enter the workload filesystem (the kit never mounts them; the operator's launcher must not bind-mount the account home or confdir) | the workload reads or edits its own policy |
 | I6 | The site must `ensure`/`verify` before workloads start; a missing or stale chain means unprotected, not safe — including after reboot, when the network object survives but the netns policy does not (since 0.5.0, `verify` names this state, the timer signals it, nothing auto-repairs) | empty/stale chains, or a profile with no `p_<name>` chain at all, silently pass traffic |
@@ -300,22 +324,53 @@ attacks table or an explicit non-goal.
   ([Rotating names](rotating-names.md)).
 - **Kit path is distribution, not isolation:** a root-owned install
   prefix protects the tool's integrity, nothing more.
+- **Kit replacement is bound to the directory it checked, not the
+  name.** `install-kit.sh`/`uninstall-kit.sh` act relative to the
+  probed prefix and refuse a swap before the open; `--init-conf` never
+  replaces an existing destination, and the deb builder copies into the
+  keep-stage leaf it created after the same check. The actor is a
+  process in the invoking account, not another account (A3/A5, above).
+  What remains: capture and comparison are two syscalls, so a swap plus
+  `dev:ino` reuse after delete-and-recreate is not closed; a prefix
+  directory itself writable by the invoking account still lets a writer
+  race the predictable `.tmp` stage names or pre-plant a link at a file
+  target and receive a write; and on a filesystem without hard links
+  `--init-conf` falls back to `mv -T`, keeping its check-then-rename
+  window. No wider claim is made.
+- **A symlink at a path we would replace is not a supported layout.**
+  A command that replaces or deletes a named destination classifies it
+  with `-L` first: the destination must be absent or a regular
+  non-symlink file, and a directory the tool owns must be a real
+  directory reached without a symlinked prefix. A symbolic link is
+  refused by name, leaving the link and the file it points to untouched.
+  The replacement does not follow the link, does not write the file it
+  points to, and never replaces the link with a regular file. Edit the
+  referent by hand while no egresslock command is running, then
+  `ensure <profile>`. Only the last named path is classified:
+  a symlinked *parent* directory is resolved and followed as usual (a
+  confdir kept as a link still works), and reads of runtime config may
+  follow a link. A hard-linked regular file is unaffected.
 - **Kit root tools are interactive-root only:** no
   sudoers file is shipped and `NOPASSWD` on `install-kit.sh`,
   `uninstall-kit.sh`, or `egresslock-setup` is unsupported — their
   arguments are free-form (`--prefix`, `--account` + `runuser`,
-  `--from`/`--conf`), so passwordless sudo on them without exact argv is
-  equivalent to root. The engine itself refuses root (T16).
+  `--from`), so passwordless sudo on them without exact argv is
+  equivalent to root. The engine itself refuses root by default (T16).
 - **Gateway base is frozen by digest:** the kit-built gateway image
   pins its base and never updates in place — base-package fixes reach
   a running gateway only through a deliberate rebuild with a refreshed
   pin, and a stale image keeps the old base's vulnerabilities until
-  that rebuild and replace. The gateway-image row in both doctors (`egresslock
-  doctor`, `egresslock-setup doctor`) and kit release notes
-  surface **image** staleness — the deployed pin against the tagged
-  image's recorded base, not what is running: after a rebuild the row
-  clears while a profile can still be serving the old base until it is
-  replaced; the rebuild-and-replace steps are in
+  that rebuild and replace. The pin freezes what the kit **asks for**
+  — the base reference the build pulls — and the digest match is only
+  as strong as the host's digest checking: on a Podman in the
+  CVE-2026-111361 range (every Podman before 5.8.10, and 6.0.0–6.1.x
+  before 6.2.0 — figures from the advisory) a digest can resolve to
+  different layers/config, so the pin is build-input identity, not an
+  absolute content guarantee. What the doctors' `gateway image:` /
+  `running gateway:` rows prove (image staleness vs. running container
+  identity, and why a row can still look stale after a rebuild) is in
+  [What the doctor prints](gateway-image.md#what-the-doctor-prints);
+  the rebuild-and-replace steps are in
   [When to rebuild the gateway image](gateway-image.md#when-to-rebuild-the-gateway-image).
 - **Name rebind through the proxy (T17) is open by design:**
   the allowlist is name-based (dstdomain), names resolve at request
@@ -330,6 +385,11 @@ attacks table or an explicit non-goal.
   profile network can answer the rebind at L2 (ARP/proxy-MITM,
   demonstrated end-to-end). LAN hosts the operator meant
   to allow directly stay on the direct path; `disallow` closes the hole.
+  A direct `allow-host <ip>:<port>` pin is explicit address intent — it
+  authorizes that address and port on the wire, so co-tenant vhosts
+  behind the pinned address and port are reachable by design. The proxy
+  lane authorizes by name; when the allow decision must name the host,
+  use the proxy lane.
 - **Profile rules are source-scoped; cap-drop is what makes them bite
   (T9 neighbor):** the profile chain matches `ip saddr <profile subnet>`
   over a base accept policy. The probe's controls confirmed the drop
@@ -386,12 +446,13 @@ attacks table or an explicit non-goal.
   too-narrow exemption fails the proxy lane closed, and per-ensure
   destination sets churn while the chain is hot.
 - **Two paths, one destination, different verdicts (T18 neighbor):**
-  on a gateway profile an `allow-host` IP is an nft-direct rule, but a
+  an `allow-host` IP is an nft-direct rule, but a
   proxied HTTP(S) request to that same literal IP never reaches it —
   the only wire destination is the gateway port, and the names-only
-  dstdomain allowlist denies it — unless `no-proxy` (conf) or the
-  client's `NO_PROXY` steers the request off the proxy. This is the
-  documented two-path behavior, not a bypass.
+  dstdomain allowlist denies it — unless the client's `NO_PROXY`
+  carries that literal IP (derived from the IPv4 direct pin) and
+  steers the request off the proxy. This is the documented two-path
+  behavior, not a bypass.
 
 - **Non-IP channels are outside the profile chain (CVE-2026-123876
   class):** the enforcement chain is IP-scoped; socket families that
@@ -409,8 +470,8 @@ attacks table or an explicit non-goal.
   were rejected identically. Newer profiles (forky's 0.67.1) add an
   `AF_VSOCK` deny for container-escape prevention, outside this model
   (see [Scope](#scope)); on the same lane that rule rejected the
-  high-bits call exactly as the plain one, so the CVE-2026-123876
-  bypass did not manifest in lane verification. Upstream fixed the
+  high-bits call exactly as the plain one, so that bypass did not
+  manifest in lane verification. Upstream fixed the
   family comparison in containers-common 0.70.0.
   Accepted: the kit's promise is the workload's **IP egress** surface;
   where you rely on the seccomp layer, prefer a fixed containers-common
@@ -419,28 +480,34 @@ attacks table or an explicit non-goal.
 ## Attacks table
 
 Hang = nft drop, no Squid log line. 403 = Squid policy denial
-(`denied` can list it). 503 = allowed but destination dead.
-CONNECT deny may show as curl `000` with 403 in the error line.
+(`denied` can list it). A direct-path IPv4 TCP drop is also recorded in
+a bounded, expiring per-profile set that `denied PROFILE --direct`
+lists as IP:port — plain `denied` still reads only the Squid log.
+Other protocols are not permitted for workload egress (DNS `:53` to
+the bridge gateway excepted), so UDP/ICMP are dropped, not merely
+unlisted; anti-spoof and IPv6 drops are not recorded. 503 = allowed
+but destination dead. CONNECT deny may show as curl `000` with 403 in
+the error line.
 
 | # | Attacker action | Expected behavior | Operator sees | Status |
 |---|---|---|---|---|
 | T1 | `curl https://evil.test` with proxy env, host not allowlisted | Squid CONNECT deny | `denied` lists `evil.test`; 403 | lab-verified |
-| T2 | Same without proxy env (direct SYN to 443) — any proxy-ignoring client, e.g. `curl --noproxy '*'` or bash `exec 3<>/dev/tcp/<host>/<port>`; `/dev/tcp` is a bash socket, not a device | nft drop | hang; **not** in `denied` | lab-verified |
+| T2 | Same without proxy env (direct SYN to 443) — any proxy-ignoring client, e.g. `curl --noproxy '*'` or bash `exec 3<>/dev/tcp/<host>/<port>`; `/dev/tcp` is a bash socket, not a device | nft drop | hang; **not** in the proxy `denied` list — `denied --direct` lists the IPv4 TCP destination when the bounded, expiring record holds it | lab-verified |
 | T3 | `curl http://deb.example/` (port 80) not allowlisted | Squid GET deny | `denied` lists `deb.example:80`; 403 | lab-verified |
 | T4 | `allow` of T3's host **without** `:80` | still denied on 80 (no-port group is 443) | `denied` still shows `:80` | design-intent |
-| T5 | UDP/TCP to 8.8.8.8:53; DoT 853; direct DoH 443 — bash `exec 3<>/dev/udp/<host>/<port>` is the same direct UDP path (ordinary UDP socket) | drop (DNS only to bridge gw) | hang; no gateway log | lab-verified |
+| T5 | UDP/TCP to 8.8.8.8:53; DoT 853; direct DoH 443 — bash `exec 3<>/dev/udp/<host>/<port>` is the same direct UDP path (ordinary UDP socket) | drop (DNS only to bridge gw) | hang; no gateway log (UDP/ICMP are dropped, not merely unrecorded) | lab-verified |
 | T6 | IPv6 destination | `p_v6deny` | fail; IPv4-only kit | lab-verified |
 | T7 | Sibling on same profile: connect to peer:22 | **allowed** (L2) | n/a — accepted risk | lab-verified (open L2; still accepted — 2026-09-21 ruling; the probe confirmed the strongest form: sibling↔sibling traffic never touches the IP-forward hook, it is pure L2 bridging, so *every* profile-internal port is open at L2) |
 | T8 | Sibling: gateway:3128; other gateway ports; cache manager | 3128 allowed + Squid ACL; other ports: nothing listens on them — **L2 does not filter them** (a service bound on one would be sibling-reachable); mgr 403 | can probe Squid; cannot widen nft | lab-verified (framing corrected by the probe: "other ports nft-dropped" was inaccurate — see T7) |
-| T9 | Co-located sibling holding `CAP_NET_ADMIN` (the live bypass also added `CAP_NET_RAW`) spoofs source IP = gateway IP (adds the gateway's address to its interface) | the kit forces cap-drop on the **gateway**; workloads are launcher policy — a sibling that holds `CAP_NET_ADMIN` can add the gateway's address and attempt the spoof, and the profile chain still sees the packet | if a spoofed `saddr GW_IP` packet is forwarded past the terminal drop, I1 is broken | lab-verified both ways. Bypass confirmed live 2026-09-19: the spoofed SYN matched the then-address-only gateway-exemption rule, `established,related` grew a full bidirectional flow, the terminal drop never moved, and the outer endpoint answered — a complete bypass. Closed for the IP-only spoof on 2026-09-21 (exemption now also requires the gateway's pinned MAC); re-probed at the fix commit: exemption counter stays 0, no new established flow, the terminal drop counts the SYN+retries, outer endpoint unreachable. **Residual (recorded, accepted):** a sibling that clones *both* the gateway's MAC and IP still matches the exemption — same cap set, same obligation; closing it needs a non-spoofable bridge-port match (out of scope). A default-caps workload cannot add the gateway's address (the tested default set includes neither `CAP_NET_ADMIN` nor `CAP_NET_RAW`; see the launcher obligation). Raw packet crafting is a different technique; creating the tested `AF_PACKET`/`SOCK_RAW` socket under plain defaults returned `EPERM` in the tested lane (see the launcher obligation and the version matrix); cap-drop on workloads remains the operator obligation — the CVE-2026-94603 class (a checkpoint annotation discarding the launcher's cap-drop on a *successful* restore; not observed from this tree, the interpretation trigger is live-observed on 5.4.2) would make this residual reachable with no operator-cap violation |
+| T9 | Co-located sibling holding `CAP_NET_ADMIN` (the live bypass also added `CAP_NET_RAW`) spoofs source IP = gateway IP (adds the gateway's address to its interface) | the kit forces cap-drop on the **gateway**; workloads are launcher policy — a sibling that holds `CAP_NET_ADMIN` can add the gateway's address and attempt the spoof, and the profile chain still sees the packet | if a spoofed `saddr GW_IP` packet is forwarded past the terminal drop, I1 is broken | lab-verified both ways. Bypass confirmed live 2026-09-19: the spoofed SYN matched the then-address-only gateway-exemption rule, `established,related` grew a full bidirectional flow, the terminal drop never moved, and the outer endpoint answered — a complete bypass. Closed for the IP-only spoof on 2026-09-21 (exemption now also requires the gateway's pinned MAC); re-probed at the fix commit: exemption counter stays 0, no new established flow, the terminal drop counts the SYN+retries, outer endpoint unreachable. **Residual (recorded, accepted):** a sibling that clones *both* the gateway's MAC and IP still matches the exemption — same cap set, same obligation; closing it needs a non-spoofable bridge-port match (out of scope). A default-caps workload cannot add the gateway's address, and the tested `AF_PACKET`/`SOCK_RAW` socket creation returned `EPERM` (version-scoped; see the launcher obligation and the version matrix). Raw packet crafting is a different technique. Cap-drop on workloads remains the operator obligation: a checkpoint annotation that discards the launcher's cap-drop on a *successful* restore (CVE-2026-94603; mechanics, range, and the recreation step above) would make this residual reachable with no operator-cap violation |
 | T10 | Workload reads `~/.config/egresslock/` | not mounted by the kit; the operator's launcher is the only path in | empty of policy files unless the operator bind-mounts `$HOME` or the confdir | code-verified (kit paths) |
 | T11 | `allow 'foo; rm -rf /'` | reject, exit 2, file unchanged | usage / invalid entry | code-verified |
 | T12 | Gateway container stopped | no useful exemption for the workload; default drop | connect fail; `denied` may be empty | design-intent |
 | T13 | `allow-host` then DNS changes | traffic still to the **old** effective A set (first 16 sorted distinct) until `ensure`; `verify` warns `drift:` on a set change | hang to new IP; `verify` rc=0 with warning | lab-verified (drift loop). E2E pin: lab-verified. A rotating single-A name (`github.com` SSH) is pinned to one member at a time — never stable; a warning whenever a cycle resolves another member, only the pinned member reachable; the literal-pool recipe replaces the pin |
 | T14 | `rule public-only` (drop-set narrower than all special-use ranges) | **retired** as of 0.6.0: the mode is gone, so the risk no longer exists to accept | n/a — see CHANGELOG | retired |
 | T15 | Another account's `podman network ls` | cannot see this account's nets | empty / other store | design-intent |
-| T16 | Engine run as root | refuse | error; root's store unused | design-intent |
-| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach: cloud metadata (`169.254.169.254`) is **not delivered** on this pasta (in-lab mitigation: connection times out); hosts-file rebind is **not injectable** from the gateway (non-root gateway; Squid resolves via internal DNS, not the hosts file); LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, nft-direct, not the name-rebind path. The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. **Shared-IP co-tenancy (live-confirmed 2026-11-06):** a CONNECT to an allowlisted name on a shared IP completes TLS with a co-tenant SNI, and an HTTP request with a mismatched Host is carried through the same tunnel — Squid's blind CONNECT authorizes the CONNECT name only, so the tunnel bytes choose what the origin sees (the same accepted class as the opaque-body risk, not a way past the name layer). Which vhost the origin serves for that SNI/Host is the origin's choice: the live observation covers the tunnel carrying the co-tenant SNI and mismatched Host, not a distinct tenant-vhost response. The same name-at-request-time semantics cover **gateway-tunneled non-HTTP** (e.g. SSH via a client `ProxyCommand` CONNECT — optional recipe, docs only): the SSH host-key check remains the mitigation for SSH, and `denied` does see **denied** CONNECT-tunneled traffic (an allowed tunnel shows in the gateway access.log as `TCP_TUNNEL/200`). | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
+| T16 | Engine run as root | refuse by default | error; root's store unused | design-intent |
+| T17 | CONNECT to allowlisted name that now resolves to RFC1918 | **open by design** (A4): name-based dstdomain + request-time DNS + the gateway's own egress exemption — an allowlisted **name** that starts resolving to a private address is connected from the gateway's position. Live facts narrow the reach without closing it: cloud metadata (`169.254.169.254`) is not delivered on this pasta (connection times out), hosts-file rebind is not injectable from the gateway, and LAN reach was demonstrated only via an **explicit IP-literal `allow-host` pin** — operator-intentional, not the name-rebind path (detail in the accepted-risks bullet above). The L2-attacker half is **demonstrated**: a hostile container on the profile network answered a hijacked flow via ARP/proxy-MITM (fresh-overlay re-run, 2026-09-23). LAN IPs the operator meant stay `allow-host`. **Shared-IP co-tenancy (live-confirmed 2026-11-06):** a CONNECT to an allowlisted name on a shared IP completes TLS with a co-tenant SNI, and an HTTP request with a mismatched Host is carried through the same tunnel — Squid's blind CONNECT authorizes the CONNECT name only, so the tunnel bytes choose what the origin sees (the same accepted class as the opaque-body risk, not a way past the name layer). Which vhost the origin serves for that SNI/Host is the origin's choice: the live observation covers the tunnel carrying the co-tenant SNI and mismatched Host, not a distinct tenant-vhost response. The same name-at-request-time semantics cover **gateway-tunneled non-HTTP** (e.g. SSH via a client `ProxyCommand` CONNECT — optional recipe, docs only): the SSH host-key check remains the mitigation for SSH, and `denied` does see **denied** CONNECT-tunneled traffic (an allowed tunnel shows in the gateway access.log as `TCP_TUNNEL/200`). | proxy returns the private service's body; `disallow` restores deny | open-by-design (lab-verified gap) |
 | T18 | Literal `http://127.0.0.1` (or other IPv4 URL) via proxy | Squid 403 (dstdomain is names). `allow` of an IPv4 literal is rejected. Use `allow <profile> <ip>:<port> --direct` for addresses. | 403; `allow` exit 2 | lab-verified (unlisted literals); grammar: literals rejected. Since 0.5.0: 403 holds **including when the IP's PTR equals an allowlisted name** (generated dstdomain ACLs carry `-n`) |
 
 Rows read as "what should happen", not a pentest report:
@@ -466,7 +533,7 @@ remains `open-by-design` as recorded.
 
 Claims in this document were checked on these dogfood hosts. Do not
 generalize them to "any rootless Podman"; re-verify after a major
-podman/pasta/netavark upgrade.
+podman/pasta/netavark/nftables upgrade.
 
 | Host | Date | OS | kernel | Podman | Netavark | nftables | Squid |
 |---|---|---|---|---|---|---|---|
@@ -488,9 +555,33 @@ AppArmor amendment is not part of the accepted-risk set: where it is
 missing but needed, `ensure` fails closed (see
 [the pasta AppArmor page](../troubleshooting/pasta-apparmor.md)).
 
+**nftables cross-version check (2026-11-17).** nftables 1.1.3 and 1.0.6
+rendered the same ruleset with one harmless difference: the NAT
+output-hook priority prints as `dstnat` on 1.0.6 and as `-100` on
+1.1.3. `verify` and `doctor` stayed clean under both, a foreign chain
+was still named as drift under both, and rules written by one version
+read cleanly under the other. One tamper shape — an accept rule
+inserted above the profile chain's final drop — went unmeasured on
+both versions in that round: the handle extraction ran against the
+system nft's listing and did not parse the handle there, so neither
+binary was exercised against the shape. That is a probe limit, not a
+missed detection.
+
 Claims are host-scoped: `egresslock doctor` (engine subcommand) is the
 per-host runtime evidence for podman/netavark/nft/unprivileged-userns —
 it is not a license to generalize the matrix to "any rootless Podman".
+
+**The Squid package and the access-log format are separate from the
+image pin.** The image base is digest-pinned, but the `squid` package
+is not: a rebuild can take a Squid security update. The gateway config
+written by `ensure` sets `access_log` with no format option, so Squid
+writes its built-in `squid` format and `denied` parses that field
+order. The doctor's rebuild floor tracks the Squid security date, not
+the format. A Squid update that changes the default format can make
+`denied` stop recognizing new denials while enforcement is unaffected;
+the raw access log still shows them. After a rebuild or kit upgrade
+that changes the Squid version, confirm one known denial in the raw
+log before trusting an empty `denied`.
 
 ## Related
 

@@ -12,7 +12,6 @@ and DNS to the bridge resolver is allowed and unaudited — see the
 ```
 # ~/.config/egresslock/build.conf            (created by `init build`)
 profile build 10.199.<auto>.0/24
-    rule gateway-only
     gateway 10.199.<auto>.2 3128 build-allowlist
 
 # ~/.config/egresslock/build-allowlist       (example below)

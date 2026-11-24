@@ -37,8 +37,12 @@ docs/
     container-hardening.md   podman run hardening baseline for example
                              launchers: always-on flags, keep-id /
                              read-only layers, stated exceptions
+    operator-obligations.md  the do / do-not list that keeps protection
+                             in place: hardening baseline, ensure/verify
+                             before workloads, host patching, and the
+                             launch modes and mounts to avoid
     gateway-image.md         kit-built gateway: when to rebuild,
-                             stale:, recipe
+                             stale:, running gateway:, recipe
     policy-reference.md      conf grammar, allowlist format,
                              destination -> mechanism decision table,
                              profile lifecycle (create / verify /
@@ -53,13 +57,13 @@ docs/
                              (`allow` by name, literals, tunnel)
     check-everything.md      full per-layer health/inspection catalog
     scripts-and-environment.md  engine env overrides, config resolution,
-                             unit.env, script defaults
+                             script defaults
     files-installed.md       what the kit installs (.deb / prefix layout,
                              unit templates) + what a checkout contains
     file-locations.md        where the account's files live on the host:
-                             conf, allowlist, pins, unit.env, lock,
-                             proxy env file, temp leftovers — modes,
-                             lifecycle, backup/cleanup
+                             conf, allowlist, pins, lock, proxy env
+                             file, temp leftovers — modes, lifecycle,
+                             backup/cleanup
     threat-model.md          assets, boundaries, threats, accepted risks
   troubleshooting.md         symptom index (ONLY entry point)
   troubleshooting/           one page per issue:

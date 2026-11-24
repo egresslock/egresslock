@@ -27,10 +27,12 @@ egresslock --version
 
 <pre>
 egl-runner@host:~$ egresslock --version
-version: 0.7.0+git20261008003735.74ec3248fd86
-commit: 74ec3248fd86b4f332780be230b39b8b8be46542
-deployed: 2026-10-08T00:37:35Z
+version: 0.11.0+git20261108123456.a1b2c3d4e5f6
+commit: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0
+deployed: 2026-11-08T12:34:56Z
 </pre>
+
+Yours will differ; the three-line shape is what matters.
 
 Troubleshooting: command not found? The install didn't land where you
 think (.deb hosts: `/usr/bin/egresslock` on PATH; prefix installs:
@@ -54,6 +56,7 @@ egl-runner@host:~$ egresslock ensure main
 using config /home/egl-runner/.config/egresslock/main.conf
 gateway 'egresslock-gateway-main' ready (allowlist applied, health verified)
 profile 'main' ready (network egresslock-main, policy verified)
+note: egresslock protects the policy, not the workload's launch settings — before starting a workload, review the operator obligations checklist: /usr/share/egresslock/docs/reference/operator-obligations.md
 </pre>
 </details>
 
@@ -132,3 +135,5 @@ Troubleshooting: Exited? Re-run `ensure main`; if they keep dying —
 
 - [Choose a recipe](../../README.md#recipes) — you're ready to pick
   one for your use case.
+- [Operator obligations](../reference/operator-obligations.md) — the
+  do / do-not list for keeping workload traffic protected.

@@ -162,6 +162,12 @@ render_chain() { # render_chain <state-file>
     while IFS= read -r _rline || [[ -n "$_rline" ]]; do
         if [[ "$_rline" =~ counter\ (drop|accept)$ ]]; then
             _rline="${_rline%"counter ${BASH_REMATCH[1]}"}counter packets 0 bytes 0 ${BASH_REMATCH[1]}"
+        elif [[ "$_rline" =~ counter$ ]]; then
+            # EGL-376-D-MOCK: a bare trailing `counter` (the non-verdict
+            # record rule) expands exactly like real nft; without this
+            # the live and mock listings would drift and verify would
+            # compare an unexpanded mock line.
+            _rline="${_rline%counter}counter packets 0 bytes 0"
         fi
         _rline="${_rline/priority -150/priority mangle}"
         if [[ "$_rline" == *"{"* || "$_rline" == *"}"* ]]; then
@@ -170,6 +176,68 @@ render_chain() { # render_chain <state-file>
             RENDERED+=("        $_rline")
         fi
     done < "$_rfile"
+}
+
+# EGL-376-D-MOCK: per-profile drop-record sets. State lives under
+# $D/sets/<table>/ — a SUBDIRECTORY, so the `$D/<table>.<chain>` chain
+# model and every existing list/tables/ruleset walk cannot mistake a set
+# for a chain. Definition and elements are separate files so a re-declare
+# (`nft -f`) updates the definition and KEEPS elements (VM P4).
+set_state_dir() { echo "$D/sets/$1"; }
+set_referenced() { # set_referenced <table> <set> -> 0 while any chain rule names @set
+    local _srt="$1" _srs="$2" _srf _srl _srre
+    _srre="@${_srs}([^A-Za-z0-9_]|$)"
+    for _srf in "$D/$_srt".*; do
+        [[ -f "$_srf" ]] || continue
+        while IFS= read -r _srl || [[ -n "$_srl" ]]; do
+            [[ "$_srl" =~ $_srre ]] && return 0
+        done < "$_srf"
+    done
+    return 1
+}
+render_set() { # render_set <table> <set> -> listing block (no table wrapper)
+    local _rst="$1" _rss="$2" _rsdir _rsdef _rsel _rsline _rsi
+    local -a _rstoks=()
+    _rsdir="$D/sets/$_rst"
+    _rsdef="$_rsdir/$_rss.def"
+    _rsel="$_rsdir/$_rss.elements"
+    [[ -f "$_rsdef" || -f "$_rsel" ]] || return 1
+    echo "set $_rss {"
+    if [[ -f "$_rsdef" ]]; then
+        while IFS= read -r _rsline || [[ -n "$_rsline" ]]; do
+            [[ -n "$_rsline" ]] && echo "    $_rsline"
+        done < "$_rsdef"
+    else
+        echo "    type ipv4_addr . inet_service"
+        echo "    flags dynamic,timeout"
+    fi
+    if [[ -f "$_rsel" ]]; then
+        while IFS= read -r _rsline || [[ -n "$_rsline" ]]; do
+            local _rsip _rsport
+            [[ -n "$_rsline" ]] || continue
+            read -r _rsip _rsport _ <<<"$_rsline"
+            [[ -n "$_rsip" && -n "$_rsport" ]] || continue
+            if [[ -f "$_rsdir/$_rss.timeout" ]]; then
+                _rstoks+=("$_rsip . $_rsport timeout 1h expires 59m57s")
+            else
+                _rstoks+=("$_rsip . $_rsport expires 59m57s")
+            fi
+        done < "$_rsel"
+    fi
+    if (( ${#_rstoks[@]} == 1 )); then
+        echo "    elements = { ${_rstoks[0]} }"
+    elif (( ${#_rstoks[@]} > 1 )); then
+        for _rsi in "${!_rstoks[@]}"; do
+            if (( _rsi == 0 )); then
+                echo "        elements = { ${_rstoks[$_rsi]},"
+            elif (( _rsi == ${#_rstoks[@]} - 1 )); then
+                echo "                      ${_rstoks[$_rsi]} }"
+            else
+                echo "                      ${_rstoks[$_rsi]},"
+            fi
+        done
+    fi
+    echo "}"
 }
 
 case "$cmd" in
@@ -238,6 +306,31 @@ case "$cmd" in
         done < "$file"
         echo "nft -f chains=$_chain_csv flush=$_flush_n rules=$_rule_n" \
             >> "$ARCMOCK_STATE/callorder.log"
+        # EGL-376-D-MOCK: set declarations create the per-table set state;
+        # re-declaring updates the definition but keeps the existing
+        # elements (VM P4). Elements live in their own file so this write
+        # cannot erase them.
+        while IFS= read -r _fline || [[ -n "$_fline" ]]; do
+            [[ "$_fline" =~ ^[[:space:]]*set\ ([A-Za-z0-9_]+)[[:space:]]*\{ ]] || continue
+            _sn="${BASH_REMATCH[1]}"
+            _sdir="$D/sets/$table"
+            mkdir -p "$_sdir"
+            _sdef=()
+            _inset=0
+            while IFS= read -r _fline2 || [[ -n "$_fline2" ]]; do
+                if [[ "$_fline2" =~ ^[[:space:]]*set\ ${_sn}[[:space:]]*\{ ]]; then
+                    _inset=1
+                    continue
+                fi
+                if (( _inset )); then
+                    [[ "$_fline2" =~ ^[[:space:]]*\}[[:space:]]*$ ]] && { _inset=0; break; }
+                    _sline="${_fline2#"${_fline2%%[![:space:]]*}"}"
+                    _sdef+=("$_sline")
+                fi
+            done < "$file"
+            printf '%s\n' "${_sdef[@]}" > "$_sdir/$_sn.def"
+            [[ -f "$_sdir/$_sn.elements" ]] || : > "$_sdir/$_sn.elements"
+        done < "$file"
         # Store or append each chain's own section (additive semantics).
         for ch in $chains; do
             _sect=()
@@ -283,9 +376,31 @@ case "$cmd" in
         # delete chain <family> <table> <chain> — family is REQUIRED
         # (real nft syntax); the R-003 on-host incident showed a missing
         # family silently broke list/flush/delete.
-        # delete table <family> <table> (ARC-54): drops every chain of
-        # the table; fails when the table does not exist, or when the
-        # state marker delete-table-fail is present (fail-closed drill).
+        # EGL-376-D-MOCK: delete set <family> <table> <set> — fails while
+        # a chain rule still references the set (`Device or resource
+        # busy`, VM P5/P7); after flush/delete chain it succeeds.
+        # delete table <family> <table> (ARC-54): drops every chain and
+        # every set of the table; fails when the table does not exist, or
+        # when the state marker delete-table-fail is present.
+        if [[ "$1" == set ]]; then
+            [[ "$2" == inet ]] || { echo "mock nft: delete set needs a family" >&2; exit 2; }
+            _sdir="$D/sets/$3"
+            if [[ ! -f "$_sdir/$4.def" && ! -f "$_sdir/$4.elements" ]]; then
+                echo "Error: No such file or directory" >&2
+                exit 1
+            fi
+            if set_referenced "$3" "$4"; then
+                echo "Error: Could not process rule: Device or resource busy" >&2
+                exit 1
+            fi
+            if [[ -f "$D/delete-set-fail" ]]; then
+                echo "Error: mock nft: delete-set-fail marker present" >&2
+                exit 1
+            fi
+            rm -f "$_sdir/$4.def" "$_sdir/$4.elements" \
+                  "$_sdir/$4.timeout" "$_sdir/$4.wrap"
+            exit 0
+        fi
         if [[ "$1" == table ]]; then
             [[ "$2" == inet ]] || { echo "mock nft: delete table needs a family" >&2; exit 2; }
             if [[ -f "$D/delete-table-fail" ]]; then
@@ -297,10 +412,20 @@ case "$cmd" in
                 [[ -f "$f" ]] || continue
                 found=1; rm -f "$f"
             done
+            if [[ -d "$D/sets/$3" ]]; then
+                found=1
+                rm -rf "$D/sets/$3"
+            fi
             [[ "$found" == 1 ]] || { echo "Error: No such file or directory" >&2; exit 1; }
             exit 0
         fi
         [[ "$1" == chain && "$2" == inet ]] || { echo "mock nft: delete chain needs family" >&2; exit 2; }
+        # EGL-518 test seam: the chain delete fails (after a successful
+        # flush) — the D5 failed-chain-delete disclosure.
+        if [[ -f "$D/delete-chain-fail" ]]; then
+            echo "Error: mock nft: delete-chain-fail marker present" >&2
+            exit 1
+        fi
         f="$D/$3.$4"
         if [[ ! -f "$f" ]]; then
             echo "Error: No such file or directory" >&2
@@ -315,6 +440,18 @@ case "$cmd" in
         ;;
     flush)
         # flush chain <family> <table> <chain>
+        # EGL-376-D-MOCK: flush set empties the elements but keeps the
+        # set (and its definition), like real nft.
+        if [[ "$1" == set ]]; then
+            [[ "$2" == inet ]] || { echo "mock nft: flush set needs a family" >&2; exit 2; }
+            _sdir="$D/sets/$3"
+            if [[ ! -f "$_sdir/$4.def" && ! -f "$_sdir/$4.elements" ]]; then
+                echo "Error: No such file or directory" >&2
+                exit 1
+            fi
+            : > "$_sdir/$4.elements"
+            exit 0
+        fi
         [[ "$1" == chain && "$2" == inet ]] || { echo "mock nft: unsupported flush $*" >&2; exit 2; }
         f="$D/$3.$4"
         if [[ ! -f "$f" ]]; then
@@ -477,6 +614,31 @@ case "$cmd" in
                 fi
                 printf '%s\n' "${RENDERED[@]}"
                 ;;
+            set)
+                # EGL-376-D-MOCK: list set <family> <table> <set>.
+                # Seams: fail-list-set (one-shot, any) and
+                # fail-list-set-<set> (one-shot) model a netlink read
+                # fault while the set still exists in `list table`.
+                [[ "$1" == inet ]] || { echo "mock nft: list set needs a family" >&2; exit 2; }
+                if [[ -f "$D/fail-list-set-$3" ]]; then
+                    rm -f "$D/fail-list-set-$3"
+                    echo "Error: mock nft: netlink read of set '$3' failed once" >&2
+                    exit 1
+                fi
+                if [[ -f "$D/fail-list-set" ]]; then
+                    rm -f "$D/fail-list-set"
+                    echo "Error: mock nft: netlink read of set '$3' failed once" >&2
+                    exit 1
+                fi
+                if [[ ! -f "$D/sets/$2/$3.def" && ! -f "$D/sets/$2/$3.elements" ]]; then
+                    echo "Error: No such file or directory" >&2
+                    exit 1
+                fi
+                echo "table inet $2 {"
+                render_set "$2" "$3" | sed 's/^/    /'
+                echo "}"
+                exit 0
+                ;;
             table)
                 # EGL-481 test seam: the chain-set read fails once
                 # (one-shot), modelling an nft/netns read fault after the
@@ -487,13 +649,32 @@ case "$cmd" in
                     echo "Error: mock nft: netlink read of table '$2' failed once (fail-list-table)" >&2
                     exit 1
                 fi
+                # EGL-527: the two-shot variant — fail the next N table
+                # reads (the counter file holds how many are left). The
+                # one-shot seam above keeps its D5(f) semantics.
+                if [[ -f "$D/fail-list-table-n" ]]; then
+                    _flt_n="$(cat "$D/fail-list-table-n" 2>/dev/null || true)"
+                    if [[ "$_flt_n" =~ ^[0-9]+$ ]] && (( _flt_n > 0 )); then
+                        printf '%s\n' "$(( _flt_n - 1 ))" > "$D/fail-list-table-n"
+                        echo "Error: mock nft: netlink read of table '$2' failed (fail-list-table-n, $_flt_n left)" >&2
+                        exit 1
+                    fi
+                fi
                 # Keyed on the TABLE name ($2), not the family: a table
-                # exists iff it has chain state files.
+                # exists iff it has chain state files or a sets dir.
                 found=0
                 for f in "$D/$2".*; do
                     [[ -f "$f" ]] || continue
                     found=1; cat "$f"
                 done
+                if [[ -d "$D/sets/$2" ]]; then
+                    for _sf in "$D/sets/$2"/*.def; do
+                        [[ -f "$_sf" ]] || continue
+                        found=1
+                        _sn="${_sf##*/}"; _sn="${_sn%.def}"
+                        render_set "$2" "$_sn"
+                    done
+                fi
                 [[ "$found" == 1 ]] || { echo "Error: No such file or directory" >&2; exit 1; }
                 ;;
             tables)
@@ -509,6 +690,15 @@ case "$cmd" in
                     [[ "$tbase" == last-transaction.nft ]] && continue
                     [[ "$tbase" == *.* ]] || continue
                     ttable="${tbase%%.*}"
+                    [[ -z "${tseen_t[$ttable]:-}" ]] || continue
+                    tseen_t[$ttable]=1
+                    echo "table inet $ttable"
+                done
+                # EGL-376: a table with only sets (its chains already
+                # removed) still exists in real nft.
+                for f in "$D/sets"/*; do
+                    [[ -d "$f" ]] || continue
+                    ttable="${f##*/}"
                     [[ -z "${tseen_t[$ttable]:-}" ]] || continue
                     tseen_t[$ttable]=1
                     echo "table inet $ttable"
@@ -543,6 +733,27 @@ case "$cmd" in
                     rseen_t[$rtable]=1
                     echo "table inet $rtable {"
                     for g in "$D/$rtable".*; do [[ -f "$g" ]] && cat "$g"; done
+                    if [[ -d "$D/sets/$rtable" ]]; then
+                        for _sf in "$D/sets/$rtable"/*.def; do
+                            [[ -f "$_sf" ]] || continue
+                            _sn="${_sf##*/}"; _sn="${_sn%.def}"
+                            render_set "$rtable" "$_sn"
+                        done
+                    fi
+                    echo "}"
+                done
+                # EGL-376: set-only tables (chains already removed).
+                for f in "$D/sets"/*; do
+                    [[ -d "$f" ]] || continue
+                    rtable="${f##*/}"
+                    [[ -z "${rseen_t[$rtable]:-}" ]] || continue
+                    rseen_t[$rtable]=1
+                    echo "table inet $rtable {"
+                    for _sf in "$D/sets/$rtable"/*.def; do
+                        [[ -f "$_sf" ]] || continue
+                        _sn="${_sf##*/}"; _sn="${_sn%.def}"
+                        render_set "$rtable" "$_sn"
+                    done
                     echo "}"
                 done
                 ;;
@@ -551,6 +762,24 @@ case "$cmd" in
     *) echo "mock nft: unsupported op $cmd" >&2; exit 2 ;;
 esac
 EOF
+
+# EGL-376 test helpers: seed the mock's per-profile drop-record set.
+# The state layout mirrors the mock nft model ($ARCMOCK_STATE/nft/sets/
+# <table>/<set>.def|.elements) so a test can preload a pre-feature policy
+# or a specific listing shape without going through `nft -f`.
+mock_nft_set_add() { # <table> <set> <ip> <port>
+    local dir="${ARCMOCK_STATE:?}/nft/sets/$1"
+    mkdir -p "$dir" || return 1
+    if [[ ! -f "$dir/$2.def" ]]; then
+        printf 'type ipv4_addr . inet_service\nflags dynamic,timeout\nsize 16384\ntimeout 24h\n' \
+            > "$dir/$2.def" || return 1
+    fi
+    : >> "$dir/$2.elements" || return 1
+    printf '%s %s\n' "$3" "$4" >> "$dir/$2.elements"
+}
+mock_nft_set_per_element_timeout() { # <table> <set>
+    : > "${ARCMOCK_STATE:?}/nft/sets/$1/$2.timeout"
+}
 
 cat > "$TESTROOT/bin/getent" <<'EOF'
 #!/usr/bin/env bash
@@ -884,8 +1113,9 @@ mock_batch_stat_ident() { # <name> <path> -> payload; rc
         return 1
     fi
     case "$tpath" in
-        /var/log/squid/access.log) lpath="$D/containers-$name.access.log" ;;
-        /var/log/squid/cache.log) lpath="$D/containers-$name.cache.log" ;;
+        # EGL-540: the cap's batch also stats the `.1` generations; the
+        # same basename mapping the log mv/rm handlers use answers them.
+        /var/log/squid/*.log*) lpath="$D/containers-$name.${tpath##*/}" ;;
         *) lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath="" ;;
     esac
     [[ -n "$lpath" && -f "$lpath" ]] || return 1
@@ -895,8 +1125,8 @@ mock_batch_stat_ident() { # <name> <path> -> payload; rc
 mock_batch_stat_stream() { # <name> <path> -> payload; rc
     local name="$1" tpath="$2" lpath=""
     case "$tpath" in
-        /var/log/squid/access.log) lpath="$D/containers-$name.access.log" ;;
-        /var/log/squid/cache.log) lpath="$D/containers-$name.cache.log" ;;
+        # EGL-540: `.1` keys ride the same read window as the live logs.
+        /var/log/squid/*.log*) lpath="$D/containers-$name.${tpath##*/}" ;;
         *) lpath="$(mock_cfg_local "$name" "$tpath" 2>/dev/null)" || lpath="" ;;
     esac
     [[ -n "$lpath" && -f "$lpath" ]] || return 1
@@ -940,17 +1170,35 @@ mock_batch_prefix() { # <name> <path> -> "dev:inode size prefix-hash"; rc
 }
 
 mock_caps_pair() { # <name> -> "CapEff NoNewPrivs"; rc 1 unreadable, 2 missing
-    local name="$1" knob_bad="" knob_nnp="" knob_unreadable=""
+    local name="$1" knob_bad="" knob_nnp="" knob_unreadable="" knob_shell=""
+    local knob_badtext="" knob_nnpbadtext=""
     # EGL-206-D2b: healthy default (CapEff all-zero, NoNewPrivs 1), with
     # the same per-container-then-global knobs the exec oracle models.
     [[ -f "$D/caps-bad-$name" || -f "$D/caps-bad" ]] && knob_bad=1
     [[ -f "$D/caps-nnp-$name" || -f "$D/caps-nnp" ]] && knob_nnp=1
     [[ -f "$D/caps-unreadable-$name" || -f "$D/caps-unreadable" ]] && knob_unreadable=1
+    # EGL-415: the install-shell five-cap add-back (SETUID, SETGID,
+    # CHOWN, DAC_OVERRIDE, FOWNER = 0xcb) is the one allowed non-zero
+    # workload mask.
+    [[ -f "$D/caps-shell-$name" || -f "$D/caps-shell" ]] && knob_shell=1
+    # EGL-415 rework: malformed text in either field must render the row
+    # UNKNOWN, never echo the raw value.
+    [[ -f "$D/caps-badtext-$name" || -f "$D/caps-badtext" ]] && knob_badtext=1
+    [[ -f "$D/caps-nnpbadtext-$name" || -f "$D/caps-nnpbadtext" ]] && knob_nnpbadtext=1
     if [[ -n "$knob_unreadable" ]]; then
         return 1
     fi
+    if [[ -n "$knob_badtext" ]]; then
+        printf 'zzzz-not-hex 1\n'
+        return 0
+    fi
+    if [[ -n "$knob_nnpbadtext" ]]; then
+        printf '0000000000000000 zz\n'
+        return 0
+    fi
     local capseff="0000000000000000" nnp="1"
     [[ -n "$knob_bad" ]] && capseff="00000000000001f7"
+    [[ -n "$knob_shell" ]] && capseff="00000000000000cb"
     [[ -n "$knob_nnp" ]] && nnp="0"
     printf '%s %s\n' "$capseff" "$nnp"
 }
@@ -1522,7 +1770,7 @@ case "$cmd" in
         ;;
     ps)
         # ps --format '{{.Names}}' lists RUNNING containers; ps -a
-        # --format '{{.Names}}' (ARC-60 teardown --runtime sweep) also
+        # --format '{{.Names}}' (ARC-60 teardown --orphans sweep) also
         # lists stopped-but-registered ones (the *.net state files, which
         # is what survives a stopped/exited container in the real store).
         # EGL-389-D7: a failed container list (wedged runtime).
@@ -1534,6 +1782,12 @@ case "$cmd" in
             echo "Error: unable to connect to Podman: cannot invoke Podman API" >&2
             exit 125
         fi
+        # EGL-602: opt-in call log, mirroring inspectlog-on. The bare
+        # doctor leg asserts it stays empty, so "reads no container
+        # list" is observed rather than inferred. The first argv token
+        # is recorded so a default listing and `ps -a` stay
+        # distinguishable.
+        [[ -f "$D/pslog-on" ]] && echo "ps ${1:-}" >> "$D/pslog"
         declare -A ps_seen=()
         for f in "$D/running"/*; do
             [[ -f "$f" ]] || continue
@@ -1559,6 +1813,9 @@ case "$cmd" in
         fmt=""
         if [[ "${1:-}" == "--format" ]]; then fmt="$2"; fi
         [[ -f "$D/containers/$name.net" || -f "$D/running/$name" ]] || { echo "Error: no such object" >&2; exit 1; }
+        # EGL-415 rework: opt-in call-count oracle — the doctor must read
+        # one inspect per running container, not three per-field calls.
+        [[ -f "$D/inspectlog-on" ]] && echo "inspect $name" >> "$D/inspectlog"
         case "$fmt" in
             '{{.State.Health.Status}}')
                 # Gateway health: healthy unless the test marks it sick.
@@ -1566,6 +1823,42 @@ case "$cmd" in
                 ;;
             '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}')
                 cat "$D/containers/$name.net" 2>/dev/null | head -1; echo ;;
+            '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{println}}{{end}}')
+                # EGL-415: one attachment name per line (multi-network
+                # workloads need the whole set for the dual-homed row).
+                cat "$D/containers/$name.net" 2>/dev/null || true ;;
+            '{{.HostConfig.NetworkMode}}{{println}}{{range $k,$v := .NetworkSettings.Networks}}net|{{$k}}{{println}}{{end}}{{range .Mounts}}mount|{{.Type}}|{{.Source}}{{println}}{{end}}')
+                # EGL-415: one combined read for the doctor's workload
+                # row — network mode, attachment names, mount rows.
+                # R-EGL-415-3 F2: a raw-bytes fixture expresses a record
+                # the line-oriented .netmode/.net/.mounts files cannot —
+                # e.g. a newline inside a mount source (the template
+                # emits it unescaped, which is exactly the split the
+                # parser must detect).
+                if [[ -f "$D/containers/$name.inspect-raw" ]]; then
+                    cat "$D/containers/$name.inspect-raw"
+                    exit 0
+                fi
+                printf '%s\n' "$(cat "$D/containers/$name.netmode" 2>/dev/null || true)"
+                if [[ -f "$D/containers/$name.net" ]]; then
+                    while IFS= read -r n; do
+                        [[ -n "$n" ]] && printf 'net|%s\n' "$n"
+                    done < "$D/containers/$name.net"
+                fi
+                if [[ -f "$D/containers/$name.mounts" ]]; then
+                    while IFS= read -r m; do
+                        [[ -n "$m" ]] && printf 'mount|%s\n' "$m"
+                    done < "$D/containers/$name.mounts"
+                fi
+                ;;
+            '{{.HostConfig.NetworkMode}}')
+                # EGL-415: host / container:<id> / a network name. The
+                # .netmode fixture is optional (hand-seeded containers).
+                cat "$D/containers/$name.netmode" 2>/dev/null || true ;;
+            '{{range .Mounts}}{{.Type}}|{{.Source}}{{println}}{{end}}')
+                # EGL-415: bind-mount sources for the policy-exposure
+                # check; the fixture is one type|source per line.
+                cat "$D/containers/$name.mounts" 2>/dev/null || true ;;
             '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}|{{$v.IPAddress}}|{{$v.MacAddress}}{{println}}{{end}}')
                 # EGL-515 D3: verify_gateway's combined attachment/IP/MAC
                 # read. One row for the container's class network.
@@ -1598,6 +1891,12 @@ case "$cmd" in
                 # running/net markers) still answers an identity.
                 cat "$D/containers-$name.id" 2>/dev/null \
                     || printf 'mockid%s\n' "$(printf '%s' "$name" | sha256sum | cut -c1-56)"
+                ;;
+            '{{.Image}}')
+                # EGL-547: the running container's image ID for the
+                # doctor's tagged-vs-running comparison. No fixture means
+                # an empty read (the doctor reports UNKNOWN, never clean).
+                cat "$D/containers-$name.image" 2>/dev/null || true
                 ;;
             '{{.State.StartedAt}}')
                 # EGL-395: a real container always has an identity even
@@ -1945,6 +2244,13 @@ case "$cmd" in
                 # moves); $D/mv-check-fails exercises the swap die.
                 if [[ "${2:-}" == /var/log/squid/* && "${3:-}" == /var/log/squid/* ]]; then
                     s="$D/containers-$name.${2##*/}"; d="$D/containers-$name.${3##*/}"
+                    # EGL-540: model a failed cache move after access
+                    # already moved aside — the engine's restore-then-
+                    # disclose site (`:7229`). The source stays in place.
+                    if [[ "${2##*/}" == cache.log && -f "$D/rotate-move-cache-fails-$name" ]]; then
+                        echo "mv: cannot move '$2' to '$3': Device or resource busy" >&2
+                        exit 1
+                    fi
                     # R-EGL-394-16 F1 mutation control: the pre-fix
                     # restore was a clobbering `mv`. Model the same
                     # reopen-at-restore race here so a reintroduced
@@ -1965,8 +2271,13 @@ case "$cmd" in
                             ;;
                     esac
                     if [[ -f "$s" ]]; then
+                        # EGL-540: propagate the real rc. A same-inode
+                        # refusal (the bug's precondition: live and `.1`
+                        # are hard links to one inode) must reach the
+                        # engine's skip branch instead of reading as a
+                        # successful move.
                         mv "$s" "$d"
-                        exit 0
+                        exit $?
                     fi
                     echo "mv: cannot stat '$2': No such file or directory" >&2
                     exit 1
@@ -1982,6 +2293,15 @@ case "$cmd" in
                 # EGL-389/EGL-395: config-path rm (rollback removal,
                 # cleanup, stage sweep) removes the modeled path.
                 if [[ "${2:-}" == -f && "${3:-}" == /var/log/squid/* ]]; then
+                    # EGL-540: model a failed unlink after the restore's
+                    # no-clobber link succeeded (live and `.1` then share
+                    # one inode). This is the log-path rm the restore and
+                    # the repair run; the cap's generation cleanup is the
+                    # separate `bash -c` case above.
+                    if [[ -f "$D/restore-rm-fails-$name" || -f "$D/restore-rm-fails" ]]; then
+                        echo "rm: cannot remove '${3:-}': Operation not permitted" >&2
+                        exit 1
+                    fi
                     rm -f "$D/containers-$name.${3##*/}"
                 fi
                 if [[ "${2:-}" == -f || "${2:-}" == -rf ]]; then
@@ -2799,8 +3119,18 @@ case "$cmd" in
                 # doctor's staleness peek) is catted verbatim instead, so
                 # a test controls what the inspect reads off the image.
                 img="${@: -1}"
+                fmt=""
+                if [[ "${2:-}" == "--format" ]]; then fmt="${3:-}"; fi
                 [[ -f "$D/images/$(echo "$img" | tr '/:' '__')" ]] \
                     || { echo "Error: no such image $img" >&2; exit 1; }
+                # EGL-547: the tagged image's ID for the running-gateway
+                # comparison. Dispatch on the template BEFORE the verbatim
+                # staleness-peek cat below: a `{{.Id}}` probe must never
+                # read a label/created fixture as an ID.
+                if [[ "$fmt" == '{{.Id}}' ]]; then
+                    cat "$D/image-id-$(echo "$img" | tr '/:' '__')" 2>/dev/null || true
+                    exit 0
+                fi
                 if [[ -f "$D/image-inspect-$(echo "$img" | tr '/:' '__')" ]]; then
                     cat "$D/image-inspect-$(echo "$img" | tr '/:' '__')"
                     exit 0
@@ -3630,23 +3960,33 @@ state_restore_or_seed() { # state_restore_or_seed <pristine-dir> <seed-cmd...>
 declare -A _sect_snap=()   # name -> "mode|label|pass|fail" (ended only)
 declare -A _sect_emitted=()  # name -> 1 when results_emit printed its line (EGL-451-F3)
 
-# EGL-481-D5: per-section mock-nft isolation. Engine windows share the ONE
-# mock netns state ($STATE/nft) inside a harness process, so a chain a
-# previous section installed used to be visible to this section — harmless
-# while verify compared only the two known chains, but EGL-481-D2 fails any
-# chain the section's own confdir does not define. Reset the mock firewall
-# at every engine window entry so each section starts from no chains (its
-# own seeds/ensures rebuild what it needs); never weaken the check itself.
-# Gated on the engine harness opt-in so the kit/docs harnesses (same
-# lib.sh) keep their state across sections. The cumulative logs live
-# outside $STATE/nft and are untouched.
-_section_reset_nft_state() {
+# EGL-481-D5 (nft) + EGL-518-F2 (networks): per-section mock-runtime
+# isolation. Engine windows share the ONE mock netns state ($STATE/nft) and
+# the ONE mock Podman network registry ($STATE/networks) inside a harness
+# process. A chain a previous section installed used to be visible to this
+# section — harmless while verify compared only the two known chains, but
+# EGL-481-D2 fails any chain the section's own confdir does not define. A
+# network a previous section created is a kit network the EGL-518 table-step
+# re-read must (correctly) keep the last table for, so a leaked
+# `egresslock-*` file silently changes a teardown leg's expected state in
+# whatever shard layout packs the producer before the consumer (seen only
+# under CI's 2-shard packing). Reset both registries at every engine window
+# entry so each section starts from no chains and no networks (its own
+# seeds/ensures rebuild what it needs); never weaken a check itself. Gated
+# on the engine harness opt-in so the kit/docs harnesses (same lib.sh) keep
+# their state across sections. The cumulative logs live outside
+# $STATE/{nft,networks} and are untouched.
+_section_reset_runtime_state() {
     [[ -n "${EGRESSLOCK_TEST_NFT_ISOLATION:-}" ]] || return 0
-    [[ -n "${STATE:-}" && -d "$STATE/nft" ]] || return 0
-    if ! rm -rf "$STATE/nft" || ! mkdir -p "$STATE/nft"; then
-        echo "FAIL: section_begin: cannot reset the mock nft state in $STATE/nft (EGL-481 isolation, fail-closed)"
-        exit 1
-    fi
+    [[ -n "${STATE:-}" ]] || return 0
+    local d
+    for d in nft networks; do
+        [[ -e "$STATE/$d" ]] || continue
+        if ! rm -rf "$STATE/$d" || ! mkdir -p "$STATE/$d"; then
+            echo "FAIL: section_begin: cannot reset the mock runtime state in $STATE/$d (EGL-481/EGL-518 isolation, fail-closed)"
+            exit 1
+        fi
+    done
 }
 
 section_begin() { # section_begin <name> "<label>" [counted|excluded|excluded-silent]
@@ -3673,7 +4013,7 @@ section_begin() { # section_begin <name> "<label>" [counted|excluded|excluded-si
     if [[ -n "${EGRESSLOCK_TEST_SHARD_PROGRESS:-}" && "${BASH_SUBSHELL:-0}" == "0" ]]; then
         printf '%s\n' "$name" > "$EGRESSLOCK_TEST_SHARD_PROGRESS" 2>/dev/null || true
     fi
-    _section_reset_nft_state
+    _section_reset_runtime_state
     _sect_open_cur="$name"; _sect_open_label="$label"; _sect_open_mode="$mode"
     pass=0; fail=0
     _sect_t0="${EPOCHREALTIME:-}"
@@ -3721,6 +4061,41 @@ results_emit() { # results_emit <name> — prints the pinned RESULTS line from t
     echo "RESULTS ($label): ${counts%%|*} passed, ${counts#*|} failed"
     _sect_emitted["$name"]=1
 }
+# EGL-558: additive battery record. A whole-set run.sh sets
+# EGRESSLOCK_TEST_BATTERY_RESULT to a private per-harness path; the harness
+# publishes the same tab schema EGL-451 uses for shards (pass/fail/ext
+# counters, skips, skip_cause rows, tree) and the runner sums the records
+# into its closing BATTERY TOTAL block. Record-in-addition-to-print: the
+# per-harness `RESULTS TOTAL:` line stays byte-identical in every mode
+# (EGL-451's shard branch below replaces the print, hence the separate
+# call site). Write-then-rename keeps a killed harness from leaving a
+# partial record the runner could mistake for a complete one (EGL-451).
+battery_result_publish() { # <pass> <fail> [ext_pass] [ext_fail]
+    [[ -n "${EGRESSLOCK_TEST_BATTERY_RESULT:-}" ]] || return 0
+    local b_pass="$1" b_fail="$2" b_ep="${3:-0}" b_ef="${4:-0}"
+    local b_rf="$EGRESSLOCK_TEST_BATTERY_RESULT"
+    local b_tmp="$b_rf.tmp.$$"
+    local b_cause
+    if ! {
+        printf 'pass\t%s\n' "$b_pass"
+        printf 'fail\t%s\n' "$b_fail"
+        printf 'ext_pass\t%s\n' "$b_ep"
+        printf 'ext_fail\t%s\n' "$b_ef"
+        printf 'skips\t%s\n' "$skip_count"
+        for b_cause in "${!skip_causes[@]}"; do
+            printf 'skip_cause\t%s\t%s\n' "$b_cause" "${skip_causes[$b_cause]}"
+        done
+        printf 'tree\t%s\n' "$(tree_shape_tag)"
+    } > "$b_tmp"; then
+        echo "FAIL: battery_result_publish: cannot write battery result '$b_tmp' (EGL-558 fail-closed)"
+        exit 1
+    fi
+    if ! mv -f -- "$b_tmp" "$b_rf"; then
+        echo "FAIL: battery_result_publish: cannot publish battery result '$b_rf' (EGL-558 fail-closed)"
+        exit 1
+    fi
+}
+
 results_total() { # results_total [ext_pass] [ext_fail] — declared raw-counter externals (engine arc14)
     local ext_pass="${1:-0}" ext_fail="${2:-0}"
     if [[ ! "$ext_pass" =~ ^[0-9]+$ || ! "$ext_fail" =~ ^[0-9]+$ ]]; then
@@ -3771,6 +4146,10 @@ results_total() { # results_total [ext_pass] [ext_fail] — declared raw-counter
     done
     total_pass=$((counted_pass + ext_pass))
     total_fail=$((counted_fail + ext_fail))
+    # EGL-558: publish the battery record before the shard branch can
+    # return — it is additive to the printed TOTAL below, never a
+    # replacement for it.
+    battery_result_publish "$counted_pass" "$counted_fail" "$ext_pass" "$ext_fail"
     # EGL-451-D5: in a multi-shard run each harness writes its counters and
     # skip causes to a private file; the parent replays the logs in shard
     # order, sums them, and prints the single pinned TOTAL line. A single
@@ -3802,4 +4181,111 @@ results_total() { # results_total [ext_pass] [ext_fail] — declared raw-counter
         return 0
     fi
     echo "RESULTS TOTAL: $total_pass passed, $total_fail failed$(skip_summary) ($(tree_shape_tag))"
+}
+
+# --- EGL-352: harness stderr tripwire -------------------------------------
+# A green harness run must write nothing to its own fd 2. tests/run.sh
+# merges stdout+stderr through `tee`, so an escaped engine/mock diagnostic
+# is invisible as a failure yet reads as an error in the run output. Each
+# harness process opts in after `source tests/lib.sh` and its PATH setup:
+# harness_stderr_guard_init saves fd 2 to $TESTROOT/harness-stderr.log and
+# extends the EXIT trap, the tail calls harness_stderr_guard_check (engine/
+# kit: a fail-only counted `egl352_guard` section, so TOTAL reds without a
+# green count) or harness_stderr_guard_assert (docs: its own counter),
+# and the trap reports an early exit or growth after the tail check. The
+# check is unconditional (never behind shard_section_run): the engine
+# shards into up to three test-engine.sh processes, so every process must
+# watch its own fd 2. `egl352_guard` is begun only here, from lib.sh —
+# a column-0 `section_begin` in a harness would join --list-sections.
+# Dump lines go to fd 1 (never fd 2, or the guard captures itself) and
+# are prefixed so escaped text cannot read as a SKIP:/RESULTS/boundary
+# record. No bypass: a `bash -x` trace also trips the guard by design.
+_egl352_guard_armed=""
+_egl352_guard_log=""
+_egl352_guard_tail_checked=""
+_egl352_guard_tail_size=0
+
+harness_stderr_guard_dump() { # <path> — prefixed, capped dump to fd 1
+    local path="${1:-}" line n=0 extra=0
+    [[ -f "$path" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        if (( n <= 200 )); then
+            printf '  harness stderr| %s\n' "$line"
+        else
+            extra=$((extra + 1))
+        fi
+    done < "$path"
+    if (( extra > 0 )); then
+        printf '  harness stderr| ... %d more line(s) not shown (EGL-352 dump cap 200)\n' "$extra"
+    fi
+}
+
+harness_stderr_guard_init() { # arm fd 2 capture for this harness process
+    [[ -z "$_egl352_guard_armed" ]] || return 0
+    _egl352_guard_log="$TESTROOT/harness-stderr.log"
+    if ! : > "$_egl352_guard_log"; then
+        echo "FAIL: harness_stderr_guard_init: cannot create $_egl352_guard_log (EGL-352 fail-closed)"
+        exit 1
+    fi
+    _egl352_guard_armed=1
+    exec 2>"$_egl352_guard_log"
+    trap 'harness_stderr_guard_exit' EXIT
+}
+
+harness_stderr_guard_assert() { # [path] — pure check; no counters
+    local path="${1:-${_egl352_guard_log:-$TESTROOT/harness-stderr.log}}"
+    local size=0 rc=0
+    if [[ ! -f "$path" ]]; then
+        printf 'FAIL: harness stderr guard: capture file is missing (%s; EGL-352 fail-closed)\n' "$path"
+        rc=1
+    else
+        size="$(wc -c < "$path" 2>/dev/null)" || size=0
+        if (( size == 0 )); then
+            printf 'PASS: harness stderr is clean (EGL-352)\n'
+        else
+            printf 'FAIL: harness stderr is not empty (EGL-352)\n'
+            harness_stderr_guard_dump "$path"
+            rc=1
+        fi
+    fi
+    # The tail check marks the armed capture; controls pass explicit paths
+    # and must not disturb the harness's own late-growth window.
+    if [[ -n "$_egl352_guard_armed" && "$path" == "$_egl352_guard_log" ]]; then
+        _egl352_guard_tail_checked=1
+        _egl352_guard_tail_size="$size"
+    fi
+    return "$rc"
+}
+
+harness_stderr_guard_check() { # engine/kit tail wrapper: book a leak, red TOTAL
+    if harness_stderr_guard_assert; then
+        return 0
+    fi
+    section_begin egl352_guard "EGL-352 harness stderr guard"
+    assert fail "harness stderr guard: this process wrote to its own fd 2 (EGL-352)"
+    section_end egl352_guard
+    results_emit egl352_guard
+    return 1
+}
+
+harness_stderr_guard_exit() { # EXIT trap: early-exit dump, late-growth rc
+    local rc=$?
+    local log="$_egl352_guard_log" size=0
+    if [[ -n "$_egl352_guard_armed" && -f "$log" ]]; then
+        size="$(wc -c < "$log" 2>/dev/null)" || size=0
+        if [[ -z "$_egl352_guard_tail_checked" ]]; then
+            if (( size > 0 )); then
+                printf 'FAIL: harness stderr was written before the tail check\n'
+                harness_stderr_guard_dump "$log"
+                rc=1
+            fi
+        elif (( size > _egl352_guard_tail_size )); then
+            printf 'FAIL: harness stderr grew after the tail check\n'
+            harness_stderr_guard_dump "$log"
+            rc=1
+        fi
+    fi
+    rm -rf "$TESTROOT" 2>/dev/null || true
+    exit "$rc"
 }

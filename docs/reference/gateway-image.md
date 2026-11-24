@@ -1,8 +1,9 @@
 # The gateway image (rebuilds and maintenance)
 
 This page answers: what the kit-built gateway image is, when to rebuild
-it, what the doctor's `stale:` and `rebuild:` lines mean, and how to
-rebuild and replace a running gateway.
+it, how to rebuild and replace a running gateway, and what the doctor's
+`gateway image:`, `stale:`, `rebuild:`, and `running gateway:` lines
+mean.
 
 ## What the gateway image is
 
@@ -12,12 +13,9 @@ built once — at account setup (quiet; the stream goes to the account's
 `egresslock build-gateway`
 (or the `egresslock-setup build-gateway` alias) — from the deployed
 `gateway/Containerfile`. Its base is a single Debian digest pin; the
-image never updates itself, and nothing rebuilds it automatically. A
-kit upgrade alone does not touch an existing image, and `egresslock
-ensure` on a healthy gateway does not compare image identity — so a
-rebuild only reaches a profile when you rebuild the image **and then
-replace** that profile's container with
-`egresslock ensure --replace-gateway <profile>` (see the recipe below).
+image never updates itself, and a kit upgrade alone does not touch an
+existing image. What the pin does and does not guarantee is in
+[Where the base pin and labels live](#where-the-base-pin-and-labels-live).
 
 ## When to rebuild the gateway image
 
@@ -25,12 +23,15 @@ replace** that profile's container with
 check it every day.** Rebuild when one of these is true:
 
 - **The doctor prints a `rebuild:` line.** The kit records a security
-  rebuild floor when an advisory requires a same-pin refresh (the
-  gateway's first entry is the squid DSA-6606-1 fix). An image created
-  before that floor, or one more than 30 days old, gets an advisory
-  line naming the date and the exact rebuild command. The floor is the
-  specific signal; the 30-day age is an offline backstop for a kit that
-  has not been upgraded.
+  rebuild floor when an advisory requires a same-pin refresh; the date
+  and the advisory that set it are recorded in `gateway/security-floor`
+  (see
+  [Where the base pin and labels live](#where-the-base-pin-and-labels-live)).
+  An image created before that floor, or one more than 30 days old,
+  gets an advisory line naming the date and the exact rebuild command.
+  The floor is the specific signal; the 30-day age is an offline
+  backstop for a kit that has not been upgraded — and age alone never
+  triggers the no-cache build (only the floor does).
 - **The release notes say so.** When you install a kit update, its
   release notes say whether the gateway base changed. That note is a
   trigger.
@@ -44,116 +45,124 @@ check it every day.** Rebuild when one of these is true:
   moves only when a kit release refreshes the pin (see the section
   below).
 
-### When does the doctor say the image is stale?
+## Rebuild and replace the gateway
 
-`egresslock doctor` (account shell, no root) and `sudo
-egresslock-setup doctor --account <acct>` both print the
-`gateway image:` row. The engine doctor is the same check without
-root or an account name. The row shows which base your
-image was built from and when. It reads `stale:` in two cases: (1)
-the kit you have installed expects a different base than the image
-was built from — in practice, right after you installed a kit update
-whose notes said the base changed, and until you rebuild; (2) an
-image built before the base record existed, which reads
-`stale: base unknown (pre-label image)`.
-
-It prints a separate indented `rebuild:` line when the image matches
-its kit but is due a security refresh: the image was created before
-the kit's recorded security rebuild floor, or it is more than 30 days
-old. The floor line wins when both apply, so the specific reason stays
-legible. A moved base pin already invalidates the apt layer, so only
-`stale:` prints then. `rebuild:` is advisory like `stale:` — the
-gateway keeps working and the doctor exit code stays 0. The floor is a
-date proxy: an image built after the floor can still carry an old
-package if its apt layer was cached by a manual build, and a rebuild
-between the fix and the floor can warn although it already has the
-fix. A plain rebuild of a pre-label image (the `stale: base unknown`
-remedy) also passes `--no-cache` when the kit records a floor, so it
-cannot reuse a pre-floor apt layer.
-
-A `stale:` or `rebuild:` row is advisory, not an error — the gateway
-keeps working on the old base until you rebuild. If the image could
-not be inspected, the row reads `base unknown` (not `stale:`) —
-rebuild when the notes or the age line say to.
-
-**The row is about the image only.** It says nothing about running
-containers: after a rebuild the image matches the pin and the advisory
-lines disappear, even on profiles still running the old image. Absence
-of `stale:`/`rebuild:` is not a rollout check — check the profiles
-themselves (see the recipe below).
-
-### Rebuild and replace the gateway
-
-Rebuild **once per account**, then replace
-**every gateway profile** in that account; repeat per account if you
-run more than one. As the account:
+Rebuild **once per account**, then replace **every profile** in
+that account; repeat per account if you run more than one.
+`egresslock ensure` on a healthy gateway does not compare image
+identity, so a rebuild reaches a profile only when you rebuild the
+image **and then replace** that profile's container with
+`egresslock ensure --replace-gateway PROFILE`. As the account:
 
 - **The release notes say the base moved, or the doctor printed the
-  floor `rebuild:` line:** a plain build is already a real refresh
-  when the image is below the recorded floor — the kit makes it pass
-  `--no-cache`, so the unpinned packages are re-fetched even though
-  the pin did not move.
+  floor `rebuild:` line:**
 
   ```sh
-  egresslock build-gateway && egresslock ensure --replace-gateway <profile>
+  egresslock build-gateway && egresslock ensure --replace-gateway PROFILE
   ```
 
 - **The doctor printed the age `rebuild:` line, or you are refreshing
   the unpinned packages yourself** (for example after a squid
-  advisory) **and the pin did not move:** add `--force`. Age alone
-  does not trigger the no-cache build (only the kit's floor does).
-  Without `--force`, `build-gateway` prints
-  `already built from deployed pin … use --force to rebuild` and
-  exits 0 — the `&&` would then go on to replace the container with
-  the **un-refreshed** image, severing the profile's sessions without
-  applying anything.
+  advisory) **and the pin did not move** — add `--force`:
 
   ```sh
-  egresslock build-gateway --force && egresslock ensure --replace-gateway <profile>
+  egresslock build-gateway --force && egresslock ensure --replace-gateway PROFILE
   ```
 
-The `&&` matters in both lines: it runs the replace **only if the
-build succeeded**.
-A failed build does not stop an ordinary second command in a plain
-sequence — with the old image still tagged, the replace would succeed
-against it, drop the profile's proxied sessions, and put the **same
-old base** back on the profile. Never replace on a failed build.
+Without `--force`, `build-gateway` prints
+`already built from deployed pin … use --force to rebuild` and exits 0
+— the `&&` would then go on to replace the container with the
+**un-refreshed** image, severing the profile's sessions without
+applying anything. The `&&` runs the replace **only if the build
+succeeded**: with the old image still tagged, a replace after a failed
+build would succeed against it, drop the profile's proxied sessions,
+and put the **same old base** back on the profile. Never replace on a
+failed build.
 
-If the build fails, stop: fix the cause and rebuild successfully
-first — the replacement only happens after a successful build. If the
-replacement itself fails, stop there too and fix the profile before
-moving on: the next `--replace-gateway` is still available. A
-replacement that failed **after** the removal left the profile without
-a running gateway; a refusal at the preflight (missing or unsafe
-target image) did not — the old gateway keeps running. Check which
-happened before retrying.
+What the two commands do:
 
-The build (`egresslock-setup build-gateway` is an alias of the same
-verb) rebuilds the image into the account's store from the deployed
-`gateway/Containerfile`. `ensure --replace-gateway <profile>` replaces
-that profile's running gateway container with one from the rebuilt
-image — replacing the container severs that profile's proxied
-sessions until the new gateway answers, and the command prints a
-notice first. Plain `egresslock ensure <profile>` does not replace a
-healthy gateway; the `--replace-gateway` flag is the explicit replace
-step — it refuses a missing or unsafe target image **before** removing
-the running gateway. (There is no need to remove the container or
-image by hand first: `ensure --replace-gateway` does the replacement
-in one step.)
+- `build-gateway` (`egresslock-setup build-gateway` is an alias of the
+  same verb) rebuilds the image into the account's store from the
+  deployed `gateway/Containerfile`. It needs the account's systemd user
+  manager active; if it is not, it exits 1 and names the fix. If the
+  build itself fails, stop: it exits 1 and prints the exact command to
+  re-run once you have fixed the cause — the replacement only happens
+  after a successful build.
+- `ensure --replace-gateway <profile>` replaces that profile's running
+  gateway container with one from the rebuilt image — replacing the
+  container severs that profile's proxied sessions until the new
+  gateway answers, and the command prints a notice first. It refuses a
+  missing or unsafe target image **before** removing the running
+  gateway, and there is no need to remove the container or image by
+  hand first: the replacement happens in one step. Plain
+  `egresslock ensure PROFILE` does not replace a healthy gateway; the
+  `--replace-gateway` flag is the explicit replace step.
 
-**Every gateway profile in the account needs its own replace** —
-build once, replace each. A profile whose container is not replaced
-keeps running the old image (and the old base's vulnerabilities) even
-though the rebuilt image is in the store and the doctor's `stale:` has
-cleared, which compares the image, not the running containers. Walk
-the account's profile configs for their `gateway <ip> <port>
-<allowlist>` lines — the directive is defined in the
-[policy reference](policy-reference.md) — and replace each profile's
-gateway in turn.
+If the replacement itself fails, stop and fix the profile before moving
+on: the next `--replace-gateway` is still available. A replacement that
+failed **after** the removal left the profile without a running
+gateway; a refusal at the preflight (missing or unsafe target image)
+did not — the old gateway keeps running. Check which happened before
+retrying.
 
-A rebuilt image lives in **one account's store**. Build again in each
-other account's shell and replace that account's gateway profiles —
-rebuilding as one account does not deploy the image elsewhere.
+**Every profile in the account needs its own replace** — build
+once, replace each:
+
+- A profile whose container is not replaced keeps running the old image
+  (and the old base's vulnerabilities) even though the rebuilt image is
+  in the store; the engine doctor's `running gateway:` row names that
+  profile.
+- List the account's profiles with `egresslock list`, and replace each
+  profile's gateway in turn — the profiles'
+  `gateway <ip> <port> <allowlist>` lines are defined in the
+  [policy reference](policy-reference.md).
+- A rebuilt image lives in **one account's store**. Build again in each
+  other account's shell and replace that account's profiles —
+  rebuilding as one account does not deploy the image elsewhere.
+
+## What the doctor prints
+
+Both doctors print a `gateway image:` row, which shows which base your
+image was built from and when: `egresslock doctor` (run as the account,
+no root; it takes no account name) and `sudo egresslock-setup doctor
+ACCOUNT`. The engine doctor also prints the `running
+gateway:` rollout row (below); the setup doctor keeps the image row
+only and prefixes its top-level rows with `OK:`/`PROBLEM:`.
+
+The rows are advisory — the gateway keeps working on the old base until
+you rebuild, and the doctor exit code stays 0 — with one exception: the
+setup doctor treats a missing image as a PROBLEM and exits 1.
+
+| Row | Meaning | What to do |
+|---|---|---|
+| `gateway image: missing (<tag>)` | No image in the account's store. | Build it: `egresslock build-gateway` (the setup doctor's fix line also offers re-running `init`, whose bundle builds it). |
+| `gateway image: present (<tag>) — base <digest>, built <date>` | Clean: the image matches the deployed pin and is not due a refresh. | Nothing. |
+| `stale: base pin moved (image base … != deployed pin …)` | The image was built from an older pin than the deployed `Containerfile` expects — in practice, right after a kit update whose notes said the base changed, and until you rebuild. | Rebuild, then replace (recipe above). A plain build is enough: the moved pin already invalidates the old cached layers. |
+| `stale: base unknown (pre-label image)` | The image predates the base label, so its base cannot be read. | Rebuild, then replace. When the kit records a floor, this build passes `--no-cache` on its own, so a pre-floor apt layer cannot be reused. |
+| `rebuild: … older than the kit's security rebuild floor <date> …` | The image matches its kit but predates the recorded security rebuild floor. | Rebuild, then replace. A plain build already passes `--no-cache`; the doctor's printed command also includes `--force`, which is harmless. |
+| `rebuild: … is more than 30 days old …` | Age backstop for a kit that has not been upgraded. When both apply, the floor line wins so the specific reason stays legible. | Rebuild with `--force`, then replace; also check for a newer egresslock release. |
+| `running gateway: <profiles> run(s) a different image — …` | Rollout check (engine doctor only): a running gateway container's image ID differs from the tagged image's. | Clean image row → replace only. Image row showed `stale:`/`rebuild:` → rebuild first, then replace. |
+| `running gateway: UNKNOWN — cannot compare to the built image (<cause>)` | The running list, a container's image ID, or the tagged image ID could not be read. | Fix the named cause and run the doctor again. |
+
+If the image itself could not be inspected, the row reads `base
+unknown` without `stale:` — rebuild when the release notes or the age
+line say to.
+
+The `rebuild:` floor is a date proxy: an image built after the floor
+can still carry an old package if its apt layer was cached by a manual
+build, and a rebuild between the fix and the floor can warn although it
+already has the fix.
+
+**The image row is about the image; the `running gateway:` row is the
+rollout check.** It compares each running
+`egresslock-gateway-<profile>` container's image ID to the tagged
+image's ID and prints one advisory line when they differ, naming the
+profiles. It is silent when no gateway runs, when every running gateway
+matches, and when the tagged image is absent. The row proves an
+image-ID difference at doctor time only: not why it differs, not since
+when, and not that a stopped or unstarted profile is affected.
+Absence of `stale:`/`rebuild:` is still not a rollout check on its own
+— use the `running gateway:` row and the recipe above.
 
 ## Where the base pin and labels live
 
@@ -170,6 +179,13 @@ you do not hand-edit the deployed Containerfile. A rebuild with the
 same pin (`--force`) refreshes only the unpinned packages (the squid
 apt package takes distro security updates this way); the frozen
 Debian base itself moves only when a kit release refreshes the pin.
+The pin freezes what the kit **asks for** — the base reference the
+build pulls — and the digest match is only as strong as the host's
+digest checking: on some Podman versions a digest can resolve to
+different layers/config than the one the kit pinned, so the pin is
+build-input identity, not an absolute content guarantee. The exact
+version ranges and the advisory behind this are in the threat model's
+[trusted computing base](threat-model.md#trusted-computing-base).
 
 What the gateway does at runtime is in the threat model's
 [trusted computing base](threat-model.md#trusted-computing-base)

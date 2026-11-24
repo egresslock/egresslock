@@ -8,8 +8,8 @@
 # Scope (EGL-163-D2, first cut): exactly the markdown the public snapshot
 # stages — README.md, SECURITY.md, CHANGELOG.md, packaging/README.md,
 # apparmor/README.md, docs/** and examples/**. The ticket flow and board
-# live outside the shipped set (not staged, not link-checked), and
-# docs/lp-*.txt / docs/debian-*.txt are not markdown (do not widen).
+# live outside the shipped set (not staged, not link-checked), and the
+# excluded correspondence text files are not markdown (do not widen).
 # A link is an inline `](target)` or reference definition `]: target`
 # whose target is RELATIVE — no scheme, leading `/`, or bare `#anchor`;
 # `.md` and non-md targets both. Validation is file existence with
@@ -24,6 +24,9 @@
 #   bash tests/test-docs.sh   (or tests/run.sh --harness docs)
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+# EGL-352: capture this harness process's own fd 2; the tail assert below
+# fails a green run that wrote to it (docs counts through docs_fail).
+harness_stderr_guard_init
 
 docs_root="$TREE_ROOT"   # scan root: the repo root (cwd-independent)
 
@@ -123,6 +126,102 @@ docs_sweep() {
     done
 }
 
+# EGL-517: runnable docs examples are paste-inert. A bare `<...>` on a
+# command line in an `sh` fence, or in a command-shaped inline span, is a
+# shell input redirect (its `>` also redirects the next word). Single- and
+# double-quoted text is one literal word and is stripped first. Comments,
+# non-`sh` fences, W6 prose identities, and non-command spans stay out of
+# scope (D2); examples/**, packaging/README.md and CHANGELOG.md are the
+# recorded out-of-scope residual.
+docs_paste_bad=0
+docs_paste_checked=0
+# A command line may carry env assignments and an absolute path prefix
+# (`EGRESSLOCK_DENIED_MAX_BYTES=0 egresslock …`,
+# `/opt/egresslock/egresslock teardown …`) — R-EGL-517-5 F12.
+docs_paste_cmd_re='^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((/[^[:space:]]+/)?(sudo|podman|systemctl|journalctl|loginctl|userdel|adduser|dpkg|nft|conntrack|mv|rm|grep|sed|tr|getent|cut|echo|printf|egresslock-setup|egresslock))[[:space:]]'
+
+docs_paste_check() { # <file> <lineno> <text>
+    local s
+    # Single-quoted text is one literal word. Double quotes do NOT protect
+    # the inside of a command substitution: `"$(egresslock network
+    # <profile>)"` re-parses `<profile>` as a redirect in the subshell
+    # (R-EGL-517-5 F12), so check `$(...)` bodies before stripping quotes.
+    s="$(sed -E "s/'[^']*'//g" <<<"$3")"
+    docs_paste_checked=$(( docs_paste_checked + 1 ))
+    if [[ "$s" =~ \$\([^\)]*\< ]]; then
+        docs_paste_bad=$(( docs_paste_bad + 1 ))
+        echo "FAIL: $1:$2: command line carries an unquoted '<': $3"
+        return
+    fi
+    s="$(sed -E "s/\"[^\"]*\"//g" <<<"$s")"
+    if [[ "$s" == *'<'* ]]; then
+        docs_paste_bad=$(( docs_paste_bad + 1 ))
+        echo "FAIL: $1:$2: command line carries an unquoted '<': $3"
+    fi
+}
+
+docs_paste_sweep() { # <file>...
+    local f line fence_line infence tag n bt rest span
+    local span_active span_acc span_line
+    bt='`'
+    for f in "$@"; do
+        [[ -f "$docs_root/$f" ]] || continue
+        infence=0; tag=""; n=0
+        span_active=0; span_acc=""; span_line=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            n=$(( n + 1 ))
+            if (( span_active )); then
+                if [[ "$line" == *"$bt"* ]]; then
+                    span_acc+=$'\n'"${line%%"$bt"*}"
+                    if [[ "$span_acc" =~ $docs_paste_cmd_re ]]; then
+                        docs_paste_check "$f" "$span_line" "$span_acc"
+                    fi
+                    span_active=0; span_acc=""
+                    line="${line#*"$bt"}"
+                else
+                    span_acc+=$'\n'"$line"
+                    continue
+                fi
+            fi
+            # R-EGL-517-5 F12: a fence indented inside a list item is still
+            # a fence (the old column-0 match scanned it as prose).
+            fence_line="${line#"${line%%[![:space:]]*}"}"
+            if [[ "$fence_line" == '```'* || "$fence_line" == '~~~'* ]]; then
+                if (( infence )); then
+                    infence=0; tag=""
+                else
+                    infence=1; tag="${fence_line:3}"; tag="${tag%% *}"
+                fi
+                continue
+            fi
+            if (( infence )); then
+                [[ "$tag" == sh || "$tag" == bash ]] || continue
+                [[ "$line" =~ ^[[:space:]]*# ]] && continue
+                [[ -z "${line//[[:space:]]/}" ]] && continue
+                docs_paste_check "$f" "$n" "$line"
+            else
+                rest="$line"
+                while [[ "$rest" == *"$bt"*"$bt"* ]]; do
+                    rest="${rest#*"$bt"}"
+                    span="${rest%%"$bt"*}"
+                    rest="${rest#*"$bt"}"
+                    if [[ "$span" =~ $docs_paste_cmd_re ]]; then
+                        docs_paste_check "$f" "$n" "$span"
+                    fi
+                done
+                if [[ "$rest" == *"$bt"* ]]; then
+                    span_active=1; span_line="$n"; span_acc="${rest#*"$bt"}"
+                fi
+            fi
+        done < "$docs_root/$f"
+        if (( span_active )); then
+            if [[ "$span_acc" =~ $docs_paste_cmd_re ]]; then
+                docs_paste_check "$f" "$span_line" "$span_acc"
+            fi
+        fi
+    done
+}
+
 # docs_require_nonempty — fail closed when the shipped-file list is empty
 # (EGL-194 item 3): a failed `find` used to yield a vacuous green sweep.
 # The FAIL line + increment is the signal; the final docs_fail check is rc 1.
@@ -214,6 +313,59 @@ else
 fi
 docs_root="$docs_root_saved"
 
+# EGL-517 self-test: the paste oracle flags a bare `<...>` on an `sh`-fence
+# command line and in a command-shaped inline span, and skips comments,
+# quoted text, non-`sh` fences, and non-command spans. R-EGL-517-5 F12:
+# an indented (list-item) fence is scanned too, and env-/path-prefixed
+# command lines are recognized. Run directly (not in $()) so the counters
+# survive; restore them after the observation.
+sd_paste="$TESTROOT/docs-paste-selftest"
+mkdir -p "$sd_paste"
+cat > "$sd_paste/page.md" <<'EOF'
+```sh
+egresslock ensure <profile>
+# comment: egresslock ensure <profile>
+grep -n '#include <local/' /etc/apparmor.d/usr.bin.pasta
+```
+prose `egresslock ensure <profile>` and identity `egresslock-<profile>`.
+```text
+egresslock ensure <profile>
+```
+Wrapped `egresslock ensure
+<profile>` stays flagged.
+
+- Indented fences are fences too:
+
+  ```sh
+  /opt/egresslock/egresslock teardown <name>
+  EGRESSLOCK_DENIED_MAX_BYTES=0 egresslock denied <profile>
+  podman ps --filter network="$(egresslock network <profile>)" --format x
+  ```
+
+  ```text
+  egresslock ensure <profile>
+  ```
+EOF
+docs_paste_bad_saved=$docs_paste_bad
+docs_paste_checked_saved=$docs_paste_checked
+docs_root_saved2="$docs_root"
+docs_root="$sd_paste"
+docs_paste_sweep page.md >"$sd_paste/out"
+docs_root="$docs_root_saved2"
+if [[ "$docs_paste_bad" -eq 6 && "$docs_paste_checked" -eq 7 ]] \
+   && grep -qF "page.md:2: command line carries an unquoted '<'" "$sd_paste/out" \
+   && grep -qF "page.md:6: command line carries an unquoted '<'" "$sd_paste/out" \
+   && grep -qF "page.md:10: command line carries an unquoted '<'" "$sd_paste/out" \
+   && grep -qF "page.md:16: command line carries an unquoted '<'" "$sd_paste/out" \
+   && grep -qF "page.md:17: command line carries an unquoted '<'" "$sd_paste/out" \
+   && grep -qF "page.md:18: command line carries an unquoted '<'" "$sd_paste/out"; then
+    a_docs pass "self-test: docs paste oracle flags fence + inline + wrapped + indented/env/path/substitution command placeholders, skips comments/quoted/prose"
+else
+    a_docs fail "self-test: docs paste oracle (bad=$docs_paste_bad checked=$docs_paste_checked): $(cat "$sd_paste/out")"
+fi
+docs_paste_bad=$docs_paste_bad_saved
+docs_paste_checked=$docs_paste_checked_saved
+
 # --- the shipped set (EGL-163-D2 roots; sorted for stable FAIL order) ---
 docs_files=()
 while IFS= read -r f; do
@@ -227,6 +379,17 @@ done < <(
 )
 docs_sweep ${docs_files[@]+"${docs_files[@]}"}
 docs_require_nonempty || true
+
+# EGL-517: the docs paste oracle over docs/** (the runnable docs set). The
+# out-of-scope residual — examples/**, packaging/README.md, CHANGELOG.md —
+# is recorded on the ticket.
+docs_paste_files=()
+for f in ${docs_files[@]+"${docs_files[@]}"}; do
+    [[ "$f" == docs/* ]] && docs_paste_files+=( "$f" )
+done
+docs_paste_sweep ${docs_paste_files[@]+"${docs_paste_files[@]}"}
+docs_pass=$(( docs_pass + docs_paste_checked ))
+docs_fail=$(( docs_fail + docs_paste_bad ))
 
 # EGL-433-D9: the public refused-run claim must stay scoped to the
 # implemented guarantees. A stale broad claim, or an unconditional
@@ -270,6 +433,18 @@ if [[ -f "$docs_root/CHANGELOG.md" ]]; then
     fi
 fi
 
+# EGL-352: docs has no section register — the pure assert prints the one
+# uncounted green PASS line; a leak adds one to docs_fail and its prefixed
+# dump above carries the FAIL label.
+harness_stderr_guard_assert
+docs_guard_rc=$?
+if (( docs_guard_rc != 0 )); then
+    docs_fail=$((docs_fail + 1))
+fi
+
 echo "RESULTS (docs link resolution): $docs_pass passed, $docs_fail failed"
+# EGL-558: the hand-rolled total also publishes the additive battery
+# record (same tab schema as results_total) when run.sh asks for one.
+battery_result_publish "$docs_pass" "$docs_fail"
 echo "RESULTS TOTAL: $docs_pass passed, $docs_fail failed$(skip_summary) ($(tree_shape_tag))"
 [[ "$docs_fail" -eq 0 ]]

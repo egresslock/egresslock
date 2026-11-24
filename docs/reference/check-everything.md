@@ -7,7 +7,7 @@ maps the four. The brief post-setup version is
 [first-run-checks](../quickstart/first-run-checks.md);
 when something is actually wrong, start at the
 [symptom index](../troubleshooting.md). Run every command **as the
-account** (`sudo -iu <account>`), not root — the three levels and
+account** (`sudo -iu ACCOUNT`), not root — the three levels and
 the tilde trap: [who-runs-what](who-runs-what.md).
 Service commands run in **system** scope (no `--user`).
 
@@ -16,7 +16,7 @@ Service commands run in **system** scope (no `--user`).
 Run as the dedicated `<account>` (never root):
 
 ```sh
-sudo -iu <account>
+sudo -iu ACCOUNT
 ```
 
 `<account>` = your account name; `<name>` = a profile name (the per-profile
@@ -51,7 +51,7 @@ egresslock list
 ```
 
 Want a one-off from your own shell? Prefix them with
-`sudo -iu <account> --` (see [The tilde trap](who-runs-what.md#the-tilde-trap)
+`sudo -iu ACCOUNT --` (see [The tilde trap](who-runs-what.md#the-tilde-trap-one-gotcha-worth-knowing)
 in the reference for why the tilde must stay unexpanded).
 
 ### 2. Per profile (needs the profile name — `main` below; one set per profile)
@@ -69,6 +69,8 @@ egresslock allowlist main
 egresslock allowlist main --direct
 # Hosts the gateway blocked (feed for `allow`; last 14 days by default — --days 0 for the full log)
 egresslock denied main
+# Recent direct-path TCP drops (IP:PORT; the in-kernel record is bounded and entries expire)
+egresslock denied main --direct
 # Every request, one line each (last 5)
 podman exec egresslock-gateway-main cat /var/log/squid/access.log | tail -5
 # Startup / DNS errors (last 5)
@@ -84,9 +86,9 @@ podman logs egresslock-gateway-main --tail 5
 systemctl list-timers 'egresslock-verify@*' --no-pager
 # Last verify run (exit 0 + 'verified (ensured)' = healthy; FAILED = the policy is
 # no longer as installed — a `drift:` line alone never fails the run — heal with ensure)
-systemctl status egresslock-verify@<account>.service --no-pager -n 10
+systemctl status egresslock-verify@ACCOUNT.service --no-pager -n 10
 # Recent verify log lines (the system journal — this one needs root)
-sudo journalctl -u egresslock-verify@<account>.service --no-pager -n 10
+sudo journalctl -u egresslock-verify@ACCOUNT.service --no-pager -n 10
 ```
 
 ## What "healthy" looks like
@@ -117,3 +119,14 @@ connect directly, then hang on the drop).
 Start at the [symptom index](../troubleshooting.md) (fastest
 first): `podman unshare` probe → AppArmor journal → user session →
 netns ownership → gateway logs.
+
+Four single-cause failures sit outside the layer checks:
+
+- a full disk makes the atomic writes fail —
+  [disk-full](../troubleshooting/disk-full.md);
+- a torn conf pair is the missing allowlist half —
+  [torn-conf-pair](../troubleshooting/torn-conf-pair.md);
+- a lock wait or timeout on a profile command —
+  [concurrent-commands](../troubleshooting/concurrent-commands.md);
+- verify green but a request cut at 15m00 —
+  [long-request-15m](../troubleshooting/long-request-15m.md).

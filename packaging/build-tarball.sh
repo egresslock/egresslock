@@ -66,6 +66,8 @@ version="${base}+git$(date -u '+%Y%m%d%H%M%S').$commit"
 # Default artifact name carries the version (matches packaging/README.md).
 out="${EGRESSLOCK_TARBALL_OUT:-$pkg_dir/egresslock_${version}.tar.gz}"
 
+# EGL-456: a build-time builder input (selects the unit-template source),
+# not a runtime test hook — the build runs as any user, so no EGL-491 gate.
 unit_src="${EGRESSLOCK_UNIT_SRC:-$kit/systemd}"
 [[ -f "$unit_src/egresslock-verify@.service" && -f "$unit_src/egresslock-verify@.timer" ]] || {
     echo "build-tarball: unit templates missing under $unit_src" >&2
@@ -85,32 +87,12 @@ mkdir -p "$stage/egresslock/systemd"
     # shipped tarball carries kit payload only, exactly the file set the
     # pre-flatten egresslock/ tree carried.
     tar -cf - --exclude=./packaging --exclude=./.git \
-        --exclude=./.forgejo \
-        --exclude=./AGENTS.md --exclude=./.gitignore \
-        --exclude=./docs/lp-*.txt --exclude=./docs/debian-*.txt . | tar -xf - -C "$stage/egresslock"
+        --exclude=./AGENTS.md --exclude=./.gitignore . | tar -xf - -C "$stage/egresslock"
 )
-# EGL-364: with the old ticket/board excludes gone, a re-introduced old
-# layout must fail closed here too — including a dangling symlink.
-if [[ -e "$stage/egresslock/docs/tickets" || -L "$stage/egresslock/docs/tickets" \
-      || -e "$stage/egresslock/docs/BOARD.md" || -L "$stage/egresslock/docs/BOARD.md" ]]; then
-    echo "build-tarball: FAIL - old ticket/board path leaked into the tarball stage" >&2
-    ls -ld "$stage/egresslock/docs/tickets" "$stage/egresslock/docs/BOARD.md" >&2 2>/dev/null || true
-    exit 1
-fi
-# EGL-343: `.forgejo/` is CI metadata (including the nightly dispatcher),
-# not kit payload — a widened copy rule must fail closed here too.
-if [[ -e "$stage/egresslock/.forgejo" || -L "$stage/egresslock/.forgejo" ]]; then
-    echo "build-tarball: FAIL - .forgejo leaked into the tarball stage" >&2
-    exit 1
-fi
-# EGL-65-D1: tripwire — the internal bug-report drafts (docs/lp-*.txt,
-# docs/debian-*.txt) stay repo-only, same as in the snapshot excludes.
-if find "$stage/egresslock/docs" -maxdepth 1 \
-        \( -name 'lp-*.txt' -o -name 'debian-*.txt' \) | grep -q .; then
-    echo "build-tarball: FAIL - internal bug-report draft leaked into the tarball stage" >&2
-    find "$stage/egresslock/docs" -maxdepth 1 \( -name 'lp-*.txt' -o -name 'debian-*.txt' \) >&2
-    exit 1
-fi
+# EGL-550-D9: the private-material tripwires are retired. No private-
+# checkout tarball is distributed: this is a public tool, the published
+# tree carries none of those paths, and the publisher's source/stage
+# gates run where the private tree actually is.
 install -m 0644 "$unit_src/egresslock-verify@.service" "$stage/egresslock/systemd/"
 install -m 0644 "$unit_src/egresslock-verify@.timer"   "$stage/egresslock/systemd/"
 
@@ -128,13 +110,14 @@ egresslock $version — manual install tarball
 Quick install (prefix deploy, root):
   tar -xzf $(basename "$out") && cd egresslock
   sudo ./install-kit.sh --prefix /opt/egresslock
-  sudo ./egresslock-setup init --account <acct> --init-conf --enable
+  sudo ./egresslock-setup init ACCT --init-conf --enable
   sudo ./egresslock-setup apparmor check  # confirm pasta AppArmor compatibility on this host
 
 On-box uninstall (root):
   sudo ./uninstall-kit.sh --prefix /opt/egresslock
-  (account teardown first, while the engine exists:
-   egresslock teardown --runtime — as the account)
+  (account teardown first, while the engine exists, as the account:
+   egresslock teardown all --yes
+   egresslock teardown --orphans)
 
 See egresslock/README.md for the full guide.
 EOF

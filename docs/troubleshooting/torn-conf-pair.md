@@ -9,9 +9,9 @@ missing:
       present: /home/<account>/.config/egresslock/main.conf
       missing: /home/<account>/.config/egresslock/main-allowlist
       fix: create the allowlist as the account — an empty file is the valid deny-all starter:
-           sudo -u <account> touch /home/<account>/.config/egresslock/main-allowlist
+           sudo -u <account> touch -- /home/<account>/.config/egresslock/main-allowlist
       or start over: if this confdir holds nothing else, move the conf aside and re-run (only this conf moves):
-           sudo -u <account> mv /home/<account>/.config/egresslock/main.conf /home/<account>/.config/egresslock/main.conf.bak
+           sudo -u <account> mv -n -T -- /home/<account>/.config/egresslock/main.conf /home/<account>/.config/egresslock/main.conf.bak
 
     Error: allowlist file missing: /home/<account>/.config/egresslock/main-allowlist (check the profile's 'gateway' directive)
 
@@ -40,21 +40,27 @@ the pair.
 Add the missing allowlist as the account, with mode 0600. An empty file
 is a valid, deny-all allowlist (the shipped starter is empty):
 
-    sudo -u <account> install -m 600 /dev/null /home/<account>/.config/egresslock/main-allowlist
+```sh
+sudo -u ACCOUNT install -m 600 /dev/null /home/ACCOUNT/.config/egresslock/main-allowlist
+```
 
 Then re-run setup and ensure:
 
-    sudo egresslock-setup init --init-conf --enable --account <account>
-    # as the account:
-    egresslock ensure main
+```sh
+sudo egresslock-setup init ACCOUNT --init-conf --enable
+# as the account:
+egresslock ensure main
+```
 
 If the conf holds nothing you want to keep, start over instead: move
 the conf aside and re-run setup — `--init-conf` writes the complete
 starter pair again (only this conf moves; the rest of the confdir is
 untouched):
 
-    sudo -u <account> mv /home/<account>/.config/egresslock/main.conf \
-        /home/<account>/.config/egresslock/main.conf.bak
+```sh
+sudo -u ACCOUNT mv /home/ACCOUNT/.config/egresslock/main.conf \
+    /home/ACCOUNT/.config/egresslock/main.conf.bak
+```
 
 ## Links
 
@@ -65,3 +71,6 @@ untouched):
   what setup does, flag by flag.
 - [which-check](which-check.md) — which doctor/check command answers
   which question.
+- [policy-reference: File names](../reference/policy-reference.md#file-names-the-convention) —
+  the legacy `gateway`-filename migration (`invalid gateway allowlist
+  '<path>'`), a different failure.

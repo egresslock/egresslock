@@ -13,6 +13,8 @@
 #   /usr/share/egresslock/examples/  starter conf + allowlist + recipes + egl-base
 #   /usr/share/egresslock/doc/       docs/ tree (EGL-28 structure,
 #                                    structure-preserving) + README.md
+#   /usr/share/egresslock/docs       relative symlink -> doc/docs, so the
+#                                    stable docs/ path resolves everywhere
 #   /usr/share/egresslock/apparmor/  ARC-27 pasta snippet + README (shipped,
 #                                    NOT applied — activation is
 #                                    egresslock-setup --apparmor-add, ARC-22-D3)
@@ -109,6 +111,8 @@ fi
 out="${EGRESSLOCK_DEB_OUT:-$pkg_dir/egresslock_${version}_all.deb}"
 
 # Unit templates: in-tree (see header); no out-of-tree fallback.
+# EGL-456: a build-time builder input (selects the unit-template source),
+# not a runtime test hook — the build runs as any user, so no EGL-491 gate.
 unit_src="${EGRESSLOCK_UNIT_SRC:-$kit/systemd}"
 for f in egresslock-verify@.service egresslock-verify@.timer; do
     [[ -f "$unit_src/$f" ]] || {
@@ -220,17 +224,13 @@ install -m 0644 "$kit/examples/egl-base/README.md"     "$share/examples/egl-base
 install -m 0644 "$kit/examples/egl-base/security-floor" "$share/examples/egl-base/security-floor"
 install -m 0755 "$kit/examples/egl-base/build-egl-base" "$share/examples/egl-base/build-egl-base"
 chmod -R go-w "$share/examples/egl-base"
-# EGL-28 / EGL-364: the docs/ tree ships structure-preserving
+# EGL-28 / EGL-550-D9: the docs/ tree ships structure-preserving
 # (quickstart/setup/reference/troubleshooting tiers + the index);
 # site-named docs never ship. README.md sits beside the tree at
-# doc/README.md. This package keeps its own process-file guard for the
-# old ticket/board paths (the BOARD.md skip and the tickets/ find filter
-# below) because it is the deb's only guard if that layout reappears — no
-# tripwire covers this stage.
+# doc/README.md. The old ticket/board process guard is retired: the
+# ticket flow and board live outside the shipped tree, which this docs
+# loop never reads.
 while IFS= read -r f; do
-    # BOARD.md is generated ticket-process navigation (see the guard
-    # note above) — process files never ship in the package.
-    [[ "$(basename "$f")" == "BOARD.md" ]] && continue
     # ARC-22 verification: no site names in the package. A doc that
     # carries fleet facts is skipped (named on stderr) rather than
     # redacted here; the prefix deploy keeps shipping everything.
@@ -241,8 +241,13 @@ while IFS= read -r f; do
     rel="${f#"$kit"/}"
     mkdir -p "$share/doc/$(dirname "$rel")"
     install -m 0644 "$f" "$share/doc/$rel"
-done < <(find "$kit/docs" -name '*.md' ! -path "$kit/docs/tickets/*" | sort)
+done < <(find "$kit/docs" -name '*.md' | sort)
 install -m 0644 "$kit/README.md" "$share/doc/README.md"
+# EGL-556-D3: one docs path on every layout. The deb keeps the documented
+# `doc/` tree; a relative alias beside it makes the `docs/` path the
+# shipped messages and apparmor/README.md's relative link already name
+# resolve on an installed host. Additive only: no rename, no moved file.
+ln -s doc/docs "$share/docs"
 install -m 0644 "$kit/apparmor/usr.bin.pasta.local" "$share/apparmor/usr.bin.pasta.local"
 install -m 0644 "$kit/apparmor/README.md" "$share/apparmor/README.md"
 
@@ -369,9 +374,19 @@ if [ "$svc_state" != absent ] || [ "$tmr_state" != absent ]; then
     fi
 fi
 if [ -e /opt/egresslock/egresslock ]; then
-    # ARC-22-D1: never run both installs at once on a host.
-    echo "WARNING: a prefix kit also exists at /opt/egresslock — do not" >&2
-    echo "  run both installs at once; remove one first (docs: /usr/share/egresslock/doc/upgrade.md)." >&2
+    # ARC-22-D1 / EGL-531-D2: never run both installs at once on a host.
+    # This is the one co-install shape that used to complete warn-only:
+    # a live prefix engine at /opt with no /etc template to shadow the
+    # package's units is still a second install channel, so refuse it
+    # with the same policy and remediation as the shadow branch above.
+    # No unit or AppArmor state is touched on this path.
+    echo "FAIL: a prefix kit is still installed at /opt/egresslock AND the" >&2
+    echo "  .deb is being installed. The two install channels must never" >&2
+    echo "  co-exist. Remediation: remove the prefix kit with" >&2
+    echo "  uninstall-kit.sh --prefix /opt/egresslock (from the checkout/" >&2
+    echo "  tarball that installed it), then finish this install with" >&2
+    echo "  'sudo dpkg --configure egresslock'." >&2
+    exit 1
 fi
 # EGL-103-D3 (R2 disclosure, bounded to unit mutates): every
 # unit-file / systemctl mutate in these scripts prints one matching
@@ -383,7 +398,7 @@ fi
 systemctl daemon-reload || true
 echo "postinst: systemd daemon-reload"
 echo "egresslock installed. next step:"
-echo "  sudo egresslock-setup init --account <acct> --init-conf --enable"
+echo "  sudo egresslock-setup init ACCT --init-conf --enable"
 echo "  sudo egresslock-setup apparmor check  # confirm pasta AppArmor compatibility on this host"
 exit 0
 EOF
@@ -424,6 +439,20 @@ if [[ -n "$keep_stage" ]]; then
             echo "  the value resolves to $qlex; move that path aside or name an empty directory, then re-run; nothing was written to $qpath:" >&2
         else
             echo "  move that path aside or name an empty directory, then re-run; nothing was written to $qpath:" >&2
+        fi
+        echo "    EGRESSLOCK_DEB_KEEP_STAGE=<new-empty-dir> packaging/build-deb.sh" >&2
+        exit 2
+    }
+    # EGL-555-D1: the leaf mkdir below pins creation; the copy must not
+    # resolve the name again. One cause line for a leaf that no longer
+    # matches the identity this run created, or that cannot be entered.
+    _keep_stage_refuse_changed() { # <q:path> [<q:lexical>]
+        local qpath="$1" qlex="${2:-}"
+        echo "build-deb: refusing: EGRESSLOCK_DEB_KEEP_STAGE changed while the staged tree was checked: $qpath" >&2
+        if [[ -n "$qlex" ]]; then
+            echo "  the value resolves to $qlex; nothing was copied to $qpath. Name an empty directory you control and re-run:" >&2
+        else
+            echo "  nothing was copied to $qpath. Name an empty directory you control and re-run:" >&2
         fi
         echo "    EGRESSLOCK_DEB_KEEP_STAGE=<new-empty-dir> packaging/build-deb.sh" >&2
         exit 2
@@ -505,7 +534,21 @@ if [[ -n "$keep_stage" ]]; then
     # classification (including a fresh non-empty directory).
     mkdir -- "$keep_lexical" \
         || _keep_stage_refuse_not_empty "$keep_q" "$keep_qlex"
-    cp -R -- "$root"/. "$keep_lexical"
+    # EGL-555-D1: bind the copy to the directory this run created. Capture
+    # its no-follow identity, enter it, and require `stat .` to match; a
+    # symlink substituted before the anchor mismatches and refuses, and a
+    # swap after it cannot redirect the relative copy.
+    keep_id="$(stat -c '%d:%i' -- "$keep_lexical" 2>/dev/null)" || keep_id=""
+    [[ -n "$keep_id" ]] \
+        || _keep_stage_refuse_changed "$keep_q" "$keep_qlex"
+    (
+    cd -- "$keep_lexical" || _keep_stage_refuse_changed "$keep_q" "$keep_qlex"
+    _keep_id_now="$(stat -c '%d:%i' . 2>/dev/null)" \
+        || _keep_stage_refuse_changed "$keep_q" "$keep_qlex"
+    [[ "$_keep_id_now" == "$keep_id" ]] \
+        || _keep_stage_refuse_changed "$keep_q" "$keep_qlex"
+    cp -R -- "$root"/. .
+    )
     # EGL-433-F5: report the lexical destination this run populated, never
     # the input spelling (`link/../stage` can traverse elsewhere).
     printf -v keep_qdest '%q' "$keep_lexical"

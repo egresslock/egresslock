@@ -177,16 +177,16 @@ conffiles — reinstall with force-confmiss:
 sudo apt-get install --reinstall -o Dpkg::Options::="--force-confmiss" pasta
 ```
 
-Then re-test **as the account**: `sudo -iu <account> -- podman unshare
+Then re-test **as the account**: `sudo -iu ACCOUNT -- podman unshare
 --rootless-netns true` must return rc=0.
 
 Only if the check says the amendment is required but applying it does
 not fix the probe: check the session
 (`systemctl --user is-system-running`, `loginctl list-sessions`,
 `/run/user/<uid>/netns/` ownership) — a
-`sudo systemctl restart user@<uid>` may be needed, but WARNING: it
+`sudo systemctl restart user@UID` may be needed, but WARNING: it
 stops user-unit children (containers); expect `podman start
-<container>` or a reboot as follow-ups (see
+CONTAINER` or a reboot as follow-ups (see
 [session-tangles](session-tangles.md)).
 
 ## Why this matters for installs

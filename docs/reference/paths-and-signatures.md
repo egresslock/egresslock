@@ -29,14 +29,25 @@ Each row is the SAME policy state — only the workload env differs.
 
 | Signature | Layer | Meaning |
 |---|---|---|
-| Squid error page; `TCP_DENIED/403` in access.log; `denied <profile>` lists the destination (with a one-time stderr note for IPv4) | Squid (proxy path) | Reached the gateway, not allowlisted — or a proxied request to an IP literal (never allowlistable). |
+| Squid error page; `TCP_DENIED/403` in access.log; `denied <profile>` lists the destination | Squid (proxy path) | Reached the gateway, not allowlisted — or a proxied request to an IP literal (never allowlistable). |
 | Hang, no error page, absent from access.log | nft (direct path) | Went direct with no direct allow — the profile's terminal drop, silently. |
 | Instant `Connection refused` (0 ms), direct-pin counters stay 0 | netns itself | Destination is the HOST machine's own address — the pasta hairpin (below). The policy never sees the packet. |
 
-`denied <profile>` lists IPv4 destinations and prints a one-time hint
-that they belong on the direct path, not the proxy path — but it only sees traffic
-that REACHED the gateway. A host absent from access.log was never
-proxied.
+`denied <profile>` lists IPv4 destinations too, but it only sees
+traffic that REACHED the gateway. An IPv4 literal is not an allowlist
+hostname: put it on the direct path (`allow main 192.0.2.24:11434
+--direct`), or add it to `NO_PROXY` and recreate the workload. A host
+absent from access.log was never proxied.
+
+Not every failure is one of these three: a request cut at exactly 15m00
+is the profile's `read-timeout`
+([long-request-15m](../troubleshooting/long-request-15m.md)); a torn
+conf pair is the missing allowlist half
+([torn-conf-pair](../troubleshooting/torn-conf-pair.md)); a lock
+timeout is
+[concurrent-commands](../troubleshooting/concurrent-commands.md); a
+full disk makes the atomic writes fail
+([disk-full](../troubleshooting/disk-full.md)).
 
 ## The pasta hairpin — why the host's own LAN IP can never work
 
@@ -45,7 +56,7 @@ host's own LAN IP is *local* to the netns. A container connecting to
 it never leaves the netns — the profile policy never sees the packet,
 and the netns kernel refuses the connection (nothing listens there).
 Confirm with `podman unshare --rootless-netns tcpdump -ni any host
-<ip>`: silence. The gateway-address trick (`192.168.0.1`) does NOT
+IP`: silence. The gateway-address trick (`198.51.100.1`) does NOT
 work either — the gateway address is not a host alias on current
 podman/pasta.
 
@@ -86,8 +97,64 @@ request `http://ollama.lan:11434` — does not rescue the proxied 403:
   (in which case /etc/hosts is unnecessary: just
   `allow main <dns-name>:port`), the proxied request fails at gateway
   DNS resolution instead of the 403.
-- The hosts-file trick only helps as naming on the DIRECT path (name
-  in NO_PROXY + an allow-host pin to the IP) — cosmetic.
+- The hosts-file trick does not create a bypass: `NO_PROXY` is derived
+  and carries no hostname, and the proxied request still fails as
+  above — the fix stays the direct-path IP literal (above), whose pin
+  lands in `NO_PROXY` automatically.
+
+## Listing recent direct-path drops
+
+The direct path's first-line record is the profile's bounded nft set,
+readable as the account without host privileges:
+
+```sh
+egresslock denied main --direct
+```
+
+It prints one `IP:PORT` per line (sorted) for IPv4 **TCP** destinations
+that hit the profile's terminal drop, so the lines paste into
+`egresslock allow main IP:PORT --direct`; a repeat drop refreshes an
+entry. Every successful `denied` view prints one shared stderr caveat
+before the entries: the view covers one lane and a short or empty list
+is not proof that nothing was denied. `--all`/`--days` apply to the
+gateway log only; the record's bounds and its full-record behavior are
+in the `--direct` limitations below. Empty stdout with the shared
+caveat and the empty-record sentence on stderr means the set is empty
+or its entries expired.
+
+Limitations of the two views (`egresslock help denied` is the canonical
+list):
+
+Gateway (proxy) view:
+- Squid access log only; no direct-lane entries.
+- Parsed and de-duplicated `TCP_DENIED/403` destinations.
+- Default 14-day window; allow-covered entries omitted unless `--all`.
+- 32 MiB tail-biased read cap (`EGRESSLOCK_DENIED_MAX_BYTES`).
+- A stopped gateway or rotated log can look like no denials.
+- IPv4 literals are not allowlist hostnames: use
+  `egresslock allow PROFILE IP:PORT --direct`, or add the IP to
+  `NO_PROXY` (`proxy-env` includes direct IPv4 pins; recreate the
+  workload).
+
+`--direct` view:
+- Terminal direct-path drops only, IPv4 TCP `IP:PORT`.
+- Other protocols are not permitted for workload egress (DNS `:53` to
+  the bridge gateway excepted), so UDP/ICMP to other destinations are
+  dropped, not merely unlisted.
+- No gateway/proxy, anti-spoof, IPv6, or pre-terminal drops.
+- Bounded to 16384 entries with a 24h idle expiry.
+- Later denials are not recorded once the record is full.
+- A short or empty list is not proof nothing was denied.
+
+To inspect the raw set (for example to see expiry times), use the
+resolved nft path in the rootless netns (stock PATH may lack it):
+
+```sh
+podman unshare --rootless-netns /usr/sbin/nft list set inet egresslock d_main
+```
+
+The set name is `d_` followed by the profile name with hyphens replaced
+by underscores (same mangling as the `p_` chain).
 
 ## Proving a drop with the counter
 

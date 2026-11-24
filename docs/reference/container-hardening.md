@@ -12,7 +12,8 @@ is the egress boundary regardless. The flags below harden the
 *workload* — capabilities, filesystem, identity — which the network
 policy alone does not. The obligation list and its boundaries are
 recorded in the [threat model](threat-model.md) (operator obligations,
-invariant I5, threats T9 and T10).
+invariant I5, threats T9 and T10). The one-screen do / do-not list is
+the [operator obligations checklist](operator-obligations.md).
 
 ## Layer 1 — always on, every workload
 
@@ -36,6 +37,20 @@ top — below; the flags themselves are never dropped):
   launcher obligation).
 - `--security-opt=no-new-privileges` prevents privilege escalation via
   setuid binaries inside the container.
+- **Checkpoint images keep the dumped configuration.** On `podman run`
+  of a checkpoint image — and on `podman container restore` — the
+  process comes up with the capabilities and `NoNewPrivs` recorded in
+  the checkpoint, not the flags on the restore command: a requested
+  `--cap-drop=all --security-opt=no-new-privileges` is silently
+  discarded (CVE-2026-94603 class; measured on rootful podman 5.4.2,
+  in the advisory range). Launch the workload with the pair, then
+  `podman container checkpoint` it; a container already running
+  unhardened must be recreated hardened and checkpointed. The dump is
+  the configuration the restore honors. The tested rootless lane
+  refuses checkpointing (`checkpointing a container requires root`),
+  and a 5.4.2 `podman image save`/`load` round trip strips the
+  checkpoint annotations — the measured discard is a rootful-podman
+  workload surface.
 
 **Install shells that run `apt` add five capabilities back — the
 baseline's one stated add-back.** With `--cap-drop=all` alone,
@@ -121,8 +136,8 @@ ordinary shell continuing to the next line:
 ```sh
 # converge network + policy (or repair), then assert the live policy
 # (exit 1 = fail closed); the launch runs only if both succeed:
-egresslock ensure <profile> \
- && egresslock verify <profile> \
+egresslock ensure PROFILE \
+ && egresslock verify PROFILE \
  && podman run ...
 ```
 

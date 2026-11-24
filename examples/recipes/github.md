@@ -206,6 +206,8 @@ egresslock ensure main \
     sh
 ```
 
+*(Same stated exception as Path 1 step 2.)*
+
 ```sh
 # workload — the container shell
 # prompt: root@9badc0ffee67:/#

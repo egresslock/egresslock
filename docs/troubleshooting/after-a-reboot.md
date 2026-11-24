@@ -12,11 +12,11 @@ After the host reboots:
 but a workload started with
 `podman run --network="$(egresslock network main)"` has **no
 egresslock policy**: direct traffic is not dropped and IPv6 is not
-denied. The verify timer (default sweep mode) now fails named within
+denied. The verify timer (aggregate) now fails named within
 ≤15 minutes (`Persistent=true`):
 
 ```text
-verify: network exists but policy does not — run: egresslock ensure main (as <account>)
+verify: network exists but policy does not — run as <account>: egresslock ensure main
 ```
 
 ## Cause
@@ -25,7 +25,7 @@ The podman network **object** is stored on disk, so it survives the
 reboot. The rootless netns and its nftables policy are volatile:
 nothing holds the netns open after a reboot, and the first container
 start recreates it fresh — without the egresslock table. Until someone
-runs `egresslock ensure <profile>` again, the persisted network
+runs `egresslock ensure PROFILE` again, the persisted network
 object is unpolicied: it looks healthy, it is not.
 
 ## Fix
@@ -37,23 +37,22 @@ any workload:
 egresslock ensure main
 ```
 
-or use the kit launcher `egresslock-start`, which always ensures first
-(fail-closed: if ensure fails, the daemon does not start). `ensure` is
-idempotent: it recreates the anchor, reinstalls the policy, and
-refreshes the gateway — reloading it in place when its running instance
+or use the kit's daemon start wrapper `egresslock-start`, which always
+ensures first (fail-closed: if ensure fails, the daemon does not start).
+`ensure` is idempotent: it recreates the anchor, reinstalls the policy,
+and refreshes the gateway — reloading it in place when its running instance
 was started on the deployed config, and restarting it once otherwise.
 
 ## What the timer does (and does not) do
 
-- The 15-minute `egresslock-verify@<account>.timer` (default sweep
-  mode) fails named with `verify: network exists but policy does not
-  — run: egresslock ensure <profile> (as <account>)` — a drift
+- The 15-minute `egresslock-verify@<account>.timer` always verifies
+  every profile with a running anchor (aggregate; there is no named
+  mode). It fails named with `verify: network exists but policy does not
+  — run as <account>: egresslock ensure <profile>` — a drift
   **signal**, not a repair. It never re-ensures by design.
-- A named-mode wiring (`egresslock-setup --profile` at setup) fails
-  the same named way on `verify <profile>`.
-- If no profile is ensured **and** nothing is stale, the sweep stays
-  silently green (exit 0): silence means "no profiles ensured and no
-  stale leftovers".
+- If the sweep sees no profile with a running anchor and nothing is
+  stale, the sweep stays silently green (exit 0): silence means "no
+  profiles with a running anchor and no stale leftovers".
 
 ## Links
 

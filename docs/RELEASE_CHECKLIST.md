@@ -1,19 +1,19 @@
 # Release checklist
 
+**Audience: maintainers cutting a release.** This is the public gates
+list, not an operator how-to, and not a pentest claim.
+
 egresslock is a security-sensitive networking tool. A release is a
 **file-allowlist snapshot** of product files (no git history, no
 process tickets). Review it against the primary invariant:
 
 > A workload on a profile network must not reach destinations outside
-> that profile's nftables policy and (on a gateway profile, for HTTP(S))
-> the Squid allowlist.
+> that profile's nftables policy and, for HTTP(S), the Squid allowlist.
 
 Read the [threat model](reference/threat-model.md) first. Documented
 accepted risks (same-profile L2, allowlisted
 name rebind through the gateway, not a sandbox) are **not** release
 blockers unless the behavior is worse than documented.
-
-This page is the public gates list. It is not a pentest claim.
 
 ## Review depth
 
@@ -39,25 +39,25 @@ number alone:
 This tree does **not** ship a workload launcher. Missing
 `--cap-drop=all` on an operator's `podman run` is an operator
 obligation; the kit-built **gateway and anchor** must drop
-capabilities — and the kit asserts the pair is live on both
-(CVE-2026-94603: per the advisory — version floor operator-provided,
-untested from this tree — a checkpoint annotation can make
-`podman run` silently discard launch-time sandbox flags; the
-annotation-triggered checkpoint interpretation is live-observed on
-Podman 5.4.2, failing at the restore import; the
-kit refuses checkpoint-annotated images for its own containers and a
-fixed Podman + annotation rejection is the operator side of the
-workaround).
+capabilities — and the kit asserts the pair is live on both. A
+checkpoint image cannot become a kit container: the kit refuses one
+carrying the checkpoint annotation. On the operator's side, a real
+checkpoint payload restores the checkpoint's recorded configuration
+— a `--cap-drop=all --security-opt=no-new-privileges` requested on
+`podman run` is silently discarded — while a benign image that only
+carries the annotation fails at the restore import (CVE-2026-94603,
+in the advisory range; the fixed floor is per the advisory). A fixed
+Podman plus annotation rejection is the operator side of the
+workaround.
 
 ## Publish gates
 
 All of these must hold on the snapshot tree (not the private
 development history):
 
-- [ ] `bash tests/run.sh` is green on the snapshot sources (the full
-      battery, default track — not `--track fast`: the per-push CI
-      battery skips the registered slow sections, the release gate
-      runs everything).
+- [ ] `bash tests/run.sh` is green on the snapshot sources: run it
+      with no track flag — `fast` and `lite` skip sections; the
+      release gate runs everything.
 - [ ] Revocation-walk pairing: if the delta under review touches the
       policy compiler's accept emitters, the accepted-set walk, or the
       reversed-orig walk, the paired walk change is present and the
@@ -67,7 +67,8 @@ development history):
 - [ ] Gateway live-config truth: if the delta under review touches
       `gw_generate_config`'s probe block/token, `gw_live_token` /
       `gw_live_probe`, or `verify_gateway`'s deployed-vs-live
-      comparison, the delta carries the `egl393` battery result. A
+      comparison, the delta carries the dedicated gateway live-config
+      battery result. A
       deployed config the running Squid never loaded is invisible to a
       parse-only verify.
 - [ ] Threat model matches the tree: no site launchers, accepted

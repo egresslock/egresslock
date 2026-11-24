@@ -6,9 +6,8 @@ egress to exactly the hosts its install chain needs — `deb.debian.org`
 Astral/uv hosts (`astral.sh`, `releases.astral.sh`), `github.com`
 (VCS), and the Python package hosts (`pypi.org`,
 `files.pythonhosted.org`) — everything else denied by the profile's
-fail-closed policy. This is the tested-2026-09-05 version of the
-hermes code-install path from
-[agentic-tool-opencode.md](agentic-tool-opencode.md).
+fail-closed policy. This is the tested-2026-09-05 hermes code-install
+path.
 
 Run every command **as the account** (`sudo -iu <account>`).
 

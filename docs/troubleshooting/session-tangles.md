@@ -3,7 +3,7 @@
 ## Symptom
 
 After the user session was restarted (`sudo systemctl restart
-user@<uid>`), the podman pause process (and any container that is a
+user@UID`), the podman pause process (and any container that is a
 child of the user systemd instance) dies with it. The next podman
 command may say:
 
@@ -19,9 +19,12 @@ instance; restarting that instance orphans them.
 
 ## Fix / recovery in order
 
+> **Do not run `podman system reset`** — it deletes every container,
+> image, and volume in the store, not just the wedged pause process.
+
 ```sh
 podman ps -a          # what got stopped? (migrate stops containers)
-podman start <name>   # restart anything that should be running
+podman start NAME   # restart anything that should be running
 # prefer a REBOOT to clear a wedged pause-process state over repeated
 # migrate calls.
 ```

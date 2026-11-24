@@ -14,7 +14,7 @@ unset them and attempt a direct connection. The boundary must therefore sit
 outside the workload, in the network namespace through which its packets are
 forwarded.
 
-With a `gateway-only` profile, egresslock makes that boundary explicit: the
+With an egresslock profile, that boundary is explicit: the
 workload can reach the gateway's intended proxy port, while the profile's
 terminal drop rejects direct internet and LAN traffic. Omitting or changing
 `HTTP_PROXY` does not create an alternate egress path. HTTP/HTTPS traffic must
@@ -48,7 +48,7 @@ operator must ensure that:
 - the gateway exposes only its intended proxy interface and port, and the
   host's network path is not independently granting a bypass.
 
-Under these assumptions, a `gateway-only` workload has no direct route around
+Under these assumptions, a workload has no direct route around
 the gateway. This is not a sandbox, host isolation, or a general-purpose
 multi-tenant boundary. Same-profile peers share L2, and an explicit
 `allow-host` direct-access rule authorizes a separate nftables-enforced path
@@ -79,11 +79,11 @@ workload container
                                             Internet
 ```
 
-EgressLock runs outside the workload container. The workload cannot gain
+The engine runs outside the workload container. The workload cannot gain
 network access merely by ignoring proxy settings; its rootless Podman network
 is fail-closed, and only explicitly configured paths are available.
 
-For a gateway-only profile, the right-hand path is the only outbound path for
+For every profile, the right-hand path is the only outbound path for
 destinations not covered by an explicitly configured direct rule. The workload
 may connect to the gateway's proxy port, but the nftables chain drops direct
 connections. The gateway's own egress is separately permitted so it can
@@ -155,8 +155,12 @@ address is permitted to reach its upstream destinations.
 
 `ensure` creates or validates the bridge network, starts the anchor and the
 gateway, installs the policy, and verifies the result. The
-shipped daemon launcher (`egresslock-start`) refuses to start the daemon
-unless `ensure` succeeds. `verify` compares the live nftables chain with the
+shipped daemon start wrapper (`egresslock-start`) refuses to start the
+daemon unless `ensure` succeeds. It is the kit's only shipped start
+wrapper and starts a site daemon, not a workload — workload launch stays
+with the operator's launcher (see
+[the wrapper reference](scripts-and-environment.md#egresslock-start--the-daemon-start-wrapper)).
+`verify` compares the live nftables chain with the
 expected policy and sends one probe request through the gateway to
 confirm the running Squid serves the deployed configuration;
 the timer repeats both checks for drift.
@@ -167,7 +171,7 @@ The safety default is no usable egress, not best-effort connectivity:
 
 - missing, unreadable, invalid, or contradictory profile policy is rejected;
 - an unhealthy rootless network, gateway, or nftables installation makes
-  `ensure` fail, the shipped daemon launcher does not start, and the
+  `ensure` fail, the shipped daemon start wrapper does not start, and the
   operator's launcher must not start workloads;
 - the profile's terminal IPv4 drop rejects direct traffic not covered by an
   explicit rule;
@@ -198,17 +202,27 @@ work (podman, pasta, nftables present), the account is dedicated and
 unprivileged, the host OS and kernel are kept security-patched
 (containers share the host kernel; a host may be a VM), and the
 root-owned kit binaries are what root says they are (tool integrity,
-not a policy boundary). Workloads must be launched with capabilities
-dropped — the kit ships no workload launcher, so this is
-the operator's launcher's job (`--cap-drop=all
---security-opt=no-new-privileges`; plain `podman run` does not). The kit
-enforces that pair on the gateway and anchor containers it builds, and
-asserts it is live on both (CVE-2026-94603: per the advisory — version
-floor operator-provided, untested from this tree — a checkpoint
-annotation can make `podman run` silently discard launch-time sandbox
-flags; the annotation-triggered checkpoint interpretation is
-live-observed on Podman 5.4.2, failing at the restore import; the kit
-also refuses checkpoint-annotated images for its own containers).
+not a policy boundary).
+
+- **Workload launcher (operator obligation).** Workloads must be
+  launched with capabilities dropped — the kit ships no workload
+  launcher, so this is the operator's launcher's job
+  (`--cap-drop=all --security-opt=no-new-privileges`; plain
+  `podman run` does not).
+- **The kit's own containers.** The kit enforces that pair on the
+  gateway and anchor containers it builds, asserts it is live on both,
+  and refuses checkpoint-annotated images for its own containers.
+- **CVE-2026-94603 mechanics.** A real checkpoint payload restores
+  the **dumped** configuration: the process comes up with the
+  capabilities and `NoNewPrivs` recorded in the checkpoint, and a
+  request for `--cap-drop=all --security-opt=no-new-privileges` on
+  `podman run` with the checkpoint image is silently discarded. A
+  benign image that merely carries the checkpoint annotation is the
+  other outcome: it is interpreted as a checkpoint and fails at the
+  restore import. Both were observed on Podman 5.4.2, in the advisory
+  range; the discard was measured on a rootful Podman, and the fixed
+  floor is per the advisory, not confirmed from this tree.
+
 Details: [threat model](threat-model.md).
 
 ### Root/rootless expectations
@@ -251,3 +265,9 @@ Scoped to the dated dogfood captures in the
   change only — a resolver reorder of the same addresses is not drift);
 - The pinned set is capped at the first 16 sorted distinct addresses
   (`DNS_SET_MAX`); a larger answer truncates with a named `note:`.
+- **DNS is not gated on either path.** Workload queries to the bridge
+  resolver leave the netns, the gateway's own resolver (pasta's
+  `169.254.1.1`) forwards any name, and DoH through an allowlisted
+  host is allowlist granularity, not a bypass — the three accepted DNS
+  risks are in the
+  [threat model](threat-model.md#non-goals--accepted-risks).

@@ -1,6 +1,6 @@
 # How to: allow non-HTTP egress (git-over-SSH example)
 
-The direct path (`egresslock allow <profile> <host:port> --direct`) is
+The direct path (`egresslock allow PROFILE HOST:PORT --direct`) is
 for use with raw IP addresses, and non-HTTP(S) traffic (anything the
 HTTP gateway cannot proxy transparently: ssh, git-over-SSH, rsync,
 databases, other non-HTTP protocols).

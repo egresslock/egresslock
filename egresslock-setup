@@ -6,7 +6,7 @@
 #   egresslock-setup init ...          the account bundle
 #   egresslock-setup doctor            kit/account state check
 #   egresslock-setup build-gateway     account-shell gateway build
-#   egresslock-setup apparmor add|remove|check
+#   egresslock-setup apparmor add, remove, or check
 #   egresslock-setup help [<verb>]     summary / one verb's details
 #
 # `--help`/`-h`/bare print the verb summary; `help <verb>` prints one
@@ -76,12 +76,16 @@ fi
 
 prefix=""
 account=""
+account_flag=0     # --account seen (the legacy alias; EGL-581-D1)
+positional_account=""
+positional_account_seen=0  # one ACCOUNT operand accepted on init/import/doctor (EGL-581-D5)
 conf=""
-conf_flag=0        # --conf seen (import rejects it; init treats it as --from)
+conf_flag=0        # --conf seen (init/import reject it; doctor keeps the hint)
 from_src=""
 allowlist_src=""
 import_force=0
 profile_name=""
+profile_flag=0     # --profile seen (EGL-333-F4: gate on presence, not value)
 enable=0
 init_conf=0
 apparmor=0
@@ -110,36 +114,51 @@ fi
 # below. Empty stays the default; a value is never optional flags.
 [[ "$gw_img" == -* ]] && { echo "egresslock-setup: EGRESSLOCK_GW_IMAGE value must not start with '-' (got '$gw_img')" >&2; exit 2; }
 
+# EGL-531-D3: EGRESSLOCK_SHARE is a test-only hook (the kit share tree is
+# production data). Resolve it once behind the gate (the EGL-434-D1/D3
+# shape) so an ignored hook is indistinguishable from an unset one at the
+# share-resolution branch below; the discard warns once per invocation,
+# including a `--help` run that exits before that branch.
+share_override=""
+if kit_test_mode && [[ -n "${EGRESSLOCK_SHARE:-}" ]]; then
+    share_override="$EGRESSLOCK_SHARE"
+else
+    egl491_warn_ignored_hook EGRESSLOCK_SHARE "${EGRESSLOCK_SHARE:-}"
+fi
+
 # Concise summary: a one-page verb index that points at
 # `egresslock-setup help <verb>` for the per-verb pages. The name is
 # unchanged so error-path call sites keep printing this summary (rc 2).
 usage() {
     cat <<'EOF'
 Usage:
-  egresslock-setup <verb> [options]
+  egresslock-setup VERB [options]
 
 egresslock-setup — one-command per-account setup (run as root).
 
 Verbs:
-  egresslock-setup init --account <acct> [--from <conf> | --init-conf] [--profile <p>]
-                                        wire one account: validate conf(s), unit.env, linger, gateway image, timer
-  egresslock-setup import --account <acct> --from <conf> [--allowlist <path>] [--force]
+  egresslock-setup init ACCOUNT [--from CONF or --init-conf]
+                                        wire one account: validate conf(s), linger, gateway image, timer
+  egresslock-setup import ACCOUNT --from CONF [--allowlist PATH] [--force]
                                         copy one profile pair into the account confdir (atomic, never clobbers)
-  egresslock-setup doctor [--account <acct>]   read-only kit/account state check with fix commands
+  egresslock-setup doctor [ACCOUNT] [--profile PROFILE]
+                                        read-only kit/account state check with fix commands; --profile narrows inspection
   egresslock-setup build-gateway [--force]     account-shell gateway image build
-  egresslock-setup apparmor add|remove|check   pasta AppArmor amendment (check is read-only)
-  egresslock-setup help [<verb>]               this list / one verb's details
+  egresslock-setup apparmor add, remove, or check   pasta AppArmor amendment (check is read-only)
+  egresslock-setup help [VERB]               this list / one verb's details
 
 checks:
   egresslock doctor                      host env (podman/nft/userns)
-  egresslock-setup doctor [--account]    kit/account wiring
+  egresslock-setup doctor [ACCOUNT]      kit/account wiring
   egresslock-setup apparmor check        pasta AppArmor patch
-  egresslock verify <profile>            profile runtime (fail-closed)
+  egresslock verify PROFILE              profile runtime (fail-closed)
 
-Run 'egresslock-setup help <verb>' for one verb's details
-(init | import | doctor | build-gateway | apparmor | env).
+Run 'egresslock-setup help VERB' for one verb's details
+(init, import, doctor, build-gateway, apparmor, or env).
 Legacy flag forms (--doctor, --build-gateway, --apparmor-*, the
-flag-only account bundle) keep working.
+flag-only account bundle) keep working. --account NAME is still
+accepted as a hidden alias of the positional ACCOUNT on init, import,
+and doctor.
 
 Exit codes: 0 ok, 1 preflight/validation failure, 2 usage error.
 EOF
@@ -153,15 +172,14 @@ help_topic() { # help_topic <topic>
     case "$1" in
         init)
             cat <<'EOF'
-egresslock-setup init --account <acct> [--from <conf>] [--profile <p>] [--init-conf] [--prefix <path>]
+egresslock-setup init ACCOUNT [--from CONF] [--init-conf] [--prefix PATH]
 
 Wire one account: resolve and validate the conf(s) already in the fixed
-config directory, write unit.env, and (with --enable) arm linger, the
-gateway image, and the verify timer. No conf path is required. Run as
-ROOT; the account steps run AS THE ACCOUNT, via runuser, always from the
-account's own home (runuser inherits the caller's CWD and chdir-fails
-when the account cannot traverse it, e.g. an operator checkout under a
-0700 home).
+config directory, and (with --enable) arm linger, the gateway image, and
+the verify timer. No conf path is required. Run as ROOT; the account
+steps run AS THE ACCOUNT, via runuser, always from the account's own
+home (runuser chdir-fails when the account cannot traverse the
+caller's CWD, e.g. an operator checkout under a 0700 home).
 
 Steps, in execution order:
   0. With --init-conf: ship the sshd-style starter conf pair
@@ -171,88 +189,66 @@ Steps, in execution order:
      allowlist. The pair is staged and renamed, never copied onto a
      live path.
      With --from: import the pair first (see `help import`); import
-     refusals stop init before anything is wired. --conf is a legacy
-     silent alias of --from. --from and --init-conf are mutually
-     exclusive.
-  1. Validates the conf(s): with --profile, exactly
-     ~/.config/egresslock/<profile>.conf; without --profile, every
-     *.conf in the fixed confdir (aggregate). The conf must parse
-     under the deployed engine and every gateway profile's allowlist
-     must be present/readable. An empty confdir fails closed and names
-     --init-conf / import --from. A pathless init never writes a conf.
-  2. Writes ~/.config/egresslock/unit.env (0600): EGRESSLOCK_PROFILE=<name>
-     only when --profile is given. Without --profile the file is
-     rewritten without a profile (aggregate/--ensured verify mode);
-     this clears named mode from an earlier run. There is no conf-path
-     line: the engine always reads
-     <account-home>/.config/egresslock/<profile>.conf.
-  3. With --enable: enables linger for the account (moved
+     refusals stop init before anything is wired. --from and
+     --init-conf are mutually exclusive.
+  1. Validates every *.conf in the fixed confdir and every gateway
+     profile's allowlist (presence/readability). An empty confdir
+     fails closed and names --init-conf / import --from. A pathless
+     init never writes a conf.
+  2. With --enable: enables linger for the account (moved
      before the gateway build so the account-side build
      is never linger-less; fails closed if it does not stick).
-  4. For any conf declaring a `gateway` directive: starts the account's
-     systemd user manager (user@<uid>.service) so a never-logged-in
-     account can run the build.
-  5. Builds the gateway image into the account's Podman store from the
+  3. Starts the account's systemd user manager (user@UID.service) so
+     a never-logged-in account can run the gateway image build in
+     step 4.
+  4. Builds the gateway image into the account's Podman store from the
      deployed --prefix if the image is missing.
-  6. With --enable: enables+starts egresslock-verify@<account>.timer
-     (linger above keeps /run/user/<uid> alive outside login
+  5. With --enable: enables+starts egresslock-verify@ACCOUNT.timer
+     (linger above keeps /run/user/UID alive outside login
      sessions for the timer's egresslock-verify).
 
-The bundle prints a numbered run map, one line per step in execution
-order:
-  1) validate conf   2) write unit.env   3) linger   4) user manager
-  5) gateway image   6) timer
-with … OK / … SKIP (step not requested) / … FAIL (fail-closed stop;
-FAIL is the last printed step). --init-conf, import, and AppArmor are
-not numbered.
+The run prints one `N) name … status` line per step; the first FAIL
+is the last line printed (fail-closed stop).
 
 Arguments and flags:
-  --account <name>  target account (required)
-  --from <path>     import this profile pair first, then wire (dest is
-                    <profile>.conf from the source's `profile` line;
+  ACCOUNT           target account (required)
+  --account NAME    legacy alias of ACCOUNT (still accepted; pass the
+                    same value in both forms only)
+  --from PATH       import this profile pair first, then wire (dest is
+                    PROFILE.conf from the source's `profile` line;
                     the allowlist is copied next to it)
-  --conf <path>     legacy silent alias of --from
   --init-conf       ship the starter conf pair from the deployed
                     prefix when ~/.config/egresslock/main.conf is
                     missing (never overwrites a conf; refuses a torn
                     pair); the starter's profile is `main`
-  --profile <name>  named verify mode: write
-                    EGRESSLOCK_PROFILE=<name>, validate exactly
-                    <name>.conf, and require it to exist. Omit for
-                    aggregate/--ensured mode (the unit.env rewrite
-                    clears named mode)
-  --prefix <path>   deployed kit prefix (default: derived from the
-                    installed unit template, else /opt/egresslock)
-  --enable          enable+start egresslock-verify@<account>.timer
+  --prefix PATH     deployed kit prefix (default: derived from the
+                    installed unit template, else /opt/egresslock);
+                    pass only for a kit deployed elsewhere
+  --enable          enable+start egresslock-verify@ACCOUNT.timer
                     AND enable linger for the account (fails
                     closed if linger does not stick)
 
-Examples:
-  sudo egresslock-setup init --account <acct> --init-conf --enable
-  sudo egresslock-setup init --account <acct> --from /opt/site/ci.conf --enable
-  sudo egresslock-setup init --account <acct> --profile <profile> --enable
-  sudo egresslock-setup init --account <acct> --enable
+There is no named verify mode. The timer always verifies every profile
+in the account's config directory; `--profile` is a `doctor` flag only
+(it narrows that read-only inspection) and is rejected here (rc 2).
 
-Defaults that are not parameter-changeable:
-  - unit.env path: ~/.config/egresslock/unit.env, mode 0600, with
-    EGRESSLOCK_PROFILE when --profile (no conf path — the engine's
-    confdir is fixed)
-  - --init-conf dest: ~/.config/egresslock/main.conf with sibling
-    main-allowlist (empty starter), both written as the account
-  - account-side steps run as the account from its own home
+Examples:
+  sudo egresslock-setup init ACCOUNT --init-conf --enable
+  sudo egresslock-setup init ACCOUNT --from /opt/site/ci.conf --enable
+  sudo egresslock-setup init ACCOUNT --enable
 
 Exit codes: 0 ok, 1 preflight/validation failure, 2 usage error.
 EOF
             ;;
         import)
             cat <<'EOF'
-egresslock-setup import --account <acct> --from <conf> [--allowlist <path>] [--force] [--prefix <path>]
+egresslock-setup import ACCOUNT --from CONF [--allowlist PATH] [--force] [--prefix PATH]
 
 Copy one profile pair into the account's fixed config directory. The
 destination conf name comes from the source file's `profile` line
-(<profile>.conf). The source must carry a
-`gateway <ip> <port> <profile>-allowlist` line naming exactly
-<profile>-allowlist, copied from the source directory to the same name;
+(PROFILE.conf). The source must carry a
+`gateway IP PORT PROFILE-allowlist` line naming exactly
+PROFILE-allowlist, copied from the source directory to the same name;
 a source without a `gateway` line is refused at staged validation
 (rc 1, nothing written) — every profile needs a gateway. An absolute
 path, another profile's allowlist basename, or any path component is
@@ -276,32 +272,36 @@ files and validated as the account with the deployed engine before
 commit. Root mode validates through a private mount namespace
 (`unshare -m`); a host that denies it fails closed before the
 destination is touched. The conf is moved last; no copy lands on the
-live destination. Import does not write unit.env, alter
-linger/timer/user@, or run ensure. A forced replacement deletes the
-regular files it replaces, after the staged pair validates; a failed
-commit restores the pre-run bytes.
+live destination. Import does not write into the confdir beyond the
+pair, alter linger/timer/user@, or run ensure. A forced replacement deletes the
+regular files it replaces, after the staged pair validates; a failed commit
+restores the pre-run bytes.
 
 Arguments and flags:
-  --account <name>   target account (required)
-  --from <path>      source conf (required; the source basename may
+  ACCOUNT            target account (required)
+  --account NAME     legacy alias of ACCOUNT (still accepted; pass the
+                     same value in both forms only)
+  --from PATH        source conf (required; the source basename may
                      differ from the profile it defines)
-  --allowlist <path> override the source allowlist (the destination is
-                     still <profile>-allowlist)
+  --allowlist PATH override the source allowlist (the destination is
+                     still PROFILE-allowlist); pass only to deploy a
+                     different allowlist than the source pair's
   --force            replace a differing or torn destination pair
                      (regular files only; refused for a directory,
                      symbolic link, or special file)
-  --prefix <path>    deployed kit prefix (validation engine)
+  --prefix PATH      deployed kit prefix (validation engine); pass
+                     only for a kit deployed elsewhere
 
 Examples:
-  sudo egresslock-setup import --account <acct> --from /opt/site/ci.conf
-  sudo egresslock-setup import --account <acct> --from /srv/egress/ci.conf --force
+  sudo egresslock-setup import ACCOUNT --from /opt/site/ci.conf
+  sudo egresslock-setup import ACCOUNT --from /srv/egress/ci.conf --force
 
 Exit codes: 0 ok, 1 preflight/validation failure or refusal, 2 usage error.
 EOF
             ;;
         doctor)
             cat <<'EOF'
-egresslock-setup doctor [--account <acct>] [--prefix <path>]
+egresslock-setup doctor [ACCOUNT] [--profile PROFILE] [--prefix PATH]
 
 Kit/account install state check with the command that fixes each
 missing item (read-only; rc nonzero when a required item is missing or
@@ -310,35 +310,45 @@ environment probe
 (podman/netavark/nft/unprivileged userns) is the ENGINE's
 `egresslock doctor`; kit/account install state is `doctor` HERE.
 
-Host slice without --account: engine present at the derived prefix,
-unit templates installed, verify-unit health (shadowed /etc fragment,
-ExecStart target, failed instances, dangling timer wants — rc 1 on
-any; named skip without systemctl). With --account it adds: conf
-parses, policy file modes (conf, allowlist, unit.env are 0600; a
-confdir writable by other users is reported), unit.env matches, timer
-enabled, linger on, and (gateway confs) user@<uid>.service active +
-gateway image present. AppArmor is
-one pointer line at apparmor check (its strings stay there). The
-optional egl-base example image gets its own rc-neutral row when it
-exists.
+Host slice without an account operand: engine present at the derived
+prefix, unit templates installed, verify-unit health (shadowed /etc
+fragment, ExecStart target, failed instances, dangling timer wants —
+rc 1 on any; named skip without systemctl). With ACCOUNT it adds: conf
+parses, policy file modes (conf and allowlist are 0600; a confdir
+writable by other users is reported), timer enabled, linger on, and
+(gateway confs) user@UID.service active + gateway image present.
+AppArmor is one pointer line at apparmor check (its strings stay
+there). The optional egl-base example image gets its own rc-neutral
+row when it exists.
+
+This verb inspects the same every-profile scope the timer verifies:
+every profile with a conf in the fixed confdir. --profile narrows the
+inspection to exactly PROFILE.conf (a single-conf look); it does not
+change what the timer verifies.
 
 Arguments and flags:
-  --account <name>  add the account slice (conf parse, policy file
-                    modes, unit.env, timer, linger, user manager,
-                    gateway image, egl-base image); needs root (sudo)
-                    to read the account state
-  --prefix <path>   deployed kit prefix (default: derived from the
-                    installed unit template, else /opt/egresslock)
+  ACCOUNT         optional account operand: add the account slice
+                  (conf parse, policy file modes, timer, linger, user
+                  manager, gateway image, egl-base image); needs root
+                  (sudo) to read the account state
+  --account NAME  legacy alias of ACCOUNT (still accepted; pass the same
+                  value in both forms only)
+  --profile NAME  inspect exactly PROFILE.conf in the account slice
+                  (default: every conf in the fixed confdir)
+  --prefix PATH   deployed kit prefix (default: derived from the
+                  installed unit template, else /opt/egresslock);
+                  pass only for a kit deployed elsewhere
 
 Example:
-  sudo egresslock-setup doctor --account <acct>
+  sudo egresslock-setup doctor ACCOUNT
+  sudo egresslock-setup doctor ACCOUNT --profile PROFILE
 
 Exit codes: 0 ok, 1 preflight/validation failure, 2 usage error.
 EOF
             ;;
         build-gateway)
             cat <<'EOF'
-egresslock-setup build-gateway [--force] [--prefix <path>]
+egresslock-setup build-gateway [--force] [--prefix PATH]
 
 Account-shell gateway build: builds the gateway image from the
 deployed gateway/ directory next to the engine into the invoking
@@ -346,12 +356,13 @@ user's Podman store (an exec alias of `egresslock build-gateway`).
 --force rebuilds even when the image matches the deployed pin.
 Requires an already-active user manager (session or linger) and fails
 closed otherwise; never starts user@, never enables linger. Cannot be
-combined with the init bundle (the root --account bundle builds via
+combined with the init bundle (the root account bundle builds via
 runuser).
 
 Arguments and flags:
-  --force    rebuild even when the image matches the deployed pin
-  --prefix <path>   deployed kit prefix
+  --force         rebuild even when the image matches the deployed pin
+  --prefix PATH   deployed kit prefix; pass only when the kit
+                  is deployed elsewhere
 
 Example:
   egresslock-setup build-gateway
@@ -361,7 +372,7 @@ EOF
             ;;
         apparmor)
             cat <<'EOF'
-egresslock-setup apparmor add|remove|check
+egresslock-setup apparmor add, remove, or check
 
 pasta AppArmor amendment management (an action, not a flag family;
 exactly one sub-verb).
@@ -385,46 +396,45 @@ exactly one sub-verb).
            the profile is present. Idempotent (rc 0 when already
            gone); an unmarked signal rule is never guessed at (rc 1).
   check    report AppArmor/pasta amendment health; read-only, works
-           without root:
+           without root. Rows printed:
              AppArmor: enabled
-             pasta enforcement: enforced / NOT enforced /
-             unknown / n/a
+             pasta enforcement: enforced / NOT enforced / unknown / n/a
              podman label: labeled / unlabeled / unknown
-               (any mode counts as labeled —
-               the label, not the mode, is the
-               discriminator; kernel listing only, so
-               non-root on root-only kernels reports
-               unknown, never a guess)
-             pasta amendment: required on this host / not
-               required on this host (podman unlabeled |
-               pasta not enforced) / condition unknown
-               (verify: podman unshare --rootless-netns true
-               as the account)
+             pasta amendment: required on this host / not required
+               on this host / condition unknown
              pasta profile: found / missing file
-             pasta local extension: present (stock |
-               egresslock) / MISSING (the
-               separate compatibility-patch line is
-               dropped — patch state is the
-               `(egresslock)` ownership here)
-             egresslock rule in local file: absent /
-               present (stock | egresslock)
-             Summary: CHECK OK (AppArmor patch applied |
-               AppArmor patch not needed) / CHECK FAILED
-               (AppArmor patch incomplete | AppArmor patch
-               needed) / CHECK UNKNOWN (run as root if
-               apparmor policy not visible to current user)
-               (rc agrees with the summary —
-               OK 0, FAILED 1, UNKNOWN 1; unknown
-               components never print a green summary)
-           Exits nonzero when a required element is missing.
-           (The `doctor` name is the kit/account state check —
-           see `egresslock-setup help doctor`.)
+             pasta local extension: present / MISSING
+             egresslock rule in local file: absent / present
+             Summary: CHECK OK / CHECK FAILED / CHECK UNKNOWN
+           Row notes:
+             - podman label: any mode counts as labeled — the
+               label, not the mode, is the discriminator; kernel
+               listing only, so non-root on root-only kernels
+               reports unknown, never a guess.
+             - pasta amendment "required": podman unlabeled or
+               pasta not enforced; verify a condition unknown with
+               `podman unshare --rootless-netns true` as the
+               account.
+             - pasta local extension and the egresslock rule:
+               present rows may be stock or egresslock; the
+               separate compatibility-patch line is dropped —
+               patch state is the `(egresslock)` ownership here.
+             - Summary triggers: CHECK OK = patch applied or not
+               needed; CHECK FAILED = patch incomplete or needed;
+               CHECK UNKNOWN = run as root if apparmor policy is
+               not visible to the current user.
+             - rc agrees with the summary — OK 0, FAILED 1,
+               UNKNOWN 1; unknown components never print a green
+               summary.
+           Exits nonzero when a required element is missing. (The
+           `doctor` name is the kit/account state check — see
+           `egresslock-setup help doctor`.)
 
 Without the add/remove action AppArmor is never touched; if pasta is
 enforced, one stderr hint points at the add verb.
 
 Arguments and flags:
-  add|remove|check   the action (exactly one required)
+  add, remove, or check   the action (exactly one required)
 
 Example:
   sudo egresslock-setup apparmor check
@@ -444,7 +454,7 @@ egresslock/ checkout/tree). The ENGINE always comes from the deployed
 prefix.
 
 Environment:
-  EGRESSLOCK_APPARMOR_PROFILES=<f>  kernel profiles listing to probe
+  EGRESSLOCK_APPARMOR_PROFILES=FILE  kernel profiles listing to probe
                              for AppArmor checks (default:
                              /sys/kernel/security/apparmor/profiles;
                              a root run always reads the kernel
@@ -452,9 +462,6 @@ Environment:
                              copied listing)
 
 Defaults that are not parameter-changeable:
-  - unit.env path: ~/.config/egresslock/unit.env, mode 0600, with
-    EGRESSLOCK_PROFILE when --profile (no conf path — the engine's
-    confdir is fixed)
   - --init-conf dest: ~/.config/egresslock/main.conf with sibling
     main-allowlist (empty starter), both copied as the account
   - account-side steps run as the account from its own home
@@ -473,9 +480,10 @@ marked `requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1` are ignored without
 it: the production default applies, and the setup tool warns when it
 ignores a set override.
 
-  EGRESSLOCK_SHARE=<dir>         kit share directory override (default:
+  EGRESSLOCK_SHARE=DIR         kit share directory override (default:
                              /usr/share/egresslock, else the directory
-                             holding this script; tests only)
+                             holding this script; tests only; requires
+                             EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
   EGRESSLOCK_GW_IMAGE            gateway image (default:
                              localhost/egresslock-gateway:latest;
                              requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
@@ -484,32 +492,32 @@ ignores a set override.
                              exactly 1 turns it on, and any other
                              value (e.g. true) warns and leaves
                              test mode off
-  EGRESSLOCK_UNIT_DIR=<dir>      unit template dir for prefix derivation
+  EGRESSLOCK_UNIT_DIR=DIR      unit template dir for prefix derivation
                              in test mode (default: /etc/systemd/system;
                              requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1;
                              EXPLICIT hook — suppresses the deb fallback
                              and the stale-prefix retry, only when the
                              flag is set)
-  EGRESSLOCK_DEFAULT_UNIT_DIR=<dir>  harness-only override of the
+  EGRESSLOCK_DEFAULT_UNIT_DIR=DIR  harness-only override of the
                              DEFAULT /etc probe path (heuristic-
                              preserving: deb fallback + stale-prefix
                              retry still run; requires
                              EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
-  EGRESSLOCK_ETC_UNIT_DIR=<dir>  harness-only override of the /etc
+  EGRESSLOCK_ETC_UNIT_DIR=DIR  harness-only override of the /etc
                              load-precedence path in the doctor
                              shadow gate (default: /etc/systemd/system;
                              requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
-  EGRESSLOCK_DEB_UNIT_DIR=<dir>  harness-only override of the deb
+  EGRESSLOCK_DEB_UNIT_DIR=DIR  harness-only override of the deb
                              unit dir in doctor shadow checks
                              (default: /usr/lib/systemd/system;
                              requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
-  EGRESSLOCK_APPARMOR_D=<dir>    AppArmor profile dir for tests
+  EGRESSLOCK_APPARMOR_D=DIR    AppArmor profile dir for tests
                              (default: /etc/apparmor.d; requires
                              EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
-  EGRESSLOCK_SYSTEMCTL=<path>    systemctl binary for tests
+  EGRESSLOCK_SYSTEMCTL=PATH    systemctl binary for tests
                              (default: systemctl on the PATH;
                              requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
-  EGRESSLOCK_ACCOUNT_HOME=<dir>  account home override in test mode
+  EGRESSLOCK_ACCOUNT_HOME=DIR  account home override in test mode
                              (requires EGRESSLOCK_KIT_ALLOW_NON_ROOT=1)
 EOF
             ;;
@@ -585,7 +593,7 @@ done
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --account)  [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --account" >&2; exit 2; }
-                    account="$2"; shift 2 ;;
+                    account="$2"; account_flag=1; shift 2 ;;
         --conf)     [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --conf" >&2; exit 2; }
                     conf="$2"; conf_flag=1; shift 2 ;;
         --from)     [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --from" >&2; exit 2; }
@@ -593,7 +601,7 @@ while [[ $# -gt 0 ]]; do
         --allowlist) [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --allowlist" >&2; exit 2; }
                     allowlist_src="$2"; shift 2 ;;
         --profile)  [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --profile" >&2; exit 2; }
-                    profile_name="$2"; shift 2 ;;
+                    profile_name="$2"; profile_flag=1; shift 2 ;;
         --prefix)   [[ $# -ge 2 ]] || { echo "egresslock-setup: missing value for --prefix" >&2; exit 2; }
                     prefix="$2"; prefix_explicit=1; shift 2 ;;
         --enable)   enable=1; shift ;;
@@ -605,7 +613,22 @@ while [[ $# -gt 0 ]]; do
         --force)    if [[ "$setup_verb" == "import" ]]; then import_force=1; else gw_force=1; fi; shift ;;
         --apparmor-remove) apparmor=1; aa_remove=1; legacy_mode=1; legacy_flag="--apparmor-remove"; legacy_form="apparmor remove"; shift ;;
         -h|--help)  if [[ -n "$setup_verb" ]]; then help_topic "$setup_verb"; else usage; fi; exit 0 ;;
-        *)          echo "egresslock-setup: unknown argument: $1" >&2; exit 2 ;;
+        *)          # EGL-581-D5: one ACCOUNT operand, in any single position,
+                    # on the three account-primary verbs (init, import,
+                    # doctor). A flag-shaped token stays the unknown-argument
+                    # error, and so does a second operand (the existing arm).
+                    if [[ "$1" != -* && "$positional_account_seen" == 0 ]]; then
+                        case "$setup_verb" in
+                            init|import|doctor)
+                                positional_account="$1"
+                                positional_account_seen=1
+                                shift
+                                continue
+                                ;;
+                        esac
+                    fi
+                    echo "egresslock-setup: unknown argument: $1" >&2
+                    exit 2 ;;
     esac
 done
 # Derive the deployed prefix when not given: the installed unit
@@ -660,6 +683,20 @@ if [[ -n "$setup_verb" && "$legacy_mode" == 1 ]]; then
     usage >&2
     exit 2
 fi
+# EGL-333-D9: the named verify mode is gone and the timer verifies every
+# profile, so --profile no longer selects a setup mode. It survives only
+# as doctor's inspection narrowing; every other form (init, the legacy
+# flag-only bundle, build-gateway, apparmor) is a specific usage error.
+# import keeps its own message below (the pair writer names the dest from
+# the source conf's profile line). EGL-333-F4: the gate keys on the FLAG
+# (profile_flag), not a nonempty value — `--profile ''` on a non-doctor
+# form is the same usage error, never a silent pathless run.
+if [[ "$profile_flag" == 1 && "$setup_verb" != "doctor" \
+        && "$setup_verb" != "import" && "$doctor" != 1 ]]; then
+    echo "egresslock-setup: --profile is a doctor flag only (inspection narrowing); the verify timer checks every profile. Use: egresslock-setup doctor ACCOUNT --profile NAME" >&2
+    usage >&2
+    exit 2
+fi
 if [[ "$aa_add" == 1 && "$aa_remove" == 1 ]]; then
     echo "egresslock-setup: --apparmor-add and --apparmor-remove are mutually exclusive" >&2
     usage >&2
@@ -674,7 +711,7 @@ if [[ "$buildgw" == 1 ]]; then
     # D38-3: the standalone build runs in the account's own shell; the
     # bundle flags belong to the root --account run (which builds via
     # runuser and owns the D1 user-manager start).
-    for bad in "account:$account" "enable:$enable" "init-conf:$init_conf" "conf:$conf" "from:$from_src" "allowlist:$allowlist_src" "import-force:$import_force" "profile:$profile_name" "apparmor:$apparmor" "apparmor-check:$aa_check" "doctor:$doctor"; do
+    for bad in "account:$account" "enable:$enable" "init-conf:$init_conf" "conf:$conf" "from:$from_src" "allowlist:$allowlist_src" "import-force:$import_force" "apparmor:$apparmor" "apparmor-check:$aa_check" "doctor:$doctor"; do
         if [[ "${bad#*:}" != "" && "${bad#*:}" != "0" ]]; then
             echo "egresslock-setup: --build-gateway cannot be combined with --${bad%%:*} (the root --account bundle builds via runuser; --build-gateway is the account-shell form)" >&2
             usage >&2
@@ -695,12 +732,12 @@ fi
 # and --force only on import.
 if [[ "$setup_verb" == "import" ]]; then
     if [[ -n "$conf" || "$conf_flag" == 1 ]]; then
-        echo "egresslock-setup: import takes --from, not --conf (import --account <acct> --from <path>)" >&2
+        echo "egresslock-setup: import takes --from, not --conf (import ACCOUNT --from PATH)" >&2
         usage >&2
         exit 2
     fi
-    if [[ -n "$profile_name" ]]; then
-        echo "egresslock-setup: --profile is an init flag (named-mode wiring), not an import flag; import names the dest from the source conf's profile line" >&2
+    if [[ "$profile_flag" == 1 ]]; then
+        echo "egresslock-setup: --profile is a doctor flag only (inspection narrowing); import names the dest from the source conf's profile line, and the verify timer checks every profile" >&2
         usage >&2
         exit 2
     fi
@@ -710,13 +747,13 @@ if [[ "$setup_verb" == "import" ]]; then
         exit 2
     fi
     if [[ -z "$from_src" ]]; then
-        echo "egresslock-setup: import requires --from <path>" >&2
+        echo "egresslock-setup: import requires --from PATH" >&2
         usage >&2
         exit 2
     fi
 else
     if [[ -n "$allowlist_src" ]]; then
-        echo "egresslock-setup: --allowlist is an import flag (use: egresslock-setup import --account <acct> --from <path> --allowlist <path>)" >&2
+        echo "egresslock-setup: --allowlist is an import flag (use: egresslock-setup import ACCOUNT --from PATH --allowlist PATH)" >&2
         usage >&2
         exit 2
     fi
@@ -731,18 +768,46 @@ if [[ -n "$from_src" && "$setup_verb" != "init" && "$setup_verb" != "import" ]];
     usage >&2
     exit 2
 fi
-if [[ -n "$from_src" && "$conf_flag" == 1 ]]; then
-    echo "egresslock-setup: --from and --conf are the same input; pass one (--conf is the legacy alias of --from)" >&2
-    usage >&2
-    exit 2
-fi
 if [[ -n "$from_src" && "$init_conf" == 1 ]]; then
     echo "egresslock-setup: --from and --init-conf are mutually exclusive (import an existing pair, or ship the starter)" >&2
     usage >&2
     exit 2
 fi
+# EGL-581-D1/D5: the positional ACCOUNT and the legacy --account alias
+# name the same thing. Same value in both forms is accepted; different
+# values are a usage error before any account read.
+if [[ "$account_flag" == 1 && "$positional_account_seen" == 1 \
+        && "$account" != "$positional_account" ]]; then
+    echo "egresslock-setup: account names differ: --account '$account' and positional '$positional_account' (pass one form, or the same value in both)" >&2
+    usage >&2
+    exit 2
+fi
+if [[ "$positional_account_seen" == 1 ]]; then
+    account="$positional_account"
+fi
+# EGL-581-D3: 'all' is reserved as an ACCOUNT NAME — the timer/status
+# verbs mean every account by the bare word. One refusal for every setup
+# path that resolves an account (init, import, doctor, the legacy bundle,
+# --account), after parsing and before the root and id/getent gates; it
+# is a pure string check (fires in kit-test mode too, no test-hook
+# bypass). The bare 'all' scope word of those verbs is routed to its
+# all-accounts branch before account resolution and never reaches here.
+# Case-sensitive: ALL is a different, legal OS name.
+if [[ "$account" == "all" ]]; then
+    echo "egresslock-setup: account name 'all' is reserved (it means every account in setup commands); use a different account name" >&2
+    echo "  fix: if this is your runner account, rename it and re-run setup (steps: docs/reference/scripts-and-environment.md)" >&2
+    usage >&2
+    exit 2
+fi
 if [[ -z "$account" && "$apparmor" == 0 && "$doctor" == 0 && "$aa_check" == 0 && "$buildgw" == 0 ]]; then
-    echo "egresslock-setup: --account is required (or a verb: doctor, build-gateway, apparmor add|remove|check)" >&2
+    # EGL-581-D2/D5: the canonical spelling is the positional operand, so
+    # name it per verb; the verb-less bundle is the flag alias path and
+    # keeps the flag spelling.
+    case "$setup_verb" in
+        init)   echo "egresslock-setup: init requires an account: egresslock-setup init ACCOUNT [--from CONF or --init-conf]" >&2 ;;
+        import) echo "egresslock-setup: import requires an account: egresslock-setup import ACCOUNT --from CONF" >&2 ;;
+        *)      echo "egresslock-setup: --account is required (or a verb: doctor, build-gateway, apparmor add, remove, or check)" >&2 ;;
+    esac
     usage >&2
     exit 2
 fi
@@ -764,7 +829,7 @@ fi
 # bundle (the test hook excepted). Account-less --doctor stays
 # read-only and rootless.
 [[ "$doctor" == 0 || -z "$account" || "$(id -u)" == 0 ]] || kit_test_mode || {
-    echo "egresslock-setup: doctor --account needs root (sudo) to read the account state" >&2
+    echo "egresslock-setup: doctor with an account needs root (sudo) to read the account state" >&2
     exit 1
 }
 # Home + account steps apply only when an account was named; --apparmor-add
@@ -802,11 +867,12 @@ fi
 # ARC-22-D1: share resolution — examples and the apparmor snippet live in
 # the share tree for the .deb (/usr/share/egresslock), in the deployed
 # prefix for install-kit.sh deploys, and next to this script in a
-# checkout/kit tree. EGRESSLOCK_SHARE overrides (tests; explicit beats
-# implicit). The ENGINE still always comes from the deployed prefix.
+# checkout/kit tree. EGRESSLOCK_SHARE overrides in test mode only
+# (EGL-531-D3; explicit beats implicit). The ENGINE still always comes
+# from the deployed prefix.
 script_dir="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
-if [[ -n "${EGRESSLOCK_SHARE:-}" ]]; then
-    share_dir="$EGRESSLOCK_SHARE"
+if [[ -n "$share_override" ]]; then
+    share_dir="$share_override"
 elif [[ "$prefix_explicit" == 1 ]]; then
     # EGL-80-L7 / ARC-19-D3: an explicit-prefix deploy is self-contained —
     # its own examples or fail closed. The host's /usr/share (a .deb on
@@ -1611,8 +1677,8 @@ fi
 # EGL-325/EGL-328: the account config directory is fixed
 # (<passwd-home>/.config/egresslock). There is no runtime file selector
 # and no main.conf fallback. `import` copies a pair; `init` resolves,
-# validates, and wires whatever is already there. `--conf` is the legacy
-# alias of `--from` for init (and a display hint for doctor).
+# validates, and wires whatever is already there. `--conf` is a display
+# hint for doctor only (init refuses the retired alias).
 confdir="$home/.config/egresslock"
 
 abs_path() { # absolutize against the CALLER's cwd (before runuser cd's)
@@ -1630,16 +1696,12 @@ if [[ -z "$setup_verb" && -n "$account" && "$doctor" == 0 && "$buildgw" == 0 \
       && "$apparmor" == 0 && "$aa_check" == 0 ]]; then
     setup_verb=init
 fi
-# EGL-328 D5: `init --conf` is a silent alias of `init --from`.
-if [[ "$setup_verb" == "init" && -n "$conf" ]]; then
-    from_src="$conf"
-    conf=""
-fi
-# The flat legacy bundle assigns setup_verb=init just above, after the
-# verb-time conflict checks. Re-assert the pair-shape rule here so
-# `--account A --conf C --init-conf` is rc 2 too, not import-then-ship.
-if [[ -n "$from_src" && "$init_conf" == 1 ]]; then
-    echo "egresslock-setup: --from/--conf and --init-conf are mutually exclusive (import an existing pair, or ship the starter)" >&2
+# EGL-329: the EGL-328-D5 `init --conf` alias is retired. Key on the
+# FLAG, not the value: `init --conf ''` must not run a silent pathless
+# init. Init-scoped because the shared parse arm still feeds doctor's
+# display hint (EGL-562 owns that spelling).
+if [[ "$setup_verb" == "init" && "$conf_flag" == 1 ]]; then
+    echo "egresslock-setup: init no longer accepts --conf; use init ACCOUNT --from PATH, or import ACCOUNT --from PATH" >&2
     usage >&2
     exit 2
 fi
@@ -1661,18 +1723,15 @@ fi
 # EGL-380: 'all' is the engine's teardown keyword, never a profile name —
 # refuse at the CLI edge before any account-side read or write.
 if [[ "$profile_name" == "all" ]]; then
-    echo "egresslock-setup: profile name 'all' is reserved ('teardown all' names the main profile); choose another name" >&2
+    echo "egresslock-setup: profile name 'all' is reserved (the word is used by 'egresslock teardown all'); choose another name" >&2
     usage >&2
     exit 2
 fi
-
-# EGL-325 F5: --init-conf ships the `profile main` starter only. A
-# --profile other than main has no conf to probe (the starter defines
-# main), so reject the combination as a usage error instead of failing
-# step 1 with a misleading "no profile config: <name>.conf" not-found.
-if [[ -n "$account" && "$init_conf" == 1 \
-      && -n "$profile_name" && "$profile_name" != main ]]; then
-    echo "egresslock-setup: --init-conf ships the 'main' starter, so --profile '$profile_name' has no conf; import that profile first (import --from <path>), or omit --profile" >&2
+# EGL-573/EGL-519-P6: `v6deny` derives the engine's shared IPv6-deny
+# chain, never a profile name — same CLI-edge refusal.
+if [[ "$profile_name" == "v6deny" ]]; then
+    echo "egresslock-setup: profile name 'v6deny' is reserved (the name derives the shared IPv6-deny chain 'p_v6deny'); choose another name" >&2
+    usage >&2
     exit 2
 fi
 
@@ -1721,32 +1780,87 @@ _egl433_fail_conf_write() { # generic post-publish failure, then guidance
     echo "  if that name already exists, nothing moves; pick another name. re-run --init-conf to check the pair." >&2
     exit 3
 }
+# EGL-555-D3/P2: publish a starter half with a no-target-directory hard
+# link, then drop the temp. `ln -T` is one link(2): it cannot replace an
+# existing destination and fails EEXIST for a regular file, a dangling
+# link, a directory, and a live directory-symlink. An appeared regular
+# allowlist (or a live link to a regular file) is left in place and the
+# pair completes; a dangling link keeps S4; a directory, live
+# directory-symlink, or special file fails closed; a non-EEXIST failure
+# (a filesystem without hard links) falls back to the previous `mv -T`
+# and keeps that residual.
+_egl555_publish_allowlist() { # 0 = published, 1 = left an existing half
+    if ln -T -- "$tmp_al" "$dir/main-allowlist" 2>/dev/null; then
+        rm -f -- "$tmp_al"
+        return 0
+    fi
+    if [[ -e "$dir/main-allowlist" || -L "$dir/main-allowlist" ]]; then
+        if [[ -L "$dir/main-allowlist" && ! -e "$dir/main-allowlist" ]]; then
+            _egl433_refuse_dangling allowlist "$dir/main-allowlist"
+        fi
+        if [[ ! -f "$dir/main-allowlist" ]]; then
+            rm -f -- "$tmp_al"
+            _egl433_fail_conf_write
+        fi
+        rm -f -- "$tmp_al"
+        return 1
+    fi
+    if ! mv -T -- "$tmp_al" "$dir/main-allowlist"; then
+        _egl433_fail_conf_write
+    fi
+    return 0
+}
+_egl555_publish_conf() { # 0 = published; every failure is classified
+    if ln -T -- "$tmp_conf" "$A19_DST_CONF" 2>/dev/null; then
+        rm -f -- "$tmp_conf"
+        return 0
+    fi
+    if [[ -f "$A19_DST_CONF" && ! -L "$A19_DST_CONF" ]]; then
+        _egl433_refuse_pair_owned
+    fi
+    if [[ -e "$A19_DST_CONF" || -L "$A19_DST_CONF" ]]; then
+        _egl433_fail_conf_write
+    fi
+    if ! mv -T -- "$tmp_conf" "$A19_DST_CONF"; then
+        if [[ -f "$A19_DST_CONF" && ! -L "$A19_DST_CONF" ]]; then
+            _egl433_refuse_pair_owned
+        fi
+        _egl433_fail_conf_write
+    fi
+}
 ( umask 077; cp "$A19_EXAMPLES/main.conf" "$tmp_conf" )
 if [[ -L "$dir/main-allowlist" && ! -e "$dir/main-allowlist" ]]; then
     _egl433_refuse_dangling allowlist "$dir/main-allowlist"
 fi
+allowlist_published=1
 if [[ ! -e "$dir/main-allowlist" ]]; then
     ( umask 077; cp "$A19_EXAMPLES/main-allowlist" "$tmp_al" )
-    mv -T -- "$tmp_al" "$dir/main-allowlist"
+    _egl555_publish_allowlist || allowlist_published=0
+else
+    # An allowlist this run did not write (a live link or another shape
+    # that predates it) is left in place; the success line must say so.
+    allowlist_published=0
 fi
 # EGL-433-D5: after this run publishes main-allowlist, never unlink that
 # path. An inode-ownership test cannot keep "a path another writer
 # replaced is never unlinked" (ext4 delete+recreate reuses dev:ino), and
 # a leftover allowlist is reused on re-run. A regular conf means another
 # initializer may have completed the pair: S5, leave both. Any other conf
-# shape or a failed conf rename prints one cause line plus the
-# retained-allowlist guidance (F4) and exits 1; the allowlist stays.
+# shape or a failed conf publish prints one cause line plus the
+# retained-allowlist guidance (F4) and exits 3 (outer rc 1); the
+# allowlist stays.
 if [[ -f "$A19_DST_CONF" && ! -L "$A19_DST_CONF" ]]; then
     _egl433_refuse_pair_owned
 fi
 if [[ -e "$A19_DST_CONF" || -L "$A19_DST_CONF" ]]; then
     _egl433_fail_conf_write
 fi
-if ! mv -T -- "$tmp_conf" "$A19_DST_CONF"; then
-    if [[ -f "$A19_DST_CONF" && ! -L "$A19_DST_CONF" ]]; then
-        _egl433_refuse_pair_owned
-    fi
-    _egl433_fail_conf_write
+_egl555_publish_conf
+# EGL-555-D3: the outer success line is one line either way; this marker
+# tells it the allowlist was already there so it does not claim to have
+# written it. It is consumed by the caller, never shown to the operator.
+if (( allowlist_published == 0 )); then
+    printf "egresslock-init-conf: allowlist-preexisting\n"
 fi
 trap - EXIT
 '
@@ -1761,15 +1875,8 @@ if [[ -n "${A18_IMPORT_AL_NAME:-}" ]]; then
 fi
 chmod 600 "$A18_STAGE/$A18_IMPORT_PROFILE.conf"
 '
-# shellcheck disable=SC2016  # $A18_* expand at RUNTIME inside the dispatched script, not here
-write_unit_env='
-set -euo pipefail
-mkdir -p "$A18_NET_DIR"
-{
-    if [[ -n "${A18_PROFILE:-}" ]]; then printf "EGRESSLOCK_PROFILE=%s\n" "$A18_PROFILE"; fi
-} > "$A18_NET_DIR/unit.env"
-chmod 600 "$A18_NET_DIR/unit.env"
-'
+# EGL-333-D2: init writes no per-account wiring file; the confdir's
+# *.conf set is the account's registry and the verify timer's input.
 # shellcheck disable=SC2016  # $A18_* expand at RUNTIME inside the dispatched script, not here
 build_gw='
 set -euo pipefail
@@ -1797,9 +1904,8 @@ run_as_account() { # $@ = command words
         # irrelevant to the commands.
         ( cd "$home" && runuser -u "$account" -- env \
             A18_NET_DIR="$confdir" \
-            A18_PROFILE="$profile_name" \
             A18_IMPORT_FROM="${import_stage_from:-}" \
-            A18_IMPORT_PROFILE="${import_stage_profile:-}" \
+            A18_IMPORT_PROFILE="${import_pair_profile:-}" \
             A18_IMPORT_AL_SRC="${import_stage_al_src:-}" \
             A18_IMPORT_AL_NAME="${import_stage_al_name:-}" \
             A18_STAGE="${import_stage_dir:-}" \
@@ -1813,9 +1919,8 @@ run_as_account() { # $@ = command words
         # confdir from the passwd home, so mock getent to the virtual
         # account home used by the non-root test hook.
         env A18_NET_DIR="$confdir" \
-            A18_PROFILE="$profile_name" \
             A18_IMPORT_FROM="${import_stage_from:-}" \
-            A18_IMPORT_PROFILE="${import_stage_profile:-}" \
+            A18_IMPORT_PROFILE="${import_pair_profile:-}" \
             A18_IMPORT_AL_SRC="${import_stage_al_src:-}" \
             A18_IMPORT_AL_NAME="${import_stage_al_name:-}" \
             A18_STAGE="${import_stage_dir:-}" \
@@ -1908,7 +2013,7 @@ dest_half_kind() { # <path> -> absent|regular|symlink|directory|special
 # EGL-418 S2: a destination half is a directory, symbolic link, or other
 # special file. --force cannot replace it.
 import_refuse_nonregular() { # <conf|allowlist> <path> <kind>
-    local label="$1" p="$2" kind="$3"
+    local label="$1" p="$2" kind="$3" q qbak
     case "$kind" in
         directory)
             echo "egresslock-setup: import: refusing: destination $label is a directory: $p" >&2
@@ -1923,7 +2028,13 @@ import_refuse_nonregular() { # <conf|allowlist> <path> <kind>
             echo "  fix: move it aside (only that path moves), then re-run this import; --force cannot replace it:" >&2
             ;;
     esac
-    printf "         mv '%s' '%s.bak'\n" "$p" "$p" >&2
+    # EGL-433-D3: a runnable, non-clobbering move-aside hint. `%q` keeps the
+    # operator's shell from re-splitting a path; `-n -T --` refuses to
+    # overwrite an occupied name and never treats a leading dash as an option.
+    printf -v q '%q' "$p"
+    printf -v qbak '%q' "$p.bak"
+    printf '         mv -n -T -- %s %s\n' "$q" "$qbak" >&2
+    echo "  if that name already exists, nothing moves; pick another name." >&2
 }
 
 # EGL-418 S5a: a forced run sees a non-regular half at commit time.
@@ -2069,8 +2180,7 @@ validate_live_pair() { # <profile> <check-allowlist> <src-conf> <dest-conf>
     return 0
 }
 
-import_pair() { # import_pair [expected-profile]
-    local expected="${1:-}"
+import_pair() { # import_pair: copy/validate the pair named by --from
     local src_conf="$from_src" src_profile gwline al_name src_al="" dest_conf dest_al=""
     local check_al=0
     local dest_conf_exists=0 dest_al_exists=0 conf_same=0 al_same=0
@@ -2111,19 +2221,27 @@ import_pair() { # import_pair [expected-profile]
         [[ -n "$src_profile" && -n "$gwline" ]] && break
     done < "$src_conf"
     [[ "$src_profile" =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
-        echo "egresslock-setup: import: cannot determine a valid profile from $src_conf (expected a 'profile <name>' line with [a-z0-9][a-z0-9-]*)" >&2
+        echo "egresslock-setup: import: cannot determine a valid profile from $src_conf (expected a 'profile NAME' line with [a-z0-9][a-z0-9-]*)" >&2
         return 1
     }
     # EGL-380: 'all' is the engine's teardown keyword, never a profile name
     # — refuse the source before any dest write (this boundary's rc is 1).
     if [[ "$src_profile" == "all" ]]; then
-        echo "egresslock-setup: import: profile name 'all' is reserved ('teardown all' names the main profile); choose another name ($src_conf)" >&2
+        echo "egresslock-setup: import: profile name 'all' is reserved (the word is used by 'egresslock teardown all'); choose another name ($src_conf)" >&2
         return 1
     fi
-    if [[ -n "$expected" && "$expected" != "$src_profile" ]]; then
-        echo "egresslock-setup: --profile '$expected' does not match the source conf's profile '$src_profile' ($src_conf); pass --profile $src_profile (or edit the conf)" >&2
-        return 2
+    # EGL-573/EGL-519-P6: 'v6deny' derives the shared IPv6-deny chain —
+    # refuse the source before any dest write (rc 1 at this boundary).
+    if [[ "$src_profile" == "v6deny" ]]; then
+        echo "egresslock-setup: import: profile name 'v6deny' is reserved (the name derives the shared IPv6-deny chain 'p_v6deny'); choose another name ($src_conf)" >&2
+        return 1
     fi
+    # EGL-333-F5: the completion block names the profile this run
+    # imported. Record it as soon as --from resolves to a valid profile,
+    # not at staging: the three "unchanged" returns below never stage, so
+    # a late assignment would let the block fall back to the aggregate
+    # list's first entry and point the operator at an older profile.
+    import_pair_profile="$src_profile"
     dest_conf="$confdir/$src_profile.conf"
 
     # EGL-381-D3: the source gateway line must name exactly
@@ -2164,6 +2282,7 @@ import_pair() { # import_pair [expected-profile]
     if [[ "$src_conf" == "$dest_conf" ]]; then
         if [[ "$check_al" == 1 && ! -f "$dest_al" ]]; then
             echo "egresslock-setup: import: refusing: destination pair is torn (source --from is the destination): present $dest_conf, missing $dest_al" >&2
+            echo "  fix: create the missing allowlist at $dest_al as $account (an empty file is the valid deny-all starter), then re-run this import; nothing was changed." >&2
             return 1
         fi
         local pv_err
@@ -2171,6 +2290,7 @@ import_pair() { # import_pair [expected-profile]
         if ! run_as_account "$prefix/egresslock" network "$src_profile" >/dev/null 2>"$pv_err"; then
             echo "egresslock-setup: import: conf failed validation in place: $dest_conf" >&2
             sed 's/^/  /' "$pv_err" >&2 2>/dev/null || true
+            echo "  fix: correct the conf at $dest_conf (the --from source is also the destination), then re-run this import; nothing was changed." >&2
             rm -f "$pv_err"
             return 1
         fi
@@ -2183,6 +2303,7 @@ import_pair() { # import_pair [expected-profile]
                 # EGL-375-D8: relay the engine's named error (invalid
                 # entry) instead of only the generic wrapper.
                 sed 's/^/  /' "$al_err" >&2 2>/dev/null || true
+                echo "  fix: correct the allowlist at $dest_al (the --from source is also the destination), then re-run this import; nothing was changed." >&2
                 rm -f "$al_err"
                 return 1
             fi
@@ -2274,7 +2395,6 @@ import_pair() { # import_pair [expected-profile]
     fi
     import_stage_dir="$stage"
     import_stage_from="$src_conf"
-    import_stage_profile="$src_profile"
     import_stage_al_src="$src_al"
     import_stage_al_name=""
     [[ "$check_al" == 1 ]] && import_stage_al_name="$al_name"
@@ -2551,41 +2671,26 @@ kit_verify_service_cause() { # $1 ExecMainStatus, $2 Result
     esac
 }
 
-# EGL-346: the invoked account's named profile — --profile when set,
-# else the regex-validated EGRESSLOCK_PROFILE in the account's unit.env.
-# Empty for another account (host-sweep rows cannot know its mode), for
-# unnamed mode, and for the EGL-325 --conf display hint (strict named
-# mode only: a display hint never seeds a printed repair).
-# Call-order note: kit_check_verify_units runs before
-# doctor_resolve_account, so this reads unit.env itself; doctor_named_mode
-# is not set at emit time.
+# EGL-346/EGL-333-D8: the invoked account's explicitly requested
+# profile — `doctor --profile` only. Empty for another account
+# (host-sweep rows cannot know its mode), for an aggregate doctor run,
+# and for the EGL-325 --conf display hint (a display hint never seeds a
+# printed repair). A failed-run `fix: egresslock ensure <profile>` line
+# prints only when the doctor run itself passed an explicit --profile:
+# an aggregate failure names no single profile, so it prints none.
 kit_verify_named_profile() {
     local e84_p_acct="$1" e84_p_prof=""
-    if [[ -n "$account" && "$account" == "$e84_p_acct" ]]; then
-        if [[ -n "${profile_name:-}" && "$profile_name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-            e84_p_prof="$profile_name"
-        elif [[ -f "$confdir/unit.env" ]]; then
-            e84_p_prof="$(awk -F= '$1 == "EGRESSLOCK_PROFILE" { print $2; exit }' "$confdir/unit.env" 2>/dev/null || true)"
-            # EGL-380: 'all' is reserved — never render it as --profile.
-            if [[ "$e84_p_prof" == "all" || ! "$e84_p_prof" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-                e84_p_prof=""
-            fi
-        fi
+    if [[ -n "$account" && "$account" == "$e84_p_acct" \
+            && -n "${profile_name:-}" && "$profile_name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        e84_p_prof="$profile_name"
     fi
     printf '%s' "$e84_p_prof"
 }
 
-# EGL-345: the re-arm command for <acct>'s timer. --profile is printed
-# only when named mode is known for the invoked account (the --profile
-# flag or unit.env); a host-sweep row cannot know another account's mode.
+# EGL-345/EGL-333-D7: the re-arm command for <acct>'s timer. The timer
+# verifies every profile, so the init command never carries --profile.
 kit_verify_rearm_fix() {
-    local e84_r_acct="$1" e84_r_prof=""
-    e84_r_prof="$(kit_verify_named_profile "$e84_r_acct")"
-    if [[ -n "$e84_r_prof" ]]; then
-        printf 'sudo egresslock-setup init --account %s --profile %s --enable' "$e84_r_acct" "$e84_r_prof"
-    else
-        printf 'sudo egresslock-setup init --account %s --enable' "$e84_r_acct"
-    fi
+    printf 'sudo egresslock-setup init %s --enable' "$1"
 }
 
 # EGL-345: state-specific remedy lines for a timer that is not armed
@@ -2676,34 +2781,34 @@ kit_emit_verify_failed() {
                 echo "  inspect: sudo journalctl -u $e84_e_unit -n 20"
                 echo "  note: an empty journal means the start error was rotated out; the clear + restart above still re-arms it"
                 echo "  check: sudo systemctl is-active $e84_e_unit"
-                echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
+                echo "  check: sudo egresslock-setup doctor $e84_e_acct"
                 ;;
             disabled)
                 echo "PROBLEM: $e84_e_unit: FAILED and not enabled — the drift-check timer is disarmed; no verify run is scheduled"
                 kit_verify_rearm_lines "$e84_e_acct"
-                echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
+                echo "  check: sudo egresslock-setup doctor $e84_e_acct"
                 ;;
             masked)
                 echo "PROBLEM: $e84_e_unit: FAILED and masked — systemd will not start it until it is unmasked"
                 kit_verify_rearm_lines "$e84_e_acct"
-                echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
+                echo "  check: sudo egresslock-setup doctor $e84_e_acct"
                 ;;
             static)
                 echo "PROBLEM: $e84_e_unit: FAILED and not enableable (static) — the unit template is missing or corrupt"
                 kit_verify_rearm_lines "$e84_e_acct"
-                echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
+                echo "  check: sudo egresslock-setup doctor $e84_e_acct"
                 ;;
             not-found)
                 echo "PROBLEM: $e84_e_unit: FAILED and not found — the unit template is missing or corrupt"
                 kit_verify_rearm_lines "$e84_e_acct"
-                echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
+                echo "  check: sudo egresslock-setup doctor $e84_e_acct"
                 ;;
             *)
                 echo "PROBLEM: $e84_e_unit: FAILED — the timer is in a failed state (armed state unknown${e84_armed_state:+: $e84_armed_state})"
                 echo "  fix: sudo systemctl reset-failed $e84_e_unit"
                 echo "  fix: sudo systemctl restart $e84_e_unit"
                 echo "  check: sudo systemctl is-active $e84_e_unit"
-                echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
+                echo "  check: sudo egresslock-setup doctor $e84_e_acct"
                 ;;
         esac
         return 0
@@ -2728,7 +2833,7 @@ kit_emit_verify_failed() {
         kit_verify_next_line
         echo "  inspect: sudo journalctl -u $e84_e_unit -n 20"
         echo "  fix: fix what the journal names (a broken or unreachable ExecStart), then: sudo systemctl reset-failed $e84_e_unit"
-        echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
+        echo "  check: sudo egresslock-setup doctor $e84_e_acct"
         return 0
     fi
 
@@ -2782,7 +2887,7 @@ kit_emit_verify_failed() {
     fi
     echo "  inspect: sudo journalctl -u $e84_e_unit -n 20"
     echo "  note: an empty journal means earlier details were rotated out; the systemctl start above writes fresh output there"
-    echo "  check: sudo egresslock-setup doctor --account $e84_e_acct"
+    echo "  check: sudo egresslock-setup doctor $e84_e_acct"
     return 0
 }
 
@@ -3082,7 +3187,7 @@ kit_check_accounts() {
     e84_noun=accounts
     (( e84_n == 1 )) && e84_noun=account
     printf -v e84_join '%s, ' "${e84_acs[@]}"; e84_join="${e84_join%, }"
-    echo "NOTE: egresslock-verify services are set up for ${e84_n} ${e84_noun}: ${e84_join} — to check an account: sudo egresslock-setup doctor --account <acct>"
+    echo "NOTE: egresslock-verify services are set up for ${e84_n} ${e84_noun}: ${e84_join} — to check an account: sudo egresslock-setup doctor ACCOUNT"
     return 0
 }
 
@@ -3090,41 +3195,20 @@ kit_check_host_pointers() {
     # EGL-102-D6-R1: sibling-surface pointer (AppArmor-row idiom) — the
     # host slice names what it did NOT examine and where to get it.
     if [[ -z "$account" ]]; then
-        echo "NOTE: account wiring (conf, policy file modes, unit.env, timer, linger, gateway image, egl-base image): not examined (no --account) — run: sudo egresslock-setup doctor --account <acct>"
+        echo "NOTE: account wiring (conf, policy file modes, timer, linger, gateway image, egl-base image): not examined (no account operand) — run: sudo egresslock-setup doctor ACCOUNT"
     fi
     echo "NOTE: AppArmor: see egresslock-setup apparmor check (pasta slice)"
     return 0
 }
 
-# EGL-328 P3/D7: doctor resolve is unit.env first, then every *.conf in
-# the fixed confdir. `--conf` remains a display hint (EGL-325) but never
-# invents main.conf. The requested `--profile` wins for inspection.
+# EGL-328 P3/D7 + EGL-333-D7: doctor resolves the fixed confdir's
+# *.conf files. `--profile` narrows the read-only inspection to exactly
+# <profile>.conf; `--conf` remains a display hint (EGL-325) but never
+# invents main.conf. There is no on-disk selector: the verify timer
+# checks every profile.
 doctor_resolve_account() {
-    local ue="$confdir/unit.env" hint="" raw=""
-    doctor_requested_profile="$profile_name"
-    doctor_unit_env_profile=""
-    doctor_invalid_env_profile=""
-    doctor_named_mode=0
-    if [[ -f "$ue" ]]; then
-        raw="$(awk -F= '$1 == "EGRESSLOCK_PROFILE" { print $2; exit }' "$ue" 2>/dev/null || true)"
-        if [[ -n "$raw" && "$raw" != "all" && "$raw" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-            doctor_unit_env_profile="$raw"
-        elif [[ -n "$raw" ]]; then
-            # EGL-380: 'all' is reported by the reserved row, not joined
-            # into a path and never offered as --profile.
-            doctor_invalid_env_profile="$raw"
-        fi
-    fi
-    if [[ -n "$profile_name" ]]; then
-        # Requested profile wins for inspection; it is also an explicit
-        # request for named mode, so the fix line carries --profile.
-        doctor_named_mode=1
-    elif [[ -n "$doctor_unit_env_profile" ]]; then
-        # D7: named mode already set by unit.env. This is the only
-        # on-disk selector; a --conf hint below never narrows the timer.
-        profile_name="$doctor_unit_env_profile"
-        doctor_named_mode=1
-    elif [[ -n "$conf" && -f "$conf" ]]; then
+    local hint=""
+    if [[ -n "$conf" && -z "$profile_name" && -f "$conf" ]]; then
         hint="$(awk '$1 == "profile" { print $2; exit }' "$conf" 2>/dev/null || true)"
         if [[ "$hint" =~ ^[a-z0-9][a-z0-9-]*$ && "$hint" != "all" ]]; then
             profile_name="$hint"
@@ -3149,35 +3233,30 @@ doctor_resolve_account() {
     done
 }
 
-doctor_init_fix() { # pathless EGL-328 re-arm; --profile only for named mode
-    if [[ "$doctor_named_mode" == 1 ]]; then
-        printf 'sudo egresslock-setup init --account %s --profile %s --enable' "$account" "$profile_name"
-    else
-        printf 'sudo egresslock-setup init --account %s --enable' "$account"
-    fi
+doctor_init_fix() { # pathless EGL-328 re-arm; EGL-333: no named mode
+    printf 'sudo egresslock-setup init %s --enable' "$account"
 }
 
 # EGL-409: read-only policy-file mode check (unix mode only, D9). One
 # PROBLEM row per policy file whose exact numeric mode is not 600 — the
 # same mode class the engine's `allow` gate refuses (egresslock:8513-
 # 8516) — plus the confdir when its other-write bit is set. Missing,
-# broken-symlink, and non-regular candidates add no row (conf parse /
-# unit.env own missing wiring); a symlink is followed to the mode that
-# actually applies. A stat failure on a present path is an rc-neutral
-# NOTE. rc 1 on any PROBLEM. Doctor never chmods; every fix is a printed
-# command for the account. Checked set (D2): each existing resolved
-# <profile>.conf plus its <profile>-allowlist sibling, and unit.env once.
+# broken-symlink, and non-regular candidates add no row (conf parse owns
+# missing wiring); a symlink is followed to the mode that actually
+# applies. A stat failure on a present path is an rc-neutral NOTE. rc 1
+# on any PROBLEM. Doctor never chmods; every fix is a printed command
+# for the account. Checked set (D2): each existing resolved
+# <profile>.conf plus its <profile>-allowlist sibling.
 # Exempt by construction: <profile>.pins / <profile>.revoke-pending
 # (written 0600) and gateway-build.log (0644 by design).
 kit_check_policy_modes() {
     local rc=0 checked=0 bad=0 unknown=0
-    local p mode cf
+    local p mode cf qp qc
     local -a pm_candidates=()
     for cf in "${doctor_conf_files[@]}"; do
         [[ -f "$cf" ]] || continue
         pm_candidates+=("$cf" "${cf%.conf}-allowlist")
     done
-    pm_candidates+=("$confdir/unit.env")
     # EGL-511: both `fix:` chmod continuations below print `sudo -u`, not
     # `sudo -iu` — chmod on an absolute path needs no login environment, so
     # the printed fix also runs for a `nologin` service account. The `-iu`
@@ -3192,7 +3271,10 @@ kit_check_policy_modes() {
         checked=$((checked + 1))
         if [[ "$mode" != "600" ]]; then
             echo "PROBLEM: policy file modes: $p is $mode, not 0600 — the account's policy files are owner-only (0600), and proxy allow rewrites only a 0600 allowlist"
-            echo "  fix: sudo -u $account -- chmod 600 -- $p"
+            # EGL-531-D4: the printed fix is meant to be pasted; %q keeps a
+            # path with a space (or other shell metacharacter) one argv.
+            printf -v qp '%q' "$p"
+            echo "  fix: sudo -u $account -- chmod 600 -- $qp"
             bad=1
         fi
     done
@@ -3205,7 +3287,9 @@ kit_check_policy_modes() {
             unknown=1
         elif (( (8#$mode & 2) != 0 )); then
             echo "PROBLEM: policy file modes: $confdir is $mode (writable by other users) — any local user can replace the policy files in it"
-            echo "  fix: sudo -u $account -- chmod o-w -- $confdir"
+            # EGL-531-D4: same %q paste-safety as the file row above.
+            printf -v qc '%q' "$confdir"
+            echo "  fix: sudo -u $account -- chmod o-w -- $qc"
             bad=1
         fi
     fi
@@ -3240,9 +3324,9 @@ kit_check_conf_parse() {
             if [[ -f "$confdir/$cprof.conf" ]]; then
                 echo "  fix: correct the conf (see the engine output above)"
             else
-                echo "  fix: install the pair with: sudo egresslock-setup import --account $account --from <path>"
+                echo "  fix: install the pair with: sudo egresslock-setup import $account --from PATH"
                 if [[ "$cprof" == main ]]; then
-                    echo "  or ship the starter: sudo egresslock-setup init --account $account --init-conf"
+                    echo "  or ship the starter: sudo egresslock-setup init $account --init-conf"
                 fi
             fi
             rm -f "$list_err"
@@ -3260,46 +3344,14 @@ kit_check_conf_parse() {
             printf '%s\n' "$list_out" | sed 's/^/  /'
             sed 's/^/  /' "$list_err" 2>/dev/null
             if (( ${#doctor_conf_files[@]} == 0 )); then
-                echo "  fix: ship the starter: sudo egresslock-setup init --account $account --init-conf"
-                echo "  or import an existing pair: sudo egresslock-setup import --account $account --from <path>"
+                echo "  fix: ship the starter: sudo egresslock-setup init $account --init-conf"
+                echo "  or import an existing pair: sudo egresslock-setup import $account --from PATH"
             else
                 echo "  fix: correct the conf (see the engine output above)"
             fi
             rm -f "$list_err"
             rc=1
         fi
-    fi
-    return $rc
-}
-
-kit_check_unit_env() {
-    local rc=0 ue="$confdir/unit.env"
-    if [[ ! -f "$ue" ]]; then
-        echo "PROBLEM: unit.env: missing ($ue)"
-        echo "  fix: $(doctor_init_fix)"
-        rc=1
-    elif grep -q '^EGRESSLOCK_CONF=' "$ue"; then
-        echo "PROBLEM: unit.env: STALE (carries the removed EGRESSLOCK_CONF wiring; see $ue)"
-        echo "  fix: $(doctor_init_fix)"
-        rc=1
-    elif [[ -n "$doctor_unit_env_profile" && ! -e "$confdir/$doctor_unit_env_profile.conf" ]]; then
-        echo "PROBLEM: unit.env: named profile '$doctor_unit_env_profile' has no conf ($confdir/$doctor_unit_env_profile.conf)"
-        echo "  fix: install the pair with: sudo egresslock-setup import --account $account --from <path>"
-        rc=1
-    elif [[ -n "$doctor_invalid_env_profile" && -z "$doctor_requested_profile" ]]; then
-        if [[ "$doctor_invalid_env_profile" == "all" ]]; then
-            echo "PROBLEM: unit.env: EGRESSLOCK_PROFILE 'all' is reserved ('teardown all' names the main profile); rename this profile and its conf file (see $ue)"
-        else
-            echo "PROBLEM: unit.env: invalid EGRESSLOCK_PROFILE '$doctor_invalid_env_profile' (expected [a-z0-9][a-z0-9-]*; see $ue)"
-        fi
-        echo "  fix: $(doctor_init_fix)"
-        rc=1
-    elif [[ -n "$doctor_requested_profile" ]] && ! grep -qx "EGRESSLOCK_PROFILE=$doctor_requested_profile" "$ue"; then
-        echo "PROBLEM: unit.env: MISMATCH (does not match --profile; see $ue)"
-        echo "  fix: sudo egresslock-setup init --account $account --profile $doctor_requested_profile --enable"
-        rc=1
-    else
-        echo "OK: unit.env: matches ($ue) — the account's fixed confdir is wired${doctor_unit_env_profile:+ (named mode: $doctor_unit_env_profile)}"
     fi
     return $rc
 }
@@ -3321,14 +3373,14 @@ kit_check_timer() {
                 # print the armed OK for a state we did not establish.
                 echo "PROBLEM: timer: enabled but its running state is unknown ($tmr)"
                 echo "  fix: sudo systemctl status $tmr"
-                echo "  check: sudo egresslock-setup doctor --account $account"
+                echo "  check: sudo egresslock-setup doctor $account"
                 rc=1
             elif [[ -n "$e84_timer_active" && "$e84_timer_active" != "active" \
                     && "$e84_timer_active" != "activating" \
                     && "$e84_timer_active" != "reloading" ]]; then
                 echo "PROBLEM: timer: enabled but not running ($tmr)"
                 echo "  fix: sudo systemctl start $tmr"
-                echo "  check: sudo egresslock-setup doctor --account $account"
+                echo "  check: sudo egresslock-setup doctor $account"
                 rc=1
             else
                 echo "OK: timer: enabled ($tmr) — the drift-check timer is armed"
@@ -3356,7 +3408,7 @@ kit_check_timer() {
             echo "PROBLEM: timer: armed state unknown ($tmr)"
             echo "  fix: check the timer state: systemctl is-enabled $tmr"
             echo "  fix: if it is not enabled, re-arm: $(doctor_init_fix)"
-            echo "  check: sudo egresslock-setup doctor --account $account"
+            echo "  check: sudo egresslock-setup doctor $account"
             rc=1
             ;;
         *)
@@ -3444,7 +3496,7 @@ kit_check_gateway() {
             echo "OK: user manager: active (user@${duid}.service) — the account's systemd user manager is running"
         else
             echo "PROBLEM: user manager: not active (user@${duid:-?}.service)"
-            echo "  fix: sudo systemctl start user@${duid:-<uid>}.service"
+            echo "  fix: sudo systemctl start user@${duid:-UID}.service"
             rc=1
         fi
         if run_as_account podman image exists "$gw_img" 2>/dev/null; then
@@ -3503,20 +3555,16 @@ kit_check_gateway() {
                 echo "OK: gateway image: present ($gw_img) — base unknown — the gateway image exists in the account's store"
             fi
             if [[ -n "$gw_stale" ]]; then
-                echo "  $gw_stale — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway <profile> per affected profile (see \"The gateway image\" reference page)"
+                echo "  $gw_stale — rebuild in the account shell: egresslock build-gateway && egresslock ensure --replace-gateway PROFILE per affected profile (see \"The gateway image\" reference page)"
             elif [[ -n "$gw_base" ]]; then
                 kit_image_rebuild_notice gateway "$gw_created" "$gw_base" "$gw_pin" \
                     "$prefix/gateway/security-floor" \
-                    'egresslock build-gateway --force && egresslock ensure --replace-gateway <profile> per affected profile' \
+                    'egresslock build-gateway --force && egresslock ensure --replace-gateway PROFILE per affected profile' \
                     '(see "The gateway image" reference page)'
             fi
         else
             echo "PROBLEM: gateway image: missing ($gw_img)"
-            if [[ -n "$profile_name" ]]; then
-                echo "  fix: sudo egresslock-setup init --account $account --profile $profile_name (the bundle builds it), or in the account shell: egresslock build-gateway"
-            else
-                echo "  fix: sudo egresslock-setup init --account $account (the bundle builds it), or in the account shell: egresslock build-gateway"
-            fi
+            echo "  fix: sudo egresslock-setup init $account (the bundle builds it), or in the account shell: egresslock build-gateway"
             rc=1
         fi
     else
@@ -3630,7 +3678,7 @@ kit_check_profile_networks() {
 # `OK:|PROBLEM:|NOTE:` token-prefixed `key: value` line per check
 # (greppable, like the engine's doctor, EGL-45/D45-2); each missing
 # required item is followed by its fix command. Host slice: engine +
-# unit templates. Account slice adds conf parse, unit.env match, timer,
+# unit templates. Account slice adds conf parse, timer,
 # linger, gateway user-manager/image, and one rc-neutral
 # profile-networks row (EGL-55-D1). AppArmor stays one pointer line
 # (the pasta slice is --apparmor-check's; EGL-32). rc 1 when any
@@ -3648,7 +3696,6 @@ doctor_kit() {
     doctor_resolve_account
     kit_check_conf_parse || rc=1
     kit_check_policy_modes || rc=1
-    kit_check_unit_env || rc=1
     kit_check_timer || rc=1
     kit_check_linger || rc=1
     kit_check_gateway || rc=1
@@ -3694,7 +3741,7 @@ fi
 
 # EGL-328: `import` copies the pair and stops. `init --from` runs the
 # same import first; on any refusal (including rc 2 profile mismatch) it
-# stops before wiring. Import never writes unit.env.
+# stops before wiring; import writes no file beyond the pair.
 if [[ "$setup_verb" == "import" ]]; then
     if import_pair; then
         exit 0
@@ -3703,7 +3750,7 @@ if [[ "$setup_verb" == "import" ]]; then
     fi
 fi
 if [[ "$setup_verb" == "init" && -n "$from_src" ]]; then
-    if import_pair "$profile_name"; then
+    if import_pair; then
         :
     else
         exit $?
@@ -3775,7 +3822,7 @@ if [[ "$init_conf" == 1 ]]; then
             exit 1
         }
         _init_rc=0
-        run_as_account bash -c "$init_conf_script" || _init_rc=$?
+        _init_out="$(run_as_account bash -c "$init_conf_script")" || _init_rc=$?
         if (( _init_rc != 0 )); then
             # The account-side script prints its own cause line (and, after
             # publish, the retained-allowlist guidance) and exits 3 for
@@ -3790,7 +3837,15 @@ if [[ "$init_conf" == 1 ]]; then
             fi
             exit 1
         fi
-        echo "egresslock-setup: --init-conf: wrote starter $main_conf (+ $main_allowlist)"
+        # EGL-555-D3: the allowlist may have appeared between the outer
+        # check and the account-side publish; the inner marker says this
+        # run did not write it, so the success line must not claim it did.
+        if [[ "$_init_out" == *"egresslock-init-conf: allowlist-preexisting"* ]]; then
+            echo "egresslock-setup: --init-conf: wrote starter $main_conf (the allowlist at $main_allowlist was already present and was left in place)"
+        else
+            echo "egresslock-setup: --init-conf: wrote starter $main_conf (+ $main_allowlist)"
+        fi
+        unset _init_out
     fi
 fi
 
@@ -3802,56 +3857,33 @@ step_line() {
     echo "$1) $2 … $3"
 }
 
-# 1. Conf validation (fail closed; never writes a conf). Named mode
-# loads exactly <profile>.conf; pathless init validates every *.conf in
-# the fixed confdir. Empty confdir names both writers that can create a
-# pair. The pair's allowlist is probed too: parse alone never reads it,
-# so a missing file would otherwise report OK.
+# 1. Conf validation (fail closed; never writes a conf). EGL-333: there
+# is no named mode — init validates every *.conf in the fixed confdir
+# (aggregate), the same set the verify timer checks. Empty confdir names
+# both writers that can create a pair. The pair's allowlist is probed
+# too: the aggregate parse never reads it, so a missing file would
+# otherwise report OK.
+conf=""
 conf_files=()
-if [[ -n "$profile_name" ]]; then
-    conf="$confdir/$profile_name.conf"
-    if [[ ! -f "$conf" ]]; then
-        step_line 1 "validate conf" FAIL
-        echo "egresslock-setup: no profile config: $conf" >&2
-        if [[ "$profile_name" == main ]]; then
-            echo "  first run? ship the starter: sudo egresslock-setup init --account $account --init-conf" >&2
-        fi
-        echo "  or import an existing pair: sudo egresslock-setup import --account $account --from <path>" >&2
-        exit 1
-    fi
-    conf_files=("$conf")
-else
-    conf=""
-    shopt -s nullglob
-    conf_files=("$confdir"/*.conf)
-    shopt -u nullglob
-    if (( ${#conf_files[@]} == 0 )); then
-        step_line 1 "validate conf" FAIL
-        echo "egresslock-setup: no profile configs in $confdir" >&2
-        echo "  first run? ship the starter: sudo egresslock-setup init --account $account --init-conf" >&2
-        echo "  or import an existing pair: sudo egresslock-setup import --account $account --from <path>" >&2
-        exit 1
-    fi
+shopt -s nullglob
+conf_files=("$confdir"/*.conf)
+shopt -u nullglob
+if (( ${#conf_files[@]} == 0 )); then
+    step_line 1 "validate conf" FAIL
+    echo "egresslock-setup: no profile configs in $confdir" >&2
+    echo "  first run? ship the starter: sudo egresslock-setup init $account --init-conf" >&2
+    echo "  or import an existing pair: sudo egresslock-setup import $account --from PATH" >&2
+    exit 1
 fi
 
 list_err="$(mktemp)"
-if [[ -n "$profile_name" ]]; then
-    list_out="$(run_as_account "$prefix/egresslock" network "$profile_name" 2>"$list_err")" || {
-        step_line 1 "validate conf" FAIL
-        echo "egresslock-setup: conf failed to parse under the deployed engine:" >&2
-        cat "$list_err" >&2
-        rm -f "$list_err"
-        exit 1
-    }
-else
-    list_out="$(run_as_account "$prefix/egresslock" list 2>"$list_err")" || {
-        step_line 1 "validate conf" FAIL
-        echo "egresslock-setup: conf failed to parse under the deployed engine:" >&2
-        cat "$list_err" >&2
-        rm -f "$list_err"
-        exit 1
-    }
-fi
+list_out="$(run_as_account "$prefix/egresslock" list 2>"$list_err")" || {
+    step_line 1 "validate conf" FAIL
+    echo "egresslock-setup: conf failed to parse under the deployed engine:" >&2
+    cat "$list_err" >&2
+    rm -f "$list_err"
+    exit 1
+}
 rm -f "$list_err"
 
 # A2: `network`/`list` do not open the allowlist. Probe it for every
@@ -3870,15 +3902,7 @@ for cf in "${conf_files[@]}"; do
 done
 step_line 1 "validate conf" OK
 
-# 2. unit.env — exactly the wiring lines, nothing else.
-if ! run_as_account bash -c "$write_unit_env"; then
-    step_line 2 "write unit.env" FAIL
-    echo "egresslock-setup: could not write $home/.config/egresslock/unit.env as the account" >&2
-    exit 1
-fi
-step_line 2 "write unit.env" OK
-
-# 3. Optional linger (ARC-28), BEFORE the gateway build (EGL-51-D2): an
+# 2. Optional linger (ARC-28), BEFORE the gateway build (EGL-51-D2): an
 #    --enable invocation must not run the account-side podman build
 #    linger-less (the build needs the session/linger). Fail closed if
 #    linger does not stick. Without --enable: no linger (ARC-28-D3); the
@@ -3886,28 +3910,28 @@ step_line 2 "write unit.env" OK
 if [[ "$enable" == 1 ]]; then
     echo "enabling linger for $account"
     if ! loginctl enable-linger "$account"; then
-        step_line 3 "linger" FAIL
+        step_line 2 "linger" FAIL
         echo "egresslock-setup: ERROR loginctl enable-linger failed for '$account'. Run manually: loginctl enable-linger $account" >&2
         exit 1
     fi
     linger="$(loginctl show-user "$account" -p Linger --value)"
     if [[ "$linger" != "yes" ]]; then
-        step_line 3 "linger" FAIL
-        echo "egresslock-setup: ERROR linger for '$account' did not stick (show-user Linger=$linger). The verify timer needs /run/user/<uid> outside login sessions. Run manually: loginctl enable-linger $account" >&2
+        step_line 2 "linger" FAIL
+        echo "egresslock-setup: ERROR linger for '$account' did not stick (show-user Linger=$linger). The verify timer needs /run/user/UID outside login sessions. Run manually: loginctl enable-linger $account" >&2
         exit 1
     fi
-    step_line 3 "linger" OK
+    step_line 2 "linger" OK
 else
-    step_line 3 "linger" SKIP
+    step_line 2 "linger" SKIP
 fi
 
-# 4+5. User manager + gateway image.
+# 3+4. User manager + gateway image.
 #    EGL-51-D1: a never-logged-in account has no systemd user manager
 #    (user@<uid>.service), so account-side podman falls back to cgroupfs
 #    and dies on the sd-bus create call. Start the user manager (start,
 #    never restart — EGL-36; already-active is a no-op) and fail closed
 #    before the first account-side podman call. D38-7: these are numbered
-#    steps 4 and 5; the gateway image is never reached when the user
+#    steps 3 and 4; the gateway image is never reached when the user
 #    manager FAILs.
 if [[ "$(id -u)" == 0 ]]; then
     uid="$(getent passwd "$account" 2>/dev/null | cut -d: -f3)"
@@ -3915,32 +3939,32 @@ else
     uid="$(id -u)"   # hook mode: the invoking process IS the account
 fi
 if [[ -z "$uid" ]]; then
-    step_line 4 "user manager" FAIL
+    step_line 3 "user manager" FAIL
     echo "egresslock-setup: cannot resolve the uid of '$account' (getent passwd failed); cannot start user@.service" >&2
     exit 1
 fi
 if ! systemctl start "user@${uid}.service"; then
-    step_line 4 "user manager" FAIL
+    step_line 3 "user manager" FAIL
     echo "egresslock-setup: systemctl start user@${uid}.service failed for '$account'" >&2
     exit 1
 fi
 if ! systemctl is-active --quiet "user@${uid}.service"; then
-    step_line 4 "user manager" FAIL
+    step_line 3 "user manager" FAIL
     echo "egresslock-setup: no systemd user manager for '$account' (user@${uid}.service inactive). As root: systemctl start user@${uid}.service" >&2
     linger="$(loginctl show-user "$account" -p Linger --value 2>/dev/null || true)"
     [[ "$linger" == "yes" ]] || \
         echo "egresslock-setup: ... and: loginctl enable-linger ${account}  (or re-run setup with --enable)" >&2
     exit 1
 fi
-step_line 4 "user manager" OK
+step_line 3 "user manager" OK
 if ! run_as_account bash -c "$build_gw"; then
-    step_line 5 "gateway image" FAIL
+    step_line 4 "gateway image" FAIL
     echo "egresslock-setup: gateway image build failed for '$account' (see the podman output above)" >&2
     exit 1
 fi
-step_line 5 "gateway image" OK
+step_line 4 "gateway image" OK
 
-# 6. Optional timer enable. --enable arms the verify timer; the linger
+# 5. Optional timer enable. --enable arms the verify timer; the linger
 #    half of the old --enable block (ARC-28) moved above, before the
 #    gateway build (EGL-51-D2), so this step only arms the timer.
 if [[ "$enable" == 1 ]]; then
@@ -3949,32 +3973,34 @@ if [[ "$enable" == 1 ]]; then
     # vocabulary (ARC-69-D1).
     echo "enabling verify timer for $account (egresslock-verify@$account.timer)"
     if ! systemctl enable --now "egresslock-verify@$account.timer"; then
-        step_line 6 "timer" FAIL
+        step_line 5 "timer" FAIL
         echo "egresslock-setup: systemctl enable --now egresslock-verify@$account.timer failed for '$account'" >&2
         exit 1
     fi
-    step_line 6 "timer" OK
+    step_line 5 "timer" OK
+    # EGL-600 P3: state the sweep's real coverage — verify --ensured
+    # covers profiles whose anchor is running, not every conf blindly.
+    echo "egresslock-setup: the scheduled check will verify every profile whose anchor is running"
 else
-    step_line 6 "timer" SKIP
+    step_line 5 "timer" SKIP
     # ARC-70-D2: the skip must not be silent. Staying explicit (no
     # --no-enable / auto-default, ARC-70-D1) is fine — hiding it is not.
     # EGL-102-D6-F1/EGL-328: state what THIS run did (never a claim
     # about linger that may be false on a re-run) and give a runnable
-    # pathless re-arm command; named mode carries --profile.
-    echo "egresslock-setup: timer NOT enabled — this run did not arm drift checks. Arm it: sudo egresslock-setup init --account $account${profile_name:+ --profile $profile_name} --enable"
+    # pathless re-arm command (EGL-333: the timer is aggregate-only, so
+    # there is no --profile to carry).
+    # EGL-600 P3: no scheduled-check claim here — this run armed no timer.
+    echo "egresslock-setup: timer NOT enabled — this run did not arm drift checks. Arm it: sudo egresslock-setup init $account --enable"
 fi
-
-echo "egresslock-setup: unit.env written for $account to $home/.config/egresslock/unit.env"
-[[ -n "$profile_name" ]] \
-    && echo "egresslock-setup: the scheduled check will verify only profile '$profile_name'" \
-    || echo "egresslock-setup: the scheduled check will verify every profile"
 echo "egresslock-setup: account '$account' is ready — it can ensure profiles now"
 # EGL-200 P1: operator-first next-step block — the run ends on the
-# next action (D1). <profile>: --profile value, else the first
-# profile in the step-1 list (NAME header skipped). Reaching this
-# point means step 1 passed, so at least one profile exists (the
-# engine refuses a profile-less conf).
-next_profile="$profile_name"
+# next action (D1). <profile>: the profile this run just imported when
+# --from named a pair, staged or unchanged (EGL-333-F5: an aggregate
+# list's first entry can be an older profile, leaving the imported one
+# unensured); otherwise the first profile in the step-1 list (NAME
+# header skipped). Reaching this point means step 1 passed, so at least
+# one profile exists (the engine refuses a profile-less conf).
+next_profile="${import_pair_profile:-}"
 if [[ -z "$next_profile" ]]; then
     next_profile="$(awk 'NR>1 && NF {print $1; exit}' <<<"$list_out")"
 fi

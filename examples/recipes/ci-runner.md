@@ -10,7 +10,6 @@ package registries they need — nothing else.
 ```
 # ~/.config/egresslock/runner.conf
 profile runner 10.199.3.0/24
-    rule gateway-only
     gateway 10.199.3.2 3128 runner-allowlist
 
 # ~/.config/egresslock/runner-allowlist
@@ -28,28 +27,31 @@ install-kit deploys):
 
 A service account can get the pair from deploy tooling without editing
 its conf; `init --from` imports it first, then validates and wires the
-named timer in one command:
+timer in one command:
 
 ```sh
-sudo egresslock-setup init --account runner \
-    --from /srv/runner/runner.conf --profile runner --enable
+sudo egresslock-setup init runner \
+    --from /srv/runner/runner.conf --enable
 ```
 
-This validates the pair, writes `unit.env`, builds the gateway image if
-missing, enables the verify timer, and enables linger (required so
-`/run/user/<uid>` exists at boot for a runner started before login).
-To re-pin a changed conf later, use `import --force` and then
-`init --profile runner --enable`; split the installation from wiring
-with `import --account runner --from <path>` then
-`init --account runner --profile runner --enable`.
+This validates the pair, builds the gateway image if missing, enables
+the verify timer, and enables linger (required so `/run/user/<uid>`
+exists at boot for a runner started before login). The timer checks
+every profile with a running anchor, which for this
+single-profile account is just `runner`. To re-pin a changed conf
+later, use `import --force` and then `init runner --enable`;
+split the installation from wiring with
+`import runner --from <path>` then
+`init runner --enable`.
 
-Or, as the account, create the conf in place and allow the VCS host and
-the registries the runner needs:
+Or, as the account, write the pair above under
+`~/.config/egresslock/`, then ensure and (re)allow the three entries:
 
 ```sh
 sudo -iu runner
 egresslock ensure runner
 egresslock allow runner vcs.example.test:443
+egresslock allow runner git.example.test:443
 egresslock allow runner registry-1.docker.io:443
 ```
 
@@ -83,21 +85,38 @@ is the launcher's — the same baseline as every other recipe: the
    the job must point at the profile's Squid gateway: the runner
    config's env block sets
    `HTTP(S)_PROXY`/`http(s)_PROXY` to `http://<gateway-ip>:3128`
-   (`egresslock proxy-env runner` prints the exact values), and
-   `no_proxy` for anything that must bypass it. The exact mechanism
-   varies by runner software — an env section in the runner's
-   container config is the usual shape.
+   (`egresslock proxy-env runner` prints the exact values). Take
+   `NO_PROXY` from the same output (`egresslock proxy-env runner
+   noproxy`): it is derived — the loopback pair plus any IPv4 direct
+   pins — so there is no hand-written bypass list, and a hostname
+   cannot be added to it. The exact mechanism varies by runner
+   software — an env section in the runner's container config is the
+   usual shape.
 
-The runner daemon itself runs as a systemd service via
+The runner daemon itself runs as a systemd service started by
 `egresslock-start`, which `ensure`s the profile (fail-closed) and then
-execs the daemon with the proxy env; `--enable` above wrote
-`unit.env` from the account's conf:
+execs the daemon. The wrapper adds no proxy environment — job
+containers get theirs from the runner config in step 2 — and the
+daemon's own arguments pass through unchanged. The unit looks like
+this:
 
+```ini
+[Service]
+User=runner
+Environment=EGRESSLOCK_PROFILE=runner
+Environment=RUNNER_BIN=/usr/local/bin/<daemon>
+ExecStart=/opt/egresslock/egresslock-start <daemon args>
 ```
-# unit.env for the runner service (the conf path is fixed:
-# /home/runner/.config/egresslock/runner.conf)
-EGRESSLOCK_PROFILE=runner
-```
+
+(From a `.deb` install, the wrapper is
+`/usr/lib/egresslock/egresslock-start`; see
+[the wrapper reference](../../docs/reference/scripts-and-environment.md#egresslock-start--the-daemon-start-wrapper).)
+
+`egresslock-setup init --enable` above wired the verify timer; the
+timer checks every profile with a running anchor (here just
+`runner`). It reads no per-account environment file, and it never
+carries `RUNNER_BIN` — the daemon unit sets its own `Environment=`
+lines as above.
 
 ## 3. Watch it work
 

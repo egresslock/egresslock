@@ -12,15 +12,28 @@ policy state is live.
 | Signature | Layer | Meaning |
 |---|---|---|
 | Squid error page; `TCP_DENIED/403` in access.log; `denied <profile>` lists it | Squid (proxy path) | Reached the gateway, not allowlisted — or a proxied request to an IP literal (never allowlistable). |
-| Hang, no error page, absent from access.log | nft (direct path) | Went direct with no direct allow — the profile's terminal drop, silently. |
+| Hang, no error page, absent from access.log | nft (direct path) | Went direct with no direct allow — the profile's terminal drop, silently. `denied <profile> --direct` lists recent IPv4 TCP drops (IP:port; the record holds up to 16384 entries for 24h idle and warns when it is full). |
 | Instant `Connection refused` (0 ms), direct-pin counters stay 0 | netns itself | Destination is the HOST machine's own address (pasta hairpin — the netns owns a copy of it; the packet is never forwarded). |
 
 ## Fix / quickcheck
 
+For a hang on the direct path, first read the drop record:
+
+```sh
+egresslock denied PROFILE --direct
+```
+
+It lists recent IPv4 **TCP** destinations (IP:port) that hit the
+terminal drop, ready to paste into `allow PROFILE IP:PORT
+--direct`; an empty list is not proof of no denial — what the view
+does and does not record is in
+[gateway-logs](gateway-logs.md#reading-denied). Continue with the
+counter proof below.
+
 A direct-pin IP that 403s means the client took the proxy path:
 
 ```sh
-egresslock proxy-env <profile> noproxy   # direct IPv4 pins are unioned in
+egresslock proxy-env PROFILE noproxy   # direct IPv4 pins are unioned in
 ```
 
 If the IP is listed, **recreate** the container (env is baked at

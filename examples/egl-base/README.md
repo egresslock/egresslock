@@ -106,8 +106,8 @@ detected by date — rebuild once with `--force`. See
 
 ## Doctor row
 
-`egresslock doctor` (and `sudo egresslock-setup doctor --account
-<acct>`) prints an `egl-base image:` row when the image exists,
+`egresslock doctor` (and `sudo egresslock-setup doctor <acct>`) prints
+an `egl-base image:` row when the image exists,
 mirroring the gateway row: the base digest and build date, a `stale:`
 line for a moved pin or pre-label image, and a `rebuild:` line when
 the image predates the kit's floor (specific signal) or is more than

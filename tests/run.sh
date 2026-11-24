@@ -35,7 +35,7 @@
 # per-push, security-classed, R-EGL-270-5) through skip() with a named
 # cause; RESULTS TOTAL still reports exact counts. run.sh exports
 # EGRESSLOCK_TEST_TRACK for the harness loop (unset/empty = full). CI
-# opts in at `.forgejo/workflows/ci.yml`; the full battery stays the
+# opts in through its workflow configuration; the full battery stays the
 # handoff/pre-release gate.
 #
 # EGL-451: the engine harness shards by default. `bash tests/run.sh`
@@ -61,12 +61,29 @@
 # It refuses `--track fast` (a chosen slow section would be skipped),
 # `--shard`/`--serial` (not a shard pack), and `--harness kit|docs|all`.
 #
+# EGL-497: `--track lite` is the per-push CI track. It runs an explicit
+# core engine set (`LITE_SECTIONS` below: egl365 egl395 egl305 egl318
+# egl223) plus the kit and docs harnesses, still sharded; every other
+# engine section is deferred to the full battery (handoff, nightly,
+# release). Lite always takes the shard path — the serial path unsets the
+# section env and would run the full engine — so `--track lite` refuses
+# `--serial` and `--section` (exit 2), and `--shard 1` / a single-CPU
+# host still packs one bin. The full section list is validated exactly as
+# before (harness `--list-sections`, duplicate names, weights exact-set,
+# one window gate per section) and only then filtered, so a lite run
+# still proves the EGL-451 sharder contract over all sections; an
+# unknown or duplicate lite name exits 2. The parent-rendered merged
+# TOTAL names the deferral (`lite-deferred engine sections: N`, count =
+# full list - lite list) beside the shards' real skips, so a lite green
+# is never read as the full battery. `--track fast` keeps its EGL-270
+# meaning (only registered slow sections skip).
+#
 # EGL-86-D3: each harness's output is teed to a temp log; at suite end
 # `^SKIP:` lines are counted, bucketed by reason, and summarized as one
 # `run.sh: skips` line plus a fixed coverage note. Skips never change rc.
 #
 # Run:  bash tests/run.sh [--help] [--harness engine|kit|docs|all]
-#                                      [--track fast|full] [--no-foreground]
+#                                      [--track fast|full|lite] [--no-foreground]
 #                                      [--section <name>[,<name>…]]
 #                                      [--serial | --shard M | --shard N/M]
 #
@@ -83,15 +100,20 @@ Usage: bash tests/run.sh [options]
   --help, -h              Show this help and exit 0
   --harness engine|kit|docs|all
                           Which test-*.sh to run (default: all)
-  --track fast|full       Run track (default: full). On --track fast the
+  --track fast|full|lite  Run track (default: full). On --track fast the
                           registered slow sections (tests/lib.sh
                           _slow_sections; round 1: egl203r — egl223
                           stays per-push, security-classed, EGL-270)
                           are skipped with a named cause in each
-                          harness's RESULTS TOTAL.
-                          Default stays the full battery (EGL-79-D2);
-                          `--track fast` is CI's per-push battery and
-                          the local iteration shortcut.
+                          harness's RESULTS TOTAL. --track lite is the
+                          per-push CI track: only the core engine
+                          sections (egl365 egl395 egl305 egl318 egl223)
+                          plus kit and docs, always sharded; the merged
+                          engine TOTAL names the deferred sections
+                          (EGL-497). Default stays the full battery
+                          (EGL-79-D2); `--track fast` is the local
+                          iteration shortcut and `--track lite` is CI's
+                          per-push battery.
   --serial                Run the engine harness in one process (the
                           pre-EGL-451 path). Default is sharded.
   --shard M               Run the engine in M concurrent shards (M >= 1;
@@ -106,8 +128,9 @@ Usage: bash tests/run.sh [options]
                           Empty, duplicate, or unknown names exit 2 before
                           any test; the RESULTS TOTAL is a partial total
                           over the selected sections, not the battery
-                          total. Refused with --track fast, --shard,
-                          --serial, or --harness kit|docs|all (EGL-464).
+                          total. Refused with --track fast|lite, --shard,
+                          --serial, or --harness kit|docs|all (EGL-464,
+                          EGL-497).
   --no-foreground         Classic timeout isolation: on expiry the whole
                           harness process group is TERMed instead of the
                           direct child only. Default is foreground mode
@@ -204,7 +227,7 @@ while (( $# )); do
             ;;
         --track)
             if (( $# < 2 )); then
-                echo "run.sh: --track requires a value (fast|full)" >&2
+                echo "run.sh: --track requires a value (fast|full|lite)" >&2
                 exit 2
             fi
             track_sel="$2"
@@ -251,6 +274,19 @@ if (( section_mode )); then
         echo "run.sh: --section applies to the engine harness only (got --harness $harness_sel)" >&2
         exit 2
     fi
+    if [[ "$track_sel" == "lite" ]]; then
+        echo "run.sh: --section refuses --track lite (the lite core set is already a subset; use --section <name>[,<name>...] for a custom subset)" >&2
+        exit 2
+    fi
+fi
+
+# EGL-497 D3: the lite track always runs the engine shard path. --serial
+# would unset the section env and silently execute the full engine, so it
+# is a usage error before any harness (the same reason --section is
+# refused above).
+if [[ "$track_sel" == "lite" ]] && (( serial_sel )); then
+    echo "run.sh: --track lite refuses --serial (the lite selection needs the engine shard path; a serial run would execute the full engine)" >&2
+    exit 2
 fi
 
 # EGL-86-D1/D2: root preflight — refuse, never skip. Under uid 0 the
@@ -322,10 +358,18 @@ if (( section_mode )); then
 fi
 
 # EGL-270: validate the track and export the channel (direct runs stay full).
+# EGL-497: the lite track's explicit core engine set — the one greppable
+# home for per-push engine membership. Every other engine section is
+# deferred to the full battery; names are validated against
+# `test-engine.sh --list-sections` in the shard-planning block (unknown
+# or duplicate exits 2 there, after the full-set checks).
+LITE_SECTIONS=( egl365 egl395 egl305 egl318 egl223 )
+lite_deferred=0        # full engine section list - lite list (D6)
+lite_total_printed=0   # the parent merge added the synthetic count
 case "$track_sel" in
-    fast|full) export EGRESSLOCK_TEST_TRACK="$track_sel" ;;
+    fast|full|lite) export EGRESSLOCK_TEST_TRACK="$track_sel" ;;
     *)
-        echo "run.sh: bad --track value: '$track_sel' (expected fast|full)" >&2
+        echo "run.sh: bad --track value: '$track_sel' (expected fast|full|lite)" >&2
         exit 2
         ;;
 esac
@@ -498,6 +542,18 @@ elif (( ! section_mode )) && [[ "$harness_sel" == "engine" || "$harness_sel" == 
     fi
 fi
 
+# EGL-497 D3: lite always takes the shard path — even when `--shard 1` or
+# a single-CPU host selected the serial path — because the serial path
+# unsets EGRESSLOCK_TEST_SECTIONS and would run the full engine. A
+# one-bin pack (shard_mode=all, shard_total=1) is allowed; `--shard N/M`
+# stays a single debug window with its own partial TOTAL. No engine
+# harness selected -> nothing to force.
+if [[ "$track_sel" == "lite" && "$shard_mode" == "serial" \
+      && ( "$harness_sel" == "engine" || "$harness_sel" == "all" ) ]]; then
+    shard_mode="all"
+    (( shard_total < 1 )) && shard_total=1
+fi
+
 declare -a sections=()
 declare -a bin_names=()
 declare -a bin_load=()
@@ -572,7 +628,9 @@ if [[ "$shard_mode" != "serial" ]]; then
     # tail alias gates (arc14 on arc12, egl140 on egl139) wrap manual
     # RESULTS echoes, not windows, and do not count here.
     declare -A gate_windows=()
-    while IFS=$'\t' read -r _kind _gname _gmode _gline; do
+    declare -A alias_labels=()
+    declare -A alias_counts=()
+    while IFS=$'\t' read -r _kind _gname _gmode _gline _glabel; do
         [[ "$_kind" == "GATE" ]] || continue
         if [[ -z "${section_seen[$_gname]:-}" ]]; then
             echo "run.sh: FAIL shard gate for unknown section '$_gname' at $engine_harness:$_gline (EGL-451 fail-closed)" >&2
@@ -584,6 +642,9 @@ if [[ "$shard_mode" != "serial" ]]; then
         fi
         if [[ "$_gmode" == "window" ]]; then
             gate_windows[$_gname]=$(( ${gate_windows[$_gname]:-0} + 1 ))
+        elif [[ "$_gmode" == "alias" ]]; then
+            alias_counts[$_gname]=$(( ${alias_counts[$_gname]:-0} + 1 ))
+            alias_labels[$_gname]+="${alias_labels[$_gname]:+, }$_glabel"
         fi
     done < <(awk '
         /^if shard_section_run [A-Za-z0-9_]+; then$/ {
@@ -591,16 +652,45 @@ if [[ "$shard_mode" != "serial" ]]; then
             sub(/;$/, "", name)
             start = NR
             mode = "invalid"
+            label = ""
             while ((getline line) > 0) {
                 if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) continue
                 if (line == "if slow_section_run " name "; then") continue
                 if (line ~ ("^section_begin[[:space:]]+" name "([[:space:]]|$)")) mode = "window"
-                else if (line ~ /^[[:space:]]*echo "RESULTS \(/) mode = "alias"
+                else if (line ~ /^[[:space:]]*echo "RESULTS \(/) {
+                    mode = "alias"
+                    label = line
+                    sub(/^.*RESULTS \(/, "", label)
+                    sub(/[[:space:])].*$/, "", label)
+                    label = tolower(label)
+                    gsub(/[^a-z0-9]/, "", label)
+                }
                 break
             }
-            print "GATE\t" name "\t" mode "\t" start
+            print "GATE\t" name "\t" mode "\t" start "\t" label
         }
     ' "$engine_harness")
+    # EGL-532-D7: an alias gate must name the expected ticket. A bare
+    # `RESULTS (<label>)` under any known gate name would otherwise pass as
+    # a 0/0 alias (the tail witnesses are manual counters). Require exactly
+    # one alias gate per expected pairing; any other, missing, or duplicate
+    # pairing exits 2 before a shard starts. Count each gate separately
+    # (EGL-532 F1): a label that normalizes to empty must not vanish into
+    # the aggregate, so the order of a duplicate cannot hide it.
+    declare -A alias_expect=([arc12]=arc14 [egl139]=egl140)
+    for _an in "${!alias_expect[@]}"; do
+        if (( ${alias_counts[$_an]:-0} != 1 )) \
+           || [[ "${alias_labels[$_an]:-}" != "${alias_expect[$_an]}" ]]; then
+            echo "run.sh: FAIL alias gate '$_an' must pair exactly once with '${alias_expect[$_an]}' (found ${alias_counts[$_an]:-0} gate(s): '${alias_labels[$_an]:-<none>}') at $engine_harness (EGL-532 fail-closed)" >&2
+            exit 2
+        fi
+    done
+    for _an in "${!alias_labels[@]}"; do
+        if [[ -z "${alias_expect[$_an]:-}" ]]; then
+            echo "run.sh: FAIL unexpected RESULTS alias gate '$_an' (labels: '${alias_labels[$_an]}') at $engine_harness (EGL-532 fail-closed)" >&2
+            exit 2
+        fi
+    done
     declare -a gate_missing=()
     for s in "${sections[@]}"; do
         if (( ${gate_windows[$s]:-0} != 1 )); then
@@ -611,6 +701,35 @@ if [[ "$shard_mode" != "serial" ]]; then
         echo "run.sh: FAIL shard window gates do not match the harness section list — expected exactly one \`if shard_section_run <name>; then\` per section (EGL-451 fail-closed)" >&2
         echo "run.sh: section(s): ${gate_missing[*]}" >&2
         exit 2
+    fi
+
+    # EGL-497 D2: apply the lite selection AFTER the full-set checks above
+    # (harness list, duplicate names, weights exact-set, one window gate
+    # per section), so a lite run still proves the EGL-451 sharder
+    # contract over every section, and BEFORE the LPT packing, so the
+    # shard children receive only the validated core list. An unknown or
+    # duplicate lite name fails closed here; the deferred count feeds the
+    # parent-rendered TOTAL (D6).
+    if [[ "$track_sel" == "lite" ]]; then
+        if (( ${#LITE_SECTIONS[@]} == 0 )); then
+            echo "run.sh: FAIL LITE_SECTIONS is empty — no engine sections would run on --track lite (EGL-497 fail-closed)" >&2
+            exit 2
+        fi
+        declare -A _lite_seen=()
+        for s in "${LITE_SECTIONS[@]}"; do
+            if [[ -n "${_lite_seen[$s]:-}" ]]; then
+                echo "run.sh: FAIL duplicate lite section '$s' in LITE_SECTIONS (EGL-497 fail-closed)" >&2
+                exit 2
+            fi
+            _lite_seen[$s]=1
+            if [[ -z "${section_seen[$s]:-}" ]]; then
+                echo "run.sh: FAIL lite section '$s' is not in the harness --list-sections (EGL-497 fail-closed)" >&2
+                exit 2
+            fi
+        done
+        lite_deferred=$(( ${#sections[@]} - ${#LITE_SECTIONS[@]} ))
+        (( lite_deferred < 0 )) && lite_deferred=0
+        sections=( "${LITE_SECTIONS[@]}" )
     fi
 
     # Longest-processing-time packing: weight descending, source order as
@@ -639,6 +758,27 @@ if [[ "$shard_mode" != "serial" ]]; then
             exit 2
         fi
     done
+fi
+
+# EGL-558: whole-set closing block state (D2). The battery aggregate prints
+# only when every harness the `all` selection runs did run: not under
+# --section (engine-only subset) and not under a single debug --shard N/M.
+# --track fast and --serial still print it. The records are transient and
+# live beside the shard work dirs until the closing block consumes them.
+#
+# The record path is run.sh-internal: drop any inherited copy first, the
+# same stale-env hygiene run_harness applies to EGL-451's shard variables,
+# so a nested run.sh cannot write into an outer run's record.
+unset EGRESSLOCK_TEST_BATTERY_RESULT
+battery_on=0
+battery_dir=""
+battery_current_result=""
+if [[ "$harness_sel" == "all" ]] && (( ! section_mode )) && [[ "$shard_sel" != */* ]]; then
+    battery_on=1
+    battery_dir="$(mktemp -d /tmp/egl558-battery.XXXXXX)" || {
+        echo "run.sh: FAIL cannot create the battery result directory (EGL-558)" >&2
+        exit 2
+    }
 fi
 
 # EGL-86-D3: per-harness tee logs for the end-of-suite skip summary.
@@ -790,6 +930,8 @@ cleanup_shards() {
         done
     fi
     [[ -n "$shard_work" ]] && rm -rf "$shard_work"
+    # EGL-558: the battery records are transient like the shard work dir.
+    [[ -n "${battery_dir:-}" ]] && rm -rf "$battery_dir"
     return 0
 }
 trap cleanup_shards EXIT
@@ -801,6 +943,10 @@ run_shard_bg() { # <i> <M> <sections> <log> <result> <progress> <rcfile> <timefi
     local t0 jrc=0 cpid
     t0="$(date +%s)"
     : > "$progress"
+    # EGL-558: the battery record path is per harness. A shard child must
+    # never inherit the parent's path — its results_total would overwrite
+    # the merged engine record with one shard's partial counts.
+    unset EGRESSLOCK_TEST_BATTERY_RESULT
     export EGRESSLOCK_TEST_SHARDED=1
     export EGRESSLOCK_TEST_SECTIONS="$secs"
     export EGRESSLOCK_TEST_SHARD_PROGRESS="$progress"
@@ -866,6 +1012,111 @@ report_shard() { # <i> <M> <log> <rcfile> <timefile> <progress>
     echo "run.sh: harness $(basename "$engine_harness") shard $i/$m $(cat "$timefile" 2>/dev/null || echo '?')s"
 }
 
+# EGL-558: write one battery record in EGL-451's tab schema. Same
+# write-then-rename publication as the harness-side writer
+# (tests/lib.sh battery_result_publish); run.sh cannot source lib.sh
+# (it seeds a mock battery), so the two writers are kept byte-compatible
+# by the scratch probes in tests/test-kit.sh. <file> <pass> <fail>
+# <ext_pass> <ext_fail> <skips> <tree> [cause count]...
+battery_result_write() {
+    local b_rf="$1" b_pass="$2" b_fail="$3" b_ep="$4" b_ef="$5" b_sk="$6" b_tree="$7"
+    shift 7
+    local b_tmp="$b_rf.tmp.$$"
+    if ! {
+        printf 'pass\t%s\n' "$b_pass"
+        printf 'fail\t%s\n' "$b_fail"
+        printf 'ext_pass\t%s\n' "$b_ep"
+        printf 'ext_fail\t%s\n' "$b_ef"
+        printf 'skips\t%s\n' "$b_sk"
+        while (( $# >= 2 )); do
+            printf 'skip_cause\t%s\t%s\n' "$1" "$2"
+            shift 2
+        done
+        printf 'tree\t%s\n' "$b_tree"
+    } > "$b_tmp"; then
+        echo "run.sh: FAIL cannot write battery result '$b_tmp' (EGL-558 fail-closed)" >&2
+        rm -f -- "$b_tmp"
+        return 1
+    fi
+    if ! mv -f -- "$b_tmp" "$b_rf"; then
+        echo "run.sh: FAIL cannot publish battery result '$b_rf' (EGL-558 fail-closed)" >&2
+        rm -f -- "$b_tmp"
+        return 1
+    fi
+    return 0
+}
+
+# EGL-558: read one per-harness battery record, print its subtotal row and
+# add it to the battery counters (battery_pass/fail/skips/tree). A
+# missing, malformed, or tree-disagreeing record is a named refusal: the
+# caller prints no BATTERY TOTAL and forces a nonzero rc (D5). Records are
+# written by the harnesses (tests/lib.sh) or by merge_shard_results for the
+# sharded engine; no human text is re-parsed.
+battery_record_read() { # <harness> <file> — 0 = usable, 1 = refuse
+    local h="$1" rf="$2"
+    local key val extra
+    local p=0 f=0 ep=0 ef=0 sk=0 tree=""
+    local have_p=0 have_f=0 have_ep=0 have_ef=0 have_sk=0 have_tree=0
+    local unavailable="run.sh: FAIL battery TOTAL unavailable — $h (EGL-558)"
+    if [[ ! -f "$rf" ]]; then
+        echo "$unavailable" >&2
+        return 1
+    fi
+    while IFS=$'\t' read -r key val extra; do
+        case "$key" in
+            pass|fail|ext_pass|ext_fail|skips)
+                if [[ ! "$val" =~ ^[0-9]+$ || -n "$extra" ]]; then
+                    echo "$unavailable" >&2
+                    return 1
+                fi
+                case "$key" in
+                    pass) if (( have_p )); then echo "$unavailable" >&2; return 1; fi
+                          p=$(( 10#$val )); have_p=1 ;;
+                    fail) if (( have_f )); then echo "$unavailable" >&2; return 1; fi
+                          f=$(( 10#$val )); have_f=1 ;;
+                    ext_pass) if (( have_ep )); then echo "$unavailable" >&2; return 1; fi
+                          ep=$(( 10#$val )); have_ep=1 ;;
+                    ext_fail) if (( have_ef )); then echo "$unavailable" >&2; return 1; fi
+                          ef=$(( 10#$val )); have_ef=1 ;;
+                    skips) if (( have_sk )); then echo "$unavailable" >&2; return 1; fi
+                          sk=$(( 10#$val )); have_sk=1 ;;
+                esac
+                ;;
+            skip_cause)
+                if [[ -z "$val" || ! "$extra" =~ ^[0-9]+$ ]]; then
+                    echo "$unavailable" >&2
+                    return 1
+                fi
+                ;;
+            tree)
+                if (( have_tree )) || [[ -n "$extra" ]]; then
+                    echo "$unavailable" >&2
+                    return 1
+                fi
+                tree="$val"; have_tree=1
+                ;;
+            *)
+                echo "$unavailable" >&2
+                return 1
+                ;;
+        esac
+    done < "$rf"
+    if (( !have_p || !have_f || !have_ep || !have_ef || !have_sk || !have_tree )); then
+        echo "$unavailable" >&2
+        return 1
+    fi
+    battery_pass=$(( battery_pass + p + ep ))
+    battery_fail=$(( battery_fail + f + ef ))
+    battery_skips=$(( battery_skips + sk ))
+    echo "run.sh: subtotal — $h: $(( p + ep )) passed, $(( f + ef )) failed, $sk skipped"
+    if [[ -n "$battery_tree" && "$tree" != "$battery_tree" ]]; then
+        echo "$unavailable" >&2
+        return 1
+    fi
+    battery_tree="$tree"
+    return 0
+}
+
 merge_shard_results() { # <M> <result-prefix> — one parent-rendered TOTAL
     local m="$1" prefix="$2" i key val extra
     local pass=0 fail=0 ext_pass=0 ext_fail=0 skips=0
@@ -919,6 +1170,18 @@ merge_shard_results() { # <M> <result-prefix> — one parent-rendered TOTAL
         fi
         tree_prev="$tree"; tree_seen=1
     done
+    # EGL-497 D6: name the lite deferral in the parent-rendered TOTAL. It
+    # is a synthetic engine-section count (never a harness SKIP line),
+    # added beside the shards' real skip counts; only this parent merge
+    # adds it, so --section and direct harness runs can never claim it.
+    # The count is the full engine list minus the lite core list, so a
+    # reader sees egl139 and the other deferred sections, not a silently
+    # smaller green battery.
+    if [[ "$track_sel" == "lite" ]] && (( lite_deferred > 0 )); then
+        skips=$(( skips + lite_deferred ))
+        causes["lite-deferred engine sections"]=$(( ${causes["lite-deferred engine sections"]:-0} + lite_deferred ))
+        lite_total_printed=1
+    fi
     local total_pass=$(( pass + ext_pass )) total_fail=$(( fail + ext_fail ))
     local detail="" cause
     for cause in "${!causes[@]}"; do
@@ -932,6 +1195,20 @@ merge_shard_results() { # <M> <result-prefix> — one parent-rendered TOTAL
         echo "RESULTS TOTAL: $total_pass passed, $total_fail failed, 0 skipped ($tree)"
     else
         echo "RESULTS TOTAL: $total_pass passed, $total_fail failed, $skips skipped ($detail) ($tree)"
+    fi
+    # EGL-558: publish the merged engine record (the same numbers as the
+    # line above) for the runner's battery aggregate. The parent writes it;
+    # shard children never see the battery path (run_shard_bg unsets it).
+    if [[ -n "${battery_current_result:-}" ]]; then
+        local -a battery_cause_args=()
+        for cause in "${!causes[@]}"; do
+            battery_cause_args+=( "$cause" "${causes["$cause"]}" )
+        done
+        if ! battery_result_write "$battery_current_result" \
+                "$pass" "$fail" "$ext_pass" "$ext_fail" "$skips" "$tree" \
+                "${battery_cause_args[@]}"; then
+            rc=1
+        fi
     fi
     return 0
 }
@@ -960,6 +1237,9 @@ run_engine_shards() {
         return
     fi
     echo "run.sh: sharding engine: $shard_total shards, ${#sections[@]} sections (weights tests/shard-weights.tsv)"
+    if [[ "$track_sel" == "lite" ]]; then
+        echo "run.sh: --track lite: ${#LITE_SECTIONS[@]} core engine sections (${lite_deferred} deferred to the full battery)"
+    fi
     # The one canonical harness boundary for tier-0 evidence tooling; it
     # opens the section that the parent-rendered merged TOTAL closes.
     echo "== egresslock tests: $engine_harness =="
@@ -1000,6 +1280,11 @@ if (( section_mode )); then
 fi
 
 for h in "${harnesses[@]}"; do
+    # EGL-558: one record path per harness for the closing battery block.
+    battery_current_result=""
+    if (( battery_on )); then
+        battery_current_result="$battery_dir/$(basename "$h").result"
+    fi
     if [[ "$h" == "$engine_harness" && "$shard_mode" != "serial" ]]; then
         run_engine_shards
         continue
@@ -1007,7 +1292,11 @@ for h in "${harnesses[@]}"; do
     if (( section_mode )); then
         run_harness "$h" keep-section-env
     else
+        if (( battery_on )); then
+            export EGRESSLOCK_TEST_BATTERY_RESULT="$battery_current_result"
+        fi
         run_harness "$h"
+        unset EGRESSLOCK_TEST_BATTERY_RESULT
     fi
 done
 if (( section_mode )); then
@@ -1039,7 +1328,18 @@ if (( skip_total > 0 )); then
 else
     echo "run.sh: skips — 0"
 fi
-if [[ "$track_sel" == "fast" ]]; then
+if [[ "$track_sel" == "lite" && "$lite_total_printed" == 1 ]]; then
+    # EGL-497 (D6): the merged TOTAL's synthetic count is engine sections,
+    # not assertions, and the `run.sh: skips` line above counts only
+    # harness `SKIP:` lines — a lite green must not read as the battery.
+    # EGL-558: the battery line sums the merged harness totals, so it
+    # carries the same synthetic count; say so beside the caveat.
+    lite_agg=""
+    if (( battery_on )); then
+        lite_agg=" the BATTERY TOTAL below sums the harness totals, so its skipped count includes that deferred count;"
+    fi
+    echo "run.sh: --track lite — ${#LITE_SECTIONS[@]} core engine sections ran; the merged engine TOTAL's 'lite-deferred engine sections' count (${lite_deferred}) is deferred engine sections, not assertions, and the run.sh: skips line above counts only harness SKIP: lines;${lite_agg} run bash tests/run.sh for the full battery (handoff, nightly, release)"
+elif [[ "$track_sel" == "fast" ]]; then
     # EGL-270 (G5): the full trailer would over-claim on a fast run.
     echo "run.sh: --track fast — registered slow sections were skipped (named above); run bash tests/run.sh for the full battery; remaining skips are the private-fixture / host-shape checks"
 elif (( section_mode )); then
@@ -1047,6 +1347,32 @@ elif (( section_mode )); then
     echo "run.sh: --section subset — the rest of the battery was not run; use bash tests/run.sh for the full battery"
 else
     echo "run.sh: public-tree coverage still includes .deb staging asserts, tarball staging, and prefix guards; skipped items above are the private-fixture / host-shape checks that need a tree with those fixtures present"
+fi
+
+# EGL-558: closing block (D3/D5/D6) — one `run.sh: subtotal —` row per
+# harness with a usable record, then the battery-wide TOTAL as the last
+# numeric line. Fail-closed: a missing/malformed record or disagreeing
+# tree tags refuses the aggregate with a named failure and a nonzero rc; a
+# partial sum never renders as BATTERY TOTAL (EGL-451 precedent).
+if (( battery_on )); then
+    battery_pass=0
+    battery_fail=0
+    battery_skips=0
+    battery_tree=""
+    battery_bad=0
+    for h in "${harnesses[@]}"; do
+        h_name="$(basename "$h")"
+        if ! battery_record_read "$h_name" "$battery_dir/$h_name.result"; then
+            battery_bad=1
+        fi
+    done
+    if (( battery_bad )); then
+        (( rc == 0 )) && rc=1
+    else
+        echo "BATTERY TOTAL: $battery_pass passed, $battery_fail failed, $battery_skips skipped ($battery_tree)"
+    fi
+    rm -rf -- "$battery_dir"
+    battery_dir=""
 fi
 
 echo "run.sh: egresslock tests done (rc=$rc)"

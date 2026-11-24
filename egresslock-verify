@@ -4,27 +4,25 @@
 # The instanced timer unit `egresslock-verify@<account>.service` runs
 # this as the account.
 #
-# Hybrid verify modes:
-#   - EGRESSLOCK_PROFILE set    -> verify exactly that profile (the
-#                             engine reads <account-home>/.config/egresslock/
-#                             <profile>.conf; a missing network FAILS:
-#                             drift/teardown signal).
-#   - EGRESSLOCK_PROFILE unset  -> bare `egresslock verify --ensured`:
-#                             verify every profile whose anchor is
-#                             running; none running exits 0 silently.
-#                             The engine aggregates every *.conf in the
-#                             account's fixed confdir
-#                             (<passwd-home>/.config/egresslock).
+# One mode: bare `egresslock verify --ensured`.
+#   - The engine aggregates every *.conf in the account's fixed
+#     confdir (<passwd-home>/.config/egresslock), verifies every
+#     profile whose anchor is running, and exits 0 silently when no
+#     profile has a running anchor and nothing is stale (a podman
+#     network object without its policy chain fails named, exit 1).
+#     Silence does not mean nothing is ensured: a stopped anchor whose
+#     chain is still installed is skipped silently — that policy is
+#     still enforcing.
+#   - EGRESSLOCK_PROFILE is not read here. It stays egresslock-start's
+#     required input (the profile that wrapper ensures before exec), so
+#     a set value is ignored silently, not warned about.
 #
 # There is no conf-path wiring: the engine warns about a set
-# EGRESSLOCK_CONF (retired selector; it is not read) and it is not
-# required here. unit.env is the wiring witness the doctor checks; in
-# named mode it carries EGRESSLOCK_PROFILE.
+# EGRESSLOCK_CONF (retired selector; it is not read).
 #
 # Environment:
 #   EGRESSLOCK_DIR     engine resolution: this var >
 #                         /opt/egresslock > this script's directory.
-#   EGRESSLOCK_PROFILE         optional profile name (named-verify mode).
 #
 # Options:
 #   -h, --help            print this help
@@ -33,8 +31,6 @@
 #   - XDG_RUNTIME_DIR is forced to /run/user/$(id -u) (systemd %U does
 #     not expand per-User=; rootless Podman needs the account's own
 #     runtime dir, kept alive by linger)
-#   - EGRESSLOCK_PROFILE unset -> verify --ensured, which exits 0 silently
-#     when no anchors are running (silence = nothing ensured)
 
 set -euo pipefail
 
@@ -68,6 +64,37 @@ else
 fi
 tool="$kit_dir/egresslock"
 
+# EGL-556-D1: the installed docs base for the shipped pointers — the kit
+# this script itself runs (kit_dir: EGRESSLOCK_DIR → /opt/egresslock →
+# script dir), else the .deb share tree, and that branch only when this
+# script lives in the deb libdir (so a prefix verify never reads another
+# install's docs — the EGL-487-D5 skew guard).
+# Keep in sync with the engine's copy (the path chains are deliberately
+# duplicated rather than sourced — EGL-176-D2 / ARC-16-D4).
+docs_base() {
+    local sdir base=""
+    sdir="$(CDPATH='' cd -- "$(dirname "$0")" 2>/dev/null && pwd || true)"
+    if [[ -d "$kit_dir/docs" ]]; then
+        base="$kit_dir/docs"
+    elif [[ "$sdir" == "/usr/lib/egresslock" && -d /usr/share/egresslock/docs ]]; then
+        base=/usr/share/egresslock/docs
+    fi
+    [[ -n "$base" ]] || return 1
+    printf '%s\n' "$base"
+}
+
+# EGL-556-D1/D4: `<title>: <absolute page>` only when the page is a
+# regular file, else the title alone — never a path the operator cannot
+# open (OPERATOR_MESSAGES check 2).
+docs_hint() { # docs_hint <page> <title>
+    local base
+    if base="$(docs_base)" && [[ -f "$base/$1" ]]; then
+        printf '%s: %s\n' "$2" "$base/$1"
+    else
+        printf '%s\n' "$2"
+    fi
+}
+
 [[ -x "$tool" ]] || {
     echo "egresslock-verify: egresslock not found/executable: $tool" >&2
     exit 1
@@ -78,7 +105,10 @@ tool="$kit_dir/egresslock"
 # a broken shared netns (e.g. enforce-mode AppArmor pasta profile).
 # EGL-78-D1/D3: bound the probe like the engine — a wedged
 # `podman unshare --rootless-netns true` is a named failure after 5s,
-# never an indefinite block. Skippable in the mock harness.
+# never an indefinite block. This hand-copied probe mirrors the
+# engine's `rt_unshare -t`, including the `-k 1` KILL grace (EGL-519
+# F6), so a TERM-immune runtime call cannot outlive the bound.
+# Skippable in the mock harness.
 if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
     if ! command -v timeout >/dev/null 2>&1; then
         echo "egresslock-verify: timeout(1) (coreutils) is required for the netns probe but was not found in PATH" >&2
@@ -108,9 +138,26 @@ if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
         exit 1
     fi
     vprc=0
-    vout="$( ( vprobe_env; cd / && timeout 5 podman unshare --rootless-netns true ) 2>&1)" || vprc=$?
-    if (( vprc == 124 )); then
-        echo "egresslock-verify: netns probe timed out after 5s (probe: 'timeout 5 podman unshare --rootless-netns true'); the rootless netns is not answering — check pasta/podman health before retrying" >&2
+    v_start=$SECONDS
+    vout="$( ( vprobe_env; cd / && timeout -k 1 5 podman unshare --rootless-netns true ) 2>&1)" || vprc=$?
+    v_elapsed=$(( SECONDS - v_start ))
+    # F1 (R-EGL-583-2) / F5 (R-EGL-583-4): timeout(1) propagates a
+    # child's own exit status when the bound is not reached — 124 when
+    # the probe exits 124 itself, and 137 for ANY SIGKILL death of the
+    # probe, not only its own KILL after the grace. Only a probe that
+    # reached the 5s bound gets the timeout narrative; an early 124 or
+    # 137 (OOM kill, stray kill -9, runtime abort) falls through to the
+    # generic branch and reports the real rc/output. A real 5s expiry
+    # always measures v_elapsed >= 5 (TERM fires at +5s and SECONDS is
+    # whole-second, so the measured difference cannot drop below 5).
+    if (( v_elapsed >= 5 && (vprc == 124 || vprc == 137) )); then
+        # D1: a 137 at/after the bound is the 1s-grace KILL — a timeout
+        # outcome, not a runtime fault, so it keeps the named timeout line.
+        vterm=""
+        if (( vprc == 137 )); then
+            vterm=" the probe ignored TERM and was killed after the 1s grace;"
+        fi
+        echo "egresslock-verify: netns probe timed out after 5s (probe: 'timeout -k 1 5 podman unshare --rootless-netns true');$vterm the rootless netns is not answering — check pasta/podman health before retrying" >&2
         exit 1
     elif (( vprc != 0 )); then
         # EGL-347-D1: same routing as the engine's netns_probe — report
@@ -139,22 +186,23 @@ if [[ "${EGRESSLOCK_SKIP_NETNS_PROBE:-0}" != "1" ]]; then
             vmsg "  If it reports \"podman label: unlabeled\" or"
             vmsg "  \"pasta amendment: not required ...\", this is not AppArmor:"
             vmsg "  check the account session — see"
-            vmsg "  docs/troubleshooting/pasta-apparmor"
+            vmsg "  $(docs_hint troubleshooting/pasta-apparmor.md 'the pasta/AppArmor troubleshooting page')"
             vmsg "  If it reports \"condition unknown\", see"
-            vmsg "  docs/troubleshooting/pasta-apparmor (Diagnosis)"
+            vmsg "  $(docs_hint troubleshooting/pasta-apparmor.md 'the pasta/AppArmor troubleshooting page (Diagnosis)')"
             vmsg "Then re-run the probe. If it still fails, see"
-            vmsg "docs/troubleshooting/pasta-apparmor"
+            vmsg "$(docs_hint troubleshooting/pasta-apparmor.md 'the pasta/AppArmor troubleshooting page')"
         else
             vmsg "Check podman's output above; for shared-netns checks see"
-            vmsg "docs/troubleshooting/netns-inspection"
+            vmsg "$(docs_hint troubleshooting/netns-inspection.md 'the shared-netns troubleshooting page')"
         fi
         vmsg "Do NOT reinstall the kit — nothing is installed wrong."
         exit 1
     fi
 fi
 
-if [[ -n "${EGRESSLOCK_PROFILE:-}" ]]; then
-    exec "$tool" verify "$EGRESSLOCK_PROFILE"
-fi
-# Sweep mode: bare --ensured; the engine aggregates the account confdir.
+# EGL-333: the timer is aggregate-only — every profile with a running
+# anchor that has a conf in the account's fixed confdir. Manual
+# `egresslock verify <profile>` stays for a single-profile human check;
+# a set EGRESSLOCK_PROFILE is ignored here (it belongs to
+# egresslock-start, not this wrapper).
 exec "$tool" verify --ensured

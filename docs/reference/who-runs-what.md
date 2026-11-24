@@ -5,12 +5,15 @@ levels, three separate worlds.
 
 ## 1. root — install and forget
 
-Root does exactly two things, once per host / once per account. It
+Root's standing jobs, once per host / once per account — plus a
+one-time `apparmor add` only where the check says `FAILED`. It
 never runs the engine, never starts workloads, never edits policy:
 
 ```sh
-sudo dpkg -i ./egresslock_<VERSION>_all.deb          # once per host
-sudo egresslock-setup init --init-conf --enable --account <account>   # once per account
+sudo dpkg -i ./egresslock_VERSION_all.deb          # once per host
+sudo egresslock-setup init ACCOUNT --init-conf --enable   # once per account
+# only where `egresslock-setup apparmor check` says CHECK FAILED:
+# sudo egresslock-setup apparmor add
 ```
 
 `egresslock-setup` is real host root: run it with `sudo` from the host,
@@ -30,7 +33,7 @@ and the containers. Every `egresslock` command and every workload
 container start runs here:
 
 ```sh
-sudo -iu <account>      # ... then: egresslock ensure main
+sudo -iu ACCOUNT      # ... then: egresslock ensure main
 ```
 
 The engine refuses to run as root — a root run builds policy in
@@ -53,8 +56,8 @@ takes it outside the profile's guarantees: host networking and
 shared-gateway-netns both grant raw direct egress past the policy (no
 Squid), and a dual-homed container keys as an ordinary profile workload
 on its profile leg. The kit does not reject these launch modes — they
-are operator obligations, listed with the others in the [threat
-model's operator obligations](threat-model.md#operator-obligations-the-kit-does-not-enforce).
+are operator obligations, listed with the others in the
+[operator obligations checklist](operator-obligations.md).
 
 ## The tilde trap (one gotcha worth knowing)
 
@@ -64,7 +67,7 @@ conf path to `~`-expand, because the engine always reads
 `<account-home>/.config/egresslock/<profile>.conf`:
 
 ```sh
-sudo -iu <account> -- egresslock ensure main
+sudo -iu ACCOUNT -- egresslock ensure main
 ```
 
 ## Root, sudo, and NOPASSWD (no passwordless root)
@@ -72,9 +75,10 @@ sudo -iu <account> -- egresslock ensure main
 The three root-running kit entry points — `install-kit.sh`,
 `uninstall-kit.sh`, and `egresslock-setup` — are **interactive root**
 tools. Do **not** grant them passwordless sudo (`NOPASSWD` in
-sudoers): their arguments are deliberately free-form (`--prefix`,
-`--account`, `--from`/`--conf`), and `egresslock-setup` runs as the target
-account via `runuser` — so a `NOPASSWD` rule on any of these binaries
+sudoers): their arguments are deliberately free-form (`--prefix`, the
+account operand, `--from`), and `egresslock-setup` runs as the
+target account via `runuser` — so a `NOPASSWD` rule on any of these
+binaries
 without an exact-argv restriction is **equivalent to full root**.
 
 The engine itself never runs as root (the root guard) and does not

@@ -8,24 +8,25 @@
 #        --account runner
 #
 # What it does:
-#   1. Stops/disables egresslock-verify@<account>.timer for each
+#   1. Stops/disables egresslock-verify@ACCOUNT.timer for each
 #      --account.
 #   2. Removes the instanced unit templates and the installed kit from
 #      --prefix (egresslock, egresslock-start, egresslock-verify,
-#      egresslock-setup, gateway/, apparmor/, examples/, VERSION) and
-#      this prefix's PATH wrappers, then daemon-reloads.
+#      egresslock-setup, gateway/, apparmor/, examples/, docs/, VERSION)
+#      and this prefix's PATH wrappers, then daemon-reloads.
 #
 # What it deliberately does NOT touch (account-owned):
-#   - ~/.config/egresslock/ (conf, allowlist, unit.env) — operator
+#   - ~/.config/egresslock/ (conf, allowlist) — operator
 #     runtime state. Pass --purge-account-data to remove it.
 #   - Podman state: anchor/gateway containers, networks, images. The
 #     uninstaller never runs podman. Teardown is the
 #     account's job, run while the engine still exists:
-#       egresslock teardown --runtime
-#     (as the account; no conf needed — it sweeps kit containers and
-#     networks. If the engine is
-#     already gone, reinstall the kit and run `teardown --runtime` to
-#     recover leftovers.)
+#       egresslock teardown all --yes
+#       egresslock teardown --orphans
+#     (as the account; `all` tears down every configured profile, then
+#     `--orphans` sweeps kit objects whose conf is already gone — no
+#     conf needed. If the engine is already gone, reinstall the kit and
+#     run these to recover leftovers.)
 #
 # Options:
 #   --prefix <path>         kit prefix to remove (default:
@@ -67,11 +68,11 @@
 #     the REAL kit markers — egresslock (executable), egresslock-verify,
 #     VERSION, and gateway/Containerfile — anything else is warned and
 #     kept (a lone VERSION or egresslock file is not a kit)
-#   - account data (conf, allowlist, unit.env) is preserved by default;
+#   - account data (conf, allowlist) is preserved by default;
 #     only --purge-account-data removes it
 #   - Podman state (anchors/gateways/networks/images) is never touched;
-#     run `egresslock teardown --runtime` as the account, while the
-#     engine still exists
+#     run `egresslock teardown all --yes` and then `egresslock teardown
+#     --orphans` as the account, while the engine still exists
 #
 # Exit codes: 0 ok, 1 preflight failure (non-root, unknown account),
 #   2 usage/environment error.
@@ -220,7 +221,29 @@ if [[ -L "$prefix_probe" ]]; then
     fi
     exit 2
 fi
-unset prefix_probe prefix_resolved q_prefix q_resolved
+unset prefix_resolved q_prefix q_resolved
+
+# EGL-555-D2: capture the probed prefix's no-follow identity (or record that
+# it is absent) so the marker fence and the removal below can run relative to
+# the directory that was checked, not to its name. stat without -L is the
+# directory itself, never a referent.
+prefix_id=""
+if [[ -e "$prefix_probe" || -L "$prefix_probe" ]]; then
+    prefix_id="$(stat -c '%d:%i' -- "$prefix_probe" 2>/dev/null)" || prefix_id=""
+    if [[ -z "$prefix_id" ]]; then
+        printf -v q_prefix '%q' "$prefix"
+        echo "uninstall-kit: refusing: cannot read the --prefix directory identity: $q_prefix" >&2
+        echo "  check that the path is a readable directory, then re-run; nothing was stopped, removed, or disabled." >&2
+        exit 1
+    fi
+fi
+# EGL-555-D2: one cause line for a prefix that no longer matches the probe.
+_kit_prefix_refuse_changed() {
+    printf -v q_prefix '%q' "$prefix"
+    echo "uninstall-kit: refusing: --prefix changed while the kit checked it: $q_prefix" >&2
+    echo "  no kit files were removed from it; the instanced timer templates are already removed. Name the real kit prefix and re-run." >&2
+    exit 1
+}
 
 # 1. Stop/disable the per-account timers (D2: conservative, explicit).
 # EGL-463-D1: the attempt's exit status is the only locale/version-stable
@@ -255,29 +278,77 @@ done
 # R-017-1 F4: an installed-but-unnamed account would otherwise keep a
 # stale wants-symlink pointing at the removed template — disable every
 # enabled instance of the timer, not just the named ones.
-# EGL-463-D1: capture the list in this shell (no pipeline/xargs, whose
-# status hid per-unit failures); the query's own rc is part of the
+# EGL-434-D1/D3: the unit dir is a test-only hook. Without the flag an
+# inherited value is ignored and the production default is used, exactly
+# as if the variable were unset. Resolved here, above the sweep
+# (EGL-535-D2): the sweep's path sources read the same resolved dir.
+unit_dest="/etc/systemd/system"
+if kit_test_mode; then
+    if [[ -n "${EGRESSLOCK_UNIT_DIR:-}" ]]; then unit_dest="$EGRESSLOCK_UNIT_DIR"; fi
+else
+    egl491_warn_ignored_hook EGRESSLOCK_UNIT_DIR "${EGRESSLOCK_UNIT_DIR:-}"
+fi
+# EGL-535-D1: every name any source yields passes this one attempt path —
+# shape filter, bare-template skip, attempted-set de-dup, then the
+# existing `_stop_disable`. The filters are load-bearing: a mock (or an
+# over-broad listing) must not widen the sweep to `.service` units or
+# foreign names, and a pattern-shaped test must never admit its own
+# unmatched glob literal (`*`, `?`, `[`) or a path.
+_stop_try_unit() {
+    local _unit="$1" _seen=0 _attempted
+    case "$_unit" in
+        egresslock-verify@*.timer) ;;
+        *) return 0 ;;
+    esac
+    case "$_unit" in
+        *'*'*|*'?'*|*'['*|*/*) return 0 ;;
+    esac
+    [[ "$_unit" == "egresslock-verify@.timer" ]] && return 0
+    for _attempted in "${_stop_attempted_units[@]}"; do
+        [[ "$_attempted" == "$_unit" ]] && { _seen=1; break; }
+    done
+    (( _seen == 0 )) || return 0
+    _stop_attempted_units+=("$_unit")
+    _stop_disable "$_unit"
+}
+# EGL-463-D1: capture each list in this shell (no pipeline/xargs, whose
+# status hid per-unit failures); the queries' own rc is part of the
 # outcome, and the bare template is not an instance to disable.
+# EGL-535-D1: one source can succeed while returning an incomplete list
+# (systemd 257 renders only the template row for the file query), so the
+# union below is the source of record — never any single query.
+# EGL-535-D3: any failing query leaves the stop unconfirmed; a succeeding
+# source never certifies a failing one.
 _stop_list_rc=0
 _stop_list="$(systemctl list-unit-files 'egresslock-verify@*.timer' --no-legend 2>/dev/null)" \
+    || _stop_list_rc=$?
+_stop_units="$(systemctl list-units --all --type=timer --plain --no-legend 'egresslock-verify@*.timer' 2>/dev/null)" \
     || _stop_list_rc=$?
 if (( _stop_list_rc != 0 )); then
     timer_stop_confirmed=0
 fi
 if [[ -n "$_stop_list" ]]; then
     while IFS= read -r _stop_line; do
-        _stop_unit="${_stop_line%%[[:space:]]*}"
-        [[ -n "$_stop_unit" ]] || continue
-        [[ "$_stop_unit" == "egresslock-verify@.timer" ]] && continue
-        _stop_seen=0
-        for _attempted in "${_stop_attempted_units[@]}"; do
-            [[ "$_attempted" == "$_stop_unit" ]] && { _stop_seen=1; break; }
-        done
-        (( _stop_seen == 0 )) || continue
-        _stop_attempted_units+=("$_stop_unit")
-        _stop_disable "$_stop_unit"
+        _stop_try_unit "${_stop_line%%[[:space:]]*}"
     done <<< "$_stop_list"
 fi
+if [[ -n "$_stop_units" ]]; then
+    while IFS= read -r _stop_line; do
+        _stop_try_unit "${_stop_line%%[[:space:]]*}"
+    done <<< "$_stop_units"
+fi
+# EGL-535-D1 amendment / D4: the path sources admit existing entries only.
+# An unmatched glob yields its own literal, and a dangling wants link is
+# section 2's job (attempting it would fake a failed stop on a state that
+# section already cleans up).
+for _stop_path in "$unit_dest"/egresslock-verify@*.timer; do
+    [[ -e "$_stop_path" ]] || continue
+    _stop_try_unit "${_stop_path##*/}"
+done
+for _stop_path in "$unit_dest"/timers.target.wants/egresslock-verify@*.timer; do
+    [[ -L "$_stop_path" && -e "$_stop_path" ]] || continue
+    _stop_try_unit "${_stop_path##*/}"
+done
 if (( timer_stop_confirmed == 0 )); then
     echo "uninstall-kit: WARNING - could not confirm the verify timers stopped." >&2
     if (( ${#_stop_failed_units[@]} > 0 )); then
@@ -289,20 +360,11 @@ if (( timer_stop_confirmed == 0 )); then
         echo "  The enabled verify timers could not be listed." >&2
     fi
     echo "  When systemd is available, check: systemctl list-timers 'egresslock-verify@*.timer'" >&2
-    echo "  If a verify timer is still active, stop it: systemctl disable --now egresslock-verify@<account>.timer" >&2
+    echo "  If a verify timer is still active, stop it: systemctl disable --now egresslock-verify@ACCOUNT.timer" >&2
 fi
-unset _stop_line _stop_unit _stop_seen _attempted
+unset _stop_line _stop_units _stop_path _stop_list
 
 # 2. Remove the instanced templates and the deployed kit.
-# EGL-434-D1/D3: the unit dir is a test-only hook. Without the flag an
-# inherited value is ignored and the production default is used, exactly
-# as if the variable were unset.
-unit_dest="/etc/systemd/system"
-if kit_test_mode; then
-    if [[ -n "${EGRESSLOCK_UNIT_DIR:-}" ]]; then unit_dest="$EGRESSLOCK_UNIT_DIR"; fi
-else
-    egl491_warn_ignored_hook EGRESSLOCK_UNIT_DIR "${EGRESSLOCK_UNIT_DIR:-}"
-fi
 rm -f "$unit_dest/egresslock-verify@.service" \
       "$unit_dest/egresslock-verify@.timer"
 # EGL-102-D6-R2: a timers.target.wants symlink whose template is gone
@@ -315,21 +377,48 @@ for _want in "$unit_dest"/timers.target.wants/egresslock-verify@*.timer; do
     echo "uninstall-kit: removed dangling timer enablement: $_want"
 done
 unset _want
-# R-017-1 F5 / EGL-89-D1: only rm -rf a directory that IS a kit prefix —
+# R-017-1 F5 / EGL-89-D1: only remove a directory that IS a kit prefix —
 # an absolute, charset-clean path (checked above) carrying all four
 # regular-file markers. A checkout (egresslock, no VERSION) or a scratch
 # dir with one marker is not a kit; warn and keep it.
+# EGL-555-D2: the path fence above decides only the branch; the removal
+# itself runs in a subshell whose cwd is the probed directory and whose
+# `stat .` must still equal the captured identity. The marker fence is
+# re-read there (authoritative), the contents are emptied from inside
+# (relative names, never `rm -rf "$prefix"`, never a trailing `/`), and
+# the emptied name is then rmdir'd from the parent: a substituted link
+# fails ENOTDIR and a repopulated directory ENOTEMPTY, both fail closed.
 prefix_removed=0
-if [[ -d "$prefix" \
-      && -f "$prefix/egresslock" && -x "$prefix/egresslock" \
-      && -f "$prefix/egresslock-verify" \
-      && -f "$prefix/VERSION" \
-      && -f "$prefix/gateway/Containerfile" ]]; then
-    rm -rf "$prefix"
+if [[ -d "$prefix_probe" \
+      && -f "$prefix_probe/egresslock" && -x "$prefix_probe/egresslock" \
+      && -f "$prefix_probe/egresslock-verify" \
+      && -f "$prefix_probe/VERSION" \
+      && -f "$prefix_probe/gateway/Containerfile" ]]; then
+    (
+        cd -- "$prefix_probe" || _kit_prefix_refuse_changed
+        _kit_id_now="$(stat -c '%d:%i' . 2>/dev/null)" || _kit_prefix_refuse_changed
+        [[ "$_kit_id_now" == "$prefix_id" ]] || _kit_prefix_refuse_changed
+        [[ -f egresslock && -x egresslock \
+              && -f egresslock-verify && -f VERSION \
+              && -f gateway/Containerfile ]] || _kit_prefix_refuse_changed
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || {
+            printf -v q_prefix '%q' "$prefix"
+            echo "uninstall-kit: FAIL - could not empty the kit prefix: $q_prefix" >&2
+            echo "  some kit files were removed; inspect the directory and remove it yourself once it is empty." >&2
+            exit 1
+        }
+    )
+    rmdir -- "$prefix_probe" || {
+        printf -v q_prefix '%q' "$prefix"
+        echo "uninstall-kit: FAIL - could not remove the emptied kit prefix: $q_prefix" >&2
+        echo "  the kit files were removed from it, then the name was repopulated or replaced; inspect it and remove it yourself." >&2
+        exit 1
+    }
     prefix_removed=1
 elif [[ -e "$prefix" ]]; then
     echo "uninstall-kit: WARNING - $prefix exists but is not a real kit prefix (missing real-kit markers: egresslock, egresslock-verify, VERSION, gateway/Containerfile); not removing" >&2
 fi
+unset prefix_id _kit_id_now
 
 # EGL-43-D4: remove THIS prefix's PATH wrappers only — the marker
 # comment on line 2 carries the prefix, so another prefix's wrappers and
@@ -371,7 +460,7 @@ if (( _reload_rc == 0 )) && [[ -z "$_reload_out" ]]; then
 else
     echo "uninstall-kit: WARNING - systemd did not confirm the unit-file reload; the verify timer templates were removed, but a running systemd may still have them loaded." >&2
     echo "  An enabled verify timer may still be active; when systemd is available, run: systemctl daemon-reload" >&2
-    echo "  If a verify timer is still active, stop it: systemctl disable --now egresslock-verify@<acct>.timer" >&2
+    echo "  If a verify timer is still active, stop it: systemctl disable --now egresslock-verify@ACCT.timer" >&2
 fi
 
 # 3. Account data: preserved unless explicitly purged.
@@ -390,7 +479,12 @@ for acct in "${accounts[@]:-}"; do
         continue
     fi
     if (( purge_account_data )); then
-        if [[ -e "$home/.config/egresslock" ]]; then
+        if [[ -L "$home/.config/egresslock" ]]; then
+            # EGL-433-D2: a symlink is only the link, never "account data";
+            # removing it leaves the target (the real policy tree) intact.
+            rm -f -- "$home/.config/egresslock"
+            echo "uninstall-kit: removed $home/.config/egresslock (symbolic link; its target was not touched)"
+        elif [[ -e "$home/.config/egresslock" ]]; then
             rm -rf "$home/.config/egresslock"
             echo "uninstall-kit: purged $home/.config/egresslock (account data)"
         fi
@@ -399,7 +493,7 @@ for acct in "${accounts[@]:-}"; do
         # removed, so the reminder must say so instead of prescribing an
         # unrunnable command.
         [[ -e "$home/.config/egresslock" ]] && \
-            echo "uninstall-kit: kept $home/.config/egresslock (account-owned policy data; Podman state untouched — run 'egresslock teardown --runtime' as the account to remove kit containers/networks; it needs the engine, so reinstall the kit first if it is already gone)"
+            echo "uninstall-kit: kept $home/.config/egresslock (account-owned policy data; Podman state untouched — run 'egresslock teardown all --yes' then 'egresslock teardown --orphans' as the account to remove kit containers/networks; they need the engine, so reinstall the kit first if it is already gone)"
     fi
 done
 
